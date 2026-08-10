@@ -53,6 +53,20 @@ sweep_interval_ms = 100
 # Bounds how long one reclamation pass can hold the write transaction.
 sweep_batch = 512
 
+[store.tags]
+# The registry lives entirely in RAM, so without a ceiling a client inventing
+# tag names is a memory leak.
+max_tags = 100000
+# Tag-index entries examined per reclamation pass. While an invalidation is
+# still being cleaned up these passes run back to back, so this bounds
+# transaction length rather than drain rate.
+reclaim_batch = 512
+
+[protocol]
+# FLUSH empties the whole cache for anyone who can reach the port. Off unless
+# deliberately enabled.
+flush_enabled = false
+
 [observability]
 log_format = "pretty"   # or "json"
 log_level = "info"      # overridden by RUST_LOG when set

@@ -158,6 +158,42 @@ impl Client {
         }
     }
 
+    /// Invalidates every record carrying `tag`.
+    ///
+    /// Constant time on the server regardless of how many keys are affected.
+    /// Returns `false` if the tag was never registered, so nothing referenced
+    /// it.
+    pub async fn delete_by_tag(&mut self, tag: &[u8]) -> Result<bool> {
+        match self.round_trip(Opcode::DeleteByTag, tag).await? {
+            (Status::Ok, _) => Ok(true),
+            (Status::NotFound, _) => Ok(false),
+            (status, _) => Err(ClientError::Status(status)),
+        }
+    }
+
+    /// Empties the cache, returning the new flush epoch. Refused unless the
+    /// server has `protocol.flush_enabled` set.
+    pub async fn flush(&mut self) -> Result<u32> {
+        match self.round_trip(Opcode::Flush, &[]).await? {
+            (Status::Ok, payload) if payload.len() >= 4 => {
+                Ok(u32::from_le_bytes(payload[0..4].try_into().unwrap()))
+            }
+            (Status::Ok, _) => Err(ClientError::Protocol("truncated flush response")),
+            (status, _) => Err(ClientError::Status(status)),
+        }
+    }
+
+    /// Stores a value with tags attached.
+    pub async fn set_with_tags(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl_secs: u32,
+        tags: &[&[u8]],
+    ) -> Result<u64> {
+        self.set_tagged(key, value, ttl_secs, tags).await
+    }
+
     /// Fetches many keys in one round trip, against one consistent snapshot.
     /// The result has one slot per requested key, in order; `None` is a miss.
     pub async fn get_many(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Value>>> {

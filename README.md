@@ -6,9 +6,10 @@ protocol compatibility.
 Design and rationale: [docs/plan.md](docs/plan.md). Original brief:
 [docs/project.md](docs/project.md).
 
-**Status: M1 complete.** Single-key and batch operations over the native binary
-protocol (KCP), TTLs with background reclamation, and group-committed writes.
-Not yet production-usable — see [What works today](#what-works-today).
+**Status: M2 complete.** Single-key and batch operations over the native binary
+protocol (KCP), TTLs with background reclamation, group-committed writes, and
+constant-time tag invalidation. Not yet production-usable — see
+[What works today](#what-works-today).
 
 ## Quick start
 
@@ -33,7 +34,7 @@ Run with `--ephemeral` to start from an empty database and skip syncing, or
 | `GET_MANY`, `SET_MANY`, `DELETE_MANY` | Working — one transaction per batch, all-or-nothing |
 | TTLs | Enforced on read, and reclaimed in the background by the sweeper |
 | Group commit | Working — see [benchmark](#write-throughput) |
-| Tags and `DELETE_BY_TAG` | M2 — currently **rejected** with `UNSUPPORTED` rather than silently ignored |
+| Tags, `DELETE_BY_TAG`, `FLUSH` | Working — invalidation is constant time, see [benchmark](#tag-invalidation) |
 | Memcached protocol | M3 |
 | Sharding, capacity eviction, Prometheus metrics | M4 |
 | Cluster tag invalidation | M5 |
@@ -67,6 +68,34 @@ write to build a batch. A batch is simply whatever queued while the previous
 commit was in flight, so an idle server commits immediately and a loaded one
 batches on its own. Sharding (M4) multiplies this by running independent
 environments with a writer each.
+
+## Tag invalidation
+
+Invalidating a tag is one generation-counter bump, so it costs the same whether
+the tag covers ten keys or half a million. Records store the generation their
+tags had when written, and a read compares those against the registry in RAM —
+no extra disk lookup, no walk over the affected keys.
+
+```bash
+cargo run --release -p cache-store --example tag_bench
+```
+
+| keys carrying the tag | `DELETE_BY_TAG` | background reclaim |
+|---:|---:|---:|
+| 100 | 676µs | 33ms |
+| 1,000 | 457µs | 35ms |
+| 10,000 | 1.77ms | 326ms |
+| 100,000 | 197µs | 3.75s |
+| 500,000 | 205µs | 32.5s |
+
+Invalidation is flat across a 5,000× range in cardinality (the spread is commit
+timing, not growth). Reclaiming the freed space *is* proportional to the key
+count and runs in the background, bounded per pass so it never holds the write
+transaction long enough to stall traffic.
+
+The alternative — finding and deleting every key with the tag — would cost O(n)
+while holding the environment's only write transaction, which for a large tag is
+a multi-second stall of every other write on the node.
 
 ## Layout
 

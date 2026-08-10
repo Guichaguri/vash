@@ -26,6 +26,32 @@ impl LmdbStore {
         Ok(Self { engine, writer })
     }
 
+    /// Registers any tag names in `sets` that the registry has not seen.
+    ///
+    /// A record may never reference a tag that is not durably registered: after
+    /// a restart the id would either be unknown — a spurious miss — or reused
+    /// for a different name, which would invalidate unrelated data. So this
+    /// costs an extra writer round trip, but only the first time a given tag
+    /// name is used; afterwards resolution is a RAM lookup.
+    fn ensure_tags_registered(&self, sets: &[Set<'_>]) -> Result<()> {
+        let mut missing: Vec<Box<[u8]>> = Vec::new();
+        for set in sets {
+            if set.tags.is_empty() {
+                continue;
+            }
+            for name in self.engine.tags().missing(&set.tags) {
+                if !missing.contains(&name) {
+                    missing.push(name);
+                }
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.writer.create_tags(missing)
+    }
+
     /// Stops the writer and releases the environment, blocking until LMDB has
     /// fully let go of it.
     pub fn close(mut self) {
@@ -51,20 +77,31 @@ impl Store for LmdbStore {
     }
 
     fn set(&self, set: &Set<'_>) -> Result<u64> {
-        let prepared = self.engine.prepare_set(set)?;
-        let mut cas = self.writer.set_many(vec![prepared])?;
+        let mut cas = self.set_many(std::slice::from_ref(set))?;
         cas.pop()
             .ok_or_else(|| crate::StoreError::Corrupt("writer dropped a set result".into()))
     }
 
     fn set_many(&self, sets: &[Set<'_>]) -> Result<Vec<u64>> {
+        self.ensure_tags_registered(sets)?;
+
         // Encoding happens here, on the caller's thread, so the value copies
         // for a whole batch run in parallel with other connections instead of
         // serialising behind the single writer.
         let prepared = sets
             .iter()
-            .map(|set| self.engine.prepare_set(set))
+            .map(|set| {
+                let tags = self.engine.tags().resolve(&set.tags).map_err(|name| {
+                    // `ensure_tags_registered` just created these, so a gap
+                    // here means the registry and the batch disagree.
+                    crate::StoreError::Corrupt(format!(
+                        "tag {name:?} vanished between registration and use"
+                    ))
+                })?;
+                self.engine.prepare_set(set, tags)
+            })
             .collect::<Result<Vec<_>>>()?;
+
         self.writer.set_many(prepared)
     }
 
@@ -82,6 +119,14 @@ impl Store for LmdbStore {
         self.writer.touch(key, ttl_secs)
     }
 
+    fn delete_by_tag(&self, tag: &[u8]) -> Result<bool> {
+        Ok(self.writer.delete_by_tag(tag)?.is_some())
+    }
+
+    fn flush(&self) -> Result<u32> {
+        self.writer.flush()
+    }
+
     fn stats(&self) -> Result<StoreStats> {
         use std::sync::atomic::Ordering;
 
@@ -92,6 +137,7 @@ impl Store for LmdbStore {
             sweeps: metrics.sweeps.load(Ordering::Relaxed),
             reclaimed: metrics.reclaimed.load(Ordering::Relaxed),
             sweep_lag_ms: metrics.sweep_lag_ms.load(Ordering::Relaxed),
+            tag_reclaimed: metrics.tag_reclaimed.load(Ordering::Relaxed),
             ..self.engine.stats()?
         })
     }

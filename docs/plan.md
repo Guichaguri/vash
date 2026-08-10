@@ -254,16 +254,35 @@ alive = record.epoch == global_epoch                       // §6 flush
      && record.tags.all(|(id, gen)| registry[id].gen == gen) // §5 tags
 ```
 
-`FLUSH`/`flush_all` reuses the same trick with a single global epoch counter — also O(1).
+`FLUSH`/`flush_all` reuses the same trick with a single global epoch counter. **As implemented (M2) it
+bumps the epoch *and* clears the data sub-databases in the same transaction**, because the two do
+different jobs: the clear frees the space, which an epoch bump alone would never do for records without
+a TTL (nothing would come looking for them), while the epoch closes the MVCC window — a read
+transaction opened before the flush still sees the old snapshot, and comparing those records against
+the new epoch is what stops them being served.
 
 ### Reclamation
 
-Correctness is instant; disk space is not. A `tagidx` sub-database (LMDB `DUPSORT`) maps
-`tag_id u32 BE → [user key bytes]` and is maintained on write. On a generation bump, a job is enqueued
-in a `jobs` sub-database recording `{ tag_id, target_generation, resume_cursor }`. The reclaimer walks
-the tag's duplicate list in bounded batches, re-checks each record's liveness, and deletes the dead ones
-plus their index entries — checkpointing its cursor so a restart resumes rather than restarts. It shares
-the writer queue with the sweeper and yields to user traffic under load.
+Correctness is instant; disk space is not. A `tagidx` sub-database is maintained on write. On a
+generation bump, a job is enqueued in a `jobs` sub-database recording `{ tag_id, target_generation,
+resume_cursor }`. The reclaimer walks the tag's entries in bounded batches, re-checks each record, and
+deletes the dead ones plus their index entries — checkpointing its cursor so a restart resumes rather
+than restarts. It shares the writer's transaction with the sweeper and yields to user traffic under load.
+
+**Two corrections found while implementing this (M2):**
+
+1. **`tagidx` is a compound key, not `DUPSORT`.** The original design mapped `tag_id → [user key]` as
+   duplicates. LMDB can seek to a *key* but offers no way to seek to a position *within* a duplicate
+   list, so resuming a half-finished job meant re-walking every duplicate already processed —
+   quadratic for a large tag. The layout is now `tag_id u32 BE || xxh3_64(user key) BE → user key`,
+   which preserves the ordering and makes resumption an O(log n) range seek. The key is hashed because
+   LMDB caps keys at 511 bytes and a prefix plus a full-length user key would not fit; a collision
+   costs one unreclaimed record, never a wrong answer.
+2. **Deadness is judged against the job's `target_generation`, never the live registry.** A reclamation
+   pass can share a transaction with the `DELETE_BY_TAG` that queued it, and the in-memory generation
+   is only published *after* that commit — so the registry still reads the old value during that pass.
+   Judging from RAM there marks every record live, advances the cursor past them, and leaks them
+   permanently. This was caught by a test and is now a regression test in its own right.
 
 `tag_reclaim` is configurable: `index` (default), `sweep` (no `tagidx`, rely on the TTL sweeper to notice
 dead records — cheaper writes, slower reclamation), or `off`.

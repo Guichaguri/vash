@@ -112,6 +112,20 @@ fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> 
                 Ok(Reply::NotFound)
             }
         }
+
+        Command::DeleteByTag { tag } => Ok(Reply::Invalidated(
+            state.store.delete_by_tag(tag).map_err(to_status)?,
+        )),
+
+        Command::Flush => {
+            if !state.flush_enabled {
+                // A remote cache-wipe primitive stays off unless deliberately
+                // enabled.
+                warn!("rejected flush: disabled by configuration");
+                return Err(Status::Unauthorized);
+            }
+            Ok(Reply::Flushed(state.store.flush().map_err(to_status)?))
+        }
     }
 }
 
@@ -133,6 +147,10 @@ fn to_status(err: StoreError) -> Status {
         StoreError::Core(CoreError::ValueTooLarge { .. } | CoreError::KeyTooLong { .. }) => {
             Status::TooLarge
         }
+        StoreError::TagLimit(limit) => {
+            warn!(limit, "tag registry is full");
+            Status::CapacityFull
+        }
         StoreError::Core(_) => Status::BadRequest,
         other => {
             error!(error = %other, "storage failure");
@@ -148,9 +166,9 @@ pub fn server_info(shards: u16, max_value_len: usize) -> ServerInfo {
         shards,
         max_key_len: cache_core::MAX_KEY_LEN as u32,
         max_value_len: max_value_len as u32,
-        // Tags, memcached and cluster are advertised as each milestone lands.
-        // Advertising them early would make a client trust a feature that is
-        // not there.
-        capabilities: 0,
+        // Advertised only as each milestone lands: claiming a capability the
+        // server does not have would make a client trust invalidation that is
+        // not happening.
+        capabilities: cache_core::capability::TAGS,
     }
 }

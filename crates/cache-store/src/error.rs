@@ -30,6 +30,11 @@ pub enum StoreError {
     #[error("store is shutting down")]
     ShuttingDown,
 
+    /// The tag registry is full. It lives entirely in RAM, so an unbounded one
+    /// is a memory leak a client could drive by inventing tag names.
+    #[error("tag registry is full ({0} tags)")]
+    TagLimit(usize),
+
     #[error("database is corrupt or was written by an incompatible build: {0}")]
     Corrupt(String),
 }

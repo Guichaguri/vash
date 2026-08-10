@@ -64,7 +64,9 @@ pub struct RecordHeader {
 
 /// A record's reference to one of its tags, capturing the tag's generation as
 /// it stood when the record was written. See plan §5.
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
+#[derive(
+    FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug, PartialEq, Eq,
+)]
 #[repr(C)]
 pub struct TagRef {
     pub tag_id: U32,

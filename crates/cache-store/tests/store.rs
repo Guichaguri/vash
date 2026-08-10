@@ -46,13 +46,17 @@ impl Harness {
     }
 
     fn set(&self, key: &[u8], value: &[u8], ttl_secs: u32) -> u64 {
+        self.set_tagged(key, value, ttl_secs, &[])
+    }
+
+    fn set_tagged(&self, key: &[u8], value: &[u8], ttl_secs: u32, tags: &[&[u8]]) -> u64 {
         self.store()
             .set(&Set {
                 key: Key::new(key).unwrap(),
                 value,
                 ttl_secs,
                 mc_flags: 0,
-                tags: Vec::new(),
+                tags: tags.to_vec(),
             })
             .unwrap()
     }
@@ -70,6 +74,14 @@ impl Harness {
 
     fn entries(&self) -> u64 {
         self.store().stats().unwrap().entries
+    }
+
+    fn tag_index_entries(&self) -> u64 {
+        self.store().stats().unwrap().tag_index_entries
+    }
+
+    fn pending_reclaims(&self) -> u64 {
+        self.store().stats().unwrap().pending_reclaims
     }
 
     /// Waits for a condition the background sweeper is expected to bring about.
@@ -394,6 +406,422 @@ fn concurrent_writers_share_commits_and_never_reuse_a_cas() {
         "every CAS token must be unique"
     );
     assert_eq!(h.entries(), 800, "no write may be lost to batching");
+}
+
+// ---- tags ------------------------------------------------------------------
+
+#[test]
+fn invalidating_a_tag_hides_every_record_carrying_it() {
+    let h = Harness::new();
+
+    h.set_tagged(b"a", b"1", 0, &[b"news"]);
+    h.set_tagged(b"b", b"2", 0, &[b"news", b"sport"]);
+    h.set_tagged(b"c", b"3", 0, &[b"sport"]);
+    h.set(b"untagged", b"4", 0);
+
+    assert!(h.store().delete_by_tag(b"news").unwrap());
+
+    assert!(h.get(b"a").is_none(), "single-tagged record must go");
+    assert!(
+        h.get(b"b").is_none(),
+        "one dead tag is enough to kill a record"
+    );
+    assert_eq!(
+        h.get(b"c").as_deref(),
+        Some(&b"3"[..]),
+        "other tags unaffected"
+    );
+    assert_eq!(h.get(b"untagged").as_deref(), Some(&b"4"[..]));
+}
+
+#[test]
+fn invalidation_takes_effect_before_any_space_is_reclaimed() {
+    // The whole point of generation counters: the data stops being served
+    // immediately, and freeing it is a separate background concern.
+    let h = Harness::with(|c| {
+        // Long enough that no reclamation can run during the assertion.
+        c.write.sweep_interval_ms = 60_000;
+        c.write.reclaim_batch = 1;
+    });
+
+    for i in 0..100u32 {
+        h.set_tagged(format!("k{i}").as_bytes(), b"v", 0, &[b"batch"]);
+    }
+    h.store().delete_by_tag(b"batch").unwrap();
+
+    assert!(h.get(b"k0").is_none());
+    assert!(h.get(b"k99").is_none());
+    assert!(
+        h.entries() > 0,
+        "records should still be on disk; invalidation must not have deleted them synchronously"
+    );
+}
+
+#[test]
+fn rewriting_after_an_invalidation_brings_a_key_back() {
+    let h = Harness::new();
+
+    h.set_tagged(b"k", b"old", 0, &[b"t"]);
+    h.store().delete_by_tag(b"t").unwrap();
+    assert!(h.get(b"k").is_none());
+
+    // The rewrite captures the bumped generation, so it is live again.
+    h.set_tagged(b"k", b"new", 0, &[b"t"]);
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"new"[..]));
+}
+
+#[test]
+fn repeated_invalidations_keep_advancing() {
+    let h = Harness::new();
+
+    for round in 0..5u32 {
+        let value = format!("v{round}");
+        h.set_tagged(b"k", value.as_bytes(), 0, &[b"t"]);
+        assert_eq!(h.get(b"k").as_deref(), Some(value.as_bytes()));
+
+        h.store().delete_by_tag(b"t").unwrap();
+        assert!(
+            h.get(b"k").is_none(),
+            "round {round} should have invalidated"
+        );
+    }
+}
+
+#[test]
+fn invalidating_an_unknown_tag_is_a_miss_not_an_error() {
+    let h = Harness::new();
+    assert!(!h.store().delete_by_tag(b"never-used").unwrap());
+}
+
+#[test]
+fn reclamation_sharing_a_transaction_with_its_own_invalidation_still_frees_everything() {
+    // A reclamation pass can land in the same commit as the DELETE_BY_TAG that
+    // queued it. The in-memory tag generation is only published after that
+    // commit, so a pass that judged deadness from RAM would see every record as
+    // live, advance its cursor past them, and leak them for good. Judging
+    // against the job's own target generation is what makes it correct.
+    //
+    // A zero sweep interval makes maintenance run on every batch, so the
+    // overlap happens every time rather than by timing luck.
+    let h = Harness::with(|c| {
+        c.write.sweep_interval_ms = 1;
+        c.write.reclaim_batch = 8;
+    });
+
+    for i in 0..64u32 {
+        h.set_tagged(format!("k{i}").as_bytes(), b"v", 0, &[b"t"]);
+    }
+    h.store().delete_by_tag(b"t").unwrap();
+
+    h.wait_for("every invalidated record to be reclaimed", |h| {
+        h.entries() == 0
+    });
+    assert_eq!(h.tag_index_entries(), 0);
+    assert_eq!(h.pending_reclaims(), 0);
+}
+
+#[test]
+fn the_reclaimer_frees_invalidated_records() {
+    let h = Harness::with(|c| {
+        c.write.sweep_interval_ms = 10;
+        c.write.reclaim_batch = 16;
+    });
+
+    for i in 0..200u32 {
+        h.set_tagged(format!("k{i}").as_bytes(), b"v", 0, &[b"bulk"]);
+    }
+    h.set(b"survivor", b"v", 0);
+
+    h.store().delete_by_tag(b"bulk").unwrap();
+
+    // Only the reclaimer can remove these: nothing reads them, and they have
+    // no TTL for the sweeper to act on.
+    h.wait_for("the reclaimer to free the invalidated records", |h| {
+        h.entries() == 1
+    });
+    assert_eq!(h.get(b"survivor").as_deref(), Some(&b"v"[..]));
+    assert_eq!(h.tag_index_entries(), 0, "index entries must go too");
+    assert_eq!(
+        h.pending_reclaims(),
+        0,
+        "the job must complete and be removed"
+    );
+}
+
+#[test]
+fn the_reclaimer_keeps_records_rewritten_after_the_invalidation() {
+    let h = Harness::with(|c| {
+        c.write.sweep_interval_ms = 10;
+        c.write.reclaim_batch = 4;
+    });
+
+    for i in 0..50u32 {
+        h.set_tagged(format!("k{i}").as_bytes(), b"old", 0, &[b"t"]);
+    }
+    h.store().delete_by_tag(b"t").unwrap();
+
+    // Rewritten immediately, so these are live again and must survive a
+    // reclamation pass that is already walking the same index entries.
+    for i in 0..10u32 {
+        h.set_tagged(format!("k{i}").as_bytes(), b"new", 0, &[b"t"]);
+    }
+
+    h.wait_for("reclamation to finish", |h| h.pending_reclaims() == 0);
+
+    for i in 0..10u32 {
+        assert_eq!(
+            h.get(format!("k{i}").as_bytes()).as_deref(),
+            Some(&b"new"[..]),
+            "k{i} was rewritten after the invalidation and must not be reclaimed"
+        );
+    }
+    assert_eq!(h.entries(), 10);
+}
+
+#[test]
+fn reclamation_resumes_across_a_restart() {
+    // The M2 exit criterion: a job interrupted mid-scan must continue rather
+    // than restart, and must not lose or over-delete anything.
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("db"),
+        map_size: 64 * 1024 * 1024,
+        write: WriteConfig {
+            // Effectively frozen: reclamation only advances when we say so.
+            sweep_interval_ms: 60_000,
+            reclaim_batch: 8,
+            ..WriteConfig::default()
+        },
+        ..StoreConfig::default()
+    };
+
+    {
+        let store = LmdbStore::open(&config).unwrap();
+        for i in 0..100u32 {
+            let key = format!("k{i}");
+            store
+                .set(&Set {
+                    key: Key::new(key.as_bytes()).unwrap(),
+                    value: b"v",
+                    ttl_secs: 0,
+                    mc_flags: 0,
+                    tags: vec![b"t"],
+                })
+                .unwrap();
+        }
+        store.delete_by_tag(b"t").unwrap();
+
+        // Let a few bounded passes run, then stop mid-job.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.stats().unwrap().entries > 50 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let stats = store.stats().unwrap();
+        assert!(
+            stats.entries > 0,
+            "test needs an unfinished job to be meaningful"
+        );
+        assert_eq!(stats.pending_reclaims, 1, "a job must still be outstanding");
+        store.close();
+    }
+
+    // Reopen: the persisted job and cursor must carry on.
+    let store = LmdbStore::open(&config).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store.stats().unwrap().entries > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let stats = store.stats().unwrap();
+    assert_eq!(
+        stats.entries, 0,
+        "reclamation must finish after the restart"
+    );
+    assert_eq!(stats.pending_reclaims, 0);
+    assert_eq!(stats.tag_index_entries, 0);
+    store.close();
+}
+
+#[test]
+fn tag_generations_survive_a_restart() {
+    // If a bumped generation were lost, every invalidated record would come
+    // back to life on restart.
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("db"),
+        map_size: 64 * 1024 * 1024,
+        write: WriteConfig {
+            sweep_interval_ms: 60_000,
+            ..WriteConfig::default()
+        },
+        ..StoreConfig::default()
+    };
+
+    {
+        let store = LmdbStore::open(&config).unwrap();
+        store
+            .set(&Set {
+                key: Key::new(b"k").unwrap(),
+                value: b"v",
+                ttl_secs: 0,
+                mc_flags: 0,
+                tags: vec![b"t"],
+            })
+            .unwrap();
+        store.delete_by_tag(b"t").unwrap();
+        store.close();
+    }
+
+    let store = LmdbStore::open(&config).unwrap();
+    assert!(
+        store.get(Key::new(b"k").unwrap()).unwrap().is_none(),
+        "an invalidated record must not be resurrected by a restart"
+    );
+    store.close();
+}
+
+#[test]
+fn tag_ids_are_stable_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("db"),
+        map_size: 64 * 1024 * 1024,
+        write: WriteConfig {
+            sweep_interval_ms: 60_000,
+            ..WriteConfig::default()
+        },
+        ..StoreConfig::default()
+    };
+
+    {
+        let store = LmdbStore::open(&config).unwrap();
+        for (i, tag) in [b"a".as_slice(), b"b", b"c"].iter().enumerate() {
+            store
+                .set(&Set {
+                    key: Key::new(format!("k{i}").as_bytes()).unwrap(),
+                    value: b"v",
+                    ttl_secs: 0,
+                    mc_flags: 0,
+                    tags: vec![tag],
+                })
+                .unwrap();
+        }
+        store.close();
+    }
+
+    let store = LmdbStore::open(&config).unwrap();
+    // Invalidating "b" must hit only k1. If ids were reassigned on load, this
+    // would kill the wrong record.
+    store.delete_by_tag(b"b").unwrap();
+
+    assert!(store.get(Key::new(b"k0").unwrap()).unwrap().is_some());
+    assert!(store.get(Key::new(b"k1").unwrap()).unwrap().is_none());
+    assert!(store.get(Key::new(b"k2").unwrap()).unwrap().is_some());
+    store.close();
+}
+
+#[test]
+fn overwriting_does_not_accumulate_tag_index_entries() {
+    let h = Harness::new();
+    for _ in 0..100 {
+        h.set_tagged(b"hot", b"v", 0, &[b"t"]);
+    }
+    assert_eq!(h.tag_index_entries(), 1);
+}
+
+#[test]
+fn changing_a_records_tags_drops_the_old_index_entry() {
+    let h = Harness::new();
+    h.set_tagged(b"k", b"v", 0, &[b"old"]);
+    assert_eq!(h.tag_index_entries(), 1);
+
+    h.set_tagged(b"k", b"v", 0, &[b"new"]);
+    assert_eq!(h.tag_index_entries(), 1);
+
+    // The record no longer carries "old", so invalidating it must not matter.
+    h.store().delete_by_tag(b"old").unwrap();
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"v"[..]));
+}
+
+#[test]
+fn deleting_a_record_drops_its_tag_index_entries() {
+    let h = Harness::new();
+    h.set_tagged(b"k", b"v", 0, &[b"a", b"b"]);
+    assert_eq!(h.tag_index_entries(), 2);
+
+    h.store().delete(Key::new(b"k").unwrap()).unwrap();
+    assert_eq!(h.tag_index_entries(), 0);
+}
+
+#[test]
+fn the_tag_registry_is_bounded() {
+    let h = Harness::with(|c| c.max_tags = 4);
+
+    for i in 0..4u32 {
+        h.set_tagged(b"k", b"v", 0, &[format!("t{i}").as_bytes()]);
+    }
+
+    let err = h.store().set(&Set {
+        key: Key::new(b"k").unwrap(),
+        value: b"v",
+        ttl_secs: 0,
+        mc_flags: 0,
+        tags: vec![b"one-too-many"],
+    });
+    assert!(
+        matches!(err, Err(cache_store::StoreError::TagLimit(4))),
+        "an unbounded RAM registry is a leak a client could drive: {err:?}"
+    );
+}
+
+#[test]
+fn flush_empties_everything_and_bumps_the_epoch() {
+    let h = Harness::new();
+
+    h.set(b"plain", b"v", 0);
+    h.set_tagged(b"tagged", b"v", 0, &[b"t"]);
+    h.set(b"expiring", b"v", 3600);
+
+    let before = h.store().stats().unwrap().epoch;
+    let epoch = h.store().flush().unwrap();
+    assert_eq!(epoch, before + 1);
+
+    assert!(h.get(b"plain").is_none());
+    assert!(h.get(b"tagged").is_none());
+    assert!(h.get(b"expiring").is_none());
+
+    let stats = h.store().stats().unwrap();
+    assert_eq!(
+        stats.entries, 0,
+        "an epoch bump alone would leak non-expiring records"
+    );
+    assert_eq!(stats.expiry_entries, 0);
+    assert_eq!(stats.tag_index_entries, 0);
+    assert_eq!(stats.epoch, epoch);
+}
+
+#[test]
+fn writes_after_a_flush_survive_it() {
+    let h = Harness::new();
+    h.set(b"before", b"v", 0);
+    h.store().flush().unwrap();
+
+    h.set(b"after", b"v", 0);
+    assert_eq!(h.get(b"after").as_deref(), Some(&b"v"[..]));
+    assert!(h.get(b"before").is_none());
+}
+
+#[test]
+fn tags_still_work_after_a_flush() {
+    let h = Harness::new();
+    h.set_tagged(b"k", b"v", 0, &[b"t"]);
+    h.store().flush().unwrap();
+
+    // Registrations survive a flush; only the data goes.
+    h.set_tagged(b"k", b"v", 0, &[b"t"]);
+    assert!(h.store().delete_by_tag(b"t").unwrap());
+    assert!(h.get(b"k").is_none());
 }
 
 #[test]

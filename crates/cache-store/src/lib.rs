@@ -21,7 +21,9 @@ pub mod engine;
 pub mod error;
 pub mod expiry;
 pub mod lmdb;
+pub mod reclaim;
 pub mod schema;
+pub mod tags;
 mod writer;
 
 use cache_core::{Key, Set, Value};
@@ -37,6 +39,13 @@ pub struct StoreStats {
     /// how much of the keyspace carries a TTL — and, if it drifts far above,
     /// a sign the sweeper is falling behind.
     pub expiry_entries: u64,
+    /// Live entries in the tag index, which the reclaimer walks.
+    pub tag_index_entries: u64,
+    /// Registered tag names. Bounded by `store.max_tags`.
+    pub tags: u64,
+    /// Tag invalidations whose space has not been fully reclaimed yet.
+    /// Invalidation is instant; this is the background cleanup trailing it.
+    pub pending_reclaims: u64,
     pub map_size: u64,
     pub used_bytes: u64,
     /// `used_bytes / map_size`, the input to the eviction watermarks (plan §6).
@@ -57,6 +66,8 @@ pub struct StoreStats {
     /// How far behind the oldest due expiry entry was on the last pass.
     /// Sustained growth means reclamation is losing to expiry.
     pub sweep_lag_ms: u64,
+    /// Records freed by tag reclamation, as opposed to expiry sweeping.
+    pub tag_reclaimed: u64,
 }
 
 impl StoreStats {
@@ -111,6 +122,18 @@ pub trait Store: Send + Sync + 'static {
     /// Replaces a key's TTL without the client resending the value. Returns
     /// whether the key was live.
     fn touch(&self, key: Key<'_>, ttl_secs: u32) -> Result<bool>;
+
+    /// Invalidates every record carrying `tag`, in **constant time** — one
+    /// generation bump, regardless of how many keys are affected. They stop
+    /// being served the moment this returns; freeing their space happens in the
+    /// background.
+    ///
+    /// Returns `false` when the tag was never registered, so nothing could
+    /// reference it.
+    fn delete_by_tag(&self, tag: &[u8]) -> Result<bool>;
+
+    /// Empties the cache, returning the new flush epoch.
+    fn flush(&self) -> Result<u32>;
 
     fn stats(&self) -> Result<StoreStats>;
 

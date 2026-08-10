@@ -5,11 +5,12 @@
 //! the transaction out of this layer is what makes group commit possible
 //! without duplicating the operations.
 
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use cache_core::{
-    Clock, Key, RecordMeta, RecordRef, Set, Value, encode_record, patch_cas, record::NEVER,
+    Clock, Key, RecordMeta, RecordRef, Set, TagRef, Value, encode_record, patch_cas, record::NEVER,
     validate_value,
 };
 use heed::types::Bytes as HeedBytes;
@@ -18,8 +19,9 @@ use tracing::{info, warn};
 
 use crate::config::{Durability, StoreConfig};
 use crate::error::{Result, StoreError};
-use crate::expiry;
+use crate::reclaim::{self, Job, ReclaimStats};
 use crate::schema::{CAS_BLOCK, MAX_DBS, SCHEMA_VERSION, db, meta_key};
+use crate::tags::{TagLookup, TagRegistry};
 use crate::{StoreStats, SweepStats};
 
 type Db = Database<HeedBytes, HeedBytes>;
@@ -33,12 +35,16 @@ pub struct PreparedSet {
     pub key: Box<[u8]>,
     pub record: Vec<u8>,
     pub expires_at_ms: u64,
+    pub tags: Vec<TagRef>,
 }
 
 pub struct LmdbEngine {
     env: Env<WithoutTls>,
     main: Db,
     exp: Db,
+    tagidx: Db,
+    tag_meta: Db,
+    jobs: Db,
     meta: Db,
     clock: Clock,
     epoch: AtomicU32,
@@ -46,6 +52,7 @@ pub struct LmdbEngine {
     cas_watermark: AtomicU64,
     max_value_len: usize,
     bucket_granularity_ms: u64,
+    tags: TagRegistry,
 }
 
 impl LmdbEngine {
@@ -73,15 +80,12 @@ impl LmdbEngine {
         .map_err(StoreError::from_heed)?;
 
         let mut wtxn = env.write_txn().map_err(StoreError::from_heed)?;
-        let main: Db = env
-            .create_database(&mut wtxn, Some(db::MAIN))
-            .map_err(StoreError::from_heed)?;
-        let exp: Db = env
-            .create_database(&mut wtxn, Some(db::EXPIRY))
-            .map_err(StoreError::from_heed)?;
-        let meta: Db = env
-            .create_database(&mut wtxn, Some(db::META))
-            .map_err(StoreError::from_heed)?;
+        let main: Db = create_db(&env, &mut wtxn, db::MAIN)?;
+        let exp: Db = create_db(&env, &mut wtxn, db::EXPIRY)?;
+        let tagidx: Db = create_db(&env, &mut wtxn, db::TAG_INDEX)?;
+        let tag_meta: Db = create_db(&env, &mut wtxn, db::TAGS)?;
+        let jobs: Db = create_db(&env, &mut wtxn, db::JOBS)?;
+        let meta: Db = create_db(&env, &mut wtxn, db::META)?;
 
         match read_u32(&meta, &wtxn, meta_key::SCHEMA_VERSION)? {
             None => {
@@ -112,6 +116,24 @@ impl LmdbEngine {
         // shutdown, so the whole block is skipped rather than risk reuse.
         let cas_start = read_u64(&meta, &wtxn, meta_key::CAS_WATERMARK)?.unwrap_or(0);
 
+        // The whole tag table lives in RAM: it is small, and the read path
+        // consults it on every tagged record.
+        let registry = TagRegistry::new(config.max_tags);
+        let mut loaded = Vec::new();
+        for entry in tag_meta.iter(&wtxn).map_err(StoreError::from_heed)? {
+            let (name, raw) = entry.map_err(StoreError::from_heed)?;
+            let Some((id, generation)) = crate::tags::decode_entry(raw) else {
+                return Err(StoreError::Corrupt(format!(
+                    "tag registry entry for {name:?} is {} bytes, expected {}",
+                    raw.len(),
+                    crate::tags::TAG_RECORD_LEN
+                )));
+            };
+            loaded.push((name.to_vec().into_boxed_slice(), id, generation));
+        }
+        let tag_count = loaded.len();
+        registry.load_from(loaded);
+
         wtxn.commit().map_err(StoreError::from_heed)?;
 
         info!(
@@ -120,6 +142,7 @@ impl LmdbEngine {
             map_size = config.map_size,
             epoch,
             cas_start,
+            tag_count,
             "opened store"
         );
 
@@ -127,6 +150,9 @@ impl LmdbEngine {
             env,
             main,
             exp,
+            tagidx,
+            tag_meta,
+            jobs,
             meta,
             clock: Clock::new(),
             epoch: AtomicU32::new(epoch),
@@ -136,6 +162,7 @@ impl LmdbEngine {
             cas_watermark: AtomicU64::new(cas_start),
             max_value_len: config.max_value_len,
             bucket_granularity_ms: config.bucket_granularity_ms,
+            tags: registry,
         })
     }
 
@@ -154,7 +181,12 @@ impl LmdbEngine {
 
     #[inline]
     pub fn epoch(&self) -> u32 {
-        self.epoch.load(Ordering::Relaxed)
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Publishes a bumped flush epoch. Applied only after its commit.
+    pub fn set_epoch(&self, epoch: u32) {
+        self.epoch.store(epoch, Ordering::Release);
     }
 
     #[inline]
@@ -162,29 +194,27 @@ impl LmdbEngine {
         self.clock.expiry_from_ttl(ttl_secs)
     }
 
-    /// Tag generation lookup. No record can carry a tag until the registry
-    /// lands in M2; returning `None` fails closed if one somehow appears,
-    /// turning a stale hit into a miss.
-    #[inline]
-    fn tag_generation(_tag_id: u32) -> Option<u64> {
-        None
+    pub fn tags(&self) -> &TagRegistry {
+        &self.tags
     }
 
     // ---- reads -------------------------------------------------------------
 
-    pub fn get_in(&self, rtxn: &RoTxn<'_, WithoutTls>, key: Key<'_>) -> Result<Option<Value>> {
-        let Some(blob) = self
-            .main
-            .get(rtxn, key.as_bytes())
-            .map_err(StoreError::from_heed)?
-        else {
+    fn read_record(
+        &self,
+        txn: &RoTxn<'_, WithoutTls>,
+        lookup: &TagLookup<'_>,
+        key: &[u8],
+    ) -> Result<Option<Value>> {
+        let Some(blob) = self.main.get(txn, key).map_err(StoreError::from_heed)? else {
             return Ok(None);
         };
 
         let record = RecordRef::parse(blob)?;
-        if !record.is_alive(self.now_ms(), self.epoch(), Self::tag_generation) {
-            // Logically absent. Reclaiming the space is the sweeper's job; a
-            // read never writes.
+        if !record.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id)) {
+            // Expired, flushed or tag-invalidated: logically absent. Reclaiming
+            // the space belongs to the sweeper and the reclaimer; a read never
+            // writes.
             return Ok(None);
         }
 
@@ -195,25 +225,27 @@ impl LmdbEngine {
         }))
     }
 
-    /// Resolves a whole batch inside one read transaction, so every key in a
-    /// `GET_MANY` sees the same consistent snapshot.
-    pub fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {
-        let rtxn = self.read_txn()?;
-        keys.iter().map(|key| self.get_in(&rtxn, *key)).collect()
-    }
-
     pub fn get(&self, key: Key<'_>) -> Result<Option<Value>> {
         let rtxn = self.read_txn()?;
-        self.get_in(&rtxn, key)
+        let lookup = self.tags.lookup();
+        self.read_record(&rtxn, &lookup, key.as_bytes())
+    }
+
+    /// Resolves a whole batch inside one read transaction, so every key in a
+    /// `GET_MANY` sees the same consistent snapshot — and under a single tag
+    /// registry lock rather than one per key.
+    pub fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {
+        let rtxn = self.read_txn()?;
+        let lookup = self.tags.lookup();
+        keys.iter()
+            .map(|key| self.read_record(&rtxn, &lookup, key.as_bytes()))
+            .collect()
     }
 
     // ---- write preparation (runs off the writer thread) --------------------
 
-    pub fn prepare_set(&self, set: &Set<'_>) -> Result<PreparedSet> {
+    pub fn prepare_set(&self, set: &Set<'_>, tags: Vec<TagRef>) -> Result<PreparedSet> {
         validate_value(set.value, self.max_value_len)?;
-        if !set.tags.is_empty() {
-            return Err(StoreError::Unsupported("tagging"));
-        }
 
         let expires_at_ms = self.expiry_from_ttl(set.ttl_secs);
         let meta = RecordMeta {
@@ -224,13 +256,14 @@ impl LmdbEngine {
             cas: 0,
         };
 
-        let mut record = Vec::with_capacity(cache_core::record_len(0, set.value.len()));
-        encode_record(&mut record, meta, &[], set.value)?;
+        let mut record = Vec::with_capacity(cache_core::record_len(tags.len(), set.value.len()));
+        encode_record(&mut record, meta, &tags, set.value)?;
 
         Ok(PreparedSet {
             key: set.key.as_bytes().into(),
             record,
             expires_at_ms,
+            tags,
         })
     }
 
@@ -251,29 +284,36 @@ impl LmdbEngine {
         Ok(cas)
     }
 
-    /// Removes the expiry-index entry belonging to whatever is currently stored
+    /// Removes the index entries belonging to whatever is currently stored
     /// under `key`.
     ///
-    /// Without this, overwriting a key would leave its old index entry behind,
-    /// and a hot key rewritten every second would accumulate one dead entry per
-    /// write until its bucket came due.
-    fn drop_expiry_entry(&self, wtxn: &mut RwTxn, key: &[u8]) -> Result<()> {
-        let existing = self
-            .main
-            .get(wtxn, key)
-            .map_err(StoreError::from_heed)?
-            .map(RecordRef::parse)
-            .transpose()?
-            .map(|rec| (rec.expires_at_ms(), rec.cas()));
+    /// Without this, overwriting a key would leave its old expiry and tag index
+    /// entries behind, and a hot key rewritten every second would accumulate
+    /// dead entries until its buckets came due.
+    fn drop_index_entries(&self, wtxn: &mut RwTxn, key: &[u8]) -> Result<()> {
+        let Some(blob) = self.main.get(wtxn, key).map_err(StoreError::from_heed)? else {
+            return Ok(());
+        };
+        let record = RecordRef::parse(blob)?;
 
-        if let Some((expires_at_ms, cas)) = existing
-            && expires_at_ms != NEVER
-        {
-            let index_key = expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms);
+        let expires_at_ms = record.expires_at_ms();
+        let cas = record.cas();
+        let tag_ids: Vec<u32> = record.tags.iter().map(|t| t.tag_id.get()).collect();
+
+        if expires_at_ms != NEVER {
+            let index_key =
+                crate::expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms);
             self.exp
                 .delete(wtxn, &index_key)
                 .map_err(StoreError::from_heed)?;
         }
+
+        for tag_id in tag_ids {
+            self.tagidx
+                .delete(wtxn, &reclaim::index_key(tag_id, key))
+                .map_err(StoreError::from_heed)?;
+        }
+
         Ok(())
     }
 
@@ -281,7 +321,7 @@ impl LmdbEngine {
         let cas = self.next_cas(wtxn)?;
         patch_cas(&mut prepared.record, cas)?;
 
-        self.drop_expiry_entry(wtxn, &prepared.key)?;
+        self.drop_index_entries(wtxn, &prepared.key)?;
 
         self.main
             .put(wtxn, &prepared.key, &prepared.record)
@@ -289,9 +329,19 @@ impl LmdbEngine {
 
         if prepared.expires_at_ms != NEVER {
             let index_key =
-                expiry::encode_key(prepared.expires_at_ms, cas, self.bucket_granularity_ms);
+                crate::expiry::encode_key(prepared.expires_at_ms, cas, self.bucket_granularity_ms);
             self.exp
                 .put(wtxn, &index_key, &prepared.key)
+                .map_err(StoreError::from_heed)?;
+        }
+
+        for tag in &prepared.tags {
+            self.tagidx
+                .put(
+                    wtxn,
+                    &reclaim::index_key(tag.tag_id.get(), &prepared.key),
+                    &prepared.key,
+                )
                 .map_err(StoreError::from_heed)?;
         }
 
@@ -303,13 +353,16 @@ impl LmdbEngine {
     /// removing it counts as a miss even though it frees a row.
     pub fn apply_delete(&self, wtxn: &mut RwTxn, key: &[u8]) -> Result<bool> {
         let was_live = match self.main.get(wtxn, key).map_err(StoreError::from_heed)? {
-            Some(blob) => RecordRef::parse(blob)
-                .map(|r| r.is_alive(self.now_ms(), self.epoch(), Self::tag_generation))
-                .unwrap_or(false),
+            Some(blob) => {
+                let lookup = self.tags.lookup();
+                RecordRef::parse(blob)
+                    .map(|r| r.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id)))
+                    .unwrap_or(false)
+            }
             None => false,
         };
 
-        self.drop_expiry_entry(wtxn, key)?;
+        self.drop_index_entries(wtxn, key)?;
         self.main.delete(wtxn, key).map_err(StoreError::from_heed)?;
 
         Ok(was_live)
@@ -328,11 +381,15 @@ impl LmdbEngine {
             return Ok(false);
         };
         let record = RecordRef::parse(blob)?;
-        if !record.is_alive(now_ms, epoch, Self::tag_generation) {
-            return Ok(false);
+        {
+            let lookup = self.tags.lookup();
+            if !record.is_alive(now_ms, epoch, |id| lookup.generation(id)) {
+                return Ok(false);
+            }
         }
 
         let expires_at_ms = self.expiry_from_ttl(ttl_secs);
+        let tags = record.tags.to_vec();
         let mut rewritten = Vec::with_capacity(blob.len());
         encode_record(
             &mut rewritten,
@@ -342,26 +399,114 @@ impl LmdbEngine {
                 expires_at_ms,
                 cas: 0,
             },
-            record.tags,
+            &tags,
             record.value,
         )?;
 
-        let cas = self.next_cas(wtxn)?;
-        patch_cas(&mut rewritten, cas)?;
-
-        self.drop_expiry_entry(wtxn, key)?;
-        self.main
-            .put(wtxn, key, &rewritten)
-            .map_err(StoreError::from_heed)?;
-
-        if expires_at_ms != NEVER {
-            let index_key = expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms);
-            self.exp
-                .put(wtxn, &index_key, key)
-                .map_err(StoreError::from_heed)?;
-        }
+        let mut prepared = PreparedSet {
+            key: key.into(),
+            record: rewritten,
+            expires_at_ms,
+            tags,
+        };
+        self.apply_set(wtxn, &mut prepared)?;
 
         Ok(true)
+    }
+
+    /// Registers a tag, returning its id and starting generation.
+    ///
+    /// A record may never reference a tag that is not durably registered: after
+    /// a restart the id would either be unknown (a spurious miss) or reused for
+    /// a different name (a spurious invalidation).
+    pub fn apply_create_tag(&self, wtxn: &mut RwTxn, name: &[u8]) -> Result<(u32, u64)> {
+        if name.is_empty() || name.len() > cache_core::MAX_TAG_LEN {
+            return Err(StoreError::Core(cache_core::CoreError::TagTooLong {
+                len: name.len(),
+                max: cache_core::MAX_TAG_LEN,
+            }));
+        }
+
+        // Another job in the same batch may have created it already.
+        if let Some(raw) = self
+            .tag_meta
+            .get(wtxn, name)
+            .map_err(StoreError::from_heed)?
+            && let Some(existing) = crate::tags::decode_entry(raw)
+        {
+            return Ok(existing);
+        }
+
+        let id = self.tags.allocate_id()?;
+        let generation = 0u64;
+        self.tag_meta
+            .put(wtxn, name, &crate::tags::encode_entry(id, generation))
+            .map_err(StoreError::from_heed)?;
+
+        Ok((id, generation))
+    }
+
+    /// Invalidates a tag by bumping its generation.
+    ///
+    /// **Constant time**, regardless of how many keys carry the tag: every
+    /// record referencing it compares unequal from the moment this commits.
+    /// Freeing their space is handed to the reclaimer.
+    ///
+    /// Returns `None` when the tag has never been registered, in which case no
+    /// record can reference it and there is nothing to do.
+    pub fn apply_delete_by_tag(&self, wtxn: &mut RwTxn, name: &[u8]) -> Result<Option<(u32, u64)>> {
+        let Some(raw) = self
+            .tag_meta
+            .get(wtxn, name)
+            .map_err(StoreError::from_heed)?
+        else {
+            return Ok(None);
+        };
+        let Some((id, generation)) = crate::tags::decode_entry(raw) else {
+            return Err(StoreError::Corrupt(format!(
+                "tag registry entry for {name:?} is malformed"
+            )));
+        };
+
+        // Read from disk rather than RAM so the counter advances from the
+        // durable value; a RAM-only bump lost to a crash would resurrect data.
+        let next = generation + 1;
+        self.tag_meta
+            .put(wtxn, name, &crate::tags::encode_entry(id, next))
+            .map_err(StoreError::from_heed)?;
+
+        // One job per tag: re-invalidating mid-reclaim raises the target and
+        // restarts the scan rather than queueing a second pass.
+        self.jobs
+            .put(wtxn, &id.to_be_bytes(), &Job::new(next).encode())
+            .map_err(StoreError::from_heed)?;
+
+        Ok(Some((id, next)))
+    }
+
+    /// Empties the cache, returning the new flush epoch.
+    ///
+    /// The epoch bump and the clear do different jobs, and both are needed. The
+    /// clear frees the space — an epoch bump alone would leak every record
+    /// without a TTL, since nothing would ever come looking for them. The epoch
+    /// closes the MVCC window: a read transaction opened before this commit
+    /// still sees the old snapshot, and comparing those records against the new
+    /// epoch is what stops them being served.
+    pub fn apply_flush(&self, wtxn: &mut RwTxn) -> Result<u32> {
+        let epoch = self.epoch().wrapping_add(1);
+        self.meta
+            .put(wtxn, meta_key::EPOCH, &epoch.to_le_bytes())
+            .map_err(StoreError::from_heed)?;
+
+        self.main.clear(wtxn).map_err(StoreError::from_heed)?;
+        self.exp.clear(wtxn).map_err(StoreError::from_heed)?;
+        self.tagidx.clear(wtxn).map_err(StoreError::from_heed)?;
+        // Their index entries are gone, so the jobs have nothing left to walk.
+        self.jobs.clear(wtxn).map_err(StoreError::from_heed)?;
+
+        // Tag registrations survive: a flush empties the data, it does not
+        // un-declare the tags, and their generations must keep advancing.
+        Ok(epoch)
     }
 
     /// Reclaims up to `budget` expired records.
@@ -375,16 +520,16 @@ impl LmdbEngine {
 
         // Collected up front because LMDB will not let the cursor and the
         // deletes share the transaction cleanly. `budget` bounds the memory.
-        let mut victims: Vec<([u8; expiry::EXPIRY_KEY_LEN], Vec<u8>)> = Vec::new();
+        let mut victims: Vec<([u8; crate::expiry::EXPIRY_KEY_LEN], Vec<u8>)> = Vec::new();
         {
             let iter = self.exp.iter(wtxn).map_err(StoreError::from_heed)?;
             for entry in iter {
                 let (index_key, user_key) = entry.map_err(StoreError::from_heed)?;
-                let Some((bucket, _)) = expiry::decode_key(index_key) else {
+                let Some((bucket, _)) = crate::expiry::decode_key(index_key) else {
                     return Err(StoreError::Corrupt(format!(
                         "expiry index key is {} bytes, expected {}",
                         index_key.len(),
-                        expiry::EXPIRY_KEY_LEN
+                        crate::expiry::EXPIRY_KEY_LEN
                     )));
                 };
 
@@ -398,7 +543,7 @@ impl LmdbEngine {
                     stats.lag_ms = now_ms.saturating_sub(bucket);
                 }
 
-                let mut owned = [0u8; expiry::EXPIRY_KEY_LEN];
+                let mut owned = [0u8; crate::expiry::EXPIRY_KEY_LEN];
                 owned.copy_from_slice(index_key);
                 victims.push((owned, user_key.to_vec()));
 
@@ -412,7 +557,7 @@ impl LmdbEngine {
         stats.scanned = victims.len();
 
         for (index_key, user_key) in victims {
-            let (_, entry_cas) = expiry::decode_key(&index_key).expect("validated above");
+            let (_, entry_cas) = crate::expiry::decode_key(&index_key).expect("validated above");
 
             match self
                 .main
@@ -425,9 +570,16 @@ impl LmdbEngine {
                     // key was overwritten, this entry no longer describes the
                     // record and must not delete it.
                     if record.cas() == entry_cas && record.is_expired(now_ms) {
+                        let tag_ids: Vec<u32> =
+                            record.tags.iter().map(|t| t.tag_id.get()).collect();
                         self.main
                             .delete(wtxn, &user_key)
                             .map_err(StoreError::from_heed)?;
+                        for tag_id in tag_ids {
+                            self.tagidx
+                                .delete(wtxn, &reclaim::index_key(tag_id, &user_key))
+                                .map_err(StoreError::from_heed)?;
+                        }
                         stats.reclaimed += 1;
                     } else {
                         stats.stale += 1;
@@ -444,6 +596,187 @@ impl LmdbEngine {
         Ok(stats)
     }
 
+    /// Advances the oldest outstanding tag-reclamation job by up to `budget`
+    /// index entries.
+    ///
+    /// Resumable by design: the cursor is persisted in the same transaction as
+    /// the deletions, so a crash or restart continues from where it stopped
+    /// rather than starting the tag over.
+    pub fn reclaim_step(&self, wtxn: &mut RwTxn, budget: usize) -> Result<Option<ReclaimStats>> {
+        let Some((tag_id, job)) = self.next_job(wtxn)? else {
+            return Ok(None);
+        };
+
+        let (low, high) = reclaim::index_range(tag_id);
+        let start = match &job.cursor {
+            // Exclusive: resume just past the last entry processed.
+            Some(cursor) => Bound::Excluded(cursor.to_vec()),
+            None => Bound::Included(low.to_vec()),
+        };
+
+        let mut batch: Vec<([u8; reclaim::INDEX_KEY_LEN], Vec<u8>)> = Vec::new();
+        {
+            let bounds = (
+                match &start {
+                    Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+                    _ => Bound::Included(low.as_slice()),
+                },
+                Bound::Included(high.as_slice()),
+            );
+            let iter = self
+                .tagidx
+                .range(wtxn, &bounds)
+                .map_err(StoreError::from_heed)?;
+
+            for entry in iter {
+                let (index_key, user_key) = entry.map_err(StoreError::from_heed)?;
+                let mut owned = [0u8; reclaim::INDEX_KEY_LEN];
+                if index_key.len() != reclaim::INDEX_KEY_LEN {
+                    return Err(StoreError::Corrupt(format!(
+                        "tag index key is {} bytes, expected {}",
+                        index_key.len(),
+                        reclaim::INDEX_KEY_LEN
+                    )));
+                }
+                owned.copy_from_slice(index_key);
+                batch.push((owned, user_key.to_vec()));
+
+                if batch.len() >= budget {
+                    break;
+                }
+            }
+        }
+
+        let mut stats = ReclaimStats {
+            scanned: batch.len(),
+            ..ReclaimStats::default()
+        };
+        let mut cursor = job.cursor;
+
+        let now_ms = self.now_ms();
+        let epoch = self.epoch();
+
+        for (index_key, user_key) in batch {
+            cursor = Some(index_key);
+
+            let Some(blob) = self
+                .main
+                .get(wtxn, &user_key)
+                .map_err(StoreError::from_heed)?
+            else {
+                // The record is already gone; its index entry is litter.
+                self.tagidx
+                    .delete(wtxn, &index_key)
+                    .map_err(StoreError::from_heed)?;
+                stats.orphaned += 1;
+                continue;
+            };
+
+            let record = RecordRef::parse(blob)?;
+
+            // Deadness is judged against the job's own target generation, not
+            // the live registry.
+            //
+            // This pass can share a transaction with the very `DELETE_BY_TAG`
+            // that queued it, and the registry is only updated *after* that
+            // commits — so the in-memory generation still reads as the old one
+            // here. Trusting it would mark every record live, advance the
+            // cursor past them, and leak them permanently. The job carries the
+            // target precisely so this decision needs no RAM state.
+            let doomed = match record.tags.iter().find(|t| t.tag_id.get() == tag_id) {
+                Some(tag) => tag.generation.get() < job.target_generation,
+                None => {
+                    // The record no longer carries this tag, so the entry is
+                    // litter — but the record itself is somebody else's.
+                    self.tagidx
+                        .delete(wtxn, &index_key)
+                        .map_err(StoreError::from_heed)?;
+                    stats.orphaned += 1;
+                    continue;
+                }
+            };
+
+            // A record the registry already knows to be dead — expired, flushed
+            // or invalidated via another tag — is fair game too. RAM can lag
+            // behind the truth but never runs ahead of it, so "dead" is always
+            // trustworthy even when "alive" is not.
+            let known_dead = {
+                let lookup = self.tags.lookup();
+                !record.is_alive(now_ms, epoch, |id| lookup.generation(id))
+            };
+
+            if !doomed && !known_dead {
+                // Rewritten since the invalidation, so this entry is current
+                // and must survive.
+                stats.retained += 1;
+                continue;
+            }
+
+            let expires_at_ms = record.expires_at_ms();
+            let cas = record.cas();
+            let tag_ids: Vec<u32> = record.tags.iter().map(|t| t.tag_id.get()).collect();
+
+            self.main
+                .delete(wtxn, &user_key)
+                .map_err(StoreError::from_heed)?;
+            if expires_at_ms != NEVER {
+                self.exp
+                    .delete(
+                        wtxn,
+                        &crate::expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms),
+                    )
+                    .map_err(StoreError::from_heed)?;
+            }
+            for other in tag_ids {
+                self.tagidx
+                    .delete(wtxn, &reclaim::index_key(other, &user_key))
+                    .map_err(StoreError::from_heed)?;
+            }
+            stats.reclaimed += 1;
+        }
+
+        // Fewer than the budget means the range ran out, so the tag is done.
+        if stats.scanned < budget {
+            self.jobs
+                .delete(wtxn, &tag_id.to_be_bytes())
+                .map_err(StoreError::from_heed)?;
+            stats.completed = true;
+        } else {
+            let resumed = Job {
+                target_generation: job.target_generation,
+                cursor,
+            };
+            self.jobs
+                .put(wtxn, &tag_id.to_be_bytes(), &resumed.encode())
+                .map_err(StoreError::from_heed)?;
+        }
+
+        Ok(Some(stats))
+    }
+
+    fn next_job(&self, wtxn: &RwTxn) -> Result<Option<(u32, Job)>> {
+        let Some(entry) = self
+            .jobs
+            .iter(wtxn)
+            .map_err(StoreError::from_heed)?
+            .next()
+            .transpose()
+            .map_err(StoreError::from_heed)?
+        else {
+            return Ok(None);
+        };
+
+        let (raw_id, raw_job) = entry;
+        let id: [u8; 4] = raw_id.try_into().map_err(|_| {
+            StoreError::Corrupt("reclaim job key is not a 4-byte tag id".to_string())
+        })?;
+        Ok(Some((u32::from_be_bytes(id), Job::decode(raw_job)?)))
+    }
+
+    pub fn pending_jobs(&self, txn: &RoTxn<'_, WithoutTls>) -> Result<u64> {
+        Ok(self.jobs.stat(txn).map_err(StoreError::from_heed)?.entries as u64)
+    }
+
     // ---- housekeeping ------------------------------------------------------
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -457,6 +790,12 @@ impl LmdbEngine {
             .map_err(StoreError::from_heed)?
             .entries as u64;
         let expiry_entries = self.exp.stat(&rtxn).map_err(StoreError::from_heed)?.entries as u64;
+        let tag_index_entries = self
+            .tagidx
+            .stat(&rtxn)
+            .map_err(StoreError::from_heed)?
+            .entries as u64;
+        let pending_reclaims = self.pending_jobs(&rtxn)?;
 
         let page_size = stat.page_size as u64;
         let used_bytes = (info.last_page_number as u64 + 1) * page_size;
@@ -464,6 +803,9 @@ impl LmdbEngine {
         Ok(StoreStats {
             entries,
             expiry_entries,
+            tag_index_entries,
+            tags: self.tags.len() as u64,
+            pending_reclaims,
             map_size: info.map_size as u64,
             used_bytes,
             utilisation: used_bytes as f64 / info.map_size as f64,
@@ -487,6 +829,11 @@ impl LmdbEngine {
     pub fn close(self) {
         self.env.prepare_for_closing().wait();
     }
+}
+
+fn create_db(env: &Env<WithoutTls>, wtxn: &mut RwTxn, name: &str) -> Result<Db> {
+    env.create_database(wtxn, Some(name))
+        .map_err(StoreError::from_heed)
 }
 
 fn env_flags(durability: Durability) -> EnvFlags {

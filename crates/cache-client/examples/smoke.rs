@@ -64,6 +64,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?
     );
 
+    client
+        .set_tagged(b"smoke:t1", b"tagged one", 0, &[b"demo"])
+        .await?;
+    client
+        .set_tagged(b"smoke:t2", b"tagged two", 0, &[b"demo", b"other"])
+        .await?;
+    client.set(b"smoke:plain", b"untagged", 0).await?;
+    println!(
+        "tagged  -> t1={} t2={} plain={}",
+        client.get(b"smoke:t1").await?.is_some(),
+        client.get(b"smoke:t2").await?.is_some(),
+        client.get(b"smoke:plain").await?.is_some()
+    );
+
+    println!("del_tag -> {}", client.delete_by_tag(b"demo").await?);
+    println!(
+        "after   -> t1={} t2={} plain={} (untagged untouched)",
+        client.get(b"smoke:t1").await?.is_some(),
+        client.get(b"smoke:t2").await?.is_some(),
+        client.get(b"smoke:plain").await?.is_some()
+    );
+    client.delete(b"smoke:plain").await?;
+
     let cas = client.set(b"smoke:ttl", b"expires", 1).await?;
     println!(
         "set ttl -> cas {cas}, live now: {}",

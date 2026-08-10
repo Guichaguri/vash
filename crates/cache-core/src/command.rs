@@ -52,6 +52,13 @@ pub enum Command<'a> {
         key: Key<'a>,
         ttl_secs: u32,
     },
+    /// Invalidates every record carrying the tag, in constant time regardless
+    /// of how many keys that is.
+    DeleteByTag {
+        tag: &'a [u8],
+    },
+    /// Empties the cache.
+    Flush,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +97,11 @@ pub enum Reply {
     /// `true` where the key was live before the delete.
     DeletedMany(Vec<bool>),
     Touched,
+    /// A tag was invalidated. `false` means the tag was never registered, so
+    /// nothing could have referenced it.
+    Invalidated(bool),
+    /// The cache was emptied, carrying the new flush epoch.
+    Flushed(u32),
     NotFound,
 }
 

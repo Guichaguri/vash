@@ -31,6 +31,9 @@ pub(crate) enum WriteOp {
     Set(Vec<PreparedSet>),
     Delete(Vec<Box<[u8]>>),
     Touch { key: Box<[u8]>, ttl_secs: u32 },
+    CreateTags(Vec<Box<[u8]>>),
+    DeleteByTag(Box<[u8]>),
+    Flush,
     Sync,
 }
 
@@ -44,7 +47,8 @@ impl WriteOp {
         match self {
             Self::Set(items) => items.len(),
             Self::Delete(keys) => keys.len(),
-            Self::Touch { .. } => 1,
+            Self::Touch { .. } | Self::DeleteByTag(_) | Self::Flush => 1,
+            Self::CreateTags(names) => names.len(),
             Self::Sync => 0,
         }
     }
@@ -54,7 +58,30 @@ pub(crate) enum WriteOutcome {
     Cas(Vec<u64>),
     Deleted(Vec<bool>),
     Touched(bool),
+    /// `None` when the tag was never registered, so nothing referenced it.
+    Invalidated(Option<u64>),
+    Flushed(u32),
     Done,
+}
+
+/// A change to in-memory state that must not be published until the
+/// transaction carrying it has committed.
+///
+/// Ordering matters in one direction only, and it is the dangerous one: a
+/// generation bumped in RAM but lost to a failed commit would let invalidated
+/// records come back to life after a restart. Applying RAM changes strictly
+/// after the commit means a failure leaves RAM matching disk.
+enum PostCommit {
+    TagCreated {
+        name: Box<[u8]>,
+        id: u32,
+        generation: u64,
+    },
+    TagGeneration {
+        id: u32,
+        generation: u64,
+    },
+    Epoch(u32),
 }
 
 struct WriteJob {
@@ -74,6 +101,8 @@ pub(crate) struct WriterMetrics {
     pub sweeps: AtomicU64,
     pub reclaimed: AtomicU64,
     pub sweep_lag_ms: AtomicU64,
+    /// Records freed by tag reclamation, as opposed to expiry sweeping.
+    pub tag_reclaimed: AtomicU64,
 }
 
 /// Client handle onto the writer thread.
@@ -159,6 +188,32 @@ impl Writer {
         }
     }
 
+    /// Registers tags durably. Must complete before any record referencing them
+    /// is encoded.
+    pub fn create_tags(&self, names: Vec<Box<[u8]>>) -> Result<()> {
+        self.submit(WriteOp::CreateTags(names)).map(|_| ())
+    }
+
+    /// Invalidates a tag. Returns the new generation, or `None` if the tag was
+    /// never registered and so nothing referenced it.
+    pub fn delete_by_tag(&self, name: &[u8]) -> Result<Option<u64>> {
+        match self.submit(WriteOp::DeleteByTag(name.into()))? {
+            WriteOutcome::Invalidated(generation) => Ok(generation),
+            _ => Err(StoreError::Corrupt(
+                "writer returned the wrong reply".into(),
+            )),
+        }
+    }
+
+    pub fn flush(&self) -> Result<u32> {
+        match self.submit(WriteOp::Flush)? {
+            WriteOutcome::Flushed(epoch) => Ok(epoch),
+            _ => Err(StoreError::Corrupt(
+                "writer returned the wrong reply".into(),
+            )),
+        }
+    }
+
     pub fn sync(&self) -> Result<()> {
         self.submit(WriteOp::Sync).map(|_| ())
     }
@@ -198,10 +253,21 @@ fn writer_loop(
         "writer thread started"
     );
 
+    // While a tag reclamation is outstanding the loop stops waiting, so a
+    // backlog drains at full speed instead of one batch per sweep interval.
+    // A million-key tag would otherwise take minutes to reclaim.
+    let mut reclaim_pending = true; // unknown at startup: a job may have survived a restart
+
     loop {
+        let idle_timeout = if reclaim_pending {
+            Duration::ZERO
+        } else {
+            sweep_interval
+        };
+
         // Block until there is work, but wake up on the sweep interval so the
         // sweeper runs during idle periods for free.
-        match rx.recv_timeout(sweep_interval) {
+        match rx.recv_timeout(idle_timeout) {
             Ok(job) => batch.push(job),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -220,18 +286,31 @@ fn writer_loop(
             }
         }
 
-        // Sweeping shares the batch's transaction, so reclamation costs no
-        // extra commit. Under sustained write load the interval check is what
-        // keeps it from starving.
-        let due_for_sweep = last_sweep.elapsed() >= sweep_interval;
-        if batch.is_empty() && !due_for_sweep {
+        // Maintenance shares the batch's transaction, so it costs no extra
+        // commit. Under sustained write load the interval check is what keeps
+        // it from starving.
+        let due_for_maintenance = reclaim_pending || last_sweep.elapsed() >= sweep_interval;
+        if batch.is_empty() && !due_for_maintenance {
             continue;
         }
 
-        if let Err(e) = commit_batch(&engine, &mut batch, due_for_sweep, &config, &metrics) {
-            error!(error = %e, "write batch failed");
+        match commit_batch(
+            &engine,
+            &mut batch,
+            due_for_maintenance,
+            &config,
+            &metrics,
+            &mut reclaim_pending,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                error!(error = %e, "write batch failed");
+                // A failed commit says nothing about whether work remains, and
+                // spinning on it would burn a core. Back off to the interval.
+                reclaim_pending = false;
+            }
         }
-        if due_for_sweep {
+        if due_for_maintenance {
             last_sweep = Instant::now();
         }
     }
@@ -239,7 +318,14 @@ fn writer_loop(
     // The channel is closed and no more jobs can arrive; anything still queued
     // was sent before shutdown and deserves to be committed.
     if !batch.is_empty()
-        && let Err(e) = commit_batch(&engine, &mut batch, false, &config, &metrics)
+        && let Err(e) = commit_batch(
+            &engine,
+            &mut batch,
+            false,
+            &config,
+            &metrics,
+            &mut reclaim_pending,
+        )
     {
         error!(error = %e, "final write batch failed");
     }
@@ -249,9 +335,10 @@ fn writer_loop(
 fn commit_batch(
     engine: &LmdbEngine,
     batch: &mut Vec<WriteJob>,
-    sweep: bool,
+    maintenance: bool,
     config: &WriteConfig,
     metrics: &WriterMetrics,
+    reclaim_pending: &mut bool,
 ) -> Result<()> {
     let batch_size = batch.len();
     let committed_items: usize = batch.iter().map(|job| job.op.item_count()).sum();
@@ -269,23 +356,25 @@ fn commit_batch(
     };
 
     let mut outcomes = Vec::with_capacity(batch_size);
+    let mut effects: Vec<PostCommit> = Vec::new();
     for job in batch.iter_mut() {
-        outcomes.push(apply(engine, &mut wtxn, &mut job.op));
+        outcomes.push(apply(engine, &mut wtxn, &mut job.op, &mut effects));
     }
 
-    let sweep_stats = if sweep {
+    let mut sweep_stats = None;
+    let mut reclaim_stats = None;
+    if maintenance {
+        // Neither failure may lose the user writes sharing this transaction;
+        // both simply retry next interval.
         match engine.sweep(&mut wtxn, config.sweep_batch) {
-            Ok(stats) => Some(stats),
-            Err(e) => {
-                // A failed sweep must not lose the user writes sharing this
-                // transaction; it simply retries next interval.
-                warn!(error = %e, "sweep failed");
-                None
-            }
+            Ok(stats) => sweep_stats = Some(stats),
+            Err(e) => warn!(error = %e, "sweep failed"),
         }
-    } else {
-        None
-    };
+        match engine.reclaim_step(&mut wtxn, config.reclaim_batch) {
+            Ok(stats) => reclaim_stats = stats,
+            Err(e) => warn!(error = %e, "tag reclamation failed"),
+        }
+    }
 
     let mut needs_sync = false;
     for job in batch.iter() {
@@ -296,6 +385,21 @@ fn commit_batch(
 
     match wtxn.commit() {
         Ok(()) => {
+            // Only now is it safe to publish: everything below is durable.
+            for effect in effects {
+                match effect {
+                    PostCommit::TagCreated {
+                        name,
+                        id,
+                        generation,
+                    } => engine.tags().insert(name, id, generation),
+                    PostCommit::TagGeneration { id, generation } => {
+                        engine.tags().merge_generation(id, generation)
+                    }
+                    PostCommit::Epoch(epoch) => engine.set_epoch(epoch),
+                }
+            }
+
             if batch_size > 0 {
                 metrics.commits.fetch_add(1, Ordering::Relaxed);
                 metrics
@@ -313,6 +417,29 @@ fn commit_batch(
                 metrics.sweep_lag_ms.store(stats.lag_ms, Ordering::Relaxed);
                 report_sweep(stats);
             }
+
+            // Only a committed reclamation pass counts, and only an unfinished
+            // one keeps the loop hot.
+            *reclaim_pending = match reclaim_stats {
+                Some(stats) => {
+                    metrics
+                        .tag_reclaimed
+                        .fetch_add(stats.reclaimed as u64, Ordering::Relaxed);
+                    if stats.scanned > 0 || stats.completed {
+                        debug!(
+                            scanned = stats.scanned,
+                            reclaimed = stats.reclaimed,
+                            orphaned = stats.orphaned,
+                            retained = stats.retained,
+                            completed = stats.completed,
+                            "reclaimed tagged records"
+                        );
+                    }
+                    !stats.completed
+                }
+                // No job to work on.
+                None => false,
+            };
             if needs_sync && let Err(e) = engine.sync() {
                 error!(error = %e, "explicit sync failed");
             }
@@ -334,7 +461,12 @@ fn commit_batch(
     }
 }
 
-fn apply(engine: &LmdbEngine, wtxn: &mut heed::RwTxn, op: &mut WriteOp) -> Result<WriteOutcome> {
+fn apply(
+    engine: &LmdbEngine,
+    wtxn: &mut heed::RwTxn,
+    op: &mut WriteOp,
+    effects: &mut Vec<PostCommit>,
+) -> Result<WriteOutcome> {
     match op {
         WriteOp::Set(prepared) => {
             let mut cas = Vec::with_capacity(prepared.len());
@@ -353,6 +485,29 @@ fn apply(engine: &LmdbEngine, wtxn: &mut heed::RwTxn, op: &mut WriteOp) -> Resul
         WriteOp::Touch { key, ttl_secs } => Ok(WriteOutcome::Touched(
             engine.apply_touch(wtxn, key, *ttl_secs)?,
         )),
+        WriteOp::CreateTags(names) => {
+            for name in names.iter() {
+                let (id, generation) = engine.apply_create_tag(wtxn, name)?;
+                effects.push(PostCommit::TagCreated {
+                    name: name.clone(),
+                    id,
+                    generation,
+                });
+            }
+            Ok(WriteOutcome::Done)
+        }
+        WriteOp::DeleteByTag(name) => match engine.apply_delete_by_tag(wtxn, name)? {
+            Some((id, generation)) => {
+                effects.push(PostCommit::TagGeneration { id, generation });
+                Ok(WriteOutcome::Invalidated(Some(generation)))
+            }
+            None => Ok(WriteOutcome::Invalidated(None)),
+        },
+        WriteOp::Flush => {
+            let epoch = engine.apply_flush(wtxn)?;
+            effects.push(PostCommit::Epoch(epoch));
+            Ok(WriteOutcome::Flushed(epoch))
+        }
         // The sync itself happens after the commit, since it is an environment
         // operation rather than a transactional one.
         WriteOp::Sync => Ok(WriteOutcome::Done),

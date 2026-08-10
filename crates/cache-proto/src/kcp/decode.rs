@@ -257,7 +257,20 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
             Command::SetMany(sets)
         }
 
-        Opcode::Auth | Opcode::Stats | Opcode::Cluster | Opcode::DeleteByTag | Opcode::Flush => {
+        // The whole body is the tag name.
+        Opcode::DeleteByTag => {
+            if body.is_empty() {
+                return Err(fail(Status::BadRequest, "tag name is empty"));
+            }
+            if body.len() > cache_core::MAX_TAG_LEN {
+                return Err(fail(Status::TooLarge, "tag name is too long"));
+            }
+            Command::DeleteByTag { tag: body }
+        }
+
+        Opcode::Flush => Command::Flush,
+
+        Opcode::Auth | Opcode::Stats | Opcode::Cluster => {
             return Err(fail(Status::Unsupported, "opcode not implemented yet"));
         }
     };

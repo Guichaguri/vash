@@ -7,10 +7,17 @@ use cache_store::LmdbStore;
 pub struct ServerState {
     pub store: Arc<LmdbStore>,
     pub info: ServerInfo,
+    /// `FLUSH` is a remote cache-wipe primitive, so it is off unless
+    /// deliberately enabled.
+    pub flush_enabled: bool,
 }
 
 impl ServerState {
-    pub fn new(store: Arc<LmdbStore>, info: ServerInfo) -> Arc<Self> {
-        Arc::new(Self { store, info })
+    pub fn new(store: Arc<LmdbStore>, info: ServerInfo, flush_enabled: bool) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            info,
+            flush_enabled,
+        })
     }
 }

@@ -34,11 +34,16 @@ impl TestServer {
     }
 
     async fn start_in(dir: TempDir) -> Self {
+        Self::start_with(dir, |_| {}).await
+    }
+
+    async fn start_with(dir: TempDir, tweak: impl FnOnce(&mut Config)) -> Self {
         let mut config = Config::default();
         config.server.listen = "127.0.0.1:0".parse().unwrap();
         config.store.path = dir.path().join("db");
         // Small enough to be cheap in CI, large enough for these tests.
         config.store.map_size_mb = 64;
+        tweak(&mut config);
 
         let server = Server::bind(config).await.expect("binding the server");
         let addr = server.local_addr().expect("reading the bound address");
@@ -106,8 +111,9 @@ async fn handshake_reports_server_limits() {
     assert_eq!(info.protocol_version, cache_core::PROTOCOL_VERSION);
     assert_eq!(info.max_key_len, cache_core::MAX_KEY_LEN as u32);
     assert_eq!(info.max_value_len, cache_core::DEFAULT_MAX_VALUE_LEN as u32);
-    // M0 implements no optional features, and must not claim otherwise.
-    assert_eq!(info.capabilities, 0);
+    // Capabilities are advertised only as each milestone lands: memcached (M3)
+    // and cluster invalidation (M5) are not claimed yet.
+    assert_eq!(info.capabilities, cache_core::capability::TAGS);
 }
 
 #[tokio::test]
@@ -240,16 +246,141 @@ async fn empty_key_is_rejected() {
 }
 
 #[tokio::test]
-async fn tagged_writes_are_refused_rather_than_silently_dropped() {
+async fn tagged_writes_round_trip() {
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
-    // Tags land in M2. Until then the server must say so, because silently
-    // ignoring them would let a client believe invalidation is working.
+    client
+        .set_tagged(b"k", b"v", 0, &[b"alpha", b"beta"])
+        .await
+        .unwrap();
+
+    let got = client.get(b"k").await.unwrap().expect("a hit");
+    assert_eq!(&got.data[..], b"v");
+}
+
+#[tokio::test]
+async fn delete_by_tag_invalidates_over_the_wire() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set_tagged(b"a", b"1", 0, &[b"news"]).await.unwrap();
+    client
+        .set_tagged(b"b", b"2", 0, &[b"news", b"sport"])
+        .await
+        .unwrap();
+    client.set_tagged(b"c", b"3", 0, &[b"sport"]).await.unwrap();
+    client.set(b"plain", b"4", 0).await.unwrap();
+
+    assert!(client.delete_by_tag(b"news").await.unwrap());
+
+    assert!(client.get(b"a").await.unwrap().is_none());
+    assert!(
+        client.get(b"b").await.unwrap().is_none(),
+        "one dead tag is enough to kill a record"
+    );
+    assert!(client.get(b"c").await.unwrap().is_some());
+    assert!(client.get(b"plain").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn delete_by_tag_reports_an_unknown_tag_as_a_miss() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    assert!(!client.delete_by_tag(b"never-used").await.unwrap());
+}
+
+#[tokio::test]
+async fn an_empty_or_oversized_tag_is_rejected() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
     assert!(matches!(
-        client.set_tagged(b"k", b"v", 0, &[b"tag"]).await,
-        Err(ClientError::Status(Status::Unsupported))
+        client.delete_by_tag(b"").await,
+        Err(ClientError::Status(Status::BadRequest))
     ));
+
+    let long = vec![b't'; cache_core::MAX_TAG_LEN + 1];
+    assert!(matches!(
+        client.delete_by_tag(&long).await,
+        Err(ClientError::Status(Status::TooLarge))
+    ));
+
+    client.ping().await.expect("connection still usable");
+}
+
+#[tokio::test]
+async fn the_handshake_advertises_tag_support() {
+    let server = TestServer::start().await;
+    let client = server.client().await;
+    assert_eq!(
+        client.server_info().capabilities & cache_core::capability::TAGS,
+        cache_core::capability::TAGS
+    );
+}
+
+#[tokio::test]
+async fn flush_is_refused_unless_enabled() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set(b"k", b"v", 0).await.unwrap();
+
+    // A remote cache-wipe primitive must not be available by default.
+    assert!(matches!(
+        client.flush().await,
+        Err(ClientError::Status(Status::Unauthorized))
+    ));
+    assert!(
+        client.get(b"k").await.unwrap().is_some(),
+        "data must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn flush_empties_the_cache_when_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| config.protocol.flush_enabled = true).await;
+    let mut client = server.client().await;
+
+    client.set(b"a", b"1", 0).await.unwrap();
+    client.set_tagged(b"b", b"2", 0, &[b"t"]).await.unwrap();
+
+    let epoch = client.flush().await.unwrap();
+    assert!(epoch > 0);
+
+    assert!(client.get(b"a").await.unwrap().is_none());
+    assert!(client.get(b"b").await.unwrap().is_none());
+    assert_eq!(
+        server.entries(),
+        0,
+        "flush must free the space, not just hide it"
+    );
+
+    client.set(b"c", b"3", 0).await.unwrap();
+    assert!(client.get(b"c").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn the_server_reclaims_invalidated_records_in_the_background() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    for i in 0..100u32 {
+        client
+            .set_tagged(format!("k{i}").as_bytes(), b"v", 0, &[b"bulk"])
+            .await
+            .unwrap();
+    }
+    client.delete_by_tag(b"bulk").await.unwrap();
+
+    // Nothing reads these and none has a TTL, so only the tag reclaimer can
+    // free them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.entries() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.entries(), 0);
 }
 
 #[tokio::test]

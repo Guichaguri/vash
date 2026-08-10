@@ -46,6 +46,21 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
         Reply::Touched => encode_response(out, opcode, request_id, Status::Ok, &[]),
         Reply::NotFound => encode_response(out, opcode, request_id, Status::NotFound, &[]),
 
+        // An unregistered tag is reported as a miss rather than an error: the
+        // caller asked for nothing tagged that way to be served, and nothing is.
+        Reply::Invalidated(existed) => {
+            let status = if *existed {
+                Status::Ok
+            } else {
+                Status::NotFound
+            };
+            encode_response(out, opcode, request_id, status, &[]);
+        }
+
+        Reply::Flushed(epoch) => {
+            encode_response(out, opcode, request_id, Status::Ok, &epoch.to_le_bytes())
+        }
+
         // Batch bodies are built first because the frame header carries their
         // total length. They are sized up front so the payload copy is the only
         // one that happens.

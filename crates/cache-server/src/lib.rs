@@ -40,7 +40,7 @@ impl Server {
         let store = Arc::new(store);
 
         let info = dispatch::server_info(1, config.store.max_value_bytes);
-        let state = ServerState::new(Arc::clone(&store), info);
+        let state = ServerState::new(Arc::clone(&store), info, config.protocol.flush_enabled);
 
         let listener = TcpListener::bind(config.server.listen)
             .await

@@ -14,6 +14,7 @@ use serde::Deserialize;
 pub struct Config {
     pub server: ServerConfig,
     pub store: StoreConfig,
+    pub protocol: ProtocolConfig,
     pub observability: ObservabilityConfig,
 }
 
@@ -45,6 +46,29 @@ pub struct StoreConfig {
     pub wipe_on_start: bool,
     pub write: WriteConfig,
     pub ttl: TtlConfig,
+    pub tags: TagConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TagConfig {
+    /// Ceiling on registered tag names. The registry is held entirely in RAM,
+    /// so without a limit a client inventing tag names is a memory leak.
+    pub max_tags: usize,
+    /// Tag-index entries examined per reclamation pass. While a job is
+    /// outstanding these run back to back, so this bounds transaction length
+    /// rather than drain rate.
+    pub reclaim_batch: usize,
+}
+
+impl Default for TagConfig {
+    fn default() -> Self {
+        let defaults = cache_store::StoreConfig::default();
+        Self {
+            max_tags: defaults.max_tags,
+            reclaim_batch: defaults.write.reclaim_batch,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -125,6 +149,14 @@ pub struct ObservabilityConfig {
     pub log_level: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProtocolConfig {
+    /// `FLUSH` empties the whole cache on request from any client that can
+    /// reach the port, so it is off unless deliberately enabled.
+    pub flush_enabled: bool,
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -149,6 +181,7 @@ impl Default for StoreConfig {
             wipe_on_start: false,
             write: WriteConfig::default(),
             ttl: TtlConfig::default(),
+            tags: TagConfig::default(),
         }
     }
 }
@@ -228,6 +261,14 @@ impl Config {
             self.store.ttl.bucket_granularity_ms > 0,
             "store.ttl.bucket_granularity_ms must be > 0"
         );
+        anyhow::ensure!(
+            self.store.tags.max_tags > 0,
+            "store.tags.max_tags must be > 0"
+        );
+        anyhow::ensure!(
+            self.store.tags.reclaim_batch > 0,
+            "store.tags.reclaim_batch must be > 0"
+        );
         Ok(())
     }
 
@@ -240,12 +281,14 @@ impl Config {
             max_value_len: self.store.max_value_bytes,
             wipe_on_start: self.store.wipe_on_start,
             bucket_granularity_ms: self.store.ttl.bucket_granularity_ms,
+            max_tags: self.store.tags.max_tags,
             write: cache_store::WriteConfig {
                 max_batch: self.store.write.max_batch,
                 queue_depth: self.store.write.queue_depth,
                 linger_us: self.store.write.linger_us,
                 sweep_interval_ms: self.store.ttl.sweep_interval_ms,
                 sweep_batch: self.store.ttl.sweep_batch,
+                reclaim_batch: self.store.tags.reclaim_batch,
             },
         }
     }

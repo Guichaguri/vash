@@ -35,6 +35,9 @@ pub struct StoreConfig {
     /// a read from seeing the key as expired, because the read path checks the
     /// record's exact timestamp.
     pub bucket_granularity_ms: u64,
+    /// Ceiling on registered tag names. The registry is held entirely in RAM,
+    /// so without a limit a client inventing tag names is a memory leak.
+    pub max_tags: usize,
     pub write: WriteConfig,
 }
 
@@ -55,6 +58,10 @@ pub struct WriteConfig {
     /// Most expiry-index entries examined per sweep, bounding how long
     /// reclamation can hold the write transaction.
     pub sweep_batch: usize,
+    /// Most tag-index entries examined per reclamation pass. While a job is
+    /// outstanding these run back to back rather than once per interval, so
+    /// this bounds transaction length, not drain rate.
+    pub reclaim_batch: usize,
 }
 
 impl Default for WriteConfig {
@@ -65,6 +72,7 @@ impl Default for WriteConfig {
             linger_us: 0,
             sweep_interval_ms: 100,
             sweep_batch: 512,
+            reclaim_batch: 512,
         }
     }
 }
@@ -79,6 +87,7 @@ impl Default for StoreConfig {
             max_value_len: cache_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
             bucket_granularity_ms: 1000,
+            max_tags: 100_000,
             write: WriteConfig::default(),
         }
     }
