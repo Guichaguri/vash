@@ -49,9 +49,12 @@ pub enum Closing {
 fn memcached_error(status: Status) -> cache_proto::memcached::ErrorKind {
     use cache_proto::memcached::ErrorKind;
 
+    // The wording is memcached's, verbatim: the differential suite compares
+    // response bytes against a real server.
     match status {
         Status::TooLarge => ErrorKind::Server("object too large for cache"),
         Status::BadRequest => ErrorKind::Client("bad command line format"),
+        Status::NotNumeric => ErrorKind::Client("cannot increment or decrement non-numeric value"),
         Status::Unsupported => ErrorKind::Error,
         Status::Unauthorized => ErrorKind::Client("command disabled by configuration"),
         Status::CapacityFull => ErrorKind::Server("out of memory storing object"),
@@ -225,8 +228,9 @@ fn to_status(err: StoreError) -> Status {
             warn!(limit, "tag registry is full");
             Status::CapacityFull
         }
-        // memcached reports this as a client error, not a miss.
-        StoreError::NotNumeric => Status::BadRequest,
+        // memcached reports this as a client error, not a miss, and with its
+        // own wording — see `memcached_error`.
+        StoreError::NotNumeric => Status::NotNumeric,
         StoreError::Core(_) => Status::BadRequest,
         other => {
             error!(error = %other, "storage failure");

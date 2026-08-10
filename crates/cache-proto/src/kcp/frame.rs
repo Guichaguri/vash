@@ -139,6 +139,8 @@ pub enum Status {
     Internal = 9,
     /// A guarded write whose condition was not met.
     NotStored = 10,
+    /// Arithmetic on a value that is not a decimal number.
+    NotNumeric = 11,
 }
 
 impl Status {
@@ -155,6 +157,7 @@ impl Status {
             8 => Self::Unsupported,
             9 => Self::Internal,
             10 => Self::NotStored,
+            11 => Self::NotNumeric,
             _ => return None,
         })
     }

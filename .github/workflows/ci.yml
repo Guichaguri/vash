@@ -68,6 +68,12 @@ jobs:
           done
           python3 tests/compat/memcached_compat.py 127.0.0.1:11311 --flush --tags
 
+      # Stricter than the client-library suite: identical command sequences to
+      # both servers, comparing the raw response bytes. A library smooths over
+      # exact error strings and edge-case verdicts; this does not.
+      - name: Byte-for-byte differential
+        run: python3 tests/compat/differential.py --reference 127.0.0.1:11211 --subject 127.0.0.1:11311
+
   lint:
     runs-on: ubuntu-latest
     steps:

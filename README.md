@@ -124,15 +124,33 @@ which is part of the upstream protocol: a `G` flag on `ms` attaching a
 comma-separated tag list, and `mdt <tag>` (or `delete_by_tag <tag>` in the
 classic dialect) to invalidate one. Clients that never send them are unaffected.
 
-Compatibility is verified against a **real client library**, and the identical
-suite is run against **real memcached** in CI — so a divergence fails the build
-rather than someone's cache:
+### How compatibility is checked
+
+Two suites, both run in CI against **real memcached** as well as against kached,
+so a divergence fails the build rather than someone's cache.
+
+**Client library** — drives `pymemcache` through the behaviour clients actually
+depend on:
 
 ```bash
 pip install pymemcache
 cargo run --release --bin kached -- --listen 127.0.0.1:11311 --data ./data --ephemeral
 python tests/compat/memcached_compat.py 127.0.0.1:11311 --tags
 ```
+
+**Byte-for-byte differential** — sends identical command sequences to both
+servers and compares the raw responses. A client library smooths over exact
+error strings, edge-case verdicts and response framing; this does not:
+
+```bash
+docker run -d -p 11211:11211 memcached:1.6-alpine
+python tests/compat/differential.py --reference 127.0.0.1:11211 --subject 127.0.0.1:11311
+```
+
+Current result: **37 of 38 probes byte-identical**, with one deliberate
+divergence recorded in the script — for an over-long key memcached emits a stray
+empty line after the error, which kached does not reproduce because it would
+leave a pipelining client counting one more response than it sent commands.
 
 ## Layout
 

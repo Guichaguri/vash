@@ -516,11 +516,14 @@ fn reclamation_sharing_a_transaction_with_its_own_invalidation_still_frees_every
     }
     h.store().delete_by_tag(b"t").unwrap();
 
-    h.wait_for("every invalidated record to be reclaimed", |h| {
-        h.entries() == 0
+    // Waiting on the job rather than on the record count: the last records go
+    // in one pass, and the pass after that is what finds the range empty and
+    // retires the job. Checking `entries` first would race that gap.
+    h.wait_for("the reclamation job to finish", |h| {
+        h.pending_reclaims() == 0
     });
+    assert_eq!(h.entries(), 0);
     assert_eq!(h.tag_index_entries(), 0);
-    assert_eq!(h.pending_reclaims(), 0);
 }
 
 #[test]

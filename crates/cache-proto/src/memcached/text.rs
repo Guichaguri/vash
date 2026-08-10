@@ -15,6 +15,11 @@ use cache_core::{Command, Key, Set, SetMode};
 use super::encode::ResponseStyle;
 use super::{ErrorKind, MAX_KEY_LEN, Outcome, Parsed, ProtocolError};
 
+/// memcached's catch-all rejection for a malformed command line. Reproduced
+/// verbatim: the differential suite compares response bytes against a real
+/// server, so a friendlier message would read as a divergence.
+pub(crate) const BAD_LINE: &str = "bad command line format";
+
 pub fn parse<'a>(
     verb: &[u8],
     line: &'a [u8],
@@ -158,6 +163,11 @@ pub fn parse<'a>(
             style: ResponseStyle::Version,
         })),
 
+        // An empty line is a malformed command, not an unknown one — which is
+        // the distinction memcached draws, and it shows up in practice after a
+        // rejected data block leaves a stray terminator behind.
+        b"" => Err(fail(ErrorKind::Client(BAD_LINE))),
+
         _ => Err(fail(ErrorKind::Error)),
     }
 }
@@ -169,21 +179,50 @@ fn parse_storage<'a>(
     buf: &'a [u8],
     line_consumed: usize,
 ) -> Result<Outcome<'a>, ProtocolError> {
+    let tokens: Vec<&[u8]> = line
+        .split(|b| *b == b' ')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    // The declared length is read before anything is validated, so that a
+    // malformed line still consumes its data block. Skipping the block would
+    // leave the value in the stream to be parsed as commands, and every request
+    // after it on that connection would be misread.
+    let bytes = parse_u64(tokens.get(4).copied())
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or(ProtocolError::Recoverable {
+            response: ErrorKind::Client(BAD_LINE),
+            consumed: line_consumed,
+        })?;
+
+    // Reject an absurd length before waiting for that many bytes to arrive,
+    // or a hostile client could pin a connection's buffer at will.
+    if bytes > cache_core::ABSOLUTE_MAX_VALUE_LEN {
+        return Err(ProtocolError::Fatal("declared value length is implausible"));
+    }
+
+    // The block plus its own CRLF must have arrived before any verdict is
+    // reported, because every one of them consumes it.
+    let data_end = line_consumed + bytes;
+    if buf.len() < data_end + 2 {
+        return Ok(Outcome::Incomplete);
+    }
+    let consumed = data_end + 2;
+
     let fail = |kind: ErrorKind| ProtocolError::Recoverable {
         response: kind,
-        consumed: line_consumed,
+        consumed,
     };
 
-    let mut tokens = line.split(|b| *b == b' ').filter(|t| !t.is_empty()).skip(1);
+    if &buf[data_end..data_end + 2] != b"\r\n" {
+        return Err(fail(ErrorKind::Client("bad data chunk")));
+    }
 
-    let key = parse_key(tokens.next(), line_consumed)?;
-    let mc_flags = parse_u64(tokens.next())
+    let key = parse_key(tokens.get(1).copied(), consumed)?;
+    let mc_flags = parse_u64(tokens.get(2).copied())
         .and_then(|v| u32::try_from(v).ok())
-        .ok_or_else(|| fail(ErrorKind::Client("bad command line format")))?;
-    let ttl_secs = parse_exptime(tokens.next(), line_consumed)?;
-    let bytes = parse_u64(tokens.next())
-        .and_then(|v| usize::try_from(v).ok())
-        .ok_or_else(|| fail(ErrorKind::Client("bad command line format")))?;
+        .ok_or_else(|| fail(ErrorKind::Client(BAD_LINE)))?;
+    let ttl_secs = parse_exptime(tokens.get(3).copied(), consumed)?;
 
     let mode = match verb {
         b"set" => SetMode::Set,
@@ -192,36 +231,14 @@ fn parse_storage<'a>(
         b"append" => SetMode::Append,
         b"prepend" => SetMode::Prepend,
         b"cas" => {
-            let cas = parse_u64(tokens.next())
-                .ok_or_else(|| fail(ErrorKind::Client("bad command line format")))?;
+            let cas = parse_u64(tokens.get(5).copied())
+                .ok_or_else(|| fail(ErrorKind::Client(BAD_LINE)))?;
             SetMode::Cas(cas)
         }
         _ => unreachable!("caller matched the verb"),
     };
-    let noreply = has_noreply(tokens);
-
-    // Reject an absurd length before waiting for that many bytes to arrive,
-    // or a hostile client could pin a connection's buffer at will.
-    if bytes > cache_core::ABSOLUTE_MAX_VALUE_LEN {
-        return Err(ProtocolError::Fatal("declared value length is implausible"));
-    }
-
-    // The data block plus its own CRLF must have arrived.
-    let data_start = line_consumed;
-    let data_end = data_start + bytes;
-    if buf.len() < data_end + 2 {
-        return Ok(Outcome::Incomplete);
-    }
-
-    let data = &buf[data_start..data_end];
-    if &buf[data_end..data_end + 2] != b"\r\n" {
-        // memcached treats a mismatched length as a client error and discards
-        // the block, which is what keeps the stream in sync.
-        return Err(ProtocolError::Recoverable {
-            response: ErrorKind::Client("bad data chunk"),
-            consumed: data_end + 2,
-        });
-    }
+    let noreply = has_noreply(tokens.iter().copied());
+    let data = &buf[line_consumed..data_end];
 
     Ok(Outcome::Command(Parsed {
         command: Command::Set(Set {
@@ -232,7 +249,7 @@ fn parse_storage<'a>(
             tags: Vec::new(),
             mode,
         }),
-        consumed: data_end + 2,
+        consumed,
         noreply,
         style: ResponseStyle::Storage,
     }))
@@ -244,20 +261,19 @@ fn parse_key(token: Option<&[u8]>, consumed: usize) -> Result<Key<'_>, ProtocolE
         consumed,
     };
 
-    let token = token.ok_or_else(|| fail("missing key"))?;
-    if token.is_empty() {
-        return Err(fail("missing key"));
+    // Every one of these is `bad command line format` because that is verbatim
+    // what memcached answers, and the differential suite compares the bytes. A
+    // more descriptive message would be a divergence a client could trip over.
+    let token = token.ok_or_else(|| fail(BAD_LINE))?;
+    if token.is_empty() || token.len() > MAX_KEY_LEN {
+        return Err(fail(BAD_LINE));
     }
-    // memcached's limit is stricter than LMDB's, and control characters would
-    // break the line framing.
-    if token.len() > MAX_KEY_LEN {
-        return Err(fail("key too long"));
-    }
+    // Control characters would break the line framing.
     if token.iter().any(|b| *b <= b' ' || *b == 0x7f) {
-        return Err(fail("key contains a control character"));
+        return Err(fail(BAD_LINE));
     }
 
-    Key::new(token).map_err(|_| fail("invalid key"))
+    Key::new(token).map_err(|_| fail(BAD_LINE))
 }
 
 fn parse_keys<'a>(
@@ -276,7 +292,7 @@ fn parse_keys<'a>(
     }
     if keys.is_empty() {
         return Err(ProtocolError::Recoverable {
-            response: ErrorKind::Client("missing key"),
+            response: ErrorKind::Client(BAD_LINE),
             consumed,
         });
     }
@@ -373,6 +389,41 @@ mod tests {
             panic!()
         };
         assert_eq!(set.value, b"a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn a_malformed_command_line_still_consumes_its_data_block() {
+        // `notanumber` is not valid flags, but the length token is readable, so
+        // the block must be swallowed anyway — otherwise the value would be
+        // parsed as the next command and every request after it misread.
+        let input = b"set foo notanumber 0 1\r\nx\r\n";
+        let Err(ProtocolError::Recoverable { consumed, .. }) = parse(input) else {
+            panic!("expected a recoverable client error")
+        };
+        assert_eq!(consumed, input.len(), "the data block must be consumed too");
+    }
+
+    #[test]
+    fn a_malformed_line_with_no_readable_length_consumes_only_the_line() {
+        // Nothing can be swallowed when the length itself is unreadable.
+        let input = b"set foo 0 0 notanumber\r\n";
+        let Err(ProtocolError::Recoverable { consumed, .. }) = parse(input) else {
+            panic!("expected a recoverable client error")
+        };
+        assert_eq!(consumed, input.len());
+    }
+
+    #[test]
+    fn an_empty_line_is_malformed_rather_than_unknown() {
+        // memcached draws this distinction, and it shows up right after a
+        // rejected data block leaves a stray terminator behind.
+        assert!(matches!(
+            parse(b"\r\n"),
+            Err(ProtocolError::Recoverable {
+                response: ErrorKind::Client(BAD_LINE),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -477,13 +528,15 @@ mod tests {
     #[test]
     fn keys_are_validated_against_memcached_rules() {
         // Over memcached's 250-byte limit, even though LMDB would take it.
+        // The wording is memcached's own — a differential run against a real
+        // server compares these bytes.
         let mut long = b"get ".to_vec();
         long.extend_from_slice(&vec![b'k'; MAX_KEY_LEN + 1]);
         long.extend_from_slice(b"\r\n");
         assert!(matches!(
             parse(&long),
             Err(ProtocolError::Recoverable {
-                response: ErrorKind::Client("key too long"),
+                response: ErrorKind::Client(BAD_LINE),
                 ..
             })
         ));
