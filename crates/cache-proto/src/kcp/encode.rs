@@ -116,8 +116,32 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             encode_response(out, opcode, request_id, Status::Ok, &body);
         }
 
-        Reply::Stored { cas } => {
-            encode_response(out, opcode, request_id, Status::Ok, &cas.to_le_bytes())
+        // The guarded outcomes only arise over the memcached adapter today, but
+        // they are mapped rather than lumped into a generic error so that
+        // adding conditional writes to KCP needs no wire change.
+        Reply::Stored(outcome) => match outcome {
+            cache_core::Stored::Stored(cas) => {
+                encode_response(out, opcode, request_id, Status::Ok, &cas.to_le_bytes())
+            }
+            cache_core::Stored::NotStored => {
+                encode_response(out, opcode, request_id, Status::NotStored, &[])
+            }
+            cache_core::Stored::Exists => {
+                encode_response(out, opcode, request_id, Status::Exists, &[])
+            }
+            cache_core::Stored::NotFound => {
+                encode_response(out, opcode, request_id, Status::NotFound, &[])
+            }
+        },
+
+        Reply::Counter(value) => {
+            encode_response(out, opcode, request_id, Status::Ok, &value.to_le_bytes())
+        }
+
+        // Protocol-level replies with no KCP representation yet. Reported as
+        // unsupported rather than silently rendered as success.
+        Reply::Stats(_) | Reply::Version(_) | Reply::Closing => {
+            encode_response(out, opcode, request_id, Status::Unsupported, &[])
         }
 
         Reply::Value(value) => {

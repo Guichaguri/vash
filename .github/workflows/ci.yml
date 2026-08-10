@@ -27,6 +27,47 @@ jobs:
       - run: cargo build --all-targets
       - run: cargo test --all-features
 
+  # The memcached compatibility claim is only worth anything if it is checked
+  # against real clients, and against real memcached. Running the identical
+  # suite on both is what turns "we implemented the protocol" into "a client
+  # cannot tell the difference".
+  compat:
+    name: memcached client compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install memcached and a real client library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y memcached
+          python3 -m pip install --user pymemcache
+
+      - run: cargo build --release --bin kached
+
+      # Baseline first: if the suite does not pass against upstream memcached,
+      # the suite is wrong, not the server.
+      - name: Against real memcached
+        run: |
+          memcached -d -p 11211 -m 64 -u "$(whoami)"
+          for _ in $(seq 20); do
+            (echo -n "" >/dev/tcp/127.0.0.1/11211) 2>/dev/null && break
+            sleep 0.2
+          done
+          python3 tests/compat/memcached_compat.py 127.0.0.1:11211 --flush
+
+      - name: Against kached
+        run: |
+          ./target/release/kached --listen 127.0.0.1:11311 --data /tmp/kached \
+            --ephemeral --enable-flush &
+          for _ in $(seq 40); do
+            (echo -n "" >/dev/tcp/127.0.0.1/11311) 2>/dev/null && break
+            sleep 0.2
+          done
+          python3 tests/compat/memcached_compat.py 127.0.0.1:11311 --flush --tags
+
   lint:
     runs-on: ubuntu-latest
     steps:

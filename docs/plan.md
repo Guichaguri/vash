@@ -154,10 +154,15 @@ printable character. Unambiguous, zero cost after the first byte. A separate por
 for anyone who prefers explicit separation.
 
 **Tags for memcached clients** are exposed via a meta-protocol flag extension on `ms` carrying a
-comma-separated tag list, plus a non-standard `mdt <tag>` command for invalidation. The specific flag
-letter must be picked from the currently-unassigned set in upstream `protocol.txt` at implementation
-time and is a single constant in the code. Clients discover support via the `HELLO`/`stats` capability
-list; classic memcached clients that never send it are unaffected.
+comma-separated tag list, plus a non-standard `mdt <tag>` command for invalidation. Clients discover
+support via the `HELLO`/`stats` capability list; classic memcached clients that never send it are
+unaffected.
+
+**As implemented (M3):** the flag letter is `G`, picked from the letters upstream leaves unassigned,
+and defined as a single constant (`memcached::meta::TAG_FLAG`). The classic dialect also gets
+`delete_by_tag <tag>`, named distinctly enough that it cannot collide with a future upstream command.
+The meta flag set is the documented core (`v f c t s k O q T F C M D N`); an unrecognised flag is
+rejected with `CLIENT_ERROR`, as upstream does, so a client never believes a flag took effect.
 
 **UDP will not be implemented.** Memcached's UDP support is a well-known reflection/amplification vector
 and upstream disables it by default. TCP (and optionally Unix domain sockets) only.

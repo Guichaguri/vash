@@ -63,8 +63,12 @@ max_tags = 100000
 reclaim_batch = 512
 
 [protocol]
-# FLUSH empties the whole cache for anyone who can reach the port. Off unless
-# deliberately enabled.
+# FLUSH / flush_all empties the whole cache for anyone who can reach the port.
+# Off unless deliberately enabled; --enable-flush does the same from the CLI.
+#
+# The memcached text and meta protocols are always available: they share the
+# port with the native protocol and are told apart by the connection's first
+# byte, so there is nothing to turn on.
 flush_enabled = false
 
 [observability]

@@ -59,6 +59,26 @@ pub enum Command<'a> {
     },
     /// Empties the cache.
     Flush,
+
+    /// Fetch several keys and re-stamp their TTL in one pass (memcached `gat`).
+    GetAndTouch {
+        keys: Vec<Key<'a>>,
+        ttl_secs: u32,
+    },
+    /// Atomic numeric add or subtract (memcached `incr`/`decr`).
+    ///
+    /// Operates on the decimal text of the value, because that is what the
+    /// memcached protocol defines and what clients round-trip.
+    Incr {
+        key: Key<'a>,
+        delta: u64,
+        decrement: bool,
+    },
+
+    /// Protocol-level commands with no storage effect.
+    Stats,
+    Version,
+    Quit,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +92,57 @@ pub struct Set<'a> {
     pub mc_flags: u32,
     /// Tag names. Empty for untagged writes, which costs no allocation.
     pub tags: Vec<&'a [u8]>,
+    /// The condition under which the write applies.
+    pub mode: SetMode,
+}
+
+impl<'a> Set<'a> {
+    /// An unconditional write with no tags — the common case.
+    pub fn plain(key: Key<'a>, value: &'a [u8], ttl_secs: u32) -> Self {
+        Self {
+            key,
+            value,
+            ttl_secs,
+            mc_flags: 0,
+            tags: Vec::new(),
+            mode: SetMode::Set,
+        }
+    }
+}
+
+/// When a write is allowed to take effect.
+///
+/// Modelled as one field rather than one command per variant because they all
+/// resolve to the same storage operation under a different guard — which is
+/// also why they can share a transaction and a code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetMode {
+    /// Always store.
+    #[default]
+    Set,
+    /// Store only if the key is absent (memcached `add`).
+    Add,
+    /// Store only if the key is present (memcached `replace`).
+    Replace,
+    /// Concatenate onto an existing value; no-op if absent. The existing
+    /// TTL and client flags are kept, as memcached does.
+    Append,
+    Prepend,
+    /// Store only if the key is present with exactly this CAS token.
+    Cas(u64),
+}
+
+/// The outcome of a conditional write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    Stored(u64),
+    /// The guard rejected it: `add` on a present key, `replace`/`append`/
+    /// `prepend` on an absent one.
+    NotStored,
+    /// `cas` on a key that exists but has moved on.
+    Exists,
+    /// `cas` on a key that is not there at all.
+    NotFound,
 }
 
 /// The outcome of a command, ready to be encoded by whichever adapter received it.
@@ -89,9 +160,7 @@ pub enum Reply {
     Value(Value),
     /// One slot per requested key; `None` is a miss.
     Values(Vec<Option<Value>>),
-    Stored {
-        cas: u64,
-    },
+    Stored(Stored),
     StoredMany(Vec<u64>),
     Deleted,
     /// `true` where the key was live before the delete.
@@ -102,6 +171,12 @@ pub enum Reply {
     Invalidated(bool),
     /// The cache was emptied, carrying the new flush epoch.
     Flushed(u32),
+    /// New value of a counter after `incr`/`decr`.
+    Counter(u64),
+    Stats(Vec<(String, String)>),
+    Version(&'static str),
+    /// The client asked to hang up.
+    Closing,
     NotFound,
 }
 

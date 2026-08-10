@@ -111,9 +111,12 @@ async fn handshake_reports_server_limits() {
     assert_eq!(info.protocol_version, cache_core::PROTOCOL_VERSION);
     assert_eq!(info.max_key_len, cache_core::MAX_KEY_LEN as u32);
     assert_eq!(info.max_value_len, cache_core::DEFAULT_MAX_VALUE_LEN as u32);
-    // Capabilities are advertised only as each milestone lands: memcached (M3)
-    // and cluster invalidation (M5) are not claimed yet.
-    assert_eq!(info.capabilities, cache_core::capability::TAGS);
+    // Capabilities are advertised only as each milestone lands: cluster
+    // invalidation (M5) is not claimed yet.
+    assert_eq!(
+        info.capabilities,
+        cache_core::capability::TAGS | cache_core::capability::MEMCACHED
+    );
 }
 
 #[tokio::test]

@@ -26,7 +26,7 @@ pub mod schema;
 pub mod tags;
 mod writer;
 
-use cache_core::{Key, Set, Value};
+use cache_core::{Key, Set, Stored, Value};
 
 pub use config::{Durability, StoreConfig, WriteConfig};
 pub use error::{Result, StoreError};
@@ -107,8 +107,20 @@ pub trait Store: Send + Sync + 'static {
     /// Resolves many keys against a single consistent snapshot.
     fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>>;
 
-    /// Stores a value, returning its new CAS token.
+    /// Stores a value unconditionally, returning its new CAS token.
+    ///
+    /// Ignores `set.mode`; use [`Store::store`] for guarded writes.
     fn set(&self, set: &Set<'_>) -> Result<u64>;
+
+    /// Applies a write under its [`SetMode`] guard.
+    fn store(&self, set: &Set<'_>) -> Result<Stored>;
+
+    /// Adds to or subtracts from a counter held as decimal text. `None` when
+    /// the key is absent.
+    fn incr(&self, key: Key<'_>, delta: u64, decrement: bool) -> Result<Option<u64>>;
+
+    /// Fetches keys and re-stamps their TTL in one pass (memcached `gat`).
+    fn get_and_touch(&self, keys: &[Key<'_>], ttl_secs: u32) -> Result<Vec<Option<Value>>>;
 
     /// Stores many values in one transaction: all of them apply, or none do.
     fn set_many(&self, sets: &[Set<'_>]) -> Result<Vec<u64>>;

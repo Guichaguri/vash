@@ -8,6 +8,59 @@ use tracing::{error, warn};
 
 use crate::state::ServerState;
 
+/// Executes a memcached command, rendering the reply in that dialect.
+///
+/// Shares [`execute`] with the KCP path: the storage layer never learns which
+/// wire format a request arrived on.
+pub fn execute_memcached(
+    state: &ServerState,
+    parsed: &cache_proto::memcached::Parsed<'_>,
+    out: &mut Vec<u8>,
+) -> Closing {
+    use cache_proto::memcached::encode as mc;
+
+    let result = execute(state, &parsed.command);
+    let closing = matches!(result, Ok(Reply::Closing));
+
+    match result {
+        Ok(reply) => {
+            // `noreply` suppresses the response but never the work.
+            if !parsed.noreply {
+                mc::encode(out, &parsed.style, &parsed.command, &reply);
+            }
+        }
+        Err(status) => {
+            if !parsed.noreply {
+                mc::encode_error(out, memcached_error(status));
+            }
+        }
+    }
+
+    if closing { Closing::Yes } else { Closing::No }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closing {
+    Yes,
+    No,
+}
+
+/// Maps an internal status onto the memcached error vocabulary.
+fn memcached_error(status: Status) -> cache_proto::memcached::ErrorKind {
+    use cache_proto::memcached::ErrorKind;
+
+    match status {
+        Status::TooLarge => ErrorKind::Server("object too large for cache"),
+        Status::BadRequest => ErrorKind::Client("bad command line format"),
+        Status::Unsupported => ErrorKind::Error,
+        Status::Unauthorized => ErrorKind::Client("command disabled by configuration"),
+        Status::CapacityFull => ErrorKind::Server("out of memory storing object"),
+        Status::Overloaded => ErrorKind::Server("server is overloaded"),
+        Status::NotStored => ErrorKind::Server("not stored"),
+        _ => ErrorKind::Server("internal error"),
+    }
+}
+
 /// Decodes and executes one complete frame, returning the encoded response.
 ///
 /// Runs on a blocking thread, and takes ownership of the frame bytes, so the
@@ -84,10 +137,31 @@ fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> 
             state.store.get_many(keys).map_err(to_status)?,
         )),
 
-        Command::Set(set) => {
-            let cas = state.store.set(set).map_err(to_status)?;
-            Ok(Reply::Stored { cas })
-        }
+        Command::Set(set) => Ok(Reply::Stored(state.store.store(set).map_err(to_status)?)),
+
+        Command::GetAndTouch { keys, ttl_secs } => Ok(Reply::Values(
+            state
+                .store
+                .get_and_touch(keys, *ttl_secs)
+                .map_err(to_status)?,
+        )),
+
+        Command::Incr {
+            key,
+            delta,
+            decrement,
+        } => match state
+            .store
+            .incr(*key, *delta, *decrement)
+            .map_err(to_status)?
+        {
+            Some(value) => Ok(Reply::Counter(value)),
+            None => Ok(Reply::NotFound),
+        },
+
+        Command::Stats => Ok(Reply::Stats(collect_stats(state))),
+        Command::Version => Ok(Reply::Version(cache_proto::memcached::encode::VERSION)),
+        Command::Quit => Ok(Reply::Closing),
 
         Command::SetMany(sets) => Ok(Reply::StoredMany(
             state.store.set_many(sets).map_err(to_status)?,
@@ -151,12 +225,66 @@ fn to_status(err: StoreError) -> Status {
             warn!(limit, "tag registry is full");
             Status::CapacityFull
         }
+        // memcached reports this as a client error, not a miss.
+        StoreError::NotNumeric => Status::BadRequest,
         StoreError::Core(_) => Status::BadRequest,
         other => {
             error!(error = %other, "storage failure");
             Status::Internal
         }
     }
+}
+
+/// The `stats` payload.
+///
+/// A subset of memcached's counters, restricted to what this server actually
+/// measures — plus its own. Reporting a plausible-looking zero for something we
+/// do not track would mislead any dashboard reading it.
+fn collect_stats(state: &ServerState) -> Vec<(String, String)> {
+    let mut stats = vec![
+        ("pid".into(), std::process::id().to_string()),
+        (
+            "version".into(),
+            cache_proto::memcached::encode::VERSION.into(),
+        ),
+        ("pointer_size".into(), usize::BITS.to_string()),
+    ];
+
+    match state.store.stats() {
+        Ok(s) => stats.extend([
+            ("curr_items".into(), s.entries.to_string()),
+            ("bytes".into(), s.used_bytes.to_string()),
+            ("limit_maxbytes".into(), s.map_size.to_string()),
+            // Beyond memcached's set, but they are what this server is actually
+            // about.
+            ("kached_utilisation".into(), format!("{:.4}", s.utilisation)),
+            ("kached_expiry_entries".into(), s.expiry_entries.to_string()),
+            ("kached_tags".into(), s.tags.to_string()),
+            (
+                "kached_tag_index_entries".into(),
+                s.tag_index_entries.to_string(),
+            ),
+            (
+                "kached_pending_reclaims".into(),
+                s.pending_reclaims.to_string(),
+            ),
+            ("kached_commits".into(), s.commits.to_string()),
+            ("kached_committed_ops".into(), s.committed_ops.to_string()),
+            (
+                "kached_mean_batch".into(),
+                format!("{:.2}", s.mean_batch_size()),
+            ),
+            ("kached_sweeps".into(), s.sweeps.to_string()),
+            ("kached_reclaimed".into(), s.reclaimed.to_string()),
+            ("kached_tag_reclaimed".into(), s.tag_reclaimed.to_string()),
+            ("kached_sweep_lag_ms".into(), s.sweep_lag_ms.to_string()),
+            ("kached_epoch".into(), s.epoch.to_string()),
+            ("kached_readers_in_use".into(), s.readers_in_use.to_string()),
+        ]),
+        Err(e) => error!(error = %e, "could not read store stats"),
+    }
+
+    stats
 }
 
 /// Builds the handshake response advertised to clients.
@@ -169,6 +297,6 @@ pub fn server_info(shards: u16, max_value_len: usize) -> ServerInfo {
         // Advertised only as each milestone lands: claiming a capability the
         // server does not have would make a client trust invalidation that is
         // not happening.
-        capabilities: cache_core::capability::TAGS,
+        capabilities: cache_core::capability::TAGS | cache_core::capability::MEMCACHED,
     }
 }

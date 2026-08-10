@@ -1,4 +1,4 @@
-//! Measures whether `DELETE_BY_TAG` is really constant time.
+﻿//! Measures whether `DELETE_BY_TAG` is really constant time.
 //!
 //! ```text
 //! cargo run --release -p cache-store --example tag_bench
@@ -10,7 +10,7 @@
 //! with cardinality, the design has silently regressed into the O(n) version.
 //!
 //! Reclamation of the freed space happens afterwards, in the background, and is
-//! reported separately — it *is* proportional to the number of keys, and is
+//! reported separately â€” it *is* proportional to the number of keys, and is
 //! meant to be.
 
 use std::time::{Duration, Instant};
@@ -56,6 +56,7 @@ fn main() {
                     ttl_secs: 0,
                     mc_flags: 0,
                     tags: vec![b"everything"],
+                    mode: cache_core::SetMode::Set,
                 })
                 .collect();
             store.set_many(&sets).expect("set_many");

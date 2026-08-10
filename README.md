@@ -6,10 +6,10 @@ protocol compatibility.
 Design and rationale: [docs/plan.md](docs/plan.md). Original brief:
 [docs/project.md](docs/project.md).
 
-**Status: M2 complete.** Single-key and batch operations over the native binary
-protocol (KCP), TTLs with background reclamation, group-committed writes, and
-constant-time tag invalidation. Not yet production-usable — see
-[What works today](#what-works-today).
+**Status: M3 complete.** Speaks both its own binary protocol and the memcached
+text and meta protocols, on the same port. TTLs with background reclamation,
+group-committed writes, and constant-time tag invalidation. Not yet
+production-usable — see [What works today](#what-works-today).
 
 ## Quick start
 
@@ -35,9 +35,13 @@ Run with `--ephemeral` to start from an empty database and skip syncing, or
 | TTLs | Enforced on read, and reclaimed in the background by the sweeper |
 | Group commit | Working — see [benchmark](#write-throughput) |
 | Tags, `DELETE_BY_TAG`, `FLUSH` | Working — invalidation is constant time, see [benchmark](#tag-invalidation) |
-| Memcached protocol | M3 |
+| Memcached text protocol | Working — `get`/`gets`/`set`/`add`/`replace`/`append`/`prepend`/`cas`/`delete`/`touch`/`gat`/`gats`/`incr`/`decr`/`stats`/`version`/`flush_all`/`quit` |
+| Memcached meta protocol | Working — `mg`/`ms`/`md`/`ma`/`mn`/`me`, core flag set |
 | Sharding, capacity eviction, Prometheus metrics | M4 |
 | Cluster tag invalidation | M5 |
+
+The legacy memcached **binary** protocol (magic `0x80`) is not implemented and
+will not be: upstream deprecated it in favour of the meta commands.
 
 The on-disk record format is already the final one — epoch, TTL, CAS and the tag
 table are all written today — so later milestones add behaviour without a
@@ -97,12 +101,45 @@ The alternative — finding and deleting every key with the tag — would cost O
 while holding the environment's only write transaction, which for a large tag is
 a multi-second stall of every other write on the node.
 
+## Memcached compatibility
+
+Both protocols share one port. The dialect is settled by the connection's first
+byte — KCP opens with a `HELLO` frame (`0x01`), every memcached command opens
+with a lowercase letter — so nothing is re-parsed and the two cannot be
+confused. A key written by a memcached client is readable by a KCP client and
+the other way round, client flags included.
+
+Existing memcached clients need no changes:
+
+```bash
+python -c "
+from pymemcache.client.base import Client
+c = Client(('127.0.0.1', 11311))
+c.set(b'key', b'value'); print(c.get(b'key'))
+"
+```
+
+Tags are reachable from memcached clients through two extensions, neither of
+which is part of the upstream protocol: a `G` flag on `ms` attaching a
+comma-separated tag list, and `mdt <tag>` (or `delete_by_tag <tag>` in the
+classic dialect) to invalidate one. Clients that never send them are unaffected.
+
+Compatibility is verified against a **real client library**, and the identical
+suite is run against **real memcached** in CI — so a divergence fails the build
+rather than someone's cache:
+
+```bash
+pip install pymemcache
+cargo run --release --bin kached -- --listen 127.0.0.1:11311 --data ./data --ephemeral
+python tests/compat/memcached_compat.py 127.0.0.1:11311 --tags
+```
+
 ## Layout
 
 ```
 crates/cache-core     domain types, on-disk record format, no I/O
 crates/cache-store    LMDB adapter behind the `Store` trait
-crates/cache-proto    wire codecs; pure byte-slice in, `Command` out
+crates/cache-proto    wire codecs (KCP + memcached); byte-slice in, `Command` out
 crates/cache-server   network tier, dispatch, config, the `kached` binary
 crates/cache-client   KCP client, and the integration-test driver
 ```

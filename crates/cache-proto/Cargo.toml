@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "cache-proto"
 version.workspace = true
 edition.workspace = true
@@ -9,5 +9,7 @@ license.workspace = true
 cache-core.workspace = true
 
 bytes.workspace = true
+memchr.workspace = true
 thiserror.workspace = true
 zerocopy.workspace = true
+

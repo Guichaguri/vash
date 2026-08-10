@@ -137,6 +137,8 @@ pub enum Status {
     CapacityFull = 7,
     Unsupported = 8,
     Internal = 9,
+    /// A guarded write whose condition was not met.
+    NotStored = 10,
 }
 
 impl Status {
@@ -152,6 +154,7 @@ impl Status {
             7 => Self::CapacityFull,
             8 => Self::Unsupported,
             9 => Self::Internal,
+            10 => Self::NotStored,
             _ => return None,
         })
     }

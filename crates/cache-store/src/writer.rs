@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cache_core::Key;
+use cache_core::{Key, SetMode, Stored};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use tracing::{debug, error, info, warn};
 
@@ -29,8 +29,20 @@ use crate::error::{Result, StoreError};
 
 pub(crate) enum WriteOp {
     Set(Vec<PreparedSet>),
+    /// A single write under a guard. Kept apart from `Set` because its outcome
+    /// is a verdict rather than a CAS token, and it must not be batched with
+    /// other writes to the same key.
+    ConditionalSet(PreparedSet, SetMode),
     Delete(Vec<Box<[u8]>>),
-    Touch { key: Box<[u8]>, ttl_secs: u32 },
+    Touch {
+        key: Box<[u8]>,
+        ttl_secs: u32,
+    },
+    Incr {
+        key: Box<[u8]>,
+        delta: u64,
+        decrement: bool,
+    },
     CreateTags(Vec<Box<[u8]>>),
     DeleteByTag(Box<[u8]>),
     Flush,
@@ -47,7 +59,11 @@ impl WriteOp {
         match self {
             Self::Set(items) => items.len(),
             Self::Delete(keys) => keys.len(),
-            Self::Touch { .. } | Self::DeleteByTag(_) | Self::Flush => 1,
+            Self::ConditionalSet(..)
+            | Self::Touch { .. }
+            | Self::Incr { .. }
+            | Self::DeleteByTag(_)
+            | Self::Flush => 1,
             Self::CreateTags(names) => names.len(),
             Self::Sync => 0,
         }
@@ -56,8 +72,11 @@ impl WriteOp {
 
 pub(crate) enum WriteOutcome {
     Cas(Vec<u64>),
+    Conditional(Stored),
     Deleted(Vec<bool>),
     Touched(bool),
+    /// `None` when the key was absent.
+    Counter(Option<u64>),
     /// `None` when the tag was never registered, so nothing referenced it.
     Invalidated(Option<u64>),
     Flushed(u32),
@@ -169,6 +188,29 @@ impl Writer {
     pub fn delete_many(&self, keys: Vec<Box<[u8]>>) -> Result<Vec<bool>> {
         match self.submit(WriteOp::Delete(keys))? {
             WriteOutcome::Deleted(hits) => Ok(hits),
+            _ => Err(StoreError::Corrupt(
+                "writer returned the wrong reply".into(),
+            )),
+        }
+    }
+
+    pub fn conditional_set(&self, prepared: PreparedSet, mode: SetMode) -> Result<Stored> {
+        match self.submit(WriteOp::ConditionalSet(prepared, mode))? {
+            WriteOutcome::Conditional(outcome) => Ok(outcome),
+            _ => Err(StoreError::Corrupt(
+                "writer returned the wrong reply".into(),
+            )),
+        }
+    }
+
+    pub fn incr(&self, key: Key<'_>, delta: u64, decrement: bool) -> Result<Option<u64>> {
+        let op = WriteOp::Incr {
+            key: key.as_bytes().into(),
+            delta,
+            decrement,
+        };
+        match self.submit(op)? {
+            WriteOutcome::Counter(value) => Ok(value),
             _ => Err(StoreError::Corrupt(
                 "writer returned the wrong reply".into(),
             )),
@@ -482,8 +524,18 @@ fn apply(
             }
             Ok(WriteOutcome::Deleted(hits))
         }
+        WriteOp::ConditionalSet(prepared, mode) => Ok(WriteOutcome::Conditional(
+            engine.apply_conditional_set(wtxn, prepared, *mode)?,
+        )),
         WriteOp::Touch { key, ttl_secs } => Ok(WriteOutcome::Touched(
             engine.apply_touch(wtxn, key, *ttl_secs)?,
+        )),
+        WriteOp::Incr {
+            key,
+            delta,
+            decrement,
+        } => Ok(WriteOutcome::Counter(
+            engine.apply_incr(wtxn, key, *delta, *decrement)?,
         )),
         WriteOp::CreateTags(names) => {
             for name in names.iter() {

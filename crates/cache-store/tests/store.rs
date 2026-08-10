@@ -1,7 +1,7 @@
-//! Storage-engine tests, driven directly against the `Store` trait.
+﻿//! Storage-engine tests, driven directly against the `Store` trait.
 //!
-//! These cover behaviour that is invisible from the wire — expiry-index
-//! bookkeeping, sweeper reclamation, group commit — and would otherwise only be
+//! These cover behaviour that is invisible from the wire â€” expiry-index
+//! bookkeeping, sweeper reclamation, group commit â€” and would otherwise only be
 //! observable as a slow disk leak.
 
 use cache_core::{Key, Set};
@@ -57,6 +57,7 @@ impl Harness {
                 ttl_secs,
                 mc_flags: 0,
                 tags: tags.to_vec(),
+                mode: cache_core::SetMode::Set,
             })
             .unwrap()
     }
@@ -311,6 +312,7 @@ fn batch_writes_apply_atomically_and_return_ordered_cas() {
             ttl_secs: 0,
             mc_flags: 0,
             tags: Vec::new(),
+            mode: cache_core::SetMode::Set,
         })
         .collect();
 
@@ -386,6 +388,7 @@ fn concurrent_writers_share_commits_and_never_reuse_a_cas() {
                                     ttl_secs: 0,
                                     mc_flags: 0,
                                     tags: Vec::new(),
+                                    mode: cache_core::SetMode::Set,
                                 })
                                 .unwrap()
                         })
@@ -606,6 +609,7 @@ fn reclamation_resumes_across_a_restart() {
                     ttl_secs: 0,
                     mc_flags: 0,
                     tags: vec![b"t"],
+                    mode: cache_core::SetMode::Set,
                 })
                 .unwrap();
         }
@@ -667,6 +671,7 @@ fn tag_generations_survive_a_restart() {
                 ttl_secs: 0,
                 mc_flags: 0,
                 tags: vec![b"t"],
+                mode: cache_core::SetMode::Set,
             })
             .unwrap();
         store.delete_by_tag(b"t").unwrap();
@@ -704,6 +709,7 @@ fn tag_ids_are_stable_across_a_restart() {
                     ttl_secs: 0,
                     mc_flags: 0,
                     tags: vec![tag],
+                    mode: cache_core::SetMode::Set,
                 })
                 .unwrap();
         }
@@ -768,6 +774,7 @@ fn the_tag_registry_is_bounded() {
         ttl_secs: 0,
         mc_flags: 0,
         tags: vec![b"one-too-many"],
+        mode: cache_core::SetMode::Set,
     });
     assert!(
         matches!(err, Err(cache_store::StoreError::TagLimit(4))),
@@ -847,6 +854,7 @@ fn data_and_the_expiry_index_survive_a_reopen() {
                 ttl_secs: 3600,
                 mc_flags: 0,
                 tags: Vec::new(),
+                mode: cache_core::SetMode::Set,
             })
             .unwrap();
         store.close();
@@ -868,6 +876,7 @@ fn data_and_the_expiry_index_survive_a_reopen() {
             ttl_secs: 0,
             mc_flags: 0,
             tags: Vec::new(),
+            mode: cache_core::SetMode::Set,
         })
         .unwrap();
     assert!(next > cas, "CAS must not go backwards across a restart");

@@ -34,6 +34,7 @@ toml = "0.9"
 clap = { version = "4", features = ["derive"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam-channel = "0.5"
+memchr = "2"
 
 [profile.release]
 opt-level = 3
@@ -45,4 +46,5 @@ debug = 1
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
 

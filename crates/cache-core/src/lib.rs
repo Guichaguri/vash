@@ -17,7 +17,8 @@ pub mod value;
 
 pub use clock::{Clock, MAX_TTL_SECS};
 pub use command::{
-    Command, MAX_BATCH_ITEMS, PROTOCOL_VERSION, Reply, ServerInfo, Set, Value, capability,
+    Command, MAX_BATCH_ITEMS, PROTOCOL_VERSION, Reply, ServerInfo, Set, SetMode, Stored, Value,
+    capability,
 };
 pub use error::{CoreError, Result};
 pub use key::{Key, MAX_KEY_LEN};

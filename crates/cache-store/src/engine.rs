@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use cache_core::{
-    Clock, Key, RecordMeta, RecordRef, Set, TagRef, Value, encode_record, patch_cas, record::NEVER,
-    validate_value,
+    Clock, Key, RecordMeta, RecordRef, Set, SetMode, Stored, TagRef, Value, encode_record,
+    patch_cas, record::NEVER, validate_value,
 };
 use heed::types::Bytes as HeedBytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
@@ -315,6 +315,148 @@ impl LmdbEngine {
         }
 
         Ok(())
+    }
+
+    /// Reads the record currently under `key`, if it is live.
+    ///
+    /// Every conditional write is judged against what a *client* would see, so
+    /// an expired-but-unswept record counts as absent. Otherwise `add` would
+    /// fail against a key that reads as a miss.
+    fn live_record<'t>(&self, wtxn: &'t RwTxn, key: &[u8]) -> Result<Option<RecordRef<'t>>> {
+        let Some(blob) = self.main.get(wtxn, key).map_err(StoreError::from_heed)? else {
+            return Ok(None);
+        };
+        let record = RecordRef::parse(blob)?;
+
+        let lookup = self.tags.lookup();
+        if !record.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id)) {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    /// Evaluates a conditional write's guard, and for the concatenating modes
+    /// builds the combined record.
+    ///
+    /// Returns `Ok(None)` when the guard rejected the write.
+    pub fn apply_conditional_set(
+        &self,
+        wtxn: &mut RwTxn,
+        prepared: &mut PreparedSet,
+        mode: SetMode,
+    ) -> Result<Stored> {
+        let existing = self
+            .live_record(wtxn, &prepared.key)?
+            .map(|r| (r.cas(), r.mc_flags(), r.expires_at_ms(), r.value.to_vec()));
+
+        match (mode, &existing) {
+            (SetMode::Set, _) => {}
+            (SetMode::Add, Some(_)) => return Ok(Stored::NotStored),
+            (SetMode::Add, None) => {}
+            (SetMode::Replace, None) => return Ok(Stored::NotStored),
+            (SetMode::Replace, Some(_)) => {}
+            (SetMode::Append | SetMode::Prepend, None) => return Ok(Stored::NotStored),
+            (SetMode::Cas(_), None) => return Ok(Stored::NotFound),
+            (SetMode::Cas(expected), Some((cas, ..))) if *cas != expected => {
+                return Ok(Stored::Exists);
+            }
+            (SetMode::Cas(_), Some(_)) => {}
+            (SetMode::Append | SetMode::Prepend, Some(_)) => {}
+        }
+
+        // Concatenation keeps the stored value's TTL and client flags, matching
+        // memcached: append/prepend carry no metadata of their own.
+        if matches!(mode, SetMode::Append | SetMode::Prepend) {
+            let (_, mc_flags, expires_at_ms, current) =
+                existing.expect("guarded above: concatenation requires an existing record");
+
+            let addition = RecordRef::parse(&prepared.record)?.value.to_vec();
+            let mut combined = Vec::with_capacity(current.len() + addition.len());
+            if mode == SetMode::Append {
+                combined.extend_from_slice(&current);
+                combined.extend_from_slice(&addition);
+            } else {
+                combined.extend_from_slice(&addition);
+                combined.extend_from_slice(&current);
+            }
+
+            validate_value(&combined, self.max_value_len)?;
+
+            let mut record =
+                Vec::with_capacity(cache_core::record_len(prepared.tags.len(), combined.len()));
+            encode_record(
+                &mut record,
+                RecordMeta {
+                    epoch: self.epoch(),
+                    mc_flags,
+                    expires_at_ms,
+                    cas: 0,
+                },
+                &prepared.tags,
+                &combined,
+            )?;
+            prepared.record = record;
+            prepared.expires_at_ms = expires_at_ms;
+        }
+
+        Ok(Stored::Stored(self.apply_set(wtxn, prepared)?))
+    }
+
+    /// Adds to or subtracts from a value held as decimal text.
+    ///
+    /// The memcached protocol defines counters this way, so the value stays a
+    /// plain string that a `get` returns unchanged.
+    pub fn apply_incr(
+        &self,
+        wtxn: &mut RwTxn,
+        key: &[u8],
+        delta: u64,
+        decrement: bool,
+    ) -> Result<Option<u64>> {
+        let Some(record) = self.live_record(wtxn, key)? else {
+            return Ok(None);
+        };
+
+        let current = std::str::from_utf8(record.value)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .ok_or(StoreError::NotNumeric)?;
+
+        // memcached clamps a decrement at zero rather than wrapping, and lets
+        // an increment wrap at 64 bits.
+        let updated = if decrement {
+            current.saturating_sub(delta)
+        } else {
+            current.wrapping_add(delta)
+        };
+
+        let mc_flags = record.mc_flags();
+        let expires_at_ms = record.expires_at_ms();
+        let tags = record.tags.to_vec();
+        let text = updated.to_string();
+
+        let mut encoded = Vec::with_capacity(cache_core::record_len(tags.len(), text.len()));
+        encode_record(
+            &mut encoded,
+            RecordMeta {
+                epoch: self.epoch(),
+                mc_flags,
+                expires_at_ms,
+                cas: 0,
+            },
+            &tags,
+            text.as_bytes(),
+        )?;
+
+        let mut prepared = PreparedSet {
+            key: key.into(),
+            record: encoded,
+            expires_at_ms,
+            tags,
+        };
+        self.apply_set(wtxn, &mut prepared)?;
+
+        Ok(Some(updated))
     }
 
     pub fn apply_set(&self, wtxn: &mut RwTxn, prepared: &mut PreparedSet) -> Result<u64> {

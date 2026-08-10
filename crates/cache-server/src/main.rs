@@ -24,6 +24,11 @@ struct Cli {
     /// Start from an empty database, and do not sync to disk.
     #[arg(long)]
     ephemeral: bool,
+
+    /// Allow `FLUSH` / `flush_all`, which empties the cache for any client that
+    /// can reach the port. Off unless asked for.
+    #[arg(long)]
+    enable_flush: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -43,6 +48,9 @@ fn main() -> anyhow::Result<()> {
     if cli.ephemeral {
         config.store.durability = cache_server::config::Durability::Ephemeral;
         config.store.wipe_on_start = true;
+    }
+    if cli.enable_flush {
+        config.protocol.flush_enabled = true;
     }
     config.validate()?;
 

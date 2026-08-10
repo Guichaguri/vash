@@ -1,4 +1,4 @@
-//! Measures whether group commit actually amortises the commit cost.
+﻿//! Measures whether group commit actually amortises the commit cost.
 //!
 //! ```text
 //! cargo run --release -p cache-store --example write_bench
@@ -41,6 +41,7 @@ fn set(store: &LmdbStore, key: &str) {
             ttl_secs: 0,
             mc_flags: 0,
             tags: Vec::new(),
+            mode: cache_core::SetMode::Set,
         })
         .expect("set");
 }
@@ -126,6 +127,7 @@ fn main() {
                                 ttl_secs: 0,
                                 mc_flags: 0,
                                 tags: Vec::new(),
+                                mode: cache_core::SetMode::Set,
                             })
                             .collect();
                         store.set_many(&sets).expect("set_many");

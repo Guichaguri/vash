@@ -123,6 +123,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "cache-core",
+ "memchr",
  "thiserror",
  "zerocopy",
 ]

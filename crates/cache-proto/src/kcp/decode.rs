@@ -338,6 +338,9 @@ fn decode_set<'a>(c: &mut Cursor<'a>) -> Result<Set<'a>, (Status, &'static str)>
         ttl_secs: header.ttl_secs.get(),
         mc_flags: 0,
         tags,
+        // KCP has no conditional writes yet; the guarded modes reach the store
+        // only through the memcached adapter.
+        mode: cache_core::SetMode::Set,
     })
 }
 

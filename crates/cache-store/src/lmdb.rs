@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use cache_core::{Key, Set, Value};
+use cache_core::{Key, Set, Stored, Value};
 
 use crate::config::StoreConfig;
 use crate::engine::LmdbEngine;
@@ -52,6 +52,16 @@ impl LmdbStore {
         self.writer.create_tags(missing)
     }
 
+    /// Resolves a write's tag names, after [`Self::ensure_tags_registered`] has
+    /// guaranteed they all exist.
+    fn resolve_tags(&self, set: &Set<'_>) -> Result<Vec<cache_core::TagRef>> {
+        self.engine.tags().resolve(&set.tags).map_err(|name| {
+            crate::StoreError::Corrupt(format!(
+                "tag {name:?} vanished between registration and use"
+            ))
+        })
+    }
+
     /// Stops the writer and releases the environment, blocking until LMDB has
     /// fully let go of it.
     pub fn close(mut self) {
@@ -91,18 +101,35 @@ impl Store for LmdbStore {
         let prepared = sets
             .iter()
             .map(|set| {
-                let tags = self.engine.tags().resolve(&set.tags).map_err(|name| {
-                    // `ensure_tags_registered` just created these, so a gap
-                    // here means the registry and the batch disagree.
-                    crate::StoreError::Corrupt(format!(
-                        "tag {name:?} vanished between registration and use"
-                    ))
-                })?;
+                let tags = self.resolve_tags(set)?;
                 self.engine.prepare_set(set, tags)
             })
             .collect::<Result<Vec<_>>>()?;
 
         self.writer.set_many(prepared)
+    }
+
+    fn store(&self, set: &Set<'_>) -> Result<Stored> {
+        self.ensure_tags_registered(std::slice::from_ref(set))?;
+        let tags = self.resolve_tags(set)?;
+        let prepared = self.engine.prepare_set(set, tags)?;
+        self.writer.conditional_set(prepared, set.mode)
+    }
+
+    fn incr(&self, key: Key<'_>, delta: u64, decrement: bool) -> Result<Option<u64>> {
+        self.writer.incr(key, delta, decrement)
+    }
+
+    fn get_and_touch(&self, keys: &[Key<'_>], ttl_secs: u32) -> Result<Vec<Option<Value>>> {
+        // Read first so the reply reflects the values as they were found, then
+        // re-stamp only the keys that were actually live.
+        let values = self.engine.get_many(keys)?;
+        for (key, value) in keys.iter().zip(&values) {
+            if value.is_some() {
+                self.writer.touch(*key, ttl_secs)?;
+            }
+        }
+        Ok(values)
     }
 
     fn delete(&self, key: Key<'_>) -> Result<bool> {
