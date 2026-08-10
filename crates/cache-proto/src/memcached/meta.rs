@@ -243,10 +243,13 @@ fn collect<'a>(
             b's' => out.meta.want_size = true,
             b'k' => out.meta.want_key = true,
             b'q' => out.meta.quiet = true,
-            // Accepted and ignored: they concern internals we do not model.
-            b'h' | b'l' | b'u' | b'b' | b'x' | b'I' | b'E' | b'R' | b'W' => {}
+
+            // The only genuinely inert flag: it asks the server not to bump the
+            // item's LRU position, and there is no LRU here to bump.
+            b'u' => {}
+
             b'O' => out.meta.opaque = Some(arg.to_vec()),
-            b'T' | b'N' => {
+            b'T' => {
                 out.ttl = Some(parse_ttl(arg).ok_or_else(|| fail("bad TTL flag"))?);
             }
             b'F' => {
@@ -276,6 +279,16 @@ fn collect<'a>(
                     out.tags.push(name);
                 }
             }
+            // Defined upstream but not implemented here, and each one changes
+            // behaviour, so accepting them silently would be worse than saying
+            // no: `b` would file the value under the un-decoded key, `N` would
+            // skip the vivify the client is relying on, and `h`/`l` are return
+            // flags whose absence leaves the client parsing a shorter reply
+            // than it expects.
+            b'b' | b'h' | b'l' | b'x' | b'I' | b'E' | b'R' | b'N' => {
+                return Err(fail("unsupported flag"));
+            }
+
             // Rejecting an unknown flag is deliberate: silently ignoring it
             // would let a client believe it took effect.
             _ => return Err(fail("invalid flag")),

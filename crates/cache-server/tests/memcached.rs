@@ -495,6 +495,56 @@ async fn meta_arithmetic() {
 }
 
 #[tokio::test]
+async fn the_meta_ttl_flag_reports_a_real_remaining_lifetime() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.line("ms forever 1\r\nx\r\n").await;
+    assert_eq!(
+        c.line("mg forever t\r\n").await,
+        "HD t-1\r\n",
+        "-1 is memcached's 'never expires'"
+    );
+
+    c.line("ms expiring 1 T120\r\nx\r\n").await;
+    let response = c.line("mg expiring t\r\n").await;
+    let ttl: i64 = response
+        .trim_end()
+        .rsplit(" t")
+        .next()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("expected a ttl token, got {response:?}"));
+
+    // Must be the actual remaining lifetime, not a placeholder.
+    assert!(
+        (110..=120).contains(&ttl),
+        "expected roughly 120s remaining, got {ttl}"
+    );
+}
+
+#[tokio::test]
+async fn meta_flags_that_are_not_implemented_are_refused() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    // Accepting these silently would be worse than refusing: `b` would file the
+    // value under the un-decoded key, and `h`/`l` are return flags whose
+    // absence leaves the client parsing a shorter reply than it expects.
+    for flag in ["b", "h", "l", "N30", "E5", "I", "R10", "x"] {
+        let response = c.line(&format!("mg k {flag}\r\n")).await;
+        assert!(
+            response.starts_with("CLIENT_ERROR"),
+            "flag {flag} should be refused, got {response:?}"
+        );
+    }
+
+    // `u` asks the server not to bump the LRU, and there is no LRU here, so it
+    // is genuinely inert and accepted.
+    c.line("ms k 1\r\nx\r\n").await;
+    assert_eq!(c.line("mg k v u\r\n").await, "VA 1\r\nx\r\n");
+}
+
+#[tokio::test]
 async fn an_unknown_meta_flag_is_rejected() {
     let server = TestServer::start().await;
     let mut c = server.connect().await;

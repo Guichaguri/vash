@@ -3,8 +3,9 @@
 A cache server built on LMDB, with TTLs, tag-based invalidation and memcached
 protocol compatibility.
 
-Design and rationale: [docs/plan.md](docs/plan.md). Original brief:
-[docs/project.md](docs/project.md).
+Wire protocols: [docs/protocol.md](docs/protocol.md) — enough detail to write a
+client against. Design and rationale: [docs/plan.md](docs/plan.md). Original
+brief: [docs/project.md](docs/project.md).
 
 **Status: M3 complete.** Speaks both its own binary protocol and the memcached
 text and meta protocols, on the same port. TTLs with background reclamation,

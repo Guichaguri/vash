@@ -1,9 +1,9 @@
-//! A KCP client.
+﻿//! A KCP client.
 //!
 //! Deliberately simple: one request in flight at a time. It exists to drive
 //! integration tests and to be the reference for what the protocol looks like
-//! from the outside. Pipelining and out-of-order completion — which the frame
-//! format already supports via `request_id` — are a later concern, once there
+//! from the outside. Pipelining and out-of-order completion â€” which the frame
+//! format already supports via `request_id` â€” are a later concern, once there
 //! is a sharded server able to benefit from them.
 
 use bytes::{Bytes, BytesMut};
@@ -106,6 +106,7 @@ impl Client {
                     data: body.slice(12..),
                     mc_flags,
                     cas,
+                    expires_at_ms: None,
                 }))
             }
             other => Err(ClientError::Status(other)),
@@ -220,6 +221,7 @@ impl Client {
                 data: c.take(len)?,
                 mc_flags,
                 cas,
+                expires_at_ms: None,
             }));
         }
         Ok(values)

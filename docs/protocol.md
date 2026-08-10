@@ -1,0 +1,665 @@
+# Protocol reference
+
+Normative specification of the two protocols kached speaks, written to be
+sufficient for implementing a client without reading the server source.
+
+- [KCP](#kcp--the-native-binary-protocol) — the native binary protocol.
+- [Memcached](#memcached-compatibility) — what is supported, what is extended,
+  and where behaviour deliberately differs from upstream.
+
+Design rationale for these choices lives in [plan.md](plan.md) §3 and §7; this
+document describes only what is on the wire.
+
+**Protocol version:** 1. **Default port:** 11311.
+
+---
+
+## Choosing between them
+
+Both protocols are served on the **same port**. Use KCP for anything new: it is
+cheaper to parse, supports batch operations in one round trip, and exposes tags
+natively. Use the memcached protocol when an existing client library must work
+unchanged.
+
+### First-byte detection
+
+The server decides which dialect a connection speaks from its **first byte**,
+once, and never revisits the decision:
+
+| First byte | Dialect |
+|---|---|
+| `0x01` | KCP (the `HELLO` opcode) |
+| `a`–`z` (`0x61`–`0x7A`) | memcached |
+| anything else | connection closed immediately |
+
+This is why **a KCP connection must open with a `HELLO` frame**. Sending any
+other opcode first closes the connection, because the leading byte would be
+ambiguous. There is no in-band negotiation beyond this.
+
+Values are shared: a key written by a memcached client is readable by a KCP
+client and vice versa, including its client-flags field.
+
+---
+
+# KCP — the native binary protocol
+
+All integers are **little-endian** and **unaligned**. There is no padding beyond
+fields explicitly named `reserved`, which must be written as zero and ignored on
+read.
+
+## Framing
+
+Every message, in both directions, is a 12-byte header followed by `body_len`
+bytes of body.
+
+```
+ 0               1               2               3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++---------------+---------------+-------------------------------+
+|   opcode u8   |   flags u8    |          status u16           |
++---------------+---------------+-------------------------------+
+|                        request_id u32                         |
++---------------------------------------------------------------+
+|                         body_len u32                          |
++---------------------------------------------------------------+
+|                      body (body_len bytes)                    |
+```
+
+| Field | Type | In requests | In responses |
+|---|---|---|---|
+| `opcode` | u8 | the command | echoed from the request, **even if unknown** |
+| `flags` | u8 | see below | bit 0 (`RESPONSE`) is always set |
+| `status` | u16 | must be 0 | the result code |
+| `request_id` | u32 | client-assigned | echoed verbatim |
+| `body_len` | u32 | body length | body length |
+
+### Flags
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 (`0x01`) | `RESPONSE` | Set by the server on every frame it sends. |
+| 1 (`0x02`) | `NO_REPLY` | Request only. The server performs the work and sends **nothing at all**. |
+| 2 (`0x04`) | — | Reserved. Must be zero. |
+
+`NO_REPLY` suppresses the response even on failure, so a client using it cannot
+learn that a write was rejected. Errors are still logged server-side.
+
+### Frame size
+
+`body_len` must not exceed **67108864** (64 MiB). A larger value is
+unrecoverable — the server cannot find the next frame boundary — so it **closes
+the connection** without a response. Clients must apply the same ceiling to
+inbound frames.
+
+## Connection lifecycle
+
+1. Connect (TCP; `TCP_NODELAY` recommended, the server sets it on its side).
+2. Send `HELLO`. This must be the first frame.
+3. Check `protocol_version` in the reply and the capability bits.
+4. Issue commands.
+5. Close the socket. There is no `QUIT` opcode in KCP.
+
+A `HELLO` carrying a version other than `1` is answered with
+`UNSUPPORTED` (8) and the connection stays open, so a client can report a clear
+error rather than hanging.
+
+## Request correlation and pipelining
+
+A client may send any number of frames without waiting. The server echoes
+`request_id`, and **clients must correlate replies by `request_id` rather than
+by arrival order**.
+
+The current server happens to answer one connection's frames in the order it
+received them. That is not a guarantee: the format exists to allow a sharded
+server to answer out of order, and a client that assumes ordering will break
+against a later version. `request_id` values are opaque to the server — any
+scheme works, including reuse, as long as ids in flight on one connection are
+distinct.
+
+Exactly one response frame is produced per request frame, except for `NO_REPLY`
+requests, which produce none.
+
+## Opcodes
+
+| Value | Name | Implemented |
+|---|---|---|
+| `0x01` | `HELLO` | yes |
+| `0x02` | `PING` | yes |
+| `0x03` | `AUTH` | reserved — returns `UNSUPPORTED` |
+| `0x04` | `STATS` | reserved — returns `UNSUPPORTED` |
+| `0x05` | `CLUSTER` | reserved — returns `UNSUPPORTED` |
+| `0x10` | `GET` | yes |
+| `0x11` | `SET` | yes |
+| `0x12` | `DELETE` | yes |
+| `0x13` | `TOUCH` | yes |
+| `0x20` | `GET_MANY` | yes |
+| `0x21` | `SET_MANY` | yes |
+| `0x22` | `DELETE_MANY` | yes |
+| `0x30` | `DELETE_BY_TAG` | yes |
+| `0x31` | `FLUSH` | yes, if enabled server-side |
+
+An unknown opcode is answered with `UNSUPPORTED` (8), an empty body, and the
+**original opcode byte echoed**, so the client can still correlate. The
+connection stays open.
+
+## Status codes
+
+| Value | Name | Meaning |
+|---|---|---|
+| 0 | `OK` | Success. |
+| 1 | `NOT_FOUND` | Key absent or no longer live; also an unregistered tag on `DELETE_BY_TAG`. |
+| 2 | `EXISTS` | Reserved for CAS mismatch. Not emitted over KCP today. |
+| 3 | `BAD_REQUEST` | Malformed body, empty key, oversized batch. |
+| 4 | `TOO_LARGE` | Key, value or tag over its limit. |
+| 5 | `UNAUTHORIZED` | Command disabled by configuration (`FLUSH`). |
+| 6 | `OVERLOADED` | Write queue full, or the server is shutting down. Retryable. |
+| 7 | `CAPACITY_FULL` | The store is out of space, or the tag registry is full. |
+| 8 | `UNSUPPORTED` | Unknown or unimplemented opcode, or an unsupported protocol version. |
+| 9 | `INTERNAL` | Server-side failure. Details are logged, not sent. |
+| 10 | `NOT_STORED` | Reserved for a guarded write whose condition failed. Not emitted over KCP today. |
+| 11 | `NOT_NUMERIC` | Reserved for arithmetic on a non-numeric value. Not emitted over KCP today. |
+
+Codes 2, 10 and 11 are defined so that conditional writes and arithmetic can be
+added to KCP without a wire change; today they arise only through the memcached
+adapter. **Clients should handle unknown status codes as generic failures**
+rather than rejecting the frame.
+
+Any response with a non-`OK` status has an **empty body**, with one exception:
+`NOT_FOUND` on `GET_MANY` does not occur — misses are reported per item inside
+an `OK` body.
+
+## Command reference
+
+Notation: `u16`/`u32`/`u64` are little-endian; `bytes[n]` is a raw byte run.
+
+### `HELLO` (0x01)
+
+**Request body** (4 bytes):
+
+| Offset | Field |
+|---|---|
+| 0 | `protocol_version` u16 — must be 1 |
+| 2 | `reserved` u16 — zero |
+
+**Response body** (16 bytes), status `OK`:
+
+| Offset | Field |
+|---|---|
+| 0 | `protocol_version` u16 |
+| 2 | `shards` u16 |
+| 4 | `max_key_len` u32 |
+| 8 | `max_value_len` u32 |
+| 12 | `capabilities` u32 |
+
+`max_key_len` and `max_value_len` are the server's configured limits; a client
+should enforce them locally rather than discovering them through errors.
+
+**Capability bits:**
+
+| Bit | Name | Meaning |
+|---|---|---|
+| `0x01` | `TAGS` | Tags and `DELETE_BY_TAG` are available. |
+| `0x02` | `MEMCACHED` | The memcached protocol is served on this port. |
+| `0x04` | `CLUSTER` | Cluster-wide tag invalidation. **Not implemented yet.** |
+
+Unlisted bits are reserved; ignore them.
+
+### `PING` (0x02)
+
+Empty request body. Response is `OK` with an empty body. Does not touch storage,
+so it is a liveness check, not a health check.
+
+### `GET` (0x10)
+
+**Request body:** the key, raw. The whole body is the key — there is no length
+prefix, because `body_len` already gives it.
+
+**Response body** on `OK`:
+
+| Offset | Field |
+|---|---|
+| 0 | `mc_flags` u32 — the memcached client-flags field |
+| 4 | `cas` u64 |
+| 12 | `value` bytes, to the end of the body |
+
+A miss — absent, expired, flushed or tag-invalidated — is `NOT_FOUND` with an
+empty body. A KCP `GET` does **not** report the remaining TTL; use the memcached
+`mg` command with the `t` flag if that is needed.
+
+### `SET` (0x11)
+
+**Request body:** a 12-byte header, then the key, the value, and the tag list.
+
+| Offset | Field |
+|---|---|
+| 0 | `ttl_secs` u32 — see [TTL](#ttl-semantics) |
+| 4 | `key_len` u16 |
+| 6 | `tag_count` u8 — at most 32 |
+| 7 | `reserved` u8 — zero |
+| 8 | `value_len` u32 |
+| 12 | key `bytes[key_len]` |
+| 12 + key_len | value `bytes[value_len]` |
+| … | `tag_count` × (`tag_len` u16, tag `bytes[tag_len]`) |
+
+**Response body** on `OK`: `cas` u64 — the new CAS token.
+
+Notes:
+
+- A KCP `SET` is unconditional. `add`/`replace`/`append`/`prepend`/`cas`
+  semantics are reachable only through the memcached protocol.
+- A KCP `SET` always stores `mc_flags` as **0**; there is no flags field in the
+  body. A value written over KCP and read by a memcached client therefore has
+  flags 0. Write it over `ms` with an `F` flag if the flags field matters.
+- Tag names must be 1–255 bytes. Unknown tag names are registered on first use.
+
+### `DELETE` (0x12)
+
+**Request body:** the key, raw.
+
+`OK` with an empty body if the key was **live** before the delete; `NOT_FOUND`
+otherwise. A record that has expired but not yet been reclaimed reports
+`NOT_FOUND`, because it was already invisible.
+
+### `TOUCH` (0x13)
+
+**Request body:**
+
+| Offset | Field |
+|---|---|
+| 0 | `ttl_secs` u32 |
+| 4 | key bytes, to the end of the body |
+
+`OK` if the key was live, `NOT_FOUND` otherwise. The value is unchanged; its CAS
+token advances.
+
+### `GET_MANY` (0x20)
+
+**Request body:**
+
+| Offset | Field |
+|---|---|
+| 0 | `count` u32 — at most 4096 |
+| 4 | `count` × (`key_len` u16, key `bytes[key_len]`) |
+
+**Response body** on `OK`:
+
+| Field |
+|---|
+| `count` u32 — always equal to the request's count |
+| `count` × item |
+
+Each item is one byte, then a payload only if that byte is 1:
+
+| Field |
+|---|
+| `found` u8 — 1 hit, 0 miss |
+| if found: `mc_flags` u32, `cas` u64, `value_len` u32, value `bytes[value_len]` |
+
+Results are in **request order**, one slot per requested key, so duplicates in
+the request produce duplicates in the reply. All keys are resolved against a
+single consistent snapshot.
+
+### `SET_MANY` (0x21)
+
+**Request body:** `count` u32, then `count` repetitions of the `SET` body layout
+(header, key, value, tags) back to back.
+
+**Response body** on `OK`: `count` u32, then `count` × `cas` u64, in request
+order.
+
+The whole batch is applied in **one transaction: either all of it lands or none
+of it does**. There is no per-item status, because everything rejectable per
+item — key length, value size, tag limits — is rejected while decoding, which
+fails the whole frame with `BAD_REQUEST` or `TOO_LARGE`.
+
+Later items overwrite earlier ones within a batch; CAS tokens increase in
+request order.
+
+### `DELETE_MANY` (0x22)
+
+**Request body:** same as `GET_MANY`.
+
+**Response body** on `OK`: `count` u32, then `count` × u8 (1 if that key was
+live, 0 otherwise), in request order.
+
+### `DELETE_BY_TAG` (0x30)
+
+**Request body:** the tag name, raw, 1–255 bytes.
+
+`OK` with an empty body if the tag existed; `NOT_FOUND` if it was never
+registered, which means nothing could have carried it.
+
+Constant time regardless of how many keys carry the tag. Affected keys stop
+being served **before the response is sent**; the disk space is reclaimed in the
+background afterwards. See [Tags](#tags).
+
+### `FLUSH` (0x31)
+
+Empty request body. **Response body** on `OK`: `epoch` u32 — the new flush
+epoch.
+
+Returns `UNAUTHORIZED` (5) unless the server was started with
+`protocol.flush_enabled` or `--enable-flush`. Empties the entire cache; tag
+registrations survive.
+
+## Worked example
+
+Bytes on the wire for a handshake, a write and a read. `→` is client-to-server.
+These are the actual bytes a freshly started server exchanges, so a client can
+be checked against them directly — the CAS token is 1 because it is the first
+write to an empty store.
+
+```
+→ HELLO, request_id 1
+  01 00 00 00  01 00 00 00  04 00 00 00     header: opcode 0x01, flags 0, status 0, id 1, body 4
+  01 00 00 00                               version 1, reserved 0
+
+← 01 01 00 00  01 00 00 00  10 00 00 00     flags 0x01 = RESPONSE, status 0, body 16
+  01 00                                     protocol_version 1
+  01 00                                     shards 1
+  ff 01 00 00                               max_key_len 511
+  00 00 10 00                               max_value_len 1048576
+  03 00 00 00                               capabilities TAGS|MEMCACHED
+
+→ SET "foo" = "bar", ttl 300, request_id 2
+  11 00 00 00  02 00 00 00  12 00 00 00     opcode 0x11, body 18
+  2c 01 00 00                               ttl_secs 300
+  03 00                                     key_len 3
+  00                                        tag_count 0
+  00                                        reserved
+  03 00 00 00                               value_len 3
+  66 6f 6f                                  "foo"
+  62 61 72                                  "bar"
+
+← 11 01 00 00  02 00 00 00  08 00 00 00     status 0, body 8
+  01 00 00 00 00 00 00 00                   cas 1
+
+→ GET "foo", request_id 3
+  10 00 00 00  03 00 00 00  03 00 00 00     opcode 0x10, body 3
+  66 6f 6f                                  "foo"
+
+← 10 01 00 00  03 00 00 00  0f 00 00 00     status 0, body 15
+  00 00 00 00                               mc_flags 0
+  01 00 00 00 00 00 00 00                   cas 1
+  62 61 72                                  "bar"
+
+→ GET "nope", request_id 4
+← 10 01 01 00  04 00 00 00  00 00 00 00     status 1 = NOT_FOUND, empty body
+```
+
+## Client implementation checklist
+
+- Send `HELLO` first; nothing else is accepted as an opening frame.
+- Buffer inbound bytes; a frame may arrive split across reads, and several may
+  arrive in one. Read the 12-byte header, then wait for `body_len` more.
+- Reject an inbound `body_len` above 64 MiB and close the connection.
+- Correlate by `request_id`. Do not assume replies arrive in order.
+- Treat unknown status codes as failures, not as protocol errors.
+- Enforce `max_key_len` and `max_value_len` from the handshake locally.
+- Expect no reply at all for `NO_REPLY` requests.
+
+---
+
+# Memcached compatibility
+
+kached speaks the classic text protocol and the meta commands. The **legacy
+binary protocol (magic `0x80`) is not implemented and will not be** — upstream
+deprecated it in favour of the meta commands.
+
+Compatibility is checked in CI two ways: a real client library
+(`pymemcache`) driven against both kached and real memcached, and a byte-for-byte
+differential that sends identical command sequences to both and compares raw
+responses. See `tests/compat/`.
+
+## Limits
+
+| | kached | Notes |
+|---|---|---|
+| Key length | 250 bytes | memcached's limit, enforced even though the storage engine allows 511. |
+| Key charset | no spaces, no control bytes, no `0x7f` | Same as memcached. |
+| Value size | 1 MiB default, configurable | `SERVER_ERROR object too large for cache` past it. |
+| Command line | 16 KiB | Connection closed past it. |
+| Keys per `get` | 4096 | |
+
+## Classic commands
+
+All are implemented with upstream semantics.
+
+| Command | Responses |
+|---|---|
+| `get <key>+` | `VALUE <key> <flags> <bytes>\r\n<data>\r\n` per hit, then `END` |
+| `gets <key>+` | as `get`, with `<cas>` appended to each `VALUE` line |
+| `gat <exptime> <key>+` | as `get`; also re-stamps the TTL |
+| `gats <exptime> <key>+` | as `gets`; also re-stamps the TTL |
+| `set <key> <flags> <exptime> <bytes> [noreply]` | `STORED` |
+| `add …` | `STORED` / `NOT_STORED` |
+| `replace …` | `STORED` / `NOT_STORED` |
+| `append …` | `STORED` / `NOT_STORED` |
+| `prepend …` | `STORED` / `NOT_STORED` |
+| `cas <key> <flags> <exptime> <bytes> <cas> [noreply]` | `STORED` / `EXISTS` / `NOT_FOUND` |
+| `delete <key> [noreply]` | `DELETED` / `NOT_FOUND` |
+| `touch <key> <exptime> [noreply]` | `TOUCHED` / `NOT_FOUND` |
+| `incr <key> <delta> [noreply]` | the new value / `NOT_FOUND` / `CLIENT_ERROR cannot increment or decrement non-numeric value` |
+| `decr <key> <delta> [noreply]` | as `incr`; clamps at zero |
+| `flush_all [delay] [noreply]` | `OK`, or `CLIENT_ERROR` when disabled |
+| `stats` | `STAT <name> <value>` lines, then `END` |
+| `version` | `VERSION <string>` |
+| `verbosity <level> [noreply]` | accepted and ignored |
+| `quit` | connection closes, no response |
+
+Storage commands are followed by exactly `<bytes>` of data and then `\r\n`. The
+framing is **length-delimited, not line-delimited**: a value may contain `\r\n`.
+
+`append` and `prepend` keep the existing item's client flags and TTL; the
+`<flags>` and `<exptime>` on their command line are ignored, as upstream does.
+
+`incr` wraps at 64 bits; `decr` clamps at zero.
+
+### `stats`
+
+A subset of memcached's counters — only what is actually measured — plus
+kached's own under a `kached_` prefix. Nothing is reported as a plausible zero
+just to fill the field out.
+
+`pid`, `version`, `pointer_size`, `curr_items`, `bytes`, `limit_maxbytes`, and:
+`kached_utilisation`, `kached_expiry_entries`, `kached_tags`,
+`kached_tag_index_entries`, `kached_pending_reclaims`, `kached_commits`,
+`kached_committed_ops`, `kached_mean_batch`, `kached_sweeps`,
+`kached_reclaimed`, `kached_tag_reclaimed`, `kached_sweep_lag_ms`,
+`kached_epoch`, `kached_readers_in_use`.
+
+## Meta commands
+
+| Command | Purpose | Success | Miss |
+|---|---|---|---|
+| `mn` | no-op / batch marker | `MN` | — |
+| `mg <key> <flags>*` | get | `HD <rflags>` or `VA <size> <rflags>\r\n<data>` | `EN` |
+| `ms <key> <datalen> <flags>*` | set | `HD <rflags>` | `NS` / `EX` / `NF` |
+| `md <key> <flags>*` | delete | `HD <rflags>` | `NF` |
+| `ma <key> <flags>*` | arithmetic | `HD <rflags>` or `VA <size>\r\n<data>` | `NF` |
+| `me <key>` | item debug | `ME <key> cas=<n> size=<n> fetch=yes` | `EN` |
+
+`ms` is followed by exactly `<datalen>` bytes of data and `\r\n`.
+
+### Supported flags
+
+| Flag | On | Meaning |
+|---|---|---|
+| `v` | mg, ma | Return the value (`VA` instead of `HD`). |
+| `f` | mg | Return client flags as `f<n>`. |
+| `c` | mg, ms | Return the CAS token as `c<n>`. |
+| `t` | mg | Return remaining TTL in seconds as `t<n>`; `t-1` means no expiry. |
+| `s` | mg | Return the value size as `s<n>`. |
+| `k` | mg, ms, md, ma | Echo the key as `k<key>`. |
+| `O<token>` | all | Opaque token, echoed as `O<token>`. |
+| `q` | all | Quiet: suppress the response. |
+| `u` | mg | Do not bump the LRU. Inert here — there is no LRU. |
+| `T<ttl>` | mg, ms, md | Set the TTL. On `mg` this makes it a get-and-touch. |
+| `F<flags>` | ms | Set the client-flags field. |
+| `C<cas>` | ms | Compare against this CAS token. Outranks `M`. |
+| `M<mode>` | ms, ma | Mode; see below. |
+| `D<delta>` | ma | Amount to add or subtract. Default 1. |
+| `G<tags>` | ms | **Extension.** Comma-separated tag list. |
+
+`ms` modes: `E` add, `A` append, `P` prepend, `R` replace, `S` set (default).
+`ma` modes: `I`/`+` increment (default), `D`/`-` decrement.
+
+Return flags appear in a **fixed order regardless of request order**: `f`, `s`,
+`c`, `t`, `k`, `O`. A client must not assume they come back in the order it
+asked for them.
+
+```
+ms doc:1 5 F9 T120 Gnews,sport
+hello
+HD
+mg doc:1 v f s c t k Oop7
+VA 5 f9 s5 c1 t120 kdoc:1 Oop7
+hello
+```
+
+### Refused flags
+
+These are defined by upstream but **not implemented here, and rejected with
+`CLIENT_ERROR unsupported flag`** rather than ignored:
+
+`b` (base64 key), `h` (hit-before), `l` (last-access), `x` (remove value only),
+`I` (invalidate), `E` (set CAS), `R` (recache), `N` (vivify on miss).
+
+Refusing is deliberate. Silently ignoring `b` would file the value under the
+un-decoded key; ignoring `h` or `l` would return fewer tokens than the client is
+parsing. Any other unrecognised flag gets `CLIENT_ERROR invalid flag`.
+
+## Extensions
+
+Two commands and one flag are **not part of the memcached protocol**. Clients
+that never use them are unaffected; the `TAGS` capability bit in the KCP
+handshake and the `kached_tags` stat both indicate support.
+
+| | Form | Response |
+|---|---|---|
+| Attach tags | `ms <key> <datalen> G<tag>[,<tag>…]` | as `ms` |
+| Invalidate (meta) | `mdt <tag> [q]` | `HD` / `NF` |
+| Invalidate (classic) | `delete_by_tag <tag> [noreply]` | `DELETED` / `NOT_FOUND` |
+
+`G` was chosen from the letters upstream leaves unassigned. It is a single
+constant in the source (`memcached::meta::TAG_FLAG`), so it can be moved if
+upstream ever claims it.
+
+```
+ms article:1 5 Gnews,sport
+value
+HD
+mdt news
+HD
+mg article:1 v
+EN
+```
+
+## Errors
+
+| Line | Meaning |
+|---|---|
+| `ERROR` | Unknown command. |
+| `CLIENT_ERROR <reason>` | The request was malformed. |
+| `SERVER_ERROR <reason>` | The server could not comply. |
+
+The wording matches upstream verbatim where upstream has one, because the
+differential suite compares response bytes. Notably, every malformed command
+line — missing key, over-long key, unparseable number, empty line — reports
+`CLIENT_ERROR bad command line format`, not a more specific message.
+
+### Stream resynchronisation
+
+A rejected storage command still consumes its declared data block whenever the
+`<bytes>` token is readable. This matters: if the block were left in the stream
+it would be parsed as commands, and every request after it on that connection
+would be misread. Client authors relying on pipelining should expect exactly one
+error line for such a command, not one per stray line of the value.
+
+If `<bytes>` itself is unreadable, only the command line is consumed — the
+server has no way to know how much to skip.
+
+## Deliberate divergences from memcached
+
+Everything else is byte-identical in the differential suite; these are the
+exceptions.
+
+| Behaviour | memcached | kached | Why |
+|---|---|---|---|
+| Over-long key on `get` | error line, then a stray empty line | error line only | The extra line leaves a pipelining client counting one more response than it sent commands. |
+| `flush_all` | always available | disabled unless enabled in config | It empties the cache for anyone who can reach the port. |
+| `flush_all <delay>` | defers the flush | delay parsed and ignored; flush is immediate | A deferred wipe needs a scheduler; every client that sends one sends 0. |
+| `me` output | full internal item dump | `cas`, `size`, `fetch` only | The rest describes internals kached does not have. |
+| `stats` fields | full counter set | a subset, plus `kached_*` | Reporting an unmeasured counter as zero would mislead a dashboard. |
+| Meta flags `b h l x I E R N` | implemented | `CLIENT_ERROR unsupported flag` | See [Refused flags](#refused-flags). |
+| Eviction under memory pressure | LRU | TTL-ordered | See [plan.md](plan.md) §6. |
+
+---
+
+# Shared semantics
+
+These apply identically to both protocols.
+
+## TTL semantics
+
+The TTL field is overloaded exactly as memcached's `exptime` is:
+
+| Value | Meaning |
+|---|---|
+| `0` | Never expires. |
+| `1` … `2592000` (30 days) | Relative offset in seconds. |
+| `> 2592000` | **Absolute unix timestamp** in seconds, not an offset. |
+| negative (memcached text only) | Already expired. |
+
+KCP carries the TTL as a `u32` and has no negative form; the memcached adapter
+translates a negative `exptime` into a sentinel the store understands.
+
+An expired item is **never served**, whether or not its space has been reclaimed
+yet. Reclamation is a background process and lags by design.
+
+## CAS tokens
+
+A `u64` that increases on every write to a key, unique across the whole server,
+and monotonic across restarts. It never repeats — a restart skips forward rather
+than reusing a range.
+
+Zero is not a valid token. Compare-and-swap is available through the memcached
+`cas` command and the `ms … C<cas>` flag.
+
+## Tags
+
+A tag is a 1–255 byte name. A record may carry up to **32** tags, attached at
+write time. Tags are registered on first use; the registry is bounded
+(`store.tags.max_tags`, default 100000) and a write that would exceed it fails
+with `CAPACITY_FULL`.
+
+Invalidation is a generation bump, so it costs the same for ten keys or a
+million. The ordering guarantee a client can rely on:
+
+> When an invalidation response is received, no subsequent read on any
+> connection will return a record that carried that tag and was written before
+> the invalidation.
+
+Rewriting a key after an invalidation makes it live again — the new write
+captures the new generation. Reclaiming the space of invalidated records happens
+in the background and is not observable except through `stats`.
+
+Tags are node-local. Cluster-wide invalidation is planned (the `CLUSTER`
+capability bit) and **not implemented**: against a multi-node deployment, a
+client must send the invalidation to every node itself.
+
+## Client flags
+
+A 32-bit field stored verbatim alongside the value, for client libraries that
+encode a type tag in it. Set it with memcached `set`'s `<flags>` argument or the
+meta `F` flag. **A KCP `SET` always stores 0**, since the KCP body has no flags
+field.
+
+## Durability
+
+A write is acknowledged once committed to the storage engine. Depending on the
+server's `store.durability` setting, that commit may not yet be on stable
+storage — in `relaxed` (the default) an OS crash can lose the last few
+transactions, and in `ephemeral` a crash discards everything. This is a cache;
+treat an acknowledged write as durable only if the deployment is configured for
+it.

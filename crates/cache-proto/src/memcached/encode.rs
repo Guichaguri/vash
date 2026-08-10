@@ -1,7 +1,7 @@
-//! Memcached response rendering.
+﻿//! Memcached response rendering.
 //!
-//! A reply's shape depends on which command asked for it — `get` answers with
-//! `VALUE`/`END`, `mg` with `HD`/`VA`/`EN`, `incr` with a bare number — so the
+//! A reply's shape depends on which command asked for it â€” `get` answers with
+//! `VALUE`/`END`, `mg` with `HD`/`VA`/`EN`, `incr` with a bare number â€” so the
 //! parser records a [`ResponseStyle`] alongside the command and the encoder
 //! renders against that. Keeping the choice in the parser means the storage
 //! layer never learns that two dialects exist.
@@ -115,7 +115,7 @@ fn encode_retrieval(out: &mut Vec<u8>, with_cas: bool, command: &Command<'_>, re
     };
 
     // A batch reply holds one slot per requested key, in order, so misses are
-    // simply skipped — memcached omits them rather than reporting them.
+    // simply skipped â€” memcached omits them rather than reporting them.
     if let Reply::Values(values) = reply {
         for (key, value) in keys.iter().zip(values) {
             let Some(value) = value else { continue };
@@ -253,9 +253,15 @@ fn write_return_flags(
             out.extend_from_slice(value.cas.to_string().as_bytes());
         }
         if flags.want_ttl {
-            // Remaining TTL is not carried on the reply path, so -1 ("unknown /
-            // does not expire") is reported rather than a fabricated number.
-            out.extend_from_slice(b" t-1");
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // `-1` is memcached's "never expires", and also the only honest
+            // answer if the value arrived without an expiry.
+            let remaining = value.remaining_ttl_secs(now_ms).unwrap_or(-1);
+            out.extend_from_slice(b" t");
+            out.extend_from_slice(remaining.to_string().as_bytes());
         }
     }
     write_key_and_opaque(out, flags, command);
@@ -316,6 +322,7 @@ mod tests {
             data: Bytes::from_static(data),
             mc_flags,
             cas,
+            expires_at_ms: None,
         }
     }
 

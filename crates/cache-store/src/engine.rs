@@ -222,6 +222,7 @@ impl LmdbEngine {
             data: Bytes::copy_from_slice(record.value),
             mc_flags: record.mc_flags(),
             cas: record.cas(),
+            expires_at_ms: Some(record.expires_at_ms()),
         }))
     }
 

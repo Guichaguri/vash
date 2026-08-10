@@ -192,6 +192,29 @@ pub struct Value {
     pub data: Bytes,
     pub mc_flags: u32,
     pub cas: u64,
+    /// Absolute expiry in unix milliseconds, or [`NEVER`] for no expiry.
+    ///
+    /// `None` means the transport did not report it. The store always fills it
+    /// in — it is what lets the memcached `t` flag give a real number — but the
+    /// KCP wire format does not carry expiry on a `GET`, so a value decoded by
+    /// a client has `None` rather than a plausible-looking lie.
+    ///
+    /// [`NEVER`]: crate::record::NEVER
+    pub expires_at_ms: Option<u64>,
+}
+
+impl Value {
+    /// Remaining lifetime in seconds, in the form memcached's `t` flag uses:
+    /// `-1` for an item that never expires, never negative otherwise (an
+    /// expired item would not have been returned), and `None` when the
+    /// transport did not report an expiry at all.
+    pub fn remaining_ttl_secs(&self, now_ms: u64) -> Option<i64> {
+        match self.expires_at_ms {
+            None => None,
+            Some(crate::record::NEVER) => Some(-1),
+            Some(at) => Some(at.saturating_sub(now_ms).div_ceil(1000) as i64),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

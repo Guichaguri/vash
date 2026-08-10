@@ -1,4 +1,4 @@
-use cache_core::{Reply, ServerInfo};
+﻿use cache_core::{Reply, ServerInfo};
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32};
 
@@ -26,7 +26,7 @@ pub fn encode_response(
 }
 
 /// Appends an error response. `opcode` is the raw byte from the request, which
-/// may not be a known [`Opcode`] — it is echoed so the client can correlate.
+/// may not be a known [`Opcode`] â€” it is echoed so the client can correlate.
 pub fn encode_error(out: &mut Vec<u8>, raw_opcode: u8, request_id: u32, status: Status) {
     let header = FrameHeader {
         opcode: raw_opcode,
@@ -231,6 +231,7 @@ mod tests {
             data: Bytes::from_static(b"payload"),
             mc_flags: 0xaabb_ccdd,
             cas: 99,
+            expires_at_ms: None,
         });
         encode_reply(&mut out, Opcode::Get, 5, &reply);
 
