@@ -127,7 +127,11 @@ Fixed 12-byte header, little-endian, so it decodes as a single `zerocopy` cast:
 
 **Opcodes:** `HELLO 0x01`, `PING 0x02`, `AUTH 0x03`, `STATS 0x04`, `CLUSTER 0x05`, `GET 0x10`,
 `SET 0x11`, `DELETE 0x12`, `TOUCH 0x13`, `GET_MANY 0x20`, `SET_MANY 0x21`, `DELETE_MANY 0x22`,
-`DELETE_BY_TAG 0x30`, `FLUSH 0x31`.
+`DELETE_BY_TAG 0x30`, `FLUSH 0x31`, `TAG_SYNC 0x40`.
+
+`TAG_SYNC` was added in M5 for peer-to-peer traffic (§10). Peers speak the ordinary protocol on
+the ordinary port — a peer is just another KCP client — which meant no second listener, no second
+codec and no second thing to fuzz.
 
 **Status codes:** `OK 0`, `NOT_FOUND 1`, `EXISTS 2`, `BAD_REQUEST 3`, `TOO_LARGE 4`, `UNAUTHORIZED 5`,
 `OVERLOADED 6`, `CAPACITY_FULL 7`, `UNSUPPORTED 8`, `INTERNAL 9`.
@@ -675,10 +679,51 @@ Because `tag_id` is node-local and **tag names are the global identity**, fan-ou
 the differences. Since generations are persisted in LMDB, a restarted node resumes with its last known
 state and converges within one interval.
 
+**As implemented (M5):** a node gossips with **every peer on its own timer**, not with one sampled
+peer per interval. Sampling is the right shape when membership is large and discovered; here it is a
+static list of a handful of addresses, and the shared loop had a flaw worth more than the saving.
+Because a round is awaited inline, an unresponsive peer blocked the loop for its whole timeout — so
+*one* node being down slowed convergence between all the healthy ones. Measured against a killed
+node, gossip fell from one round a second to roughly one every three, and the reachability metric
+stayed at "all peers reachable" throughout, because the connect-timeout path returned before the flag
+was cleared. Both are fixed: a task per peer, and reachability settled once from the round's outcome
+rather than on each failure path. The bound improves too — every peer every interval, rather than
+every `peers × interval`.
+
+The first round is immediate rather than one interval in, so a restarted node converges now rather
+than later. Digests carry only tags with a non-zero generation, since one that has never been
+invalidated anywhere says nothing; a node with more than 8192 such tags sends a rotating window
+instead of its whole table, which converges in more rounds rather than not at all.
+
 **Consistency statement, stated plainly in the docs:** tag invalidation is *strongly consistent within a
 node* and *eventually consistent across the cluster*, with a staleness bound of the gossip interval in
 `fanout` mode. For a cache this is the correct trade; for anyone who needs better, `fanout_sync` narrows
 it to the acknowledgement round-trip.
+
+**Four things found while implementing this (M5):**
+
+1. **A node's tag generations have to be uniform across its own shards.** Ids are per shard, and a
+   shard only registers a name when a record carrying it lands there — so one shard could hold
+   `news` at generation 4 while another had never heard of it. Locally that is harmless, because a
+   record is only ever compared against its own shard's registry. It stops being harmless the moment
+   the node has to export **one** number for the name: a shard registering the tag later would start
+   at 0, records written there would capture 0, and the first gossip round back would invalidate
+   records written after the last invalidation. Tag creation now adopts the node-wide generation for
+   the name, and an invalidation levels every shard to the same target.
+2. **A peer that has never seen a tag must register it at the received generation**, for the same
+   reason and by the same mechanism. This is why fan-out messages carry `(name, generation)` and not
+   just the name.
+3. **`fanout` has a write-side window the plan did not name.** A record written on node B after node
+   A invalidated a tag, but before the message reaches B, captures B's *old* generation and dies when
+   the message lands. It is not a staleness bound in the "still serving old data" direction — it is
+   the opposite, an invalidation that reaches slightly too far. It errs towards a miss, which is the
+   safe direction for a cache, and `fanout_sync` closes it for reachable peers. Documented rather
+   than fixed: fixing it would need a cross-node clock.
+4. **Idle connections made a clean shutdown impossible.** The drain waited for every in-flight
+   connection, and peers keep theirs open indefinitely, so a clustered node hit the drain timeout
+   every time and left its LMDB environment open. Connections are now released at the point they are
+   waiting for a request — nothing buffered, no reply outstanding — which is the only place it is
+   safe. This was pre-existing (any idle client did it) but a cluster makes it the normal case.
 
 ### Explicitly rejected
 
@@ -736,6 +781,8 @@ frequency_bias = false
 peers = []
 delete_by_tag = "fanout"          # local | fanout | fanout_sync
 gossip_interval_ms = 5000
+fanout_timeout_ms = 2000          # per exchange, and how long fanout_sync waits
+queue_depth = 1024                # invalidations queued per peer before dropping
 
 [protocol]
 memcached = true

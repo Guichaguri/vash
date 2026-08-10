@@ -235,9 +235,22 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
             }
         }
 
-        Command::DeleteByTag { tag } => Ok(Reply::Invalidated(
-            state.store.delete_by_tag(tag).map_err(to_status)?,
-        )),
+        Command::DeleteByTag { tag } => {
+            let generation = state.store.delete_by_tag(tag).map_err(to_status)?;
+
+            // Propagated only once the local bump has committed, so a peer can
+            // never be told about an invalidation this node did not perform. In
+            // `fanout_sync` this blocks until reachable peers acknowledge; in
+            // `fanout` it is a queue push.
+            if let Some(generation) = generation {
+                state.cluster.invalidate(tag, generation);
+            }
+            Ok(Reply::Invalidated(generation.is_some()))
+        }
+
+        Command::TagSync { full, entries } => Ok(Reply::TagSync(tag_sync(state, *full, entries)?)),
+
+        Command::Cluster => Ok(Reply::Cluster(state.cluster.view())),
 
         Command::Flush => {
             if !state.flush_enabled {
@@ -249,6 +262,59 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
             Ok(Reply::Flushed(state.store.flush().map_err(to_status)?))
         }
     }
+}
+
+/// Answers a peer's `TAG_SYNC`: merge what it knows, report what it is behind
+/// on.
+///
+/// The reply is computed from a snapshot taken **before** the merge. Afterwards
+/// every offered generation is one this node also holds, so "we know better"
+/// would be true of nothing and the peer would never learn anything from us.
+fn tag_sync(
+    state: &ServerState,
+    full: bool,
+    entries: &[(&[u8], u64)],
+) -> Result<Vec<cache_core::TagGeneration>, Status> {
+    use std::collections::{HashMap, HashSet};
+
+    let known = state.store.tag_generations().map_err(to_status)?;
+    let ours: HashMap<&[u8], u64> = known
+        .iter()
+        .map(|entry| (&*entry.name, entry.generation))
+        .collect();
+
+    let mut behind = Vec::new();
+    for (name, offered) in entries {
+        if let Some(mine) = ours.get(*name).copied()
+            && mine > *offered
+        {
+            behind.push(cache_core::TagGeneration::new(*name, mine));
+        }
+    }
+
+    // Only a peer that listed its whole table can be told about tags it never
+    // mentioned; against a partial push there is no way to tell "does not know
+    // it" from "did not fit in this message".
+    if full {
+        let named: HashSet<&[u8]> = entries.iter().map(|(name, _)| *name).collect();
+        for entry in &known {
+            if entry.generation > 0 && !named.contains(&*entry.name) {
+                behind.push(entry.clone());
+            }
+        }
+    }
+    behind.truncate(cache_core::MAX_TAG_SYNC_ENTRIES);
+
+    let offered: Vec<cache_core::TagGeneration> = entries
+        .iter()
+        .map(|(name, generation)| cache_core::TagGeneration::new(*name, *generation))
+        .collect();
+    state
+        .cluster
+        .metrics()
+        .merged(crate::cluster::apply_merges(&state.store, &offered));
+
+    Ok(behind)
 }
 
 /// Maps a storage failure onto the status the client sees.
@@ -333,19 +399,36 @@ fn collect_stats(state: &ServerState) -> Vec<(String, String)> {
         Err(e) => error!(error = %e, "could not read store stats"),
     }
 
+    let view = state.cluster.view();
+    stats.extend([
+        ("kached_cluster_mode".into(), view.mode.as_str().to_string()),
+        ("kached_cluster_peers".into(), view.peers.len().to_string()),
+        (
+            "kached_cluster_peers_reachable".into(),
+            state.cluster.peers_reachable().to_string(),
+        ),
+    ]);
+
     stats
 }
 
 /// Builds the handshake response advertised to clients.
-pub fn server_info(shards: u16, max_value_len: usize) -> ServerInfo {
+///
+/// `cluster` is whether this node actually forwards invalidations to peers —
+/// not merely whether the build supports it. Claiming the capability on a node
+/// with no peers configured would make a client trust a cluster-wide
+/// invalidation that stops at one node.
+pub fn server_info(shards: u16, max_value_len: usize, cluster: bool) -> ServerInfo {
+    let mut capabilities = cache_core::capability::TAGS | cache_core::capability::MEMCACHED;
+    if cluster {
+        capabilities |= cache_core::capability::CLUSTER;
+    }
+
     ServerInfo {
         protocol_version: cache_core::PROTOCOL_VERSION,
         shards,
         max_key_len: cache_core::MAX_KEY_LEN as u32,
         max_value_len: max_value_len as u32,
-        // Advertised only as each milestone lands: claiming a capability the
-        // server does not have would make a client trust invalidation that is
-        // not happening.
-        capabilities: cache_core::capability::TAGS | cache_core::capability::MEMCACHED,
+        capabilities,
     }
 }

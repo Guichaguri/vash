@@ -1,4 +1,4 @@
-﻿use cache_core::{Reply, ServerInfo};
+use cache_core::{Reply, ServerInfo};
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32};
 
@@ -138,6 +138,31 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             encode_response(out, opcode, request_id, Status::Ok, &value.to_le_bytes())
         }
 
+        Reply::TagSync(entries) => {
+            let mut body = Vec::new();
+            encode_tag_sync_body(
+                &mut body,
+                false,
+                entries.iter().map(|e| (&*e.name, e.generation)),
+            );
+            encode_response(out, opcode, request_id, Status::Ok, &body);
+        }
+
+        Reply::Cluster(info) => {
+            let mut body = Vec::with_capacity(
+                CLUSTER_HEADER_LEN + info.peers.iter().map(|p| 3 + p.addr.len()).sum::<usize>(),
+            );
+            body.push(info.mode as u8);
+            body.push(0); // reserved
+            body.extend_from_slice(&(info.peers.len() as u16).to_le_bytes());
+            for peer in &info.peers {
+                body.extend_from_slice(&(peer.addr.len() as u16).to_le_bytes());
+                body.extend_from_slice(peer.addr.as_bytes());
+                body.push(u8::from(peer.reachable));
+            }
+            encode_response(out, opcode, request_id, Status::Ok, &body);
+        }
+
         // Protocol-level replies with no KCP representation yet. Reported as
         // unsupported rather than silently rendered as success.
         Reply::Stats(_) | Reply::Version(_) | Reply::Closing => {
@@ -161,6 +186,56 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
 pub const HELLO_RESPONSE_LEN: usize = 16;
 /// `mc_flags u32 | cas u64` ahead of the value bytes.
 pub const VALUE_PREFIX_LEN: usize = 12;
+/// `mode u8 | reserved u8 | peer_count u16` ahead of a `CLUSTER` peer list.
+pub const CLUSTER_HEADER_LEN: usize = 4;
+
+/// Builds a `TAG_SYNC` body. Shared by the server, the peer client and the
+/// tests, so the layout has one definition.
+///
+/// `full` says the sender is listing its whole table, which licenses the
+/// receiver to answer with entries the sender never mentioned. A partial push —
+/// a single invalidation being fanned out, or a rotating window from a node
+/// with more tags than one message holds — gets an answer covering only the
+/// names it named.
+pub fn encode_tag_sync_body<'a>(
+    out: &mut Vec<u8>,
+    full: bool,
+    entries: impl ExactSizeIterator<Item = (&'a [u8], u64)>,
+) {
+    out.reserve(super::decode::TAG_SYNC_HEADER_LEN + entries.len() * 16);
+    out.push(u8::from(full));
+    out.extend_from_slice(&[0, 0, 0]); // reserved
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (name, generation) in entries {
+        out.extend_from_slice(&generation.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(name);
+    }
+}
+
+/// Parses a `CLUSTER` response body.
+pub fn decode_cluster_response(body: &[u8]) -> Option<cache_core::ClusterInfo> {
+    if body.len() < CLUSTER_HEADER_LEN {
+        return None;
+    }
+    let mode = cache_core::ClusterMode::from_u8(body[0])?;
+    let count = u16::from_le_bytes(body[2..4].try_into().ok()?) as usize;
+
+    let mut peers = Vec::with_capacity(count.min(1024));
+    let mut pos = CLUSTER_HEADER_LEN;
+    for _ in 0..count {
+        let len = u16::from_le_bytes(body.get(pos..pos + 2)?.try_into().ok()?) as usize;
+        pos += 2;
+        let addr = std::str::from_utf8(body.get(pos..pos + len)?)
+            .ok()?
+            .to_string();
+        pos += len;
+        let reachable = *body.get(pos)? != 0;
+        pos += 1;
+        peers.push(cache_core::PeerInfo { addr, reachable });
+    }
+    Some(cache_core::ClusterInfo { mode, peers })
+}
 
 /// Builds a `SET` body. Shared with the client and the tests so there is one
 /// definition of the layout rather than two that can drift.
@@ -261,6 +336,62 @@ mod tests {
         encode_reply(&mut out, Opcode::Hello, 1, &Reply::Hello(info));
         let body = &out[super::super::frame::HEADER_LEN..];
         assert_eq!(decode_hello_response(body), Some(info));
+    }
+
+    #[test]
+    fn cluster_response_roundtrips() {
+        let info = cache_core::ClusterInfo {
+            mode: cache_core::ClusterMode::FanoutSync,
+            peers: vec![
+                cache_core::PeerInfo {
+                    addr: "10.0.0.2:11311".into(),
+                    reachable: true,
+                },
+                cache_core::PeerInfo {
+                    addr: "10.0.0.3:11311".into(),
+                    reachable: false,
+                },
+            ],
+        };
+
+        let mut out = Vec::new();
+        encode_reply(&mut out, Opcode::Cluster, 4, &Reply::Cluster(info.clone()));
+        let body = &out[super::super::frame::HEADER_LEN..];
+        assert_eq!(decode_cluster_response(body), Some(info));
+    }
+
+    #[test]
+    fn a_truncated_cluster_response_is_rejected_rather_than_half_read() {
+        let info = cache_core::ClusterInfo {
+            mode: cache_core::ClusterMode::Fanout,
+            peers: vec![cache_core::PeerInfo {
+                addr: "10.0.0.2:11311".into(),
+                reachable: true,
+            }],
+        };
+        let mut out = Vec::new();
+        encode_reply(&mut out, Opcode::Cluster, 1, &Reply::Cluster(info));
+
+        let body = &out[super::super::frame::HEADER_LEN..];
+        assert!(decode_cluster_response(&body[..body.len() - 1]).is_none());
+        assert!(decode_cluster_response(&[]).is_none());
+    }
+
+    #[test]
+    fn a_tag_sync_reply_decodes_as_a_partial_push() {
+        // The reply is never a full digest: it answers what was asked about, so
+        // a peer must not read it as "this is everything I have".
+        let reply = Reply::TagSync(vec![
+            cache_core::TagGeneration::new(b"news".to_vec(), 4),
+            cache_core::TagGeneration::new(b"sport".to_vec(), 1),
+        ]);
+        let mut out = Vec::new();
+        encode_reply(&mut out, Opcode::TagSync, 2, &reply);
+
+        let body = &out[super::super::frame::HEADER_LEN..];
+        let (full, entries) = crate::kcp::decode_tag_sync(body).unwrap();
+        assert!(!full);
+        assert_eq!(entries, vec![(b"news".as_slice(), 4), (b"sport", 1)]);
     }
 
     #[test]

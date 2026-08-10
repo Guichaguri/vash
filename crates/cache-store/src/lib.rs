@@ -177,9 +177,25 @@ pub trait Store: Send + Sync + 'static {
     /// being served the moment this returns; freeing their space happens in the
     /// background.
     ///
-    /// Returns `false` when the tag was never registered, so nothing could
-    /// reference it.
-    fn delete_by_tag(&self, tag: &[u8]) -> Result<bool>;
+    /// Returns the tag's new generation, or `None` when the tag was never
+    /// registered, so nothing could reference it. The generation is what a
+    /// caller forwards to cluster peers: it is the whole content of an
+    /// invalidation message.
+    fn delete_by_tag(&self, tag: &[u8]) -> Result<Option<u64>>;
+
+    /// Raises a tag's generation to at least `generation`, registering the name
+    /// if this node has never seen it. Returns the resulting generation.
+    ///
+    /// The receiving half of cluster invalidation. **Merges by maximum**, so it
+    /// is idempotent, order-independent and safe to retry — which is what lets
+    /// peers forward invalidations without any acknowledgement protocol. See
+    /// [`cache_core::cluster`].
+    fn merge_tag_generation(&self, tag: &[u8], generation: u64) -> Result<u64>;
+
+    /// Every registered tag name with the generation this node holds for it.
+    ///
+    /// The digest a node offers a peer during anti-entropy.
+    fn tag_generations(&self) -> Result<Vec<cache_core::TagGeneration>>;
 
     /// Empties the cache, returning the new flush epoch.
     fn flush(&self) -> Result<u32>;

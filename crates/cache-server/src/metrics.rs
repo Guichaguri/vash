@@ -82,6 +82,80 @@ impl ServerMetrics {
     }
 }
 
+/// Counters for cluster invalidation.
+///
+/// The three questions an operator has about it: is fan-out getting through, is
+/// anti-entropy running, and how long since this node last heard from a peer.
+/// The last is the honest form of "convergence lag" — a node cannot measure how
+/// stale it is, only how long it has been since it last had the chance to find
+/// out.
+#[derive(Debug, Default)]
+pub struct ClusterMetrics {
+    peers: AtomicU64,
+    fanout_sent: AtomicU64,
+    fanout_failed: AtomicU64,
+    gossip_rounds: AtomicU64,
+    gossip_failed: AtomicU64,
+    merged: AtomicU64,
+    /// Milliseconds since the process started, at the last successful exchange.
+    /// Zero means there has not been one.
+    last_gossip_ms: AtomicU64,
+    started: std::sync::OnceLock<std::time::Instant>,
+}
+
+impl ClusterMetrics {
+    fn uptime_ms(&self) -> u64 {
+        self.started
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
+    pub fn peers_configured(&self, count: u64) {
+        // Starts the clock, so "time since the last round" is measured from
+        // startup rather than from the first success.
+        let _ = self.uptime_ms();
+        self.peers.store(count, Ordering::Relaxed);
+    }
+
+    pub fn fanout_sent(&self) {
+        self.fanout_sent.fetch_add(1, Ordering::Relaxed);
+        self.last_gossip_ms
+            .store(self.uptime_ms(), Ordering::Relaxed);
+    }
+
+    pub fn fanout_failed(&self) {
+        self.fanout_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn gossip_round(&self) {
+        self.gossip_rounds.fetch_add(1, Ordering::Relaxed);
+        self.last_gossip_ms
+            .store(self.uptime_ms(), Ordering::Relaxed);
+    }
+
+    pub fn gossip_rounds(&self) -> u64 {
+        self.gossip_rounds.load(Ordering::Relaxed)
+    }
+
+    pub fn gossip_failed(&self) {
+        self.gossip_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn merged(&self, count: u64) {
+        self.merged.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// How long since a peer exchange last succeeded, in milliseconds.
+    ///
+    /// Measured from startup until the first success, so a node that has never
+    /// reached anybody reports a growing number rather than a reassuring zero.
+    pub fn since_last_exchange_ms(&self) -> u64 {
+        self.uptime_ms()
+            .saturating_sub(self.last_gossip_ms.load(Ordering::Relaxed))
+    }
+}
+
 /// Error groupings an operator responds to differently: a client error is the
 /// caller's problem, capacity means the cache is too small, overload means it
 /// is too slow, and internal means something is wrong here.
@@ -94,7 +168,12 @@ pub enum ErrorClass {
 }
 
 /// Renders the Prometheus text exposition format.
-pub fn render_prometheus(server: &ServerMetrics, store: &StoreStats) -> String {
+pub fn render_prometheus(
+    server: &ServerMetrics,
+    store: &StoreStats,
+    cluster: &ClusterMetrics,
+    peers_reachable: u64,
+) -> String {
     let mut out = String::with_capacity(4096);
     let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
 
@@ -265,6 +344,57 @@ pub fn render_prometheus(server: &ServerMetrics, store: &StoreStats) -> String {
         store.max_readers.to_string(),
     );
 
+    metric!(
+        "kached_cluster_peers",
+        "gauge",
+        "Peers configured.",
+        load(&cluster.peers).to_string(),
+    );
+    metric!(
+        "kached_cluster_peers_reachable",
+        "gauge",
+        "Peers whose last exchange succeeded.",
+        peers_reachable.to_string(),
+    );
+    metric!(
+        "kached_cluster_fanout_total",
+        "counter",
+        "Invalidations forwarded to a peer.",
+        load(&cluster.fanout_sent).to_string(),
+    );
+    metric!(
+        "kached_cluster_fanout_failures_total",
+        "counter",
+        "Invalidations that did not reach a peer. Anti-entropy repairs these, so a low rate is \
+         normal and a sustained one means a peer is down.",
+        load(&cluster.fanout_failed).to_string(),
+    );
+    metric!(
+        "kached_cluster_gossip_rounds_total",
+        "counter",
+        "Anti-entropy exchanges completed.",
+        load(&cluster.gossip_rounds).to_string(),
+    );
+    metric!(
+        "kached_cluster_gossip_failures_total",
+        "counter",
+        "Anti-entropy exchanges that failed.",
+        load(&cluster.gossip_failed).to_string(),
+    );
+    metric!(
+        "kached_cluster_merged_total",
+        "counter",
+        "Tag generations received from peers and max-merged.",
+        load(&cluster.merged).to_string(),
+    );
+    metric!(
+        "kached_cluster_last_exchange_age_ms",
+        "gauge",
+        "Milliseconds since an exchange with any peer last succeeded. Growing past a few gossip \
+         intervals means this node is diverging.",
+        cluster.since_last_exchange_ms().to_string(),
+    );
+
     out
 }
 
@@ -279,7 +409,12 @@ mod tests {
         metrics.read(3, 1);
         metrics.error(ErrorClass::Capacity);
 
-        let rendered = render_prometheus(&metrics, &StoreStats::default());
+        let rendered = render_prometheus(
+            &metrics,
+            &StoreStats::default(),
+            &ClusterMetrics::default(),
+            0,
+        );
 
         // A Prometheus scrape rejects a sample without a preceding TYPE line
         // for its family, so every emitted series needs one.
@@ -306,11 +441,35 @@ mod tests {
         metrics.write();
         metrics.error(ErrorClass::Overloaded);
 
-        let rendered = render_prometheus(&metrics, &StoreStats::default());
+        let cluster = ClusterMetrics::default();
+        cluster.peers_configured(3);
+        cluster.fanout_sent();
+        cluster.fanout_failed();
+        cluster.merged(4);
+
+        let rendered = render_prometheus(&metrics, &StoreStats::default(), &cluster, 2);
         assert!(rendered.contains("kached_hits_total 2"), "{rendered}");
         assert!(rendered.contains("kached_misses_total 1"));
         assert!(rendered.contains("kached_writes_total 1"));
         assert!(rendered.contains("kached_errors_total{class=\"overloaded\"} 1"));
         assert!(rendered.contains("kached_errors_total{class=\"internal\"} 0"));
+        assert!(rendered.contains("kached_cluster_peers 3"));
+        assert!(rendered.contains("kached_cluster_peers_reachable 2"));
+        assert!(rendered.contains("kached_cluster_fanout_total 1"));
+        assert!(rendered.contains("kached_cluster_fanout_failures_total 1"));
+        assert!(rendered.contains("kached_cluster_merged_total 4"));
+    }
+
+    #[test]
+    fn a_node_that_has_never_reached_a_peer_does_not_report_zero_age() {
+        // A reassuring zero would read as "just synchronised" on a node that
+        // has in fact never talked to anybody.
+        let cluster = ClusterMetrics::default();
+        cluster.peers_configured(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(cluster.since_last_exchange_ms() > 0);
+
+        cluster.gossip_round();
+        assert!(cluster.since_last_exchange_ms() < 5);
     }
 }

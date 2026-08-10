@@ -12,14 +12,19 @@
 //!
 //! **Names are the global identity; ids are node-local.** Ids are a dense
 //! counter used only to keep the per-record tag table small (4 bytes instead of
-//! a name), and they must never be shared between nodes — cluster messages in
-//! M5 carry names.
+//! a name), and they must never be shared between nodes — cluster messages
+//! carry names, and a peer resolves them against its own registry.
+//!
+//! Ids are per *shard*, not even per node. Generations, by contrast, are held
+//! uniform across a node's shards: a shard that meets a name late adopts the
+//! node-wide value rather than starting at zero, because the number this node
+//! reports to its peers has to mean the same thing everywhere inside it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use cache_core::TagRef;
+use cache_core::{TagGeneration, TagRef};
 
 use crate::error::{Result, StoreError};
 
@@ -104,6 +109,34 @@ impl TagRegistry {
             .by_name
             .get(name)
             .cloned()
+    }
+
+    /// Current generation for a name, or `None` if this shard has never seen it.
+    pub fn generation_of(&self, name: &[u8]) -> Option<u64> {
+        self.inner
+            .read()
+            .expect("tag registry lock poisoned")
+            .by_name
+            .get(name)
+            .map(|entry| entry.generation())
+    }
+
+    /// Every registered name with the generation it currently holds.
+    ///
+    /// This is what a node offers a peer during anti-entropy. Taken from RAM
+    /// rather than from disk because the two agree by construction — a
+    /// generation is only published here after the transaction carrying it has
+    /// committed — and a gossip round must not open a transaction per node.
+    pub fn snapshot(&self) -> Vec<TagGeneration> {
+        let inner = self.inner.read().expect("tag registry lock poisoned");
+        inner
+            .by_name
+            .values()
+            .map(|entry| TagGeneration {
+                name: entry.name.clone(),
+                generation: entry.generation(),
+            })
+            .collect()
     }
 
     /// Resolves tag names to the `(id, generation)` pairs a record stores.

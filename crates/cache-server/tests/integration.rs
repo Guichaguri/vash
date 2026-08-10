@@ -133,6 +133,406 @@ impl TestServer {
     }
 }
 
+/// A set of nodes that know about each other.
+///
+/// Peers are configured before a node binds, so the addresses have to be known
+/// in advance. Reserving them by binding and immediately releasing leaves a
+/// window in which something else could take one — but the alternative is
+/// hard-coded ports that collide with whatever else is running on the machine,
+/// which is worse and fails more often.
+struct TestCluster {
+    addrs: Vec<SocketAddr>,
+    nodes: Vec<Option<TestServer>>,
+}
+
+impl TestCluster {
+    async fn start(size: usize) -> Self {
+        Self::start_with(size, |_| {}).await
+    }
+
+    async fn start_with(size: usize, tweak: impl Fn(&mut Config) + Copy) -> Self {
+        let mut held = Vec::new();
+        for _ in 0..size {
+            held.push(
+                tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("reserving a port"),
+            );
+        }
+        let addrs: Vec<SocketAddr> = held
+            .iter()
+            .map(|l| l.local_addr().expect("reading a reserved port"))
+            .collect();
+        drop(held);
+
+        let mut cluster = Self {
+            addrs,
+            nodes: Vec::new(),
+        };
+        for index in 0..size {
+            let dir = tempfile::tempdir().unwrap();
+            let node = cluster.spawn(index, dir, tweak).await;
+            cluster.nodes.push(Some(node));
+        }
+        cluster
+    }
+
+    async fn spawn(&self, index: usize, dir: TempDir, tweak: impl Fn(&mut Config)) -> TestServer {
+        let listen = self.addrs[index];
+        let peers: Vec<String> = self
+            .addrs
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, addr)| addr.to_string())
+            .collect();
+
+        TestServer::start_with(dir, |config| {
+            config.server.listen = listen;
+            config.cluster.peers = peers;
+            // Far tighter than the 5s default so a test can watch anti-entropy
+            // work rather than wait for it.
+            config.cluster.gossip_interval_ms = 100;
+            config.cluster.fanout_timeout_ms = 1_000;
+            tweak(config);
+        })
+        .await
+    }
+
+    fn node(&self, index: usize) -> &TestServer {
+        self.nodes[index].as_ref().expect("node is stopped")
+    }
+
+    async fn client(&self, index: usize) -> Client {
+        self.node(index).client().await
+    }
+
+    /// Stops one node, keeping its database so it can come back.
+    async fn stop(&mut self, index: usize) -> TempDir {
+        self.nodes[index]
+            .take()
+            .expect("node already stopped")
+            .stop()
+            .await
+    }
+
+    async fn restart(&mut self, index: usize, dir: TempDir) {
+        self.nodes[index] = Some(self.spawn(index, dir, |_| {}).await);
+    }
+
+    /// Waits for `check` to hold on every running node.
+    async fn wait_for(&self, what: &str, mut check: impl AsyncFnMut(&TestServer) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let mut all = true;
+            for node in self.nodes.iter().flatten() {
+                if !check(node).await {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn shutdown(mut self) {
+        for index in 0..self.nodes.len() {
+            if self.nodes[index].is_some() {
+                self.stop(index).await;
+            }
+        }
+    }
+}
+
+/// The key node `index` owns in a cluster test.
+///
+/// Clients shard the keyspace themselves, so in a real deployment a given key
+/// lives on exactly one node. These tests imitate that: each node holds its own
+/// key under a shared tag, which is precisely the case a single-node
+/// invalidation would get wrong.
+fn cluster_key(index: usize) -> String {
+    format!("node{index}-article")
+}
+
+#[tokio::test]
+async fn invalidation_converges_across_a_three_node_cluster() {
+    // The M5 exit criterion. A tag's keys are spread across every node, so an
+    // invalidation sent to one node has to reach the rest or most of the
+    // affected keys keep being served.
+    let cluster = TestCluster::start(3).await;
+
+    for index in 0..3 {
+        let mut client = cluster.client(index).await;
+        client
+            .set_tagged(cluster_key(index).as_bytes(), b"v", 0, &[b"news"])
+            .await
+            .unwrap();
+    }
+
+    // Written on every node, and every node is serving its own key.
+    for index in 0..3 {
+        let mut client = cluster.client(index).await;
+        assert!(
+            client
+                .get(cluster_key(index).as_bytes())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // One client, one node, one invalidation.
+    let mut client = cluster.client(0).await;
+    assert!(client.delete_by_tag(b"news").await.unwrap());
+
+    cluster
+        .wait_for(
+            "every node to stop serving the invalidated tag",
+            async |node| {
+                let mut client = node.client().await;
+                let mut gone = true;
+                for index in 0..3 {
+                    gone &= client
+                        .get(cluster_key(index).as_bytes())
+                        .await
+                        .unwrap()
+                        .is_none();
+                }
+                gone
+            },
+        )
+        .await;
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn fanout_sync_invalidates_peers_before_it_answers() {
+    // What the mode buys over `fanout`: no polling here, because the
+    // acknowledgement is what the reply waited for.
+    let cluster = TestCluster::start_with(2, |config| {
+        config.cluster.delete_by_tag = cache_server::config::FanoutMode::FanoutSync;
+        // Long enough that gossip cannot be what makes this pass.
+        config.cluster.gossip_interval_ms = 60_000;
+    })
+    .await;
+
+    let mut peer = cluster.client(1).await;
+    peer.set_tagged(b"k", b"v", 0, &[b"news"]).await.unwrap();
+
+    // Give the peer connection a moment to exist; a first fan-out that has to
+    // connect is still synchronous, this just keeps the assertion about the
+    // mode rather than about connection setup.
+    let mut origin = cluster.client(0).await;
+    origin
+        .set_tagged(b"local", b"v", 0, &[b"news"])
+        .await
+        .unwrap();
+    assert!(origin.delete_by_tag(b"news").await.unwrap());
+
+    assert!(
+        peer.get(b"k").await.unwrap().is_none(),
+        "fanout_sync must not answer before reachable peers have applied it"
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_restarted_node_catches_up_on_invalidations_it_missed() {
+    // The other half of the exit criterion. Fan-out cannot reach a node that is
+    // down, so anti-entropy has to — and it has to work from the restarted
+    // node's own persisted state, which knows nothing of what it missed.
+    let mut cluster = TestCluster::start(3).await;
+
+    for index in 0..3 {
+        let mut client = cluster.client(index).await;
+        client
+            .set_tagged(cluster_key(index).as_bytes(), b"v", 0, &[b"news"])
+            .await
+            .unwrap();
+    }
+
+    // Node 2 goes away, so the invalidation below cannot reach it.
+    let dir = cluster.stop(2).await;
+
+    let mut client = cluster.client(0).await;
+    assert!(client.delete_by_tag(b"news").await.unwrap());
+
+    cluster
+        .wait_for("the reachable nodes to converge", async |node| {
+            let mut client = node.client().await;
+            client
+                .get(cluster_key(0).as_bytes())
+                .await
+                .unwrap()
+                .is_none()
+        })
+        .await;
+
+    cluster.restart(2, dir).await;
+
+    // It comes back still serving stale data, and must shed it without anyone
+    // touching the key.
+    cluster
+        .wait_for("the restarted node to catch up", async |node| {
+            let mut client = node.client().await;
+            client
+                .get(cluster_key(2).as_bytes())
+                .await
+                .unwrap()
+                .is_none()
+        })
+        .await;
+
+    // And it is a full member again: a new invalidation reaches it directly.
+    let mut restarted = cluster.client(2).await;
+    restarted
+        .set_tagged(b"fresh", b"v", 0, &[b"sport"])
+        .await
+        .unwrap();
+
+    let mut origin = cluster.client(0).await;
+    origin
+        .set_tagged(b"other", b"v", 0, &[b"sport"])
+        .await
+        .unwrap();
+    origin.delete_by_tag(b"sport").await.unwrap();
+
+    cluster
+        .wait_for(
+            "the restarted node to receive a new invalidation",
+            async |node| {
+                let mut client = node.client().await;
+                client.get(b"fresh").await.unwrap().is_none()
+            },
+        )
+        .await;
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_write_after_an_acknowledged_invalidation_survives_convergence() {
+    // The dangerous failure mode of a max-merge counter: a node learning a
+    // higher generation must not take down records written *after* the
+    // invalidation that produced it.
+    //
+    // `fanout_sync` is what makes this checkable across nodes. Under `fanout`
+    // the invalidation may still be in flight when the write lands on another
+    // node, and that write is then treated as pre-invalidation and dropped when
+    // the message arrives — the documented staleness window, which errs towards
+    // a miss.
+    let cluster = TestCluster::start_with(2, |config| {
+        config.cluster.delete_by_tag = cache_server::config::FanoutMode::FanoutSync;
+    })
+    .await;
+
+    let mut origin = cluster.client(0).await;
+    origin.set_tagged(b"a", b"1", 0, &[b"news"]).await.unwrap();
+    origin.delete_by_tag(b"news").await.unwrap();
+
+    // The reply is back, so every reachable peer has applied it — including the
+    // one that had never heard of the tag, which registered it at the
+    // invalidated generation rather than at zero.
+    let mut peer = cluster.client(1).await;
+    peer.set_tagged(b"b", b"2", 0, &[b"news"]).await.unwrap();
+
+    // Several gossip intervals: whatever the nodes go on to exchange, this
+    // stands.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        peer.get(b"b").await.unwrap().map(|v| v.data.to_vec()),
+        Some(b"2".to_vec()),
+        "a write after the invalidation captured the new generation and is live"
+    );
+    assert!(
+        origin.get(b"a").await.unwrap().is_none(),
+        "and the invalidation itself still holds"
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_cluster_opcode_reports_the_peer_list() {
+    let cluster = TestCluster::start(2).await;
+    let mut client = cluster.client(0).await;
+
+    let view = client.cluster().await.unwrap();
+    assert_eq!(view.mode, cache_core::ClusterMode::Fanout);
+    assert_eq!(view.peers.len(), 1);
+    assert_eq!(view.peers[0].addr, cluster.addrs[1].to_string());
+
+    // The capability is claimed only because peers are actually configured.
+    assert_eq!(
+        client.server_info().capabilities & cache_core::capability::CLUSTER,
+        cache_core::capability::CLUSTER
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_standalone_node_reports_no_cluster_and_claims_no_capability() {
+    // Claiming the capability would make a client trust a cluster-wide
+    // invalidation that in fact stops here.
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let view = client.cluster().await.unwrap();
+    assert!(view.peers.is_empty());
+    assert_eq!(
+        client.server_info().capabilities & cache_core::capability::CLUSTER,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_node_accepts_invalidations_without_listing_any_peers_itself() {
+    // Membership is one-sided: peers are configured on the sending node, so a
+    // node that lists nobody can still be somebody else's fan-out target.
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set_tagged(b"k", b"v", 0, &[b"news"]).await.unwrap();
+    let learned = client.tag_sync(false, &[(b"news", 5)]).await.unwrap();
+
+    assert!(
+        learned.is_empty(),
+        "the sender was ahead, so there is nothing to send back: {learned:?}"
+    );
+    assert!(client.get(b"k").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_digest_exchange_reports_what_the_sender_is_behind_on() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set_tagged(b"k", b"v", 0, &[b"news"]).await.unwrap();
+    client.delete_by_tag(b"news").await.unwrap();
+
+    // A partial push answers only about the names it named...
+    let behind = client.tag_sync(false, &[(b"news", 0)]).await.unwrap();
+    assert_eq!(behind.len(), 1);
+    assert_eq!(&*behind[0].name, b"news");
+    assert_eq!(behind[0].generation, 1);
+
+    // ...while a full digest may also volunteer tags the sender never mentioned,
+    // which is what lets a node that knows nothing catch up in one round.
+    let behind = client.tag_sync(true, &[]).await.unwrap();
+    assert_eq!(behind.len(), 1);
+    assert_eq!(&*behind[0].name, b"news");
+}
+
 #[tokio::test]
 async fn handshake_reports_server_limits() {
     let server = TestServer::start().await;

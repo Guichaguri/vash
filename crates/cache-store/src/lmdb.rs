@@ -58,9 +58,12 @@ impl LmdbStore {
     /// spurious miss, or reused for a different name, a spurious invalidation.
     /// Costs an extra writer round trip the first time a name is used in a
     /// given shard; afterwards resolution is a RAM lookup.
+    ///
+    /// Each name is registered at the generation the rest of the node already
+    /// holds for it rather than at zero — see [`LmdbStore::node_generation`].
     fn ensure_tags_registered(&self, sets: &[Set<'_>]) -> Result<()> {
         for shard_items in self.shards.group(sets, |set| set.key.as_bytes()) {
-            let mut missing: Vec<Box<[u8]>> = Vec::new();
+            let mut missing: Vec<(Box<[u8]>, u64)> = Vec::new();
             let mut shard = None;
 
             for (_, set) in &shard_items {
@@ -70,8 +73,9 @@ impl LmdbStore {
                 let owner = self.shards.for_key(set.key.as_bytes());
                 shard = Some(owner);
                 for name in owner.engine.tags().missing(&set.tags) {
-                    if !missing.contains(&name) {
-                        missing.push(name);
+                    if !missing.iter().any(|(known, _)| *known == name) {
+                        let generation = self.node_generation(&name).unwrap_or(0);
+                        missing.push((name, generation));
                     }
                 }
             }
@@ -83,6 +87,23 @@ impl LmdbStore {
             }
         }
         Ok(())
+    }
+
+    /// The generation this node holds for a tag name: the highest any of its
+    /// shards has, or `None` if none has ever seen it.
+    ///
+    /// Generations are kept uniform across a node's shards — a shard that meets
+    /// a name late adopts this value rather than starting at zero — because
+    /// this single number is what the node reports to its peers, and it has to
+    /// mean the same thing in every shard. Taking the maximum is the
+    /// belt-and-braces reading: it is what the value would be even if the
+    /// shards had somehow diverged.
+    fn node_generation(&self, name: &[u8]) -> Option<u64> {
+        self.shards
+            .all()
+            .iter()
+            .filter_map(|shard| shard.engine.tags().generation_of(name))
+            .max()
     }
 }
 
@@ -230,17 +251,94 @@ impl Store for LmdbStore {
             .touch(key, ttl_secs)
     }
 
-    fn delete_by_tag(&self, tag: &[u8]) -> Result<bool> {
+    fn delete_by_tag(&self, tag: &[u8]) -> Result<Option<u64>> {
         // Fans out rather than routing: a tag's keys are spread across every
         // shard by key hash, so an invalidation that reached only one would
         // leave the rest being served.
-        let mut existed = false;
+        let mut highest = None;
         for shard in self.shards.all() {
-            if shard.writer.delete_by_tag(tag)?.is_some() {
-                existed = true;
+            if let Some(generation) = shard.writer.delete_by_tag(tag)? {
+                highest = Some(highest.map_or(generation, |h: u64| h.max(generation)));
             }
         }
-        Ok(existed)
+
+        // A shard left behind the others is levelled up, so the node holds one
+        // generation for the name — the number it reports to its peers. Shards
+        // only fall behind through a write registering the tag while an
+        // invalidation is in flight, so this is normally a no-op and costs
+        // nothing but the RAM check.
+        //
+        // Shards that do not hold the name at all are left alone: one that
+        // registers it later adopts the node-wide value anyway (see
+        // [`LmdbStore::node_generation`]), and creating it here would add an
+        // entry to every shard's registry for every tag ever invalidated.
+        if let Some(generation) = highest {
+            for shard in self.shards.all() {
+                if shard
+                    .engine
+                    .tags()
+                    .generation_of(tag)
+                    .is_some_and(|current| current < generation)
+                {
+                    shard.writer.merge_tag(tag, generation)?;
+                }
+            }
+        }
+        Ok(highest)
+    }
+
+    fn merge_tag_generation(&self, tag: &[u8], generation: u64) -> Result<u64> {
+        // Every shard holding the name, because a record carrying the tag can
+        // be in any of them and one left behind would keep serving records the
+        // invalidation covered.
+        //
+        // Shards already at or past the offered generation are skipped from
+        // RAM. That is the common case by far: gossip re-offers the same
+        // generations every interval, so without this a converged cluster would
+        // spend a write per shard per tag per round doing nothing.
+        let mut effective = generation;
+        let mut holders = 0;
+        for shard in self.shards.all() {
+            let Some(current) = shard.engine.tags().generation_of(tag) else {
+                continue;
+            };
+            holders += 1;
+            effective = effective.max(if current >= generation {
+                current
+            } else {
+                shard.writer.merge_tag(tag, generation)?
+            });
+        }
+
+        // No shard has the name, so nothing here can be carrying the tag — but
+        // the generation still has to be recorded somewhere, or a later write
+        // would register the tag at zero and be invalidated by the next gossip
+        // round. One shard is enough, since the node's generation for a name is
+        // the maximum across them.
+        if holders == 0 {
+            effective = effective.max(self.shards.for_key(tag).writer.merge_tag(tag, generation)?);
+        }
+        Ok(effective)
+    }
+
+    fn tag_generations(&self) -> Result<Vec<cache_core::TagGeneration>> {
+        // Read from RAM, so a digest costs no transaction. Merged across shards
+        // by maximum: they hold the same value for a name under normal running,
+        // and the maximum is the safe reading if they ever do not.
+        let mut merged: std::collections::HashMap<Box<[u8]>, u64> =
+            std::collections::HashMap::new();
+        for shard in self.shards.all() {
+            for entry in shard.engine.tags().snapshot() {
+                merged
+                    .entry(entry.name)
+                    .and_modify(|generation| *generation = (*generation).max(entry.generation))
+                    .or_insert(entry.generation);
+            }
+        }
+        Ok(merged
+            .into_iter()
+            .map(|(name, generation)| cache_core::TagGeneration { name, generation })
+            .collect())
     }
 
     fn flush(&self) -> Result<u32> {

@@ -29,6 +29,12 @@ struct Cli {
     /// can reach the port. Off unless asked for.
     #[arg(long)]
     enable_flush: bool,
+
+    /// Address of another node's cache port, to forward tag invalidations to.
+    /// Repeatable. Replaces the config file's peer list rather than adding to
+    /// it, so the flag always describes the whole cluster.
+    #[arg(long = "peer", value_name = "HOST:PORT")]
+    peers: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -51,6 +57,9 @@ fn main() -> anyhow::Result<()> {
     }
     if cli.enable_flush {
         config.protocol.flush_enabled = true;
+    }
+    if !cli.peers.is_empty() {
+        config.cluster.peers = cli.peers;
     }
     config.validate()?;
 

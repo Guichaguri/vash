@@ -7,11 +7,12 @@ Wire protocols: [docs/protocol.md](docs/protocol.md) — enough detail to write 
 client against. Design and rationale: [docs/plan.md](docs/plan.md). Original
 brief: [docs/project.md](docs/project.md).
 
-**Status: M4 complete.** Speaks both its own binary protocol and the memcached
+**Status: M5 complete.** Speaks both its own binary protocol and the memcached
 text and meta protocols, on the same port. TTLs with background reclamation,
 group-committed writes across independent shards, constant-time tag
-invalidation, capacity eviction, and Prometheus metrics. Not yet
-production-usable — see [What works today](#what-works-today).
+invalidation that propagates across a cluster, capacity eviction, and Prometheus
+metrics. Not yet production-usable — see
+[What works today](#what-works-today).
 
 ## Quick start
 
@@ -42,7 +43,7 @@ Run with `--ephemeral` to start from an empty database and skip syncing, or
 | Sharding | Working — independent environments, one writer each |
 | Capacity watermarks and eviction | Working — TTL-ordered, never LRU |
 | Metrics and admin endpoints | Working — `/metrics`, `/health`, `/stats` |
-| Cluster tag invalidation | M5 |
+| Cluster tag invalidation | Working — fan-out plus anti-entropy, see [Clustering](#clustering) |
 
 The legacy memcached **binary** protocol (magic `0x80`) is not implemented and
 will not be: upstream deprecated it in favour of the meta commands.
@@ -154,6 +155,57 @@ a TTL is the client's own statement of how long a value is worth keeping. LRU
 would mean writing recency metadata on every read, which on a single-writer
 engine puts every GET behind the write queue.
 
+## Clustering
+
+Nodes are independent. Clients shard the keyspace themselves, nothing is
+replicated, and there is no consensus anywhere — which is why adding a node adds
+capacity linearly and losing one costs `1/N` of the cache rather than an
+outage.
+
+The one thing that has to cross a node boundary is **tag invalidation**, because
+a tag's keys are spread across every node by key hash. A `DELETE_BY_TAG` that
+stopped at whichever node the client happened to call would leave most of the
+affected keys being served.
+
+```bash
+kached --listen 0.0.0.0:11311 --peer 10.0.0.2:11311 --peer 10.0.0.3:11311
+```
+
+Two mechanisms, and the second is the one that makes it correct:
+
+- **Fan-out** pushes each invalidation to peers as it happens. Fast, and lossy.
+- **Anti-entropy** exchanges tag→generation digests with each peer every
+  `gossip_interval` (default 5s), on a timer per peer so one unresponsive node
+  cannot slow convergence between the healthy ones. This is what repairs a node
+  that was down, partitioned, restarted, or that simply missed a message.
+
+None of it needs an acknowledgement protocol, retries with sequence numbers, or
+agreement on membership, because generations merge by taking the higher of the
+two. That single property makes delivery idempotent, order-independent,
+retry-safe and loss-tolerant at once — so a full queue can drop a message and a
+partitioned node can rejoin, and both converge on their own.
+
+`cluster.delete_by_tag` picks the trade:
+
+| Mode | `DELETE_BY_TAG` returns | Staleness elsewhere |
+|---|---|---|
+| `local` | after the local bump | unbounded — the client calls every node |
+| `fanout` (default) | immediately; peers told in the background | bounded by the gossip interval |
+| `fanout_sync` | after reachable peers have applied it | none for reachable peers |
+
+**Stated plainly:** invalidation is strongly consistent within a node and
+eventually consistent across the cluster. Under `fanout` there is a window —
+normally milliseconds — in which another node still serves covered records, and,
+symmetrically, in which a record written *on* that node is treated as
+pre-invalidation and dropped once the message lands. Both errors are in the
+direction of a cache miss, never a stale hit. `fanout_sync` closes both for
+reachable peers.
+
+Membership is one-sided and static: peers are configured on the sending node, so
+a node that lists nobody can still be another node's target. The `CLUSTER`
+opcode reports what a node was told and which peers it can reach, which is how a
+client detects a cluster configured inconsistently.
+
 ## Observability
 
 `/metrics` (Prometheus), `/health` and `/stats` (JSON), on a separate port so
@@ -169,7 +221,9 @@ curl -s localhost:9090/stats
 writes — the process is up, but it is not doing its job. The counters worth
 alerting on are `kached_evicted_total` rising (the cache is too small for its
 working set), `kached_sweep_lag_ms` growing (reclamation is losing to expiry),
-and `kached_readers_in_use` approaching `kached_readers_max`.
+`kached_readers_in_use` approaching `kached_readers_max`, and — in a cluster —
+`kached_cluster_last_exchange_age_ms` growing past a few gossip intervals, which
+means this node is drifting out of step with its peers.
 
 ## Memcached compatibility
 

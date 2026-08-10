@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::SweepStats;
 use crate::config::WriteConfig;
-use crate::engine::{LmdbEngine, PreparedSet, Pressure};
+use crate::engine::{LmdbEngine, PreparedSet, Pressure, TagMerge};
 use crate::error::{Result, StoreError};
 
 pub(crate) enum WriteOp {
@@ -43,8 +43,16 @@ pub(crate) enum WriteOp {
         delta: u64,
         decrement: bool,
     },
-    CreateTags(Vec<Box<[u8]>>),
+    /// Register tag names, each with the generation the rest of the node
+    /// already holds for it.
+    CreateTags(Vec<(Box<[u8]>, u64)>),
     DeleteByTag(Box<[u8]>),
+    /// Raise a tag's generation to at least this value, creating it if unknown.
+    /// The receiving half of cluster invalidation.
+    MergeTag {
+        name: Box<[u8]>,
+        generation: u64,
+    },
     Flush,
     Sync,
 }
@@ -63,6 +71,7 @@ impl WriteOp {
             | Self::Touch { .. }
             | Self::Incr { .. }
             | Self::DeleteByTag(_)
+            | Self::MergeTag { .. }
             | Self::Flush => 1,
             Self::CreateTags(names) => names.len(),
             Self::Sync => 0,
@@ -79,6 +88,8 @@ pub(crate) enum WriteOutcome {
     Counter(Option<u64>),
     /// `None` when the tag was never registered, so nothing referenced it.
     Invalidated(Option<u64>),
+    /// The generation the tag holds after a max-merge.
+    Merged(u64),
     Flushed(u32),
     Done,
 }
@@ -232,10 +243,26 @@ impl Writer {
         }
     }
 
-    /// Registers tags durably. Must complete before any record referencing them
+    /// Registers tags durably, each at the generation the rest of the node
+    /// already holds for it. Must complete before any record referencing them
     /// is encoded.
-    pub fn create_tags(&self, names: Vec<Box<[u8]>>) -> Result<()> {
+    pub fn create_tags(&self, names: Vec<(Box<[u8]>, u64)>) -> Result<()> {
         self.submit(WriteOp::CreateTags(names)).map(|_| ())
+    }
+
+    /// Raises a tag's generation to at least `generation`, creating the tag if
+    /// this shard has never seen the name. Returns the resulting generation.
+    pub fn merge_tag(&self, name: &[u8], generation: u64) -> Result<u64> {
+        let op = WriteOp::MergeTag {
+            name: name.into(),
+            generation,
+        };
+        match self.submit(op)? {
+            WriteOutcome::Merged(generation) => Ok(generation),
+            _ => Err(StoreError::Corrupt(
+                "writer returned the wrong reply".into(),
+            )),
+        }
     }
 
     /// Invalidates a tag. Returns the new generation, or `None` if the tag was
@@ -693,8 +720,8 @@ fn apply(
             engine.apply_incr(wtxn, key, *delta, *decrement)?,
         )),
         WriteOp::CreateTags(names) => {
-            for name in names.iter() {
-                let (id, generation) = engine.apply_create_tag(wtxn, name)?;
+            for (name, start_generation) in names.iter() {
+                let (id, generation) = engine.apply_create_tag(wtxn, name, *start_generation)?;
                 effects.push(PostCommit::TagCreated {
                     name: name.clone(),
                     id,
@@ -710,6 +737,22 @@ fn apply(
             }
             None => Ok(WriteOutcome::Invalidated(None)),
         },
+        WriteOp::MergeTag { name, generation } => {
+            let merged = engine.apply_merge_tag(wtxn, name, *generation)?;
+            match merged {
+                TagMerge::Created { id, generation } => effects.push(PostCommit::TagCreated {
+                    name: name.clone(),
+                    id,
+                    generation,
+                }),
+                TagMerge::Raised { id, generation } => {
+                    effects.push(PostCommit::TagGeneration { id, generation })
+                }
+                // Already at or past it, so there is nothing to publish.
+                TagMerge::Unchanged { .. } => {}
+            }
+            Ok(WriteOutcome::Merged(merged.generation()))
+        }
         WriteOp::Flush => {
             let epoch = engine.apply_flush(wtxn)?;
             effects.push(PostCommit::Epoch(epoch));

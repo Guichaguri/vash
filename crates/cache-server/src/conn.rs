@@ -20,6 +20,7 @@ pub async fn handle(
     mut stream: TcpStream,
     state: Arc<ServerState>,
     read_buffer: usize,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // Cache traffic is small and latency-sensitive; Nagle would batch a reply
     // against the next one and add up to 40ms for nothing.
@@ -30,7 +31,22 @@ pub async fn handle(
     let mut protocol: Option<Protocol> = None;
 
     loop {
-        let n = stream.read_buf(&mut read_buf).await?;
+        // Shutdown is only ever noticed *here*, between requests, where nothing
+        // is buffered and no reply is outstanding — so a client loses at most a
+        // connection it was not using. Both branches are cancel-safe, so the
+        // one that does not win has read nothing.
+        //
+        // Without this, an idle connection would hold the drain open until it
+        // timed out, and the store could not be closed. That is not a corner
+        // case in a cluster: peers keep their connections open indefinitely, so
+        // every node would have one per peer.
+        let n = tokio::select! {
+            read = stream.read_buf(&mut read_buf) => read?,
+            _ = shutdown.changed() => {
+                debug!("closing an idle connection to drain");
+                return Ok(());
+            }
+        };
         if n == 0 {
             return Ok(()); // clean disconnect
         }

@@ -83,7 +83,12 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
     match path {
         "/metrics" => {
             let store = state.store.stats().unwrap_or_default();
-            let body = render_prometheus(&state.metrics, &store);
+            let body = render_prometheus(
+                &state.metrics,
+                &store,
+                state.cluster.metrics(),
+                state.cluster.peers_reachable(),
+            );
             respond(&mut stream, 200, "text/plain; version=0.0.4", &body).await
         }
         "/health" => {
@@ -103,7 +108,13 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
         }
         "/stats" => {
             let store = state.store.stats().unwrap_or_default();
-            respond(&mut stream, 200, "application/json", &stats_json(&store)).await
+            let body = stats_json(
+                &store,
+                &state.cluster.view(),
+                state.cluster.peers_reachable(),
+                state.cluster.metrics().since_last_exchange_ms(),
+            );
+            respond(&mut stream, 200, "application/json", &body).await
         }
         _ => respond(&mut stream, 404, "text/plain", "not found").await,
     }
@@ -119,7 +130,12 @@ fn request_line(buf: &[u8]) -> Option<(&str, &str)> {
     Some((method, target.split('?').next().unwrap_or(target)))
 }
 
-fn stats_json(store: &cache_store::StoreStats) -> String {
+fn stats_json(
+    store: &cache_store::StoreStats,
+    view: &cache_core::ClusterInfo,
+    peers_reachable: u64,
+    last_exchange_age_ms: u64,
+) -> String {
     format!(
         concat!(
             "{{\n",
@@ -142,7 +158,11 @@ fn stats_json(store: &cache_store::StoreStats) -> String {
             "  \"mean_batch_size\": {:.2},\n",
             "  \"readers_in_use\": {},\n",
             "  \"max_readers\": {},\n",
-            "  \"epoch\": {}\n",
+            "  \"epoch\": {},\n",
+            "  \"cluster_mode\": \"{}\",\n",
+            "  \"cluster_peers\": {},\n",
+            "  \"cluster_peers_reachable\": {},\n",
+            "  \"cluster_last_exchange_age_ms\": {}\n",
             "}}\n"
         ),
         store.shards,
@@ -165,6 +185,10 @@ fn stats_json(store: &cache_store::StoreStats) -> String {
         store.readers_in_use,
         store.max_readers,
         store.epoch,
+        view.mode.as_str(),
+        view.peers.len(),
+        peers_reachable,
+        last_exchange_age_ms,
     )
 }
 
@@ -220,7 +244,12 @@ mod tests {
 
     #[test]
     fn stats_render_as_parseable_json() {
-        let json = stats_json(&cache_store::StoreStats::default());
+        let json = stats_json(
+            &cache_store::StoreStats::default(),
+            &cache_core::ClusterInfo::standalone(),
+            0,
+            0,
+        );
         // No serde here, so the shape is checked rather than assumed.
         assert!(json.starts_with('{') && json.trim_end().ends_with('}'));
         assert_eq!(

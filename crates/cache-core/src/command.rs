@@ -75,6 +75,20 @@ pub enum Command<'a> {
         decrement: bool,
     },
 
+    /// Cluster: merge tag generations a peer reported.
+    ///
+    /// Not a client command. Generations merge by maximum, so this is
+    /// idempotent and order-independent — see [`crate::cluster`].
+    TagSync {
+        /// The sender listed its **whole** table, so the receiver may answer
+        /// with entries the sender never mentioned. A partial push gets a reply
+        /// covering only the names it named.
+        full: bool,
+        entries: Vec<(&'a [u8], u64)>,
+    },
+    /// Cluster: this node's view of its peer list.
+    Cluster,
+
     /// Protocol-level commands with no storage effect.
     Stats,
     Version,
@@ -173,6 +187,10 @@ pub enum Reply {
     Flushed(u32),
     /// New value of a counter after `incr`/`decr`.
     Counter(u64),
+    /// Answer to a peer's `TAG_SYNC`: the generations this node holds that the
+    /// sender is behind on. Empty when the sender was already up to date.
+    TagSync(Vec<crate::cluster::TagGeneration>),
+    Cluster(crate::cluster::ClusterInfo),
     Stats(Vec<(String, String)>),
     Version(&'static str),
     /// The client asked to hang up.

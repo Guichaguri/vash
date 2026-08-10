@@ -70,6 +70,49 @@ impl Pressure {
     }
 }
 
+/// What a max-merge of a tag generation did.
+///
+/// The distinction matters after the commit: a created tag has to be published
+/// into the in-memory registry as a new entry, a raised one only needs its
+/// counter advanced, and an unchanged one needs nothing at all — which is the
+/// common case, since a peer that is already up to date receives the same
+/// generation over and over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagMerge {
+    /// This shard had never seen the name; it now exists at `generation`.
+    Created { id: u32, generation: u64 },
+    /// The stored generation was raised, and reclamation queued.
+    Raised { id: u32, generation: u64 },
+    /// Already at or past the offered generation.
+    Unchanged { id: u32, generation: u64 },
+}
+
+impl TagMerge {
+    pub fn generation(self) -> u64 {
+        match self {
+            Self::Created { generation, .. }
+            | Self::Raised { generation, .. }
+            | Self::Unchanged { generation, .. } => generation,
+        }
+    }
+
+    fn id(self) -> u32 {
+        match self {
+            Self::Created { id, .. } | Self::Raised { id, .. } | Self::Unchanged { id, .. } => id,
+        }
+    }
+}
+
+fn validate_tag_name(name: &[u8]) -> Result<()> {
+    if name.is_empty() || name.len() > cache_core::MAX_TAG_LEN {
+        return Err(StoreError::Core(cache_core::CoreError::TagTooLong {
+            len: name.len(),
+            max: cache_core::MAX_TAG_LEN,
+        }));
+    }
+    Ok(())
+}
+
 /// A record encoded and ready to store, still missing its CAS token.
 ///
 /// Built on the calling thread so that the value copy and the record framing —
@@ -672,13 +715,21 @@ impl LmdbEngine {
     /// A record may never reference a tag that is not durably registered: after
     /// a restart the id would either be unknown (a spurious miss) or reused for
     /// a different name (a spurious invalidation).
-    pub fn apply_create_tag(&self, wtxn: &mut RwTxn, name: &[u8]) -> Result<(u32, u64)> {
-        if name.is_empty() || name.len() > cache_core::MAX_TAG_LEN {
-            return Err(StoreError::Core(cache_core::CoreError::TagTooLong {
-                len: name.len(),
-                max: cache_core::MAX_TAG_LEN,
-            }));
-        }
+    ///
+    /// `start_generation` is the generation the rest of the node already holds
+    /// for this name, which is normally 0 but is not when another shard has
+    /// seen the tag and invalidated it. Starting from it keeps the generation
+    /// uniform across a node's shards. Starting from zero instead would mean a
+    /// record written here captured a *lower* number than the node reports to
+    /// its peers, and the first gossip round would kill it — an invalidation of
+    /// a record that was written after the last invalidation.
+    pub fn apply_create_tag(
+        &self,
+        wtxn: &mut RwTxn,
+        name: &[u8],
+        start_generation: u64,
+    ) -> Result<(u32, u64)> {
+        validate_tag_name(name)?;
 
         // Another job in the same batch may have created it already.
         if let Some(raw) = self
@@ -691,12 +742,66 @@ impl LmdbEngine {
         }
 
         let id = self.tags.allocate_id()?;
-        let generation = 0u64;
+        self.tag_meta
+            .put(wtxn, name, &crate::tags::encode_entry(id, start_generation))
+            .map_err(StoreError::from_heed)?;
+
+        Ok((id, start_generation))
+    }
+
+    /// Raises a tag's generation to `generation`, creating the tag if this
+    /// shard has never seen the name.
+    ///
+    /// **Merges by maximum**, never assigns, which is what makes an
+    /// invalidation received from a peer idempotent, order-independent and safe
+    /// to retry — see [`cache_core::cluster`]. It is also how a local
+    /// invalidation is applied, so both paths share one implementation and one
+    /// set of consequences.
+    pub fn apply_merge_tag(
+        &self,
+        wtxn: &mut RwTxn,
+        name: &[u8],
+        generation: u64,
+    ) -> Result<TagMerge> {
+        validate_tag_name(name)?;
+
+        let existing = match self
+            .tag_meta
+            .get(wtxn, name)
+            .map_err(StoreError::from_heed)?
+        {
+            Some(raw) => Some(crate::tags::decode_entry(raw).ok_or_else(|| {
+                StoreError::Corrupt(format!("tag registry entry for {name:?} is malformed"))
+            })?),
+            None => None,
+        };
+
+        let Some((id, current)) = existing else {
+            // Nothing here can carry a tag this shard has never registered, so
+            // there is no reclamation to queue — only the registration itself,
+            // so that records written from now on capture the right number.
+            let (id, generation) = self.apply_create_tag(wtxn, name, generation)?;
+            return Ok(TagMerge::Created { id, generation });
+        };
+
+        if generation <= current {
+            return Ok(TagMerge::Unchanged {
+                id,
+                generation: current,
+            });
+        }
+
         self.tag_meta
             .put(wtxn, name, &crate::tags::encode_entry(id, generation))
             .map_err(StoreError::from_heed)?;
 
-        Ok((id, generation))
+        // One job per tag: raising the target mid-reclaim restarts the scan
+        // rather than queueing a second pass.
+        self.jobs
+            .put(wtxn, &id.to_be_bytes(), &Job::new(generation).encode())
+            .map_err(StoreError::from_heed)?;
+
+        Ok(TagMerge::Raised { id, generation })
     }
 
     /// Invalidates a tag by bumping its generation.
@@ -723,18 +828,20 @@ impl LmdbEngine {
 
         // Read from disk rather than RAM so the counter advances from the
         // durable value; a RAM-only bump lost to a crash would resurrect data.
-        let next = generation + 1;
-        self.tag_meta
-            .put(wtxn, name, &crate::tags::encode_entry(id, next))
-            .map_err(StoreError::from_heed)?;
+        // Saturating rather than wrapping: going backwards would resurrect
+        // every record ever invalidated under this tag, which is far worse than
+        // an invalidation that cannot advance.
+        let next = generation.saturating_add(1);
+        if next == generation {
+            warn!(
+                ?name,
+                "tag generation has saturated; invalidation had no effect"
+            );
+            return Ok(Some((id, generation)));
+        }
 
-        // One job per tag: re-invalidating mid-reclaim raises the target and
-        // restarts the scan rather than queueing a second pass.
-        self.jobs
-            .put(wtxn, &id.to_be_bytes(), &Job::new(next).encode())
-            .map_err(StoreError::from_heed)?;
-
-        Ok(Some((id, next)))
+        let merged = self.apply_merge_tag(wtxn, name, next)?;
+        Ok(Some((merged.id(), merged.generation())))
     }
 
     /// Empties the cache, returning the new flush epoch.

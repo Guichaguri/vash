@@ -127,7 +127,7 @@ requests, which produce none.
 | `0x02` | `PING` | yes |
 | `0x03` | `AUTH` | reserved — returns `UNSUPPORTED` |
 | `0x04` | `STATS` | reserved — returns `UNSUPPORTED` |
-| `0x05` | `CLUSTER` | reserved — returns `UNSUPPORTED` |
+| `0x05` | `CLUSTER` | yes |
 | `0x10` | `GET` | yes |
 | `0x11` | `SET` | yes |
 | `0x12` | `DELETE` | yes |
@@ -137,6 +137,7 @@ requests, which produce none.
 | `0x22` | `DELETE_MANY` | yes |
 | `0x30` | `DELETE_BY_TAG` | yes |
 | `0x31` | `FLUSH` | yes, if enabled server-side |
+| `0x40` | `TAG_SYNC` | yes — peer-to-peer, see [Cluster](#cluster) |
 
 An unknown opcode is answered with `UNSUPPORTED` (8), an empty body, and the
 **original opcode byte echoed**, so the client can still correlate. The
@@ -205,7 +206,11 @@ atomic per shard only.
 |---|---|---|
 | `0x01` | `TAGS` | Tags and `DELETE_BY_TAG` are available. |
 | `0x02` | `MEMCACHED` | The memcached protocol is served on this port. |
-| `0x04` | `CLUSTER` | Cluster-wide tag invalidation. **Not implemented yet.** |
+| `0x04` | `CLUSTER` | An invalidation sent here reaches the rest of the cluster. |
+
+`CLUSTER` is set only when this node has peers configured **and** is set to
+forward — not merely because the build supports it. A client seeing it clear
+must invalidate on every node itself.
 
 Unlisted bits are reserved; ignore them.
 
@@ -354,6 +359,56 @@ Returns `UNAUTHORIZED` (5) unless the server was started with
 `protocol.flush_enabled` or `--enable-flush`. Empties the entire cache; tag
 registrations survive.
 
+A flush is **node-local**. It is not propagated to peers, and there is no
+cluster-wide flush.
+
+### `CLUSTER` (0x05)
+
+Empty request body. **Response body** on `OK`:
+
+| Offset | Field |
+|---|---|
+| 0 | `mode` u8 — 0 `local`, 1 `fanout`, 2 `fanout_sync` |
+| 1 | `reserved` u8 — zero |
+| 2 | `peer_count` u16 |
+| 4 | `peer_count` × (`addr_len` u16, addr `bytes[addr_len]`, `reachable` u8) |
+
+Membership is static configuration, not a negotiated set: this is what one node
+was *told*, so comparing views across nodes is how a client detects drift.
+`reachable` is whether the last exchange with that peer succeeded, and is 0
+before one has been attempted.
+
+### `TAG_SYNC` (0x40)
+
+Merges tag generations. This is how nodes propagate invalidations to each other;
+a client normally has no reason to send it, but it is an ordinary command on the
+ordinary port and is documented so a peer can be implemented against it.
+
+**Request body:**
+
+| Offset | Field |
+|---|---|
+| 0 | `kind` u8 — 0 partial, 1 full digest |
+| 1 | `reserved` u8 × 3 — zero |
+| 4 | `count` u32 — at most 8192 |
+| 8 | `count` × (`generation` u64, `name_len` u16, name `bytes[name_len]`) |
+
+**Response body** on `OK`: the same layout, always `kind` 0, carrying every
+offered name the receiver holds a **strictly higher** generation for — plus,
+when the request was a full digest, every tag the receiver holds at a non-zero
+generation that the request did not name. The sender merges those in turn, so
+one round trip converges both directions.
+
+`kind` says whether the sender listed its whole table. Only then can the
+receiver volunteer tags the sender never mentioned; against a partial message
+there is no way to tell "does not know it" from "did not fit". A generation of
+0 carries no information and is ignored on receipt, so it is never sent.
+
+Each entry is applied as `generation = max(local, received)`, creating the name
+if this node has never seen it. That makes the command **idempotent,
+order-independent and safe to retry**, which is the whole reason cluster
+invalidation needs no acknowledgement protocol. See [Cluster](#cluster).
+
 ## Worked example
 
 Bytes on the wire for a handshake, a write and a read. `→` is client-to-server.
@@ -478,7 +533,8 @@ just to fill the field out.
 `kached_tag_index_entries`, `kached_pending_reclaims`, `kached_commits`,
 `kached_committed_ops`, `kached_mean_batch`, `kached_sweeps`,
 `kached_reclaimed`, `kached_tag_reclaimed`, `kached_sweep_lag_ms`,
-`kached_epoch`, `kached_readers_in_use`.
+`kached_epoch`, `kached_readers_in_use`, `kached_cluster_mode`,
+`kached_cluster_peers`, `kached_cluster_peers_reachable`.
 
 ## Meta commands
 
@@ -662,9 +718,50 @@ Rewriting a key after an invalidation makes it live again — the new write
 captures the new generation. Reclaiming the space of invalidated records happens
 in the background and is not observable except through `stats`.
 
-Tags are node-local. Cluster-wide invalidation is planned (the `CLUSTER`
-capability bit) and **not implemented**: against a multi-node deployment, a
-client must send the invalidation to every node itself.
+## Cluster
+
+Nodes are otherwise independent — clients shard the keyspace, no data moves
+between nodes, nothing is replicated. Tag invalidation is the one thing that
+crosses a node boundary, because a tag's keys are spread across *every* node, so
+an invalidation that stopped at the node the client happened to call would leave
+most of the affected keys being served.
+
+A node forwards invalidations according to `cluster.delete_by_tag`:
+
+| Mode | `DELETE_BY_TAG` returns | Staleness elsewhere |
+|---|---|---|
+| `local` | after the local bump | unbounded — the client must call every node |
+| `fanout` (default) | after the local bump; peers are told in the background | bounded by `cluster.gossip_interval_ms` |
+| `fanout_sync` | after reachable peers have applied it | none for reachable peers; gossip interval for the rest |
+
+Regardless of mode, every node also exchanges tag generations with each of its
+peers every `cluster.gossip_interval_ms`. That is what closes the gap for a node
+that was down, partitioned, restarted, or simply missed a message — fan-out is
+an optimisation on top of it, not a replacement for it.
+
+**Consistency statement.** Tag invalidation is *strongly consistent within a
+node* and *eventually consistent across the cluster*. Concretely:
+
+- Within one node, the ordering guarantee above holds exactly.
+- Across nodes under `fanout`, there is a window — normally milliseconds, at
+  worst one gossip interval — in which another node still serves records the
+  invalidation covered.
+- A record written on another node **during** that window is treated as
+  pre-invalidation and dropped when the message lands, because that node had not
+  yet learned the invalidation happened. The error is always in the direction of
+  a miss, never a stale hit. `fanout_sync` closes this for reachable peers: once
+  the response is in hand, a subsequent write anywhere is safe.
+
+Invalidations merge by taking the higher generation, so they can be replayed,
+reordered and retried freely, and two nodes invalidating the same tag at once
+converge rather than conflict. A node that has never heard of a tag registers it
+at the generation it was told, which is what stops a later local write there from
+capturing a lower number and being killed by the next gossip round.
+
+Tag *ids* never cross the wire — they are per-shard counters, and two nodes will
+assign different ids to the same name. Names are the global identity.
+
+The `CLUSTER` opcode reports a node's peer list and their reachability.
 
 ## Client flags
 

@@ -1,5 +1,5 @@
-# Example configuration. Every key shown is one M0 actually honours; unknown
-# keys are rejected at startup rather than silently ignored.
+# Example configuration. Every key shown is one the server actually honours;
+# unknown keys are rejected at startup rather than silently ignored.
 #
 #   kached --config kached.example.toml
 
@@ -101,6 +101,44 @@ batch = 512
 # port with the native protocol and are told apart by the connection's first
 # byte, so there is nothing to turn on.
 flush_enabled = false
+
+[cluster]
+# Other nodes' cache ports. Nodes are otherwise shared-nothing — clients shard
+# the keyspace, nothing is replicated — and tag invalidation is the only thing
+# that crosses a node boundary, because a tag's keys are spread across every
+# node. Repeatable --peer flags override this list.
+#
+# Membership is one-sided and static: peers are configured on the *sending*
+# node, so a node that lists nobody can still be somebody else's target. Listing
+# yourself is harmless but wasted work.
+peers = []
+
+# local       no fan-out; the client invalidates on every node itself
+# fanout      reply immediately, forward in the background
+# fanout_sync reply once reachable peers have applied it
+#
+# Under fanout there is a window in which another node still serves records the
+# invalidation covered — and, symmetrically, in which a record written there is
+# treated as pre-invalidation and dropped. Both err towards a miss.
+delete_by_tag = "fanout"
+
+# Every node exchanges tag generations with each of its peers this often, on a
+# timer per peer so one unresponsive node cannot slow convergence between the
+# healthy ones. This is the backstop that fan-out sits on top of: it is what
+# repairs a node that was down, partitioned or restarted, so it is also the
+# staleness bound when a fan-out message is lost.
+gossip_interval_ms = 5000
+
+# Per exchange, including connecting. Also how long fanout_sync waits for
+# acknowledgements before answering the client anyway — an unreachable peer must
+# not hold up a write that has already committed locally.
+fanout_timeout_ms = 2000
+
+# Invalidations queued per peer before further ones are dropped. Dropping is
+# safe rather than merely tolerable: generations merge by maximum, so
+# anti-entropy delivers whatever fan-out lost. An unbounded queue against a dead
+# peer would not be.
+queue_depth = 1024
 
 [observability]
 log_format = "pretty"   # or "json"

@@ -9,6 +9,7 @@
 //! [`Reply`]: command::Reply
 
 pub mod clock;
+pub mod cluster;
 pub mod command;
 pub mod error;
 pub mod key;
@@ -16,6 +17,7 @@ pub mod record;
 pub mod value;
 
 pub use clock::{Clock, MAX_TTL_SECS};
+pub use cluster::{ClusterInfo, ClusterMode, MAX_TAG_SYNC_ENTRIES, PeerInfo, TagGeneration};
 pub use command::{
     Command, MAX_BATCH_ITEMS, PROTOCOL_VERSION, Reply, ServerInfo, Set, SetMode, Stored, Value,
     capability,

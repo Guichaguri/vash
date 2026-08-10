@@ -1,10 +1,12 @@
 ﻿//! A KCP client.
 //!
 //! Deliberately simple: one request in flight at a time. It exists to drive
-//! integration tests and to be the reference for what the protocol looks like
-//! from the outside. Pipelining and out-of-order completion â€” which the frame
-//! format already supports via `request_id` â€” are a later concern, once there
-//! is a sharded server able to benefit from them.
+//! integration tests, to be the reference for what the protocol looks like from
+//! the outside, and to carry the server's own peer traffic — a cluster peer is
+//! just another KCP client, so cluster invalidation goes over the published
+//! protocol rather than a private side channel. Pipelining and out-of-order
+//! completion â€” which the frame format already supports via `request_id` â€” are a
+//! later concern.
 
 use bytes::{Bytes, BytesMut};
 use cache_core::{ServerInfo, Value};
@@ -170,6 +172,49 @@ impl Client {
             (Status::NotFound, _) => Ok(false),
             (status, _) => Err(ClientError::Status(status)),
         }
+    }
+
+    /// Exchanges tag generations with the server.
+    ///
+    /// The peer-to-peer half of the protocol, exposed here because a peer is
+    /// just another KCP client. `full` says these entries are the sender's
+    /// whole table, which licenses the server to answer with tags the sender
+    /// never mentioned; a partial push gets an answer covering only the names
+    /// it named. The reply is whatever the server holds a **higher**
+    /// generation for, so the caller can max-merge it and converge.
+    pub async fn tag_sync(
+        &mut self,
+        full: bool,
+        entries: &[(&[u8], u64)],
+    ) -> Result<Vec<cache_core::TagGeneration>> {
+        let mut body = Vec::new();
+        cache_proto::kcp::encode_tag_sync_body(&mut body, full, entries.iter().copied());
+
+        let (status, payload) = self.round_trip(Opcode::TagSync, &body).await?;
+        if status != Status::Ok {
+            return Err(ClientError::Status(status));
+        }
+
+        let (_, learned) = cache_proto::kcp::decode_tag_sync(&payload)
+            .map_err(|_| ClientError::Protocol("malformed tag sync response"))?;
+        Ok(learned
+            .into_iter()
+            .map(|(name, generation)| cache_core::TagGeneration::new(name, generation))
+            .collect())
+    }
+
+    /// The server's view of its peer list.
+    ///
+    /// Membership is static configuration rather than a negotiated set, so this
+    /// is what one node was told — comparing it across nodes is how a client
+    /// detects drift.
+    pub async fn cluster(&mut self) -> Result<cache_core::ClusterInfo> {
+        let (status, payload) = self.round_trip(Opcode::Cluster, &[]).await?;
+        if status != Status::Ok {
+            return Err(ClientError::Status(status));
+        }
+        cache_proto::kcp::decode_cluster_response(&payload)
+            .ok_or(ClientError::Protocol("malformed cluster response"))
     }
 
     /// Empties the cache, returning the new flush epoch. Refused unless the

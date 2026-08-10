@@ -15,6 +15,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub store: StoreConfig,
     pub protocol: ProtocolConfig,
+    pub cluster: ClusterConfig,
     pub observability: ObservabilityConfig,
 }
 
@@ -173,6 +174,71 @@ impl From<Durability> for cache_store::Durability {
             Durability::Durable => Self::Durable,
             Durability::Relaxed => Self::Relaxed,
             Durability::Ephemeral => Self::Ephemeral,
+        }
+    }
+}
+
+/// Peers, and how tag invalidation reaches them.
+///
+/// Nodes are otherwise shared-nothing: no replication, no consensus, no
+/// server-side data movement. This is the only thing that crosses a node
+/// boundary, and it crosses as a name and a counter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClusterConfig {
+    /// Addresses of the other nodes' cache ports. Membership is static: there
+    /// is nothing to agree on, and a node simply reports what it was told.
+    pub peers: Vec<String>,
+    pub delete_by_tag: FanoutMode,
+    /// How often a node exchanges tag generations with each of its peers.
+    ///
+    /// This is the staleness bound in `fanout` mode when a message is lost, and
+    /// the only thing that closes the gap for a node that was down or
+    /// unreachable.
+    pub gossip_interval_ms: u64,
+    /// How long a single exchange with a peer may take, including connecting.
+    /// Also how long `fanout_sync` waits for an acknowledgement.
+    pub fanout_timeout_ms: u64,
+    /// Invalidations queued per peer before further ones are dropped.
+    ///
+    /// Dropping is safe rather than merely tolerable: generations max-merge, so
+    /// anti-entropy delivers whatever fan-out lost. An unbounded queue against
+    /// a peer that is down would not be.
+    pub queue_depth: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            peers: Vec::new(),
+            delete_by_tag: FanoutMode::default(),
+            gossip_interval_ms: 5_000,
+            fanout_timeout_ms: 2_000,
+            queue_depth: 1_024,
+        }
+    }
+}
+
+/// Mirrors [`cache_core::ClusterMode`], kept separate so the domain crate does
+/// not take a serde dependency for the sake of the config file.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FanoutMode {
+    /// No fan-out. The client calls every node itself.
+    Local,
+    /// Reply immediately, forward in the background.
+    #[default]
+    Fanout,
+    /// Reply once reachable peers have acknowledged.
+    FanoutSync,
+}
+
+impl From<FanoutMode> for cache_core::ClusterMode {
+    fn from(mode: FanoutMode) -> Self {
+        match mode {
+            FanoutMode::Local => Self::Local,
+            FanoutMode::Fanout => Self::Fanout,
+            FanoutMode::FanoutSync => Self::FanoutSync,
         }
     }
 }
@@ -338,6 +404,28 @@ impl Config {
             evict.critical
         );
         anyhow::ensure!(evict.batch > 0, "store.eviction.batch must be > 0");
+
+        anyhow::ensure!(
+            self.cluster.gossip_interval_ms > 0,
+            "cluster.gossip_interval_ms must be > 0"
+        );
+        anyhow::ensure!(
+            self.cluster.fanout_timeout_ms > 0,
+            "cluster.fanout_timeout_ms must be > 0"
+        );
+        anyhow::ensure!(
+            self.cluster.queue_depth > 0,
+            "cluster.queue_depth must be > 0"
+        );
+        for peer in &self.cluster.peers {
+            // Resolved lazily on each connection so a peer that is down at
+            // startup is not fatal, but an address that can never parse is a
+            // typo worth failing on rather than retrying forever.
+            anyhow::ensure!(
+                peer.contains(':') && !peer.starts_with(':'),
+                "cluster.peers entry {peer:?} is not a host:port address"
+            );
+        }
         Ok(())
     }
 

@@ -3,6 +3,8 @@ use std::sync::Arc;
 use cache_core::ServerInfo;
 use cache_store::LmdbStore;
 
+use crate::cluster::Cluster;
+
 /// Everything a connection needs, shared by `Arc` across all of them.
 pub struct ServerState {
     pub store: Arc<LmdbStore>,
@@ -11,15 +13,24 @@ pub struct ServerState {
     /// deliberately enabled.
     pub flush_enabled: bool,
     pub metrics: crate::metrics::ServerMetrics,
+    /// Present even with no peers configured, so `CLUSTER` and `/stats` have
+    /// something truthful to report and dispatch has no special case.
+    pub cluster: Arc<Cluster>,
 }
 
 impl ServerState {
-    pub fn new(store: Arc<LmdbStore>, info: ServerInfo, flush_enabled: bool) -> Arc<Self> {
+    pub fn new(
+        store: Arc<LmdbStore>,
+        info: ServerInfo,
+        flush_enabled: bool,
+        cluster: Arc<Cluster>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             info,
             flush_enabled,
             metrics: crate::metrics::ServerMetrics::default(),
+            cluster,
         })
     }
 }

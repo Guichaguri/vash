@@ -60,6 +60,8 @@ pub const SET_BODY_HEADER_LEN: usize = 12;
 pub const HELLO_BODY_LEN: usize = 4;
 /// `ttl_secs u32` ahead of the key in a `TOUCH` body.
 pub const TOUCH_PREFIX_LEN: usize = 4;
+/// `kind u8 | reserved u8 * 3 | count u32` ahead of a `TAG_SYNC` entry list.
+pub const TAG_SYNC_HEADER_LEN: usize = 8;
 
 /// A bounds-checked forward reader over a frame body.
 ///
@@ -88,6 +90,10 @@ impl<'a> Cursor<'a> {
 
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
     fn rest(&mut self) -> &'a [u8] {
@@ -120,6 +126,61 @@ fn decode_key_list<'a>(c: &mut Cursor<'a>) -> Result<Vec<Key<'a>>, (Status, &'st
         keys.push(decode_key(bytes)?);
     }
     Ok(keys)
+}
+
+/// A decoded `TAG_SYNC` body: whether the sender listed its whole table, and
+/// the name/generation pairs it offered.
+pub type TagSyncBody<'a> = (bool, Vec<(&'a [u8], u64)>);
+
+/// Reads a `TAG_SYNC` body: a kind byte, then length-prefixed names with the
+/// generation the sender holds for each.
+///
+/// Used for requests and responses alike, and by the client, so there is one
+/// definition of the layout rather than several that can drift.
+pub fn decode_tag_sync(body: &[u8]) -> Result<TagSyncBody<'_>, (Status, &'static str)> {
+    let mut c = Cursor::new(body);
+    let header = c.take(TAG_SYNC_HEADER_LEN).ok_or((
+        Status::BadRequest,
+        "tag sync body is shorter than its header",
+    ))?;
+    let full = match header[0] {
+        0 => false,
+        1 => true,
+        // Rejected rather than defaulted: a kind this build does not know might
+        // mean the reply is expected to carry something it will not.
+        _ => return Err((Status::BadRequest, "unknown tag sync kind")),
+    };
+
+    // Bounded before it is trusted to size an allocation.
+    let count = u32::from_le_bytes(header[4..8].try_into().expect("8-byte header")) as usize;
+    if count > cache_core::MAX_TAG_SYNC_ENTRIES {
+        return Err((
+            Status::BadRequest,
+            "tag sync exceeds the maximum entry count",
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let generation = c
+            .u64()
+            .ok_or((Status::BadRequest, "truncated tag generation"))?;
+        let len = c
+            .u16()
+            .ok_or((Status::BadRequest, "truncated tag name length"))? as usize;
+        let name = c
+            .take(len)
+            .ok_or((Status::BadRequest, "truncated tag name"))?;
+        if name.is_empty() {
+            return Err((Status::BadRequest, "tag name is empty"));
+        }
+        if name.len() > cache_core::MAX_TAG_LEN {
+            return Err((Status::BadRequest, "tag name is too long"));
+        }
+        entries.push((name, generation));
+    }
+
+    Ok((full, entries))
 }
 
 /// Result of looking at just enough of `buf` to find the frame boundary.
@@ -270,7 +331,14 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
 
         Opcode::Flush => Command::Flush,
 
-        Opcode::Auth | Opcode::Stats | Opcode::Cluster => {
+        Opcode::TagSync => {
+            let (full, entries) = decode_tag_sync(body).map_err(|(s, d)| fail(s, d))?;
+            Command::TagSync { full, entries }
+        }
+
+        Opcode::Cluster => Command::Cluster,
+
+        Opcode::Auth | Opcode::Stats => {
             return Err(fail(Status::Unsupported, "opcode not implemented yet"));
         }
     };
@@ -513,6 +581,73 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn tag_sync_roundtrips_both_kinds() {
+        for full in [false, true] {
+            let entries: Vec<(&[u8], u64)> = vec![(b"news", 3), (b"sport", u64::MAX)];
+            let mut body = Vec::new();
+            encode::encode_tag_sync_body(&mut body, full, entries.iter().copied());
+
+            let buf = frame(Opcode::TagSync, 11, &body);
+            let Ok(Decoded::Request { request, .. }) = decode(&buf) else {
+                panic!("expected a request");
+            };
+            let Command::TagSync {
+                full: decoded_full,
+                entries: decoded,
+            } = request.command
+            else {
+                panic!("expected a tag sync");
+            };
+            assert_eq!(decoded_full, full);
+            assert_eq!(decoded, entries);
+        }
+    }
+
+    #[test]
+    fn an_empty_tag_sync_is_valid() {
+        // What a node with nothing invalidated yet offers: a legitimate
+        // message, not a malformed one.
+        let mut body = Vec::new();
+        encode::encode_tag_sync_body(&mut body, true, std::iter::empty());
+        assert_eq!(decode_tag_sync(&body), Ok((true, Vec::new())));
+    }
+
+    #[test]
+    fn an_oversized_tag_sync_count_allocates_nothing() {
+        // The count is attacker-controlled and is used to size a Vec, so it has
+        // to be bounded before it is trusted.
+        let mut body = vec![0u8; TAG_SYNC_HEADER_LEN];
+        body[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let buf = frame(Opcode::TagSync, 1, &body);
+        assert!(matches!(
+            decode(&buf),
+            Err(DecodeError::Body {
+                status: Status::BadRequest,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_truncated_tag_sync_entry_is_rejected() {
+        let entries: Vec<(&[u8], u64)> = vec![(b"news", 3)];
+        let mut body = Vec::new();
+        encode::encode_tag_sync_body(&mut body, false, entries.iter().copied());
+        body.truncate(body.len() - 1);
+        assert!(decode_tag_sync(&body).is_err());
+    }
+
+    #[test]
+    fn an_unknown_tag_sync_kind_is_rejected_rather_than_defaulted() {
+        // Guessing would risk answering a partial push as though it were a full
+        // digest, which is a different and much larger reply.
+        let mut body = vec![0u8; TAG_SYNC_HEADER_LEN];
+        body[0] = 7;
+        assert!(decode_tag_sync(&body).is_err());
     }
 
     #[test]

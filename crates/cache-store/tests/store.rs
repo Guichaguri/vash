@@ -443,7 +443,7 @@ fn invalidating_a_tag_hides_every_record_carrying_it() {
     h.set_tagged(b"c", b"3", 0, &[b"sport"]);
     h.set(b"untagged", b"4", 0);
 
-    assert!(h.store().delete_by_tag(b"news").unwrap());
+    assert!(h.store().delete_by_tag(b"news").unwrap().is_some());
 
     assert!(h.get(b"a").is_none(), "single-tagged record must go");
     assert!(
@@ -514,7 +514,7 @@ fn repeated_invalidations_keep_advancing() {
 #[test]
 fn invalidating_an_unknown_tag_is_a_miss_not_an_error() {
     let h = Harness::new();
-    assert!(!h.store().delete_by_tag(b"never-used").unwrap());
+    assert!(h.store().delete_by_tag(b"never-used").unwrap().is_none());
 }
 
 #[test]
@@ -851,8 +851,168 @@ fn tags_still_work_after_a_flush() {
 
     // Registrations survive a flush; only the data goes.
     h.set_tagged(b"k", b"v", 0, &[b"t"]);
-    assert!(h.store().delete_by_tag(b"t").unwrap());
+    assert!(h.store().delete_by_tag(b"t").unwrap().is_some());
     assert!(h.get(b"k").is_none());
+}
+
+// ---- cluster merge ---------------------------------------------------------
+
+#[test]
+fn merging_a_higher_generation_invalidates_like_a_local_delete() {
+    // The receiving half of cluster invalidation. A peer's message is a name
+    // and a number; applying it must hide exactly what a local
+    // `delete_by_tag` would have.
+    let h = Harness::new();
+    h.set_tagged(b"a", b"1", 0, &[b"news"]);
+    h.set_tagged(b"b", b"2", 0, &[b"sport"]);
+
+    let generation = h.store().merge_tag_generation(b"news", 1).unwrap();
+    assert_eq!(generation, 1);
+
+    assert!(h.get(b"a").is_none());
+    assert_eq!(h.get(b"b").as_deref(), Some(&b"2"[..]));
+}
+
+#[test]
+fn merging_is_idempotent_and_never_moves_backwards() {
+    // The CRDT property the whole cluster design rests on: at-least-once
+    // delivery in any order has to be enough, so a replay must change nothing
+    // and a stale message must not undo a newer invalidation.
+    let h = Harness::new();
+    h.set_tagged(b"k", b"v", 0, &[b"t"]);
+    h.store().delete_by_tag(b"t").unwrap();
+
+    h.set_tagged(b"k", b"fresh", 0, &[b"t"]);
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"fresh"[..]));
+
+    // A duplicate of the invalidation that already happened.
+    assert_eq!(h.store().merge_tag_generation(b"t", 1).unwrap(), 1);
+    assert_eq!(
+        h.get(b"k").as_deref(),
+        Some(&b"fresh"[..]),
+        "a replayed invalidation must not kill a record written after it"
+    );
+
+    // An older one, arriving late.
+    assert_eq!(h.store().merge_tag_generation(b"t", 0).unwrap(), 1);
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"fresh"[..]));
+}
+
+#[test]
+fn merging_registers_a_tag_this_node_has_never_seen() {
+    // Required for convergence: without the registration, a later local write
+    // with that tag would capture generation 0 and the next gossip round would
+    // invalidate a record written after the last invalidation.
+    let h = Harness::new();
+    assert_eq!(h.store().merge_tag_generation(b"remote", 7).unwrap(), 7);
+
+    h.set_tagged(b"k", b"v", 0, &[b"remote"]);
+    assert_eq!(
+        h.get(b"k").as_deref(),
+        Some(&b"v"[..]),
+        "a write after the merge captures the merged generation and is live"
+    );
+
+    // And the node now reports that generation to its peers.
+    let digest = h.store().tag_generations().unwrap();
+    let entry = digest
+        .iter()
+        .find(|e| &*e.name == b"remote")
+        .expect("the tag is registered");
+    assert_eq!(entry.generation, 7);
+}
+
+#[test]
+fn a_digest_reports_one_entry_per_name_regardless_of_shards() {
+    let h = Harness::with(|c| c.shards = 4);
+    for i in 0..40u32 {
+        h.set_tagged(format!("k{i}").as_bytes(), b"v", 0, &[b"spread"]);
+    }
+    h.store().delete_by_tag(b"spread").unwrap();
+
+    let digest = h.store().tag_generations().unwrap();
+    assert_eq!(
+        digest.iter().filter(|e| &*e.name == b"spread").count(),
+        1,
+        "a name is one cluster-visible fact, not one per shard: {digest:?}"
+    );
+    assert_eq!(digest[0].generation, 1);
+}
+
+#[test]
+fn a_merge_that_changes_nothing_costs_no_writes() {
+    // Gossip re-offers the same generations every interval. If each round
+    // turned into a write per shard, a converged cluster would spend its write
+    // capacity agreeing with itself.
+    let h = Harness::with(|c| {
+        c.shards = 4;
+        // Nothing may be attributed to background maintenance.
+        c.write.sweep_interval_ms = 60_000;
+    });
+    h.set_tagged(b"k", b"v", 0, &[b"news"]);
+    h.store().delete_by_tag(b"news").unwrap();
+
+    let before = h.store().stats().unwrap().commits;
+    for _ in 0..20 {
+        assert_eq!(h.store().merge_tag_generation(b"news", 1).unwrap(), 1);
+    }
+    assert_eq!(
+        h.store().stats().unwrap().commits,
+        before,
+        "a merge of a generation already held must not reach the writer"
+    );
+}
+
+#[test]
+fn merging_an_unknown_tag_registers_it_once_not_once_per_shard() {
+    let h = Harness::with(|c| c.shards = 4);
+    h.store().merge_tag_generation(b"remote", 3).unwrap();
+
+    assert_eq!(
+        h.store().stats().unwrap().tags,
+        1,
+        "nothing can be carrying the tag yet, so one shard recording the \
+         generation is enough"
+    );
+
+    // And it is still the generation every shard will use.
+    for i in 0..40u32 {
+        h.set_tagged(format!("k{i}").as_bytes(), b"v", 0, &[b"remote"]);
+        assert_eq!(
+            h.get(format!("k{i}").as_bytes()).as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+}
+
+#[test]
+fn a_shard_that_meets_a_tag_late_adopts_the_node_wide_generation() {
+    // Shards register tags independently, so one can meet a name long after
+    // another has invalidated it. If it started at zero, the node would report
+    // one generation to its peers while holding a lower one in that shard — and
+    // the first gossip round back would invalidate records written after the
+    // last invalidation.
+    let h = Harness::with(|c| c.shards = 4);
+
+    // One key, so only one shard registers the tag.
+    h.set_tagged(b"first", b"v", 0, &[b"t"]);
+    let generation = h.store().delete_by_tag(b"t").unwrap().unwrap();
+    assert_eq!(generation, 1);
+
+    // Enough keys to be certain every shard now carries the tag.
+    for i in 0..40u32 {
+        h.set_tagged(format!("late{i}").as_bytes(), b"v", 0, &[b"t"]);
+    }
+
+    // Whatever a peer echoes back, nothing written after the invalidation dies.
+    h.store().merge_tag_generation(b"t", generation).unwrap();
+    for i in 0..40u32 {
+        assert_eq!(
+            h.get(format!("late{i}").as_bytes()).as_deref(),
+            Some(&b"v"[..]),
+            "late{i} was written after the invalidation and must survive it"
+        );
+    }
 }
 
 // ---- sharding --------------------------------------------------------------
@@ -947,7 +1107,7 @@ fn tags_invalidate_across_every_shard() {
     for i in 0..200u32 {
         h.set_tagged(format!("k{i}").as_bytes(), b"v", 0, &[b"everything"]);
     }
-    assert!(h.store().delete_by_tag(b"everything").unwrap());
+    assert!(h.store().delete_by_tag(b"everything").unwrap().is_some());
 
     for i in 0..200u32 {
         assert!(

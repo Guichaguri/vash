@@ -5,6 +5,7 @@
 //! than testing a stubbed-out approximation of it.
 
 pub mod admin;
+pub mod cluster;
 pub mod config;
 pub mod conn;
 pub mod dispatch;
@@ -42,8 +43,25 @@ impl Server {
             .with_context(|| format!("opening store at {}", config.store.path.display()))?;
         let store = Arc::new(store);
 
-        let info = dispatch::server_info(store.shard_count() as u16, config.store.max_value_bytes);
-        let state = ServerState::new(Arc::clone(&store), info, config.protocol.flush_enabled);
+        // Started before the listener so a peer that answers instantly on the
+        // very first invalidation finds the tasks already running.
+        let cluster = cluster::Cluster::start(
+            &config.cluster,
+            Arc::clone(&store),
+            Arc::new(metrics::ClusterMetrics::default()),
+        );
+
+        let info = dispatch::server_info(
+            store.shard_count() as u16,
+            config.store.max_value_bytes,
+            cluster.active(),
+        );
+        let state = ServerState::new(
+            Arc::clone(&store),
+            info,
+            config.protocol.flush_enabled,
+            cluster,
+        );
 
         let listener = TcpListener::bind(config.server.listen)
             .await
@@ -101,6 +119,11 @@ impl Server {
             connections,
         } = self;
 
+        // Signalled once the listener is gone, so connections sitting idle
+        // between requests let go instead of holding the drain open until it
+        // times out.
+        let (conn_stop, conn_stopped) = tokio::sync::watch::channel(false);
+
         // The admin endpoints get their own listener and their own shutdown
         // signal, so a scrape in flight cannot hold up the drain.
         let (admin_stop, admin_stopped) = tokio::sync::oneshot::channel();
@@ -142,9 +165,10 @@ impl Server {
 
                     let conn_state = Arc::clone(&state);
                     let read_buffer = config.server.read_buffer;
+                    let stopping = conn_stopped.clone();
                     conn_state.metrics.connection_opened();
                     tokio::spawn(async move {
-                        if let Err(e) = conn::handle(stream, Arc::clone(&conn_state), read_buffer).await {
+                        if let Err(e) = conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping).await {
                             debug!(%peer, error = %e, "connection ended with an error");
                         }
                         conn_state.metrics.connection_closed();
@@ -163,6 +187,7 @@ impl Server {
         // permit being back means every connection task has ended and dropped
         // its handle on the store.
         drop(listener);
+        let _ = conn_stop.send(true);
         let _ = admin_stop.send(());
         if let Some(task) = admin_task {
             let _ = task.await;
@@ -176,6 +201,10 @@ impl Server {
                 "drain timed out; closing with connections still open"
             ),
         }
+
+        // Peer tasks hold their own handle on the store, so they have to be
+        // stopped and joined before it can be closed below.
+        state.cluster.shutdown().await;
 
         // Get everything buffered onto disk before exiting. In `relaxed`
         // durability this is the difference between a clean restart and losing

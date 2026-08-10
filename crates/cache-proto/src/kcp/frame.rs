@@ -100,6 +100,11 @@ pub enum Opcode {
 
     DeleteByTag = 0x30,
     Flush = 0x31,
+
+    /// Peer-to-peer: merge tag generations. Not a client command, but it rides
+    /// the same protocol on the same port because a peer is just another KCP
+    /// client from the server's point of view.
+    TagSync = 0x40,
 }
 
 impl Opcode {
@@ -119,6 +124,7 @@ impl Opcode {
             0x22 => Self::DeleteMany,
             0x30 => Self::DeleteByTag,
             0x31 => Self::Flush,
+            0x40 => Self::TagSync,
             _ => return None,
         })
     }
