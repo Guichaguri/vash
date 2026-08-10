@@ -9,13 +9,17 @@ listen = "127.0.0.1:11311"
 # can fall back to the origin, a client left waiting cannot.
 max_connections = 10000
 read_buffer = 16384
+# Ceiling on concurrent store operations, and therefore on LMDB reader slots in
+# use. store.max_readers must exceed it, or reads fail with MDB_READERS_FULL
+# under load; startup refuses a config where it does not.
+max_blocking_threads = 128
 
 [store]
 path = "data"
 # An address-space reservation, not a preallocation — verified on both Linux
 # and Windows — so a generous value costs nothing until the data arrives.
 map_size_mb = 4096
-max_readers = 128
+max_readers = 256
 
 # durable   fsync on every commit
 # relaxed   skips the meta-page sync; loses at most the last few transactions
@@ -25,6 +29,29 @@ durability = "relaxed"
 
 max_value_bytes = 1048576
 wipe_on_start = false
+
+[store.write]
+# LMDB permits one writer, so writes scale only by sharing transactions. A batch
+# is whatever queued while the previous commit was in flight.
+max_batch = 1024
+# Writes beyond this many queued are refused with OVERLOADED rather than piling
+# up behind a writer that is already saturated.
+queue_depth = 4096
+# Artificial delay before sealing a batch. Zero adds no latency when idle and
+# still batches under load; raise it only to trade latency for throughput.
+linger_us = 0
+
+[store.ttl]
+# Expiry-index buckets round up to this. Coarser means fewer distinct index keys
+# and less write amplification. It never delays a read from seeing a key as
+# expired — reads check the record's exact timestamp.
+bucket_granularity_ms = 1000
+# The sweeper shares the writer's transaction, so reclamation costs no extra
+# commit. This is also how long the writer waits for work before waking to
+# sweep, which makes idle sweeps free.
+sweep_interval_ms = 100
+# Bounds how long one reclamation pass can hold the write transaction.
+sweep_batch = 512
 
 [observability]
 log_format = "pretty"   # or "json"

@@ -80,14 +80,34 @@ fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> 
             None => Ok(Reply::NotFound),
         },
 
+        Command::GetMany(keys) => Ok(Reply::Values(
+            state.store.get_many(keys).map_err(to_status)?,
+        )),
+
         Command::Set(set) => {
             let cas = state.store.set(set).map_err(to_status)?;
             Ok(Reply::Stored { cas })
         }
 
+        Command::SetMany(sets) => Ok(Reply::StoredMany(
+            state.store.set_many(sets).map_err(to_status)?,
+        )),
+
         Command::Delete { key } => {
             if state.store.delete(*key).map_err(to_status)? {
                 Ok(Reply::Deleted)
+            } else {
+                Ok(Reply::NotFound)
+            }
+        }
+
+        Command::DeleteMany(keys) => Ok(Reply::DeletedMany(
+            state.store.delete_many(keys).map_err(to_status)?,
+        )),
+
+        Command::Touch { key, ttl_secs } => {
+            if state.store.touch(*key, *ttl_secs).map_err(to_status)? {
+                Ok(Reply::Touched)
             } else {
                 Ok(Reply::NotFound)
             }
@@ -105,6 +125,7 @@ fn to_status(err: StoreError) -> Status {
 
     match err {
         StoreError::CapacityFull => Status::CapacityFull,
+        StoreError::Overloaded | StoreError::ShuttingDown => Status::Overloaded,
         StoreError::Unsupported(what) => {
             warn!(what, "client used a feature this build does not implement");
             Status::Unsupported

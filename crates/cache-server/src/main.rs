@@ -53,6 +53,10 @@ fn main() -> anyhow::Result<()> {
     // format rather than on a bare stderr.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Bounded so the ceiling on concurrent reads is known, and can be
+        // checked against the LMDB reader-slot table. The default of 512 would
+        // silently exceed it.
+        .max_blocking_threads(config.server.max_blocking_threads)
         .build()
         .context("building the tokio runtime")?;
 

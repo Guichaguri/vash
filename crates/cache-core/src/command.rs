@@ -22,14 +22,36 @@ pub mod capability {
 /// The KCP protocol version this build implements.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Upper bound on items in a single batch request.
+///
+/// Bounds both the work one frame can demand and the size of the write
+/// transaction a batch turns into, so a client cannot stall the shard writer
+/// with one enormous `SET_MANY`.
+pub const MAX_BATCH_ITEMS: usize = 4096;
+
 /// A decoded request, borrowing from the connection's read buffer.
 #[derive(Debug, Clone)]
 pub enum Command<'a> {
-    Hello { protocol_version: u16 },
+    Hello {
+        protocol_version: u16,
+    },
     Ping,
-    Get { key: Key<'a> },
+    Get {
+        key: Key<'a>,
+    },
+    GetMany(Vec<Key<'a>>),
     Set(Set<'a>),
-    Delete { key: Key<'a> },
+    SetMany(Vec<Set<'a>>),
+    Delete {
+        key: Key<'a>,
+    },
+    DeleteMany(Vec<Key<'a>>),
+    /// Extends (or clears, with `ttl_secs` of 0) a key's lifetime without
+    /// resending its value.
+    Touch {
+        key: Key<'a>,
+        ttl_secs: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -46,13 +68,28 @@ pub struct Set<'a> {
 }
 
 /// The outcome of a command, ready to be encoded by whichever adapter received it.
+///
+/// Batch replies carry one entry per request item, in request order. They have
+/// no per-item error variant on purpose: everything that can be rejected per
+/// item (key length, value size, tag limits) is rejected while decoding, and a
+/// failure at execution time — the map filling up, an LMDB error — fails the
+/// whole transaction. So by the time a batch runs, either all of it applies or
+/// none of it does.
 #[derive(Debug, Clone)]
 pub enum Reply {
     Hello(ServerInfo),
     Pong,
     Value(Value),
-    Stored { cas: u64 },
+    /// One slot per requested key; `None` is a miss.
+    Values(Vec<Option<Value>>),
+    Stored {
+        cas: u64,
+    },
+    StoredMany(Vec<u64>),
     Deleted,
+    /// `true` where the key was live before the delete.
+    DeletedMany(Vec<bool>),
+    Touched,
     NotFound,
 }
 

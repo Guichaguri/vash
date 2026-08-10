@@ -145,6 +145,84 @@ impl Client {
         }
     }
 
+    /// Replaces a key's TTL without resending its value. Returns whether the
+    /// key was live.
+    pub async fn touch(&mut self, key: &[u8], ttl_secs: u32) -> Result<bool> {
+        let mut body = Vec::with_capacity(4 + key.len());
+        cache_proto::kcp::encode_touch_body(&mut body, key, ttl_secs);
+
+        match self.round_trip(Opcode::Touch, &body).await? {
+            (Status::Ok, _) => Ok(true),
+            (Status::NotFound, _) => Ok(false),
+            (status, _) => Err(ClientError::Status(status)),
+        }
+    }
+
+    /// Fetches many keys in one round trip, against one consistent snapshot.
+    /// The result has one slot per requested key, in order; `None` is a miss.
+    pub async fn get_many(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Value>>> {
+        let mut body = Vec::with_capacity(4 + keys.len() * 16);
+        cache_proto::kcp::encode_key_list_body(&mut body, keys);
+
+        let (status, payload) = self.round_trip(Opcode::GetMany, &body).await?;
+        if status != Status::Ok {
+            return Err(ClientError::Status(status));
+        }
+
+        let mut c = Reader::new(payload);
+        let count = c.u32()? as usize;
+        let mut values = Vec::with_capacity(count.min(keys.len()));
+        for _ in 0..count {
+            if c.u8()? == 0 {
+                values.push(None);
+                continue;
+            }
+            let mc_flags = c.u32()?;
+            let cas = c.u64()?;
+            let len = c.u32()? as usize;
+            values.push(Some(Value {
+                data: c.take(len)?,
+                mc_flags,
+                cas,
+            }));
+        }
+        Ok(values)
+    }
+
+    /// Stores many values in one round trip. All of them apply or none do.
+    pub async fn set_many(&mut self, items: &[(&[u8], &[u8], u32)]) -> Result<Vec<u64>> {
+        let mut body = Vec::new();
+        cache_proto::kcp::encode_batch_count(&mut body, items.len());
+        for (key, value, ttl_secs) in items {
+            encode_set_body(&mut body, key, value, *ttl_secs, &[]);
+        }
+
+        let (status, payload) = self.round_trip(Opcode::SetMany, &body).await?;
+        if status != Status::Ok {
+            return Err(ClientError::Status(status));
+        }
+
+        let mut c = Reader::new(payload);
+        let count = c.u32()? as usize;
+        (0..count).map(|_| c.u64()).collect()
+    }
+
+    /// Deletes many keys in one round trip. Each result is whether that key was
+    /// live beforehand.
+    pub async fn delete_many(&mut self, keys: &[&[u8]]) -> Result<Vec<bool>> {
+        let mut body = Vec::with_capacity(4 + keys.len() * 16);
+        cache_proto::kcp::encode_key_list_body(&mut body, keys);
+
+        let (status, payload) = self.round_trip(Opcode::DeleteMany, &body).await?;
+        if status != Status::Ok {
+            return Err(ClientError::Status(status));
+        }
+
+        let mut c = Reader::new(payload);
+        let count = c.u32()? as usize;
+        (0..count).map(|_| Ok(c.u8()? != 0)).collect()
+    }
+
     async fn round_trip(&mut self, opcode: Opcode, body: &[u8]) -> Result<(Status, Bytes)> {
         let request_id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
@@ -187,6 +265,48 @@ impl Client {
                 }
             }
         }
+    }
+}
+
+/// Bounds-checked forward reader over a response body.
+///
+/// Every accessor returns a protocol error rather than panicking, so a
+/// malformed or truncated response is an ordinary error the caller can handle.
+struct Reader {
+    buf: Bytes,
+    pos: usize,
+}
+
+impl Reader {
+    fn new(buf: Bytes) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<Bytes> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(ClientError::Protocol("response length overflowed"))?;
+        if end > self.buf.len() {
+            return Err(ClientError::Protocol("response body was truncated"));
+        }
+        let slice = self.buf.slice(self.pos..end);
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        let raw = self.take(4)?;
+        Ok(u32::from_le_bytes(raw[..].try_into().expect("4 bytes")))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        let raw = self.take(8)?;
+        Ok(u64::from_le_bytes(raw[..].try_into().expect("8 bytes")))
     }
 }
 

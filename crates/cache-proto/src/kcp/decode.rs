@@ -58,6 +58,69 @@ pub struct SetBodyHeader {
 
 pub const SET_BODY_HEADER_LEN: usize = 12;
 pub const HELLO_BODY_LEN: usize = 4;
+/// `ttl_secs u32` ahead of the key in a `TOUCH` body.
+pub const TOUCH_PREFIX_LEN: usize = 4;
+
+/// A bounds-checked forward reader over a frame body.
+///
+/// Every accessor returns `None` rather than panicking on a short read, so
+/// truncated input from an unauthenticated client is an ordinary error path.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn rest(&mut self) -> &'a [u8] {
+        let slice = &self.buf[self.pos..];
+        self.pos = self.buf.len();
+        slice
+    }
+}
+
+/// Reads a batch item count, rejecting anything past the limit **before** it is
+/// used to size an allocation.
+fn decode_count(c: &mut Cursor<'_>) -> Result<usize, (Status, &'static str)> {
+    let count = c
+        .u32()
+        .ok_or((Status::BadRequest, "batch is missing its item count"))? as usize;
+    if count > cache_core::MAX_BATCH_ITEMS {
+        return Err((Status::BadRequest, "batch exceeds the maximum item count"));
+    }
+    Ok(count)
+}
+
+fn decode_key_list<'a>(c: &mut Cursor<'a>) -> Result<Vec<Key<'a>>, (Status, &'static str)> {
+    let count = decode_count(c)?;
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = c
+            .u16()
+            .ok_or((Status::BadRequest, "truncated key length"))? as usize;
+        let bytes = c.take(len).ok_or((Status::BadRequest, "truncated key"))?;
+        keys.push(decode_key(bytes)?);
+    }
+    Ok(keys)
+}
 
 /// Result of looking at just enough of `buf` to find the frame boundary.
 #[derive(Debug, PartialEq, Eq)]
@@ -158,17 +221,43 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
             key: decode_key(body).map_err(|(s, d)| fail(s, d))?,
         },
 
-        Opcode::Set => Command::Set(decode_set(body).map_err(|(s, d)| fail(s, d))?),
+        Opcode::Set => {
+            let mut cursor = Cursor::new(body);
+            Command::Set(decode_set(&mut cursor).map_err(|(s, d)| fail(s, d))?)
+        }
 
-        Opcode::Auth
-        | Opcode::Stats
-        | Opcode::Cluster
-        | Opcode::Touch
-        | Opcode::GetMany
-        | Opcode::SetMany
-        | Opcode::DeleteMany
-        | Opcode::DeleteByTag
-        | Opcode::Flush => {
+        Opcode::Touch => {
+            let mut cursor = Cursor::new(body);
+            let ttl_secs = cursor
+                .u32()
+                .ok_or_else(|| fail(Status::BadRequest, "touch body is too short"))?;
+            Command::Touch {
+                key: decode_key(cursor.rest()).map_err(|(s, d)| fail(s, d))?,
+                ttl_secs,
+            }
+        }
+
+        Opcode::GetMany => {
+            let mut cursor = Cursor::new(body);
+            Command::GetMany(decode_key_list(&mut cursor).map_err(|(s, d)| fail(s, d))?)
+        }
+
+        Opcode::DeleteMany => {
+            let mut cursor = Cursor::new(body);
+            Command::DeleteMany(decode_key_list(&mut cursor).map_err(|(s, d)| fail(s, d))?)
+        }
+
+        Opcode::SetMany => {
+            let mut cursor = Cursor::new(body);
+            let count = decode_count(&mut cursor).map_err(|(s, d)| fail(s, d))?;
+            let mut sets = Vec::with_capacity(count);
+            for _ in 0..count {
+                sets.push(decode_set(&mut cursor).map_err(|(s, d)| fail(s, d))?);
+            }
+            Command::SetMany(sets)
+        }
+
+        Opcode::Auth | Opcode::Stats | Opcode::Cluster | Opcode::DeleteByTag | Opcode::Flush => {
             return Err(fail(Status::Unsupported, "opcode not implemented yet"));
         }
     };
@@ -192,26 +281,21 @@ fn decode_key(bytes: &[u8]) -> Result<Key<'_>, (Status, &'static str)> {
     })
 }
 
-fn decode_set(body: &[u8]) -> Result<Set<'_>, (Status, &'static str)> {
-    let Ok((header, rest)) = SetBodyHeader::ref_from_prefix(body) else {
-        return Err((Status::BadRequest, "set body is shorter than its header"));
-    };
+fn decode_set<'a>(c: &mut Cursor<'a>) -> Result<Set<'a>, (Status, &'static str)> {
+    let raw = c
+        .take(SET_BODY_HEADER_LEN)
+        .ok_or((Status::BadRequest, "set body is shorter than its header"))?;
+    let header = SetBodyHeader::ref_from_bytes(raw)
+        .map_err(|_| (Status::BadRequest, "malformed set header"))?;
 
-    let key_len = header.key_len.get() as usize;
-    let value_len = header.value_len.get() as usize;
-
-    // `body_len` is already bounded, so this addition cannot overflow.
-    if rest.len() < key_len + value_len {
-        return Err((
-            Status::BadRequest,
-            "set body is shorter than its declared key and value",
-        ));
-    }
-
-    let key = decode_key(&rest[..key_len])?;
-    let after_key = &rest[key_len..];
-    let value = &after_key[..value_len];
-    let mut tail = &after_key[value_len..];
+    let key = decode_key(c.take(header.key_len.get() as usize).ok_or((
+        Status::BadRequest,
+        "set body is shorter than its declared key",
+    ))?)?;
+    let value = c.take(header.value_len.get() as usize).ok_or((
+        Status::BadRequest,
+        "set body is shorter than its declared value",
+    ))?;
 
     let tag_count = header.tag_count as usize;
     if tag_count > cache_core::MAX_TAGS {
@@ -220,14 +304,12 @@ fn decode_set(body: &[u8]) -> Result<Set<'_>, (Status, &'static str)> {
 
     let mut tags = Vec::with_capacity(tag_count);
     for _ in 0..tag_count {
-        if tail.len() < 2 {
-            return Err((Status::BadRequest, "truncated tag length"));
-        }
-        let len = u16::from_le_bytes([tail[0], tail[1]]) as usize;
-        if tail.len() < 2 + len {
-            return Err((Status::BadRequest, "truncated tag name"));
-        }
-        let name = &tail[2..2 + len];
+        let len = c
+            .u16()
+            .ok_or((Status::BadRequest, "truncated tag length"))? as usize;
+        let name = c
+            .take(len)
+            .ok_or((Status::BadRequest, "truncated tag name"))?;
         if name.is_empty() {
             return Err((Status::BadRequest, "tag name is empty"));
         }
@@ -235,7 +317,6 @@ fn decode_set(body: &[u8]) -> Result<Set<'_>, (Status, &'static str)> {
             return Err((Status::BadRequest, "tag name is too long"));
         }
         tags.push(name);
-        tail = &tail[2 + len..];
     }
 
     Ok(Set {

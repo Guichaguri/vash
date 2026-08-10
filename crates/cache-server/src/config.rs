@@ -26,6 +26,12 @@ pub struct ServerConfig {
     pub max_connections: usize,
     /// Bytes reserved per connection read buffer.
     pub read_buffer: usize,
+    /// Threads available for store operations.
+    ///
+    /// This is the ceiling on concurrent reads, and therefore on LMDB reader
+    /// slots in use — `store.max_readers` has to cover it or reads start
+    /// failing with `MDB_READERS_FULL` under load. Validation enforces that.
+    pub max_blocking_threads: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +43,57 @@ pub struct StoreConfig {
     pub durability: Durability,
     pub max_value_bytes: usize,
     pub wipe_on_start: bool,
+    pub write: WriteConfig,
+    pub ttl: TtlConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WriteConfig {
+    /// Most operations packed into a single commit.
+    pub max_batch: usize,
+    /// Queued writes before further ones are refused with `OVERLOADED`.
+    pub queue_depth: usize,
+    /// Artificial delay before sealing a batch. Zero — the default — batches
+    /// whatever queued during the previous commit, which adds no latency when
+    /// idle and still forms large batches under load.
+    pub linger_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TtlConfig {
+    /// Granularity that expiry-index buckets round up to. Coarser means fewer
+    /// distinct index keys and less write amplification. It never delays a read
+    /// from seeing a key as expired, because reads check the record's exact
+    /// timestamp.
+    pub bucket_granularity_ms: u64,
+    pub sweep_interval_ms: u64,
+    /// Most index entries examined per sweep, bounding how long reclamation can
+    /// hold the write transaction.
+    pub sweep_batch: usize,
+}
+
+impl Default for WriteConfig {
+    fn default() -> Self {
+        let defaults = cache_store::WriteConfig::default();
+        Self {
+            max_batch: defaults.max_batch,
+            queue_depth: defaults.queue_depth,
+            linger_us: defaults.linger_us,
+        }
+    }
+}
+
+impl Default for TtlConfig {
+    fn default() -> Self {
+        let defaults = cache_store::WriteConfig::default();
+        Self {
+            bucket_granularity_ms: 1000,
+            sweep_interval_ms: defaults.sweep_interval_ms,
+            sweep_batch: defaults.sweep_batch,
+        }
+    }
 }
 
 /// Mirrors `cache_store::Durability`, kept separate so the store crate does not
@@ -74,6 +131,7 @@ impl Default for ServerConfig {
             listen: "127.0.0.1:11311".parse().expect("valid default address"),
             max_connections: 10_000,
             read_buffer: 16 * 1024,
+            max_blocking_threads: 128,
         }
     }
 }
@@ -83,10 +141,14 @@ impl Default for StoreConfig {
         Self {
             path: PathBuf::from("data"),
             map_size_mb: 4096,
-            max_readers: 128,
+            // Comfortably above the default blocking pool, which is the ceiling
+            // on concurrent readers; validation enforces the relationship.
+            max_readers: 256,
             durability: Durability::default(),
             max_value_bytes: cache_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
+            write: WriteConfig::default(),
+            ttl: TtlConfig::default(),
         }
     }
 }
@@ -129,6 +191,43 @@ impl Config {
             self.server.read_buffer >= cache_proto::kcp::HEADER_LEN,
             "server.read_buffer must hold at least one frame header"
         );
+        anyhow::ensure!(
+            self.server.max_blocking_threads > 0,
+            "server.max_blocking_threads must be > 0"
+        );
+
+        // Each concurrent read holds an LMDB reader slot for the life of its
+        // transaction, so the slot table has to cover every thread that can be
+        // reading at once, plus the writer. Getting this wrong shows up only
+        // under load, as MDB_READERS_FULL.
+        anyhow::ensure!(
+            self.store.max_readers as usize > self.server.max_blocking_threads,
+            "store.max_readers ({}) must exceed server.max_blocking_threads ({}), \
+             or reads will fail with MDB_READERS_FULL under load",
+            self.store.max_readers,
+            self.server.max_blocking_threads
+        );
+
+        anyhow::ensure!(
+            self.store.write.max_batch > 0,
+            "store.write.max_batch must be > 0"
+        );
+        anyhow::ensure!(
+            self.store.write.queue_depth > 0,
+            "store.write.queue_depth must be > 0"
+        );
+        anyhow::ensure!(
+            self.store.ttl.sweep_interval_ms > 0,
+            "store.ttl.sweep_interval_ms must be > 0"
+        );
+        anyhow::ensure!(
+            self.store.ttl.sweep_batch > 0,
+            "store.ttl.sweep_batch must be > 0"
+        );
+        anyhow::ensure!(
+            self.store.ttl.bucket_granularity_ms > 0,
+            "store.ttl.bucket_granularity_ms must be > 0"
+        );
         Ok(())
     }
 
@@ -140,6 +239,14 @@ impl Config {
             durability: self.store.durability.into(),
             max_value_len: self.store.max_value_bytes,
             wipe_on_start: self.store.wipe_on_start,
+            bucket_granularity_ms: self.store.ttl.bucket_granularity_ms,
+            write: cache_store::WriteConfig {
+                max_batch: self.store.write.max_batch,
+                queue_depth: self.store.write.queue_depth,
+                linger_us: self.store.write.linger_us,
+                sweep_interval_ms: self.store.ttl.sweep_interval_ms,
+                sweep_batch: self.store.ttl.sweep_batch,
+            },
         }
     }
 }
@@ -176,6 +283,17 @@ mod tests {
     fn rejects_unknown_keys_rather_than_ignoring_them() {
         let err = toml::from_str::<Config>("[store]\nmap_sise_mb = 10\n").unwrap_err();
         assert!(err.to_string().contains("map_sise_mb"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_reader_table_too_small_for_the_blocking_pool() {
+        // Getting this wrong surfaces only under load, as MDB_READERS_FULL, so
+        // it has to be caught at startup.
+        let mut config = Config::default();
+        config.server.max_blocking_threads = config.store.max_readers as usize;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("MDB_READERS_FULL"), "{err}");
     }
 
     #[test]

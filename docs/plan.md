@@ -475,6 +475,15 @@ the whole server. The channel hop costs ~200 ns and a `oneshot`; a LAN round-tri
 `store.inline_reads = true` skips the hop for deployments that guarantee the working set is resident.
 Default off, and it stays off until a benchmark says otherwise.
 
+**As implemented (M1):** writes go to a dedicated writer thread as described below, but reads run on
+the async runtime's **bounded blocking pool** rather than a hand-rolled reader pool. That already
+satisfies the property this section is about — a page fault stalls a blocking thread, never a runtime
+worker — with less machinery. The consequence is that `server.max_blocking_threads` is the ceiling on
+concurrent readers, and therefore on LMDB reader slots in use: `store.max_readers` must exceed it or
+reads fail with `MDB_READERS_FULL` under load. Startup refuses a config where it does not. A dedicated
+reader pool stays on the table for M6, if benchmarks show the blocking pool's handoff costs enough to
+justify it.
+
 ### Reads
 
 LMDB's MVCC gives unlimited concurrent readers with **no locks and no interference with the writer**.

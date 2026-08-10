@@ -20,6 +20,16 @@ pub enum StoreError {
     #[error("{0} is not supported yet")]
     Unsupported(&'static str),
 
+    /// The writer queue is full. Reported rather than queued without bound: a
+    /// client told "overloaded" can fall back to its origin, a client left
+    /// waiting cannot.
+    #[error("write queue is full")]
+    Overloaded,
+
+    /// The store is closing and cannot accept more writes.
+    #[error("store is shutting down")]
+    ShuttingDown,
+
     #[error("database is corrupt or was written by an incompatible build: {0}")]
     Corrupt(String),
 }

@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cache_client::{Client, ClientError};
 use cache_proto::kcp::Status;
@@ -16,6 +17,12 @@ use tokio::task::JoinHandle;
 struct TestServer {
     addr: SocketAddr,
     dir: TempDir,
+    /// Held so tests can inspect on-disk state directly — `entries()` is the
+    /// only way to tell the sweeper apart from the lazy read-path check.
+    ///
+    /// An `Option` because it must be released before the server shuts down:
+    /// the environment cannot close while another handle is outstanding.
+    store: Option<Arc<cache_store::LmdbStore>>,
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -35,6 +42,7 @@ impl TestServer {
 
         let server = Server::bind(config).await.expect("binding the server");
         let addr = server.local_addr().expect("reading the bound address");
+        let store = Arc::clone(server.store());
 
         let (tx, rx) = oneshot::channel();
         let handle = tokio::spawn(async move {
@@ -48,6 +56,7 @@ impl TestServer {
         Self {
             addr,
             dir,
+            store: Some(store),
             shutdown: Some(tx),
             handle: Some(handle),
         }
@@ -61,8 +70,22 @@ impl TestServer {
         self.dir.path().join("db")
     }
 
+    /// Records currently on disk, including any the sweeper has not reached.
+    fn entries(&self) -> u64 {
+        use cache_store::Store;
+        self.store
+            .as_ref()
+            .expect("store handle released")
+            .stats()
+            .expect("reading store stats")
+            .entries
+    }
+
     /// Stops the server and waits for it to release the database.
     async fn stop(mut self) -> TempDir {
+        // Must go first: the server closes the LMDB environment on shutdown,
+        // and cannot while this handle is alive.
+        drop(self.store.take());
         drop(self.shutdown.take());
         self.handle
             .take()
@@ -356,6 +379,152 @@ async fn deleting_an_expired_key_reports_a_miss() {
     // Present on disk but logically absent, so the delete is a miss even though
     // it reclaims the row.
     assert!(!client.delete(b"gone").await.unwrap());
+}
+
+#[tokio::test]
+async fn touch_extends_a_lifetime_over_the_wire() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set(b"k", b"payload", 1).await.unwrap();
+    assert!(client.touch(b"k", 3600).await.unwrap());
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    let got = client
+        .get(b"k")
+        .await
+        .unwrap()
+        .expect("survived its original ttl");
+    assert_eq!(&got.data[..], b"payload");
+}
+
+#[tokio::test]
+async fn touch_misses_on_an_absent_key() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    assert!(!client.touch(b"absent", 60).await.unwrap());
+}
+
+#[tokio::test]
+async fn get_many_returns_one_slot_per_key_in_order() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set(b"a", b"1", 0).await.unwrap();
+    client.set(b"c", b"3", 0).await.unwrap();
+
+    let values = client
+        .get_many(&[b"a".as_slice(), b"missing", b"c"])
+        .await
+        .unwrap();
+
+    assert_eq!(values.len(), 3);
+    assert_eq!(&values[0].as_ref().unwrap().data[..], b"1");
+    assert!(values[1].is_none(), "a miss must keep its position");
+    assert_eq!(&values[2].as_ref().unwrap().data[..], b"3");
+}
+
+#[tokio::test]
+async fn get_many_of_an_empty_list_is_an_empty_result() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    assert!(client.get_many(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn set_many_then_get_many_round_trips() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let items: Vec<(&[u8], &[u8], u32)> = vec![
+        (b"k1", b"v1", 0),
+        (b"k2", b"v2", 3600),
+        (b"k3", b"", 0), // empty values must survive a batch too
+    ];
+    let cas = client.set_many(&items).await.unwrap();
+    assert_eq!(cas.len(), 3);
+    assert!(
+        cas.windows(2).all(|w| w[1] > w[0]),
+        "cas must advance in order"
+    );
+
+    let values = client
+        .get_many(&[b"k1".as_slice(), b"k2", b"k3"])
+        .await
+        .unwrap();
+    assert_eq!(&values[0].as_ref().unwrap().data[..], b"v1");
+    assert_eq!(&values[1].as_ref().unwrap().data[..], b"v2");
+    assert!(values[2].as_ref().unwrap().data.is_empty());
+}
+
+#[tokio::test]
+async fn delete_many_reports_each_key() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set(b"live", b"v", 0).await.unwrap();
+    let hits = client
+        .delete_many(&[b"live".as_slice(), b"absent"])
+        .await
+        .unwrap();
+
+    assert_eq!(hits, vec![true, false]);
+    assert!(client.get(b"live").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_oversized_batch_is_rejected_without_closing_the_connection() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let keys: Vec<&[u8]> = vec![b"k"; cache_core::MAX_BATCH_ITEMS + 1];
+    assert!(matches!(
+        client.get_many(&keys).await,
+        Err(ClientError::Status(Status::BadRequest))
+    ));
+
+    client.ping().await.expect("connection still usable");
+}
+
+#[tokio::test]
+async fn a_batch_containing_a_bad_key_is_rejected_whole() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set(b"good", b"v", 0).await.unwrap();
+
+    let oversized = vec![b'k'; cache_core::MAX_KEY_LEN + 1];
+    assert!(matches!(
+        client.get_many(&[b"good".as_slice(), &oversized]).await,
+        Err(ClientError::Status(Status::TooLarge))
+    ));
+
+    client.ping().await.expect("connection still usable");
+}
+
+#[tokio::test]
+async fn the_server_reclaims_expired_keys_in_the_background() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    for i in 0..50u32 {
+        client
+            .set(format!("k{i}").as_bytes(), b"v", 1)
+            .await
+            .unwrap();
+    }
+    assert_eq!(server.entries(), 50);
+
+    // Nothing here reads the expired keys, so only the sweeper can remove them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.entries() > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        server.entries(),
+        0,
+        "the sweeper must reclaim without any read touching the keys"
+    );
 }
 
 #[tokio::test]

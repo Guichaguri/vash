@@ -184,6 +184,26 @@ impl<'a> RecordRef<'a> {
     }
 }
 
+/// Byte offset of the `cas` field within the header.
+///
+/// Records are encoded off the writer thread, in parallel, before the CAS token
+/// is known — the token has to be allocated in commit order or a later write
+/// could end up with a lower one. The writer stamps it in with [`patch_cas`],
+/// which is why this offset is public and guarded by a test.
+pub const RECORD_CAS_OFFSET: usize = 20;
+
+/// Overwrites the `cas` field of an already-encoded record.
+pub fn patch_cas(record: &mut [u8], cas: u64) -> Result<()> {
+    let end = RECORD_CAS_OFFSET + 8;
+    if record.len() < end {
+        return Err(CoreError::MalformedRecord(
+            "record is shorter than its header",
+        ));
+    }
+    record[RECORD_CAS_OFFSET..end].copy_from_slice(&cas.to_le_bytes());
+    Ok(())
+}
+
 /// Exact encoded size of a record, for pre-sizing the write buffer.
 #[inline]
 pub const fn record_len(tag_count: usize, value_len: usize) -> usize {
@@ -350,6 +370,37 @@ mod tests {
             RecordRef::parse(&bad).unwrap_err(),
             CoreError::RecordVersion { found: 99, .. }
         ));
+    }
+
+    #[test]
+    fn patching_cas_hits_the_field_the_struct_defines() {
+        let mut buf = roundtrip(
+            RecordMeta {
+                cas: 1,
+                expires_at_ms: 777,
+                mc_flags: 5,
+                epoch: 3,
+            },
+            &[TagRef::new(2, 8)],
+            b"payload",
+        );
+
+        patch_cas(&mut buf, 0xdead_beef_cafe).unwrap();
+        let rec = RecordRef::parse(&buf).unwrap();
+
+        assert_eq!(rec.cas(), 0xdead_beef_cafe);
+        // Nothing else may shift.
+        assert_eq!(rec.expires_at_ms(), 777);
+        assert_eq!(rec.mc_flags(), 5);
+        assert_eq!(rec.header.epoch.get(), 3);
+        assert_eq!(rec.tags[0].generation.get(), 8);
+        assert_eq!(rec.value, b"payload");
+    }
+
+    #[test]
+    fn patching_a_truncated_record_is_an_error_not_a_panic() {
+        let mut buf = vec![0u8; RECORD_CAS_OFFSET + 7];
+        assert!(patch_cas(&mut buf, 1).is_err());
     }
 
     #[test]

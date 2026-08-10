@@ -43,7 +43,53 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
     match reply {
         Reply::Pong => encode_response(out, opcode, request_id, Status::Ok, &[]),
         Reply::Deleted => encode_response(out, opcode, request_id, Status::Ok, &[]),
+        Reply::Touched => encode_response(out, opcode, request_id, Status::Ok, &[]),
         Reply::NotFound => encode_response(out, opcode, request_id, Status::NotFound, &[]),
+
+        // Batch bodies are built first because the frame header carries their
+        // total length. They are sized up front so the payload copy is the only
+        // one that happens.
+        Reply::Values(values) => {
+            let payload: usize = values
+                .iter()
+                .map(|v| match v {
+                    Some(value) => 1 + VALUE_PREFIX_LEN + 4 + value.data.len(),
+                    None => 1,
+                })
+                .sum();
+
+            let mut body = Vec::with_capacity(4 + payload);
+            body.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for value in values {
+                match value {
+                    Some(value) => {
+                        body.push(1);
+                        body.extend_from_slice(&value.mc_flags.to_le_bytes());
+                        body.extend_from_slice(&value.cas.to_le_bytes());
+                        body.extend_from_slice(&(value.data.len() as u32).to_le_bytes());
+                        body.extend_from_slice(&value.data);
+                    }
+                    None => body.push(0),
+                }
+            }
+            encode_response(out, opcode, request_id, Status::Ok, &body);
+        }
+
+        Reply::StoredMany(cas_tokens) => {
+            let mut body = Vec::with_capacity(4 + cas_tokens.len() * 8);
+            body.extend_from_slice(&(cas_tokens.len() as u32).to_le_bytes());
+            for cas in cas_tokens {
+                body.extend_from_slice(&cas.to_le_bytes());
+            }
+            encode_response(out, opcode, request_id, Status::Ok, &body);
+        }
+
+        Reply::DeletedMany(hits) => {
+            let mut body = Vec::with_capacity(4 + hits.len());
+            body.extend_from_slice(&(hits.len() as u32).to_le_bytes());
+            body.extend(hits.iter().map(|hit| u8::from(*hit)));
+            encode_response(out, opcode, request_id, Status::Ok, &body);
+        }
 
         Reply::Hello(info) => {
             let mut body = [0u8; HELLO_RESPONSE_LEN];
@@ -94,6 +140,27 @@ pub fn encode_set_body(out: &mut Vec<u8>, key: &[u8], value: &[u8], ttl_secs: u3
         out.extend_from_slice(&(tag.len() as u16).to_le_bytes());
         out.extend_from_slice(tag);
     }
+}
+
+/// Builds a `TOUCH` body: `ttl_secs u32` followed by the key.
+pub fn encode_touch_body(out: &mut Vec<u8>, key: &[u8], ttl_secs: u32) {
+    out.extend_from_slice(&ttl_secs.to_le_bytes());
+    out.extend_from_slice(key);
+}
+
+/// Builds a `GET_MANY` or `DELETE_MANY` body: a count, then length-prefixed keys.
+pub fn encode_key_list_body(out: &mut Vec<u8>, keys: &[&[u8]]) {
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        out.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        out.extend_from_slice(key);
+    }
+}
+
+/// Writes the item count that prefixes a `SET_MANY` body. The caller then
+/// appends one [`encode_set_body`] per item.
+pub fn encode_batch_count(out: &mut Vec<u8>, count: usize) {
+    out.extend_from_slice(&(count as u32).to_le_bytes());
 }
 
 /// Parses a `HELLO` response body.
