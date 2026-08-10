@@ -16,8 +16,9 @@ use tokio::task::JoinHandle;
 
 struct TestServer {
     addr: SocketAddr,
+    admin: Option<SocketAddr>,
     dir: TempDir,
-    /// Held so tests can inspect on-disk state directly — `entries()` is the
+    /// Held so tests can inspect on-disk state directly â€” `entries()` is the
     /// only way to tell the sweeper apart from the lazy read-path check.
     ///
     /// An `Option` because it must be released before the server shuts down:
@@ -43,10 +44,13 @@ impl TestServer {
         config.store.path = dir.path().join("db");
         // Small enough to be cheap in CI, large enough for these tests.
         config.store.map_size_mb = 64;
+        // Port 0: these run in parallel and would otherwise fight over 9090.
+        config.observability.admin_listen = "127.0.0.1:0".into();
         tweak(&mut config);
 
         let server = Server::bind(config).await.expect("binding the server");
         let addr = server.local_addr().expect("reading the bound address");
+        let admin = server.admin_addr();
         let store = Arc::clone(server.store());
 
         let (tx, rx) = oneshot::channel();
@@ -60,11 +64,38 @@ impl TestServer {
 
         Self {
             addr,
+            admin,
             dir,
             store: Some(store),
             shutdown: Some(tx),
             handle: Some(handle),
         }
+    }
+
+    /// Fetches an admin endpoint, returning `(status code, body)`.
+    async fn admin(&self, path: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let addr = self.admin.expect("admin endpoint not bound");
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connecting");
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes())
+            .await
+            .expect("writing");
+
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("reading");
+        let text = String::from_utf8(raw).expect("responses are utf-8");
+
+        let code = text
+            .split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("no status code in {text:?}"));
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (code, body)
     }
 
     async fn client(&self) -> Client {
@@ -577,9 +608,14 @@ async fn set_many_then_get_many_round_trips() {
     ];
     let cas = client.set_many(&items).await.unwrap();
     assert_eq!(cas.len(), 3);
-    assert!(
-        cas.windows(2).all(|w| w[1] > w[0]),
-        "cas must advance in order"
+    // Tokens are unique server-wide, but not ordered across a batch: the keys
+    // land in different shards and each shard counts independently. Ordering
+    // holds per key, which is all compare-and-swap depends on.
+    let unique: std::collections::HashSet<_> = cas.iter().collect();
+    assert_eq!(
+        unique.len(),
+        cas.len(),
+        "cas tokens must be unique: {cas:?}"
     );
 
     let values = client
@@ -659,6 +695,111 @@ async fn the_server_reclaims_expired_keys_in_the_background() {
         0,
         "the sweeper must reclaim without any read touching the keys"
     );
+}
+
+#[tokio::test]
+async fn metrics_report_what_actually_happened() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client.set(b"hit-me", b"v", 0).await.unwrap();
+    client.get(b"hit-me").await.unwrap();
+    client.get(b"absent").await.unwrap();
+
+    let (code, body) = server.admin("/metrics").await;
+    assert_eq!(code, 200);
+
+    // Prometheus rejects a sample whose family has no TYPE line.
+    for line in body
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let family = line.split(['{', ' ']).next().unwrap();
+        assert!(
+            body.contains(&format!("# TYPE {family} ")),
+            "{family} has no TYPE line"
+        );
+    }
+
+    assert!(body.contains("kached_hits_total 1"), "{body}");
+    assert!(body.contains("kached_misses_total 1"), "{body}");
+    assert!(body.contains("kached_writes_total 1"), "{body}");
+    assert!(body.contains("kached_connections_active 1"), "{body}");
+    assert!(body.contains("kached_shards "), "{body}");
+}
+
+#[tokio::test]
+async fn health_reports_ok_while_serving() {
+    let server = TestServer::start().await;
+    let (code, body) = server.admin("/health").await;
+    assert_eq!(code, 200);
+    assert_eq!(body, "ok\n");
+}
+
+#[tokio::test]
+async fn stats_are_json_and_carry_the_shard_count() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    client.set(b"k", b"v", 0).await.unwrap();
+
+    let (code, body) = server.admin("/stats").await;
+    assert_eq!(code, 200);
+    assert!(body.trim_start().starts_with('{'), "{body}");
+    assert!(body.contains("\"shards\":"), "{body}");
+    assert!(body.contains("\"pressure\": \"normal\""), "{body}");
+    assert!(body.contains("\"items\": 1"), "{body}");
+}
+
+#[tokio::test]
+async fn unknown_admin_routes_and_methods_are_refused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = TestServer::start().await;
+    assert_eq!(server.admin("/nope").await.0, 404);
+
+    let mut stream = tokio::net::TcpStream::connect(server.admin.unwrap())
+        .await
+        .unwrap();
+    stream
+        .write_all(b"POST /metrics HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.unwrap();
+    assert!(raw.starts_with("HTTP/1.1 405"), "{raw}");
+}
+
+#[tokio::test]
+async fn keys_spread_across_shards_and_all_remain_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| config.store.shards = 4).await;
+    let mut client = server.client().await;
+
+    assert_eq!(
+        client.server_info().shards,
+        4,
+        "the handshake advertises the real count"
+    );
+
+    for i in 0..300u32 {
+        client
+            .set(format!("k{i}").as_bytes(), format!("v{i}").as_bytes(), 0)
+            .await
+            .unwrap();
+    }
+
+    // Through a multi-get, which is the path that fans out and reassembles.
+    let keys: Vec<String> = (0..300).map(|i| format!("k{i}")).collect();
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+    let values = client.get_many(&refs).await.unwrap();
+
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            value.as_ref().map(|v| v.data.to_vec()).as_deref(),
+            Some(format!("v{i}").as_bytes()),
+            "k{i} came back wrong"
+        );
+    }
 }
 
 #[tokio::test]

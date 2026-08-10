@@ -23,6 +23,18 @@
 
 pub const EXPIRY_KEY_LEN: usize = 16;
 
+/// Bucket assigned to records that never expire.
+///
+/// They are indexed too, at the very end of the ordering, for one reason: the
+/// capacity evictor walks this index to pick victims, and a record that is not
+/// in it cannot be evicted. Without this, a cache holding only TTL-less keys
+/// would fill up and have nothing to free. Because `u64::MAX` is always in the
+/// future, the expiry sweeper stops before reaching them — they are evictable
+/// but never *expire*.
+///
+/// Within the bucket, entries are ordered by CAS, which is insertion order.
+pub const NEVER_BUCKET: u64 = u64::MAX;
+
 /// Rounds an expiry timestamp up to the next multiple of `granularity_ms`.
 #[inline]
 pub fn bucket(expires_at_ms: u64, granularity_ms: u64) -> u64 {
@@ -36,10 +48,20 @@ pub fn bucket(expires_at_ms: u64, granularity_ms: u64) -> u64 {
     }
 }
 
+/// The bucket a record belongs in, including the never-expires case.
+#[inline]
+pub fn bucket_for(expires_at_ms: u64, granularity_ms: u64) -> u64 {
+    if expires_at_ms == cache_core::record::NEVER {
+        NEVER_BUCKET
+    } else {
+        bucket(expires_at_ms, granularity_ms)
+    }
+}
+
 #[inline]
 pub fn encode_key(expires_at_ms: u64, cas: u64, granularity_ms: u64) -> [u8; EXPIRY_KEY_LEN] {
     let mut key = [0u8; EXPIRY_KEY_LEN];
-    key[..8].copy_from_slice(&bucket(expires_at_ms, granularity_ms).to_be_bytes());
+    key[..8].copy_from_slice(&bucket_for(expires_at_ms, granularity_ms).to_be_bytes());
     key[8..].copy_from_slice(&cas.to_be_bytes());
     key
 }
@@ -99,6 +121,27 @@ mod tests {
         let key = encode_key(1_700_000_000_123, 42, 1000);
         assert_eq!(decode_key(&key), Some((1_700_000_001_000, 42)));
         assert_eq!(decode_key(&key[..15]), None);
+    }
+
+    #[test]
+    fn records_that_never_expire_sort_last() {
+        // They must be in the index so the evictor can reach them, and last so
+        // it takes everything with a TTL first.
+        let never = encode_key(cache_core::record::NEVER, 1, 1000);
+        assert_eq!(decode_key(&never).unwrap().0, NEVER_BUCKET);
+
+        for expiry in [1u64, 1000, u64::MAX / 2] {
+            assert!(encode_key(expiry, 0, 1000) < never);
+        }
+    }
+
+    #[test]
+    fn never_expiring_entries_are_ordered_by_insertion() {
+        // Same bucket, so the CAS tiebreaker decides — and CAS is assigned in
+        // commit order, making eviction oldest-first.
+        let first = encode_key(cache_core::record::NEVER, 10, 1000);
+        let second = encode_key(cache_core::record::NEVER, 11, 1000);
+        assert!(first < second);
     }
 
     #[test]

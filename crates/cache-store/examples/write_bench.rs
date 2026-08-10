@@ -1,4 +1,4 @@
-﻿//! Measures whether group commit actually amortises the commit cost.
+//! Measures whether group commit actually amortises the commit cost.
 //!
 //! ```text
 //! cargo run --release -p cache-store --example write_bench
@@ -15,13 +15,22 @@ use std::time::Instant;
 use cache_core::{Key, Set};
 use cache_store::{Durability, LmdbStore, Store, StoreConfig, WriteConfig};
 
-const OPS: usize = 20_000;
+/// Total writes per scenario. Raise it to see how shard scaling depends on
+/// offered load: `KACHED_BENCH_OPS=200000 cargo run --release ...`
+fn ops() -> usize {
+    std::env::var("KACHED_BENCH_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000)
+}
+
 const VALUE: &[u8] = &[b'x'; 256];
 
-fn open(dir: &std::path::Path, durability: Durability) -> LmdbStore {
+fn open(dir: &std::path::Path, durability: Durability, shards: usize) -> LmdbStore {
     LmdbStore::open(&StoreConfig {
         path: dir.to_path_buf(),
         map_size: 1024 * 1024 * 1024,
+        shards,
         durability,
         // Long interval: this measures writes, not reclamation.
         write: WriteConfig {
@@ -46,96 +55,145 @@ fn set(store: &LmdbStore, key: &str) {
         .expect("set");
 }
 
-fn report(label: &str, ops: usize, elapsed: std::time::Duration, store: &LmdbStore) {
-    let stats = store.stats().expect("stats");
+/// Repetitions per scenario. Throughput noise is additive — a slow run means
+/// something else stole the disk — so the best of several is a better estimate
+/// of what the code can do than any single run.
+fn repeats() -> usize {
+    std::env::var("KACHED_BENCH_REPEATS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
+
+fn scenario(
+    name: &str,
+    durability: Durability,
+    shards: usize,
+    run: impl Fn(&Arc<LmdbStore>) + Copy,
+) {
+    let mut best = 0.0f64;
+    let mut best_batch = 0.0;
+    let mut best_commits = 0;
+
+    for _ in 0..repeats() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(open(&dir.path().join("db"), durability, shards));
+
+        let started = Instant::now();
+        run(&store);
+        let elapsed = started.elapsed();
+
+        let rate = ops() as f64 / elapsed.as_secs_f64();
+        if rate > best {
+            let stats = store.stats().expect("stats");
+            best = rate;
+            best_batch = stats.mean_batch_size();
+            best_commits = stats.commits;
+        }
+        Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("store still shared"))
+            .close();
+    }
+
     println!(
-        "{label:<34} {:>10.0} ops/s   mean batch {:>7.1}   commits {:>7}",
-        ops as f64 / elapsed.as_secs_f64(),
-        stats.mean_batch_size(),
-        stats.commits
+        "{name:<34} {best:>10.0} ops/s   mean batch {best_batch:>7.1}   commits {best_commits:>7}"
     );
 }
 
-fn scenario(name: &str, durability: Durability, run: impl FnOnce(&Arc<LmdbStore>)) {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = Arc::new(open(&dir.path().join("db"), durability));
-
-    let started = Instant::now();
-    run(&store);
-    let elapsed = started.elapsed();
-
-    report(name, OPS, elapsed, &store);
-    Arc::try_unwrap(store)
-        .unwrap_or_else(|_| panic!("store still shared"))
-        .close();
+/// Writes `ops()` values from `threads` callers at once.
+///
+/// The shape that matters for sharding: LMDB serialises writers per
+/// environment, so more shards should mean more of these running at once.
+fn concurrent(store: &Arc<LmdbStore>, threads: usize) {
+    let per_thread = ops() / threads;
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let store = Arc::clone(store);
+            scope.spawn(move || {
+                for i in 0..per_thread {
+                    set(&store, &format!("t{t}-k{i}"));
+                }
+            });
+        }
+    });
 }
 
 fn main() {
-    println!(
-        "{OPS} writes of a {}-byte value, single LMDB environment\n",
-        VALUE.len()
-    );
+    println!("{} writes of a {}-byte value\n", ops(), VALUE.len());
 
-    for durability in [Durability::Relaxed, Durability::Durable] {
-        println!("-- durability: {durability:?}");
-
-        // One caller at a time: every write is its own transaction, so this is
-        // the un-batched baseline.
-        scenario("1 thread, one write at a time", durability, |store| {
-            for i in 0..OPS {
+    // How batching alone scales, on one environment.
+    println!("-- group commit (1 shard, relaxed durability)");
+    scenario(
+        "1 thread, one write at a time",
+        Durability::Relaxed,
+        1,
+        |store| {
+            for i in 0..ops() {
                 set(store, &format!("k{i}"));
             }
-        });
+        },
+    );
+    for threads in [8usize, 64] {
+        scenario(
+            &format!("{threads} threads, one write at a time"),
+            Durability::Relaxed,
+            1,
+            |store| concurrent(store, threads),
+        );
+    }
+    for batch in [16usize, 256] {
+        scenario(
+            &format!("1 thread, set_many of {batch}"),
+            Durability::Relaxed,
+            1,
+            |store| {
+                let mut written = 0;
+                while written < ops() {
+                    let keys: Vec<String> =
+                        (0..batch).map(|i| format!("b{}", written + i)).collect();
+                    let sets: Vec<Set<'_>> = keys
+                        .iter()
+                        .map(|key| Set::plain(Key::new(key.as_bytes()).unwrap(), VALUE, 0))
+                        .collect();
+                    store.set_many(&sets).expect("set_many");
+                    written += batch;
+                }
+            },
+        );
+    }
 
-        // Concurrent callers: batches form on their own, because each commit
-        // leaves the queue holding whatever arrived while it ran.
-        for threads in [8usize, 64] {
-            scenario(
-                &format!("{threads} threads, one write at a time"),
-                durability,
-                |store| {
-                    let per_thread = OPS / threads;
-                    std::thread::scope(|scope| {
-                        for t in 0..threads {
-                            let store = Arc::clone(store);
-                            scope.spawn(move || {
-                                for i in 0..per_thread {
-                                    set(&store, &format!("t{t}-k{i}"));
-                                }
-                            });
-                        }
-                    });
-                },
-            );
-        }
+    // How sharding scales, holding the client concurrency fixed. LMDB permits
+    // one writer per environment, so this is the axis that adds writers.
+    println!("\n-- sharding (64 concurrent writers, relaxed durability)");
+    for shards in [1usize, 2, 4, 8] {
+        scenario(
+            &format!("{shards} shard(s)"),
+            Durability::Relaxed,
+            shards,
+            |store| concurrent(store, 64),
+        );
+    }
 
-        // Explicit batching: one round trip carries many writes.
-        for batch in [16usize, 256] {
-            scenario(
-                &format!("1 thread, set_many of {batch}"),
-                durability,
-                |store| {
-                    let mut written = 0;
-                    while written < OPS {
-                        let keys: Vec<String> =
-                            (0..batch).map(|i| format!("b{}", written + i)).collect();
-                        let sets: Vec<Set<'_>> = keys
-                            .iter()
-                            .map(|key| Set {
-                                key: Key::new(key.as_bytes()).unwrap(),
-                                value: VALUE,
-                                ttl_secs: 0,
-                                mc_flags: 0,
-                                tags: Vec::new(),
-                                mode: cache_core::SetMode::Set,
-                            })
-                            .collect();
-                        store.set_many(&sets).expect("set_many");
-                        written += batch;
-                    }
-                },
-            );
-        }
-        println!();
+    println!("\n-- sharding (64 concurrent writers, durable)");
+    for shards in [1usize, 4, 8] {
+        scenario(
+            &format!("{shards} shard(s)"),
+            Durability::Durable,
+            shards,
+            |store| concurrent(store, 64),
+        );
+    }
+
+    // The same axis with syncing switched off. If throughput jumps here but not
+    // above, the ceiling was the disk rather than the single writer thread —
+    // and sharding cannot fix a disk.
+    println!("\n-- sharding (64 concurrent writers, ephemeral: no syncing)");
+    for shards in [1usize, 2, 4, 8] {
+        scenario(
+            &format!("{shards} shard(s)"),
+            Durability::Ephemeral,
+            shards,
+            |store| concurrent(store, 64),
+        );
     }
 }

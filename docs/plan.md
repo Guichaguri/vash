@@ -333,6 +333,30 @@ the cheapest thing in the store to lose.
 Items with no TTL sit in a separate region of the index (`expires_at = u64::MAX` bucket) and are evicted
 only after all TTL'd items, in insertion order.
 
+**Three corrections found while implementing this (M4):**
+
+1. **Every record is indexed, including those that never expire.** The original design only indexed
+   records with a TTL, which meant a record with no TTL could never be chosen as a victim — a cache of
+   TTL-less keys would fill up with nothing to free. They now go in the `u64::MAX` bucket, which the
+   sweeper never reaches (it is always in the future) but the evictor does, last. This changed the
+   on-disk layout, so `SCHEMA_VERSION` went to 2 and a version-1 database is refused rather than opened
+   under-indexed.
+2. **Utilisation is measured from non-free pages, not the high-water mark.** LMDB never returns freed
+   pages nor lowers `last_page_number`; deleted pages go on a free list. Measuring with the high-water
+   mark meant pressure could only ever rise, so the first time the cache crossed the hard watermark the
+   evictor ran until it had deleted everything. It now sums the sub-databases' own page counts, inside
+   the transaction it already holds.
+3. **`MDB_MAP_FULL` needs its own recovery path.** A failed operation invalidates the whole
+   transaction, and the batch that hit the wall was aborted along with the maintenance pass that would
+   have freed space — so every later write hit the same wall forever. A capacity failure now marks the
+   shard critical (so callers are refused before they reach the queue) and runs a reclaim in a fresh
+   transaction, retrying with smaller batches because deletions need pages of their own.
+
+**A minimum map size of 16 MiB per shard is enforced.** Below roughly 4 MiB, LMDB can report a full map
+permanently even after everything has been deleted, because the free list needs pages to record freed
+pages and there are none to spare. Measured on a sustained overfill of 4 KiB values: 2 and 3 MiB wedge,
+4 MiB limps, 6 MiB and up recover cleanly.
+
 ### Optional frequency bias
 
 A fixed-size in-memory Count-Min sketch (4 × 2^20 × 4-bit counters ≈ 2 MB, halved periodically for
@@ -554,6 +578,24 @@ throughput-over-latency deployments; default 0.)
 S independent LMDB environments (default `min(num_cpus, 8)`), key routed by `XXH3(key) % S`. This is the
 direct answer to the single-writer limitation: **S concurrent writers instead of one.** It is also why
 `XXH3` and not `foldhash` — routing must be identical across restarts.
+
+**Measured (M4): sharding helps far less than this section assumed.** Two effects the plan did not
+anticipate, both visible in the benchmark:
+
+1. **Sharding and group commit pull against each other.** At a fixed offered write rate, splitting
+   across N queues divides the mean batch size by roughly N — measured falling from ~61 on one shard to
+   ~2 on eight — so each shard's commits amortise over fewer operations and some of the gain from N
+   writers is handed straight back. It therefore pays off with *offered load*, not with shard count
+   alone: at 20k writes the gain peaked at 4 shards and regressed at 8; at 200k it kept climbing.
+2. **It only helps when the writer thread is the bottleneck.** With syncing off, 8 shards gave 1.5×.
+   With syncing on — the `relaxed` default — throughput is set by the disk, and splitting one device
+   between more environments fragments its I/O and makes things *worse*: 12.4k ops/s at one shard
+   against 10.6k at eight, and `durable` fell from 10.9k to 5.5k. Sharding cannot fix a disk.
+
+It also does nothing for reads, which were never the constraint: LMDB readers are already lock-free and
+concurrent within one environment.
+
+The default is therefore `min(num_cpus, 4)` rather than the 8 this section originally proposed.
 
 Consequences, accepted deliberately:
 

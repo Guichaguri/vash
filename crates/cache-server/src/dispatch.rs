@@ -6,6 +6,7 @@ use cache_proto::kcp::{DecodeError, Decoded, Status, decode, encode_error, encod
 use cache_store::{Store, StoreError};
 use tracing::{error, warn};
 
+use crate::metrics::ErrorClass;
 use crate::state::ServerState;
 
 /// Executes a memcached command, rendering the reply in that dialect.
@@ -116,6 +117,50 @@ pub fn execute_frame(state: &ServerState, frame: &[u8]) -> Vec<u8> {
 }
 
 fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> {
+    let outcome = execute_inner(state, command);
+
+    // Counted here, at the single point every command passes through, so the
+    // numbers cannot drift apart from what was actually served.
+    match &outcome {
+        Ok(reply) => match reply {
+            Reply::Value(_) => state.metrics.read(1, 0),
+            Reply::Values(values) => {
+                let hits = values.iter().filter(|v| v.is_some()).count() as u64;
+                state.metrics.read(hits, values.len() as u64 - hits);
+            }
+            Reply::NotFound if is_read(command) => state.metrics.read(0, 1),
+            Reply::Stored(_)
+            | Reply::StoredMany(_)
+            | Reply::Deleted
+            | Reply::DeletedMany(_)
+            | Reply::Touched
+            | Reply::Counter(_)
+            | Reply::Invalidated(_)
+            | Reply::Flushed(_) => state.metrics.write(),
+            _ => state.metrics.other(),
+        },
+        Err(status) => {
+            state.metrics.other();
+            state.metrics.error(match status {
+                Status::CapacityFull => ErrorClass::Capacity,
+                Status::Overloaded => ErrorClass::Overloaded,
+                Status::Internal => ErrorClass::Internal,
+                _ => ErrorClass::Client,
+            });
+        }
+    }
+
+    outcome
+}
+
+fn is_read(command: &Command<'_>) -> bool {
+    matches!(
+        command,
+        Command::Get { .. } | Command::GetMany(_) | Command::GetAndTouch { .. }
+    )
+}
+
+fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> {
     match command {
         Command::Ping => Ok(Reply::Pong),
 

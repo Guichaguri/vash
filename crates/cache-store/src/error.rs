@@ -45,6 +45,45 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    /// Whether this failure leaves the write transaction unusable.
+    ///
+    /// LMDB invalidates a transaction as soon as one of its operations fails —
+    /// a full map being the common case — and every later call on it returns
+    /// `MDB_BAD_TXN`. The writer has to abort the whole batch at that point
+    /// rather than carry on and report a confusing secondary error.
+    ///
+    /// Validation failures are different: they are rejected before LMDB is
+    /// touched, so the transaction is still good and the rest of the batch can
+    /// proceed.
+    pub(crate) fn poisons_transaction(&self) -> bool {
+        matches!(self, Self::Lmdb(_) | Self::CapacityFull)
+    }
+
+    /// Whether this failure means the store is out of room, and so calls for
+    /// freeing space rather than simply retrying.
+    pub(crate) fn is_capacity(&self) -> bool {
+        matches!(self, Self::CapacityFull)
+    }
+
+    /// A copy suitable for fanning one failure out to every caller in a batch.
+    ///
+    /// `heed::Error` is not `Clone`, so an LMDB failure keeps its message but
+    /// loses its type. The variants callers act on — `CapacityFull` above all —
+    /// are preserved exactly.
+    pub(crate) fn clone_shallow(&self) -> Self {
+        match self {
+            Self::CapacityFull => Self::CapacityFull,
+            Self::Overloaded => Self::Overloaded,
+            Self::ShuttingDown => Self::ShuttingDown,
+            Self::NotNumeric => Self::NotNumeric,
+            Self::TagLimit(n) => Self::TagLimit(*n),
+            Self::Unsupported(what) => Self::Unsupported(what),
+            Self::Core(e) => Self::Core(e.clone()),
+            Self::Corrupt(detail) => Self::Corrupt(detail.clone()),
+            other => Self::Corrupt(other.to_string()),
+        }
+    }
+
     /// Maps LMDB's `MDB_MAP_FULL` onto the dedicated capacity variant so callers
     /// do not have to pattern-match on heed internals.
     pub(crate) fn from_heed(err: heed::Error) -> Self {

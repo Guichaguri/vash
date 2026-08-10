@@ -4,9 +4,11 @@
 //! real server on an ephemeral port and drive it over a real socket, rather
 //! than testing a stubbed-out approximation of it.
 
+pub mod admin;
 pub mod config;
 pub mod conn;
 pub mod dispatch;
+pub mod metrics;
 pub mod state;
 
 use std::sync::Arc;
@@ -23,6 +25,7 @@ pub use state::ServerState;
 /// A bound, running server.
 pub struct Server {
     listener: TcpListener,
+    admin: Option<TcpListener>,
     state: Arc<ServerState>,
     config: Config,
     connections: Arc<Semaphore>,
@@ -39,17 +42,33 @@ impl Server {
             .with_context(|| format!("opening store at {}", config.store.path.display()))?;
         let store = Arc::new(store);
 
-        let info = dispatch::server_info(1, config.store.max_value_bytes);
+        let info = dispatch::server_info(store.shard_count() as u16, config.store.max_value_bytes);
         let state = ServerState::new(Arc::clone(&store), info, config.protocol.flush_enabled);
 
         let listener = TcpListener::bind(config.server.listen)
             .await
             .with_context(|| format!("binding {}", config.server.listen))?;
 
-        info!(addr = %listener.local_addr()?, "listening");
+        info!(
+            addr = %listener.local_addr()?,
+            shards = store.shard_count(),
+            "listening"
+        );
+
+        // Bound here rather than in `serve` so a port clash fails startup, and
+        // so tests can read the assigned port before anything is served.
+        let admin = match config.observability.admin_listen.as_str() {
+            "" => None,
+            addr => Some(
+                TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("binding the admin endpoint on {addr}"))?,
+            ),
+        };
 
         Ok(Self {
             listener,
+            admin,
             state,
             connections: Arc::new(Semaphore::new(config.server.max_connections)),
             config,
@@ -58,6 +77,10 @@ impl Server {
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
+    }
+
+    pub fn admin_addr(&self) -> Option<std::net::SocketAddr> {
+        self.admin.as_ref().and_then(|l| l.local_addr().ok())
     }
 
     pub fn store(&self) -> &Arc<LmdbStore> {
@@ -72,10 +95,24 @@ impl Server {
     ) -> anyhow::Result<()> {
         let Self {
             listener,
+            admin,
             state,
             config,
             connections,
         } = self;
+
+        // The admin endpoints get their own listener and their own shutdown
+        // signal, so a scrape in flight cannot hold up the drain.
+        let (admin_stop, admin_stopped) = tokio::sync::oneshot::channel();
+        let admin_task = admin.map(|listener| {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                admin::serve(listener, state, async {
+                    let _ = admin_stopped.await;
+                })
+                .await
+            })
+        });
 
         tokio::pin!(shutdown);
 
@@ -98,16 +135,19 @@ impl Server {
                     // a client left waiting cannot.
                     let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
                         debug!(%peer, "refusing connection: at the connection limit");
+                        state.metrics.connection_rejected();
                         drop(stream);
                         continue;
                     };
 
                     let conn_state = Arc::clone(&state);
                     let read_buffer = config.server.read_buffer;
+                    conn_state.metrics.connection_opened();
                     tokio::spawn(async move {
-                        if let Err(e) = conn::handle(stream, conn_state, read_buffer).await {
+                        if let Err(e) = conn::handle(stream, Arc::clone(&conn_state), read_buffer).await {
                             debug!(%peer, error = %e, "connection ended with an error");
                         }
+                        conn_state.metrics.connection_closed();
                         drop(permit);
                     });
                 }
@@ -123,6 +163,10 @@ impl Server {
         // permit being back means every connection task has ended and dropped
         // its handle on the store.
         drop(listener);
+        let _ = admin_stop.send(());
+        if let Some(task) = admin_task {
+            let _ = task.await;
+        }
         let outstanding = config.server.max_connections as u32;
         match tokio::time::timeout(DRAIN_TIMEOUT, connections.acquire_many(outstanding)).await {
             Ok(Ok(_permits)) => debug!("all connections drained"),

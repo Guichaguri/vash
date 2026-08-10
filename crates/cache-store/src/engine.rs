@@ -6,7 +6,7 @@
 //! without duplicating the operations.
 
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use cache_core::{
@@ -25,6 +25,50 @@ use crate::tags::{TagLookup, TagRegistry};
 use crate::{StoreStats, SweepStats};
 
 type Db = Database<HeedBytes, HeedBytes>;
+
+/// Which records a pass over the expiry index is allowed to take.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Victims {
+    /// Sweeping: only records whose TTL has passed.
+    ExpiredOnly,
+    /// Evicting under capacity pressure: whatever comes first in the index.
+    Anything,
+}
+
+/// How close the store is to full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Pressure {
+    /// Business as usual.
+    Normal = 0,
+    /// Reclamation runs continuously instead of on its idle cadence.
+    Soft = 1,
+    /// Actively evicting live records to get back under the soft mark.
+    Hard = 2,
+    /// Writes are refused. Reads and deletes still work — a delete frees space,
+    /// so refusing it would be self-defeating.
+    Critical = 3,
+}
+
+impl Pressure {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Self::Normal,
+            1 => Self::Soft,
+            2 => Self::Hard,
+            _ => Self::Critical,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Soft => "soft",
+            Self::Hard => "hard",
+            Self::Critical => "critical",
+        }
+    }
+}
 
 /// A record encoded and ready to store, still missing its CAS token.
 ///
@@ -53,13 +97,29 @@ pub struct LmdbEngine {
     max_value_len: usize,
     bucket_granularity_ms: u64,
     tags: TagRegistry,
+    pressure: AtomicU8,
+    shard_index: usize,
+    shard_count: usize,
 }
 
 impl LmdbEngine {
-    pub fn open(config: &StoreConfig) -> Result<Self> {
+    /// Opens one environment. `shard_index` and `shard_count` identify its
+    /// place in the shard set and are validated against what the database
+    /// already records.
+    pub fn open(config: &StoreConfig, shard_index: usize, shard_count: usize) -> Result<Self> {
         if config.wipe_on_start && config.path.exists() {
             warn!(path = %config.path.display(), "wiping existing database on start");
             std::fs::remove_dir_all(&config.path)?;
+        }
+        if config.map_size < crate::config::MIN_MAP_SIZE {
+            // Refused rather than allowed to wedge later: below this, LMDB can
+            // report a full map permanently even after everything is deleted.
+            return Err(StoreError::Corrupt(format!(
+                "map size {} is below the minimum of {} bytes; LMDB cannot reliably \
+                 reclaim space on a map that small",
+                config.map_size,
+                crate::config::MIN_MAP_SIZE
+            )));
         }
         std::fs::create_dir_all(&config.path)?;
 
@@ -101,6 +161,18 @@ impl LmdbEngine {
                     &(cache_core::RECORD_VERSION as u32).to_le_bytes(),
                 )
                 .map_err(StoreError::from_heed)?;
+                meta.put(
+                    &mut wtxn,
+                    meta_key::SHARD_INDEX,
+                    &(shard_index as u32).to_le_bytes(),
+                )
+                .map_err(StoreError::from_heed)?;
+                meta.put(
+                    &mut wtxn,
+                    meta_key::SHARD_COUNT,
+                    &(shard_count as u32).to_le_bytes(),
+                )
+                .map_err(StoreError::from_heed)?;
             }
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) => {
@@ -108,6 +180,28 @@ impl LmdbEngine {
                     "database has schema version {v}, this build expects {SCHEMA_VERSION}"
                 )));
             }
+        }
+
+        // Reopening with a different shard count would route every key to a
+        // different environment: the data would still be on disk, taking up
+        // space, but every read would miss. Refuse rather than silently lose
+        // the cache.
+        if let Some(stored) = read_u32(&meta, &wtxn, meta_key::SHARD_COUNT)?
+            && stored as usize != shard_count
+        {
+            return Err(StoreError::Corrupt(format!(
+                "database at {} was built for {stored} shard(s), but {shard_count} were configured; \
+                 keys would route to the wrong environment",
+                config.path.display()
+            )));
+        }
+        if let Some(stored) = read_u32(&meta, &wtxn, meta_key::SHARD_INDEX)?
+            && stored as usize != shard_index
+        {
+            return Err(StoreError::Corrupt(format!(
+                "database at {} is shard {stored}, opened as shard {shard_index}",
+                config.path.display()
+            )));
         }
 
         let epoch = read_u32(&meta, &wtxn, meta_key::EPOCH)?.unwrap_or(0);
@@ -163,6 +257,9 @@ impl LmdbEngine {
             max_value_len: config.max_value_len,
             bucket_granularity_ms: config.bucket_granularity_ms,
             tags: registry,
+            pressure: AtomicU8::new(Pressure::Normal as u8),
+            shard_index,
+            shard_count: shard_count.max(1),
         })
     }
 
@@ -246,6 +343,12 @@ impl LmdbEngine {
     // ---- write preparation (runs off the writer thread) --------------------
 
     pub fn prepare_set(&self, set: &Set<'_>, tags: Vec<TagRef>) -> Result<PreparedSet> {
+        // Refused here, on the caller's thread, rather than after a trip
+        // through the write queue: there is no point encoding a record and
+        // queueing it for a store that cannot accept it.
+        if self.pressure() == Pressure::Critical {
+            return Err(StoreError::CapacityFull);
+        }
         validate_value(set.value, self.max_value_len)?;
 
         let expires_at_ms = self.expiry_from_ttl(set.ttl_secs);
@@ -274,15 +377,21 @@ impl LmdbEngine {
     /// current block runs out. Called only from the writer thread, whose single
     /// transaction serialises it.
     fn next_cas(&self, wtxn: &mut RwTxn) -> Result<u64> {
-        let cas = self.cas_next.fetch_add(1, Ordering::Relaxed) + 1;
-        if cas >= self.cas_watermark.load(Ordering::Relaxed) {
-            let watermark = cas + CAS_BLOCK;
+        let counter = self.cas_next.fetch_add(1, Ordering::Relaxed) + 1;
+        if counter >= self.cas_watermark.load(Ordering::Relaxed) {
+            let watermark = counter + CAS_BLOCK;
             self.meta
                 .put(wtxn, meta_key::CAS_WATERMARK, &watermark.to_le_bytes())
                 .map_err(StoreError::from_heed)?;
             self.cas_watermark.store(watermark, Ordering::Relaxed);
         }
-        Ok(cas)
+
+        // Each shard counts independently, so the raw counters collide across
+        // shards. Striping them keeps every token unique server-wide, which is
+        // what clients are told to expect, while staying strictly increasing
+        // within a shard — and therefore within any single key, which is the
+        // only ordering compare-and-swap depends on.
+        Ok(counter * self.shard_count as u64 + self.shard_index as u64)
     }
 
     /// Removes the index entries belonging to whatever is currently stored
@@ -301,13 +410,12 @@ impl LmdbEngine {
         let cas = record.cas();
         let tag_ids: Vec<u32> = record.tags.iter().map(|t| t.tag_id.get()).collect();
 
-        if expires_at_ms != NEVER {
-            let index_key =
-                crate::expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms);
-            self.exp
-                .delete(wtxn, &index_key)
-                .map_err(StoreError::from_heed)?;
-        }
+        // Every record is indexed, including those that never expire, so the
+        // delete is unconditional too.
+        let index_key = crate::expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms);
+        self.exp
+            .delete(wtxn, &index_key)
+            .map_err(StoreError::from_heed)?;
 
         for tag_id in tag_ids {
             self.tagidx
@@ -470,13 +578,15 @@ impl LmdbEngine {
             .put(wtxn, &prepared.key, &prepared.record)
             .map_err(StoreError::from_heed)?;
 
-        if prepared.expires_at_ms != NEVER {
-            let index_key =
-                crate::expiry::encode_key(prepared.expires_at_ms, cas, self.bucket_granularity_ms);
-            self.exp
-                .put(wtxn, &index_key, &prepared.key)
-                .map_err(StoreError::from_heed)?;
-        }
+        // Indexed unconditionally: a record outside this index cannot be chosen
+        // as an eviction victim, so a cache of TTL-less keys would have nothing
+        // to free under pressure. Never-expiring records sort last (see
+        // `expiry::NEVER_BUCKET`), so they go only after everything with a TTL.
+        let index_key =
+            crate::expiry::encode_key(prepared.expires_at_ms, cas, self.bucket_granularity_ms);
+        self.exp
+            .put(wtxn, &index_key, &prepared.key)
+            .map_err(StoreError::from_heed)?;
 
         for tag in &prepared.tags {
             self.tagidx
@@ -658,6 +768,31 @@ impl LmdbEngine {
     /// the future, so the cost is proportional to what has actually expired.
     /// When nothing is due this is a single cursor seek.
     pub fn sweep(&self, wtxn: &mut RwTxn, budget: usize) -> Result<SweepStats> {
+        self.drain_expiry_index(wtxn, budget, Victims::ExpiredOnly)
+    }
+
+    /// Frees up to `budget` records to reclaim space, whether or not they have
+    /// expired.
+    ///
+    /// Takes them from the front of the expiry index, which is soonest-to-expire
+    /// first and never-expiring last. That ordering is free — the index already
+    /// exists for TTLs — and it is the right policy for a cache: a TTL is the
+    /// client's own statement of how long a value is worth keeping, so the item
+    /// dying in three seconds is the cheapest thing in the store to lose.
+    ///
+    /// Deliberately not LRU. Tracking recency means writing on every read, which
+    /// on a single-writer engine would put every GET behind the write queue.
+    /// See plan §6.
+    pub fn evict(&self, wtxn: &mut RwTxn, budget: usize) -> Result<SweepStats> {
+        self.drain_expiry_index(wtxn, budget, Victims::Anything)
+    }
+
+    fn drain_expiry_index(
+        &self,
+        wtxn: &mut RwTxn,
+        budget: usize,
+        accept: Victims,
+    ) -> Result<SweepStats> {
         let now_ms = self.now_ms();
         let mut stats = SweepStats::default();
 
@@ -676,13 +811,14 @@ impl LmdbEngine {
                     )));
                 };
 
-                if bucket > now_ms {
-                    // The index is time-ordered, so the first future bucket
-                    // ends the scan.
+                // A sweep stops at the first bucket in the future; an eviction
+                // keeps going, because it is freeing space rather than
+                // honouring TTLs.
+                if accept == Victims::ExpiredOnly && bucket > now_ms {
                     stats.lag_ms = 0;
                     break;
                 }
-                if victims.is_empty() {
+                if victims.is_empty() && bucket <= now_ms {
                     stats.lag_ms = now_ms.saturating_sub(bucket);
                 }
 
@@ -712,7 +848,14 @@ impl LmdbEngine {
                     // The CAS check is what makes a stale entry harmless: if the
                     // key was overwritten, this entry no longer describes the
                     // record and must not delete it.
-                    if record.cas() == entry_cas && record.is_expired(now_ms) {
+                    let current = record.cas() == entry_cas;
+                    let take = current
+                        && match accept {
+                            Victims::ExpiredOnly => record.is_expired(now_ms),
+                            Victims::Anything => true,
+                        };
+
+                    if take {
                         let tag_ids: Vec<u32> =
                             record.tags.iter().map(|t| t.tag_id.get()).collect();
                         self.main
@@ -737,6 +880,50 @@ impl LmdbEngine {
         }
 
         Ok(stats)
+    }
+
+    /// Bytes genuinely occupied, excluding pages on the free list.
+    ///
+    /// **Not** `last_page_number`. LMDB never returns freed pages to the OS nor
+    /// lowers its high-water mark — a deleted record's pages go onto a free
+    /// list for reuse — so a high-water measure only ever rises. Using it for
+    /// the capacity watermarks meant pressure could never fall, and the evictor
+    /// would keep going until the cache was empty.
+    ///
+    /// Summed from the sub-databases' own page counts, which is exactly the
+    /// non-free total, and works inside the caller's transaction rather than
+    /// needing one of its own.
+    pub fn used_bytes_in(&self, txn: &RoTxn<'_, WithoutTls>) -> Result<u64> {
+        let page_size = self.env.stat().page_size as u64;
+        let mut pages = 0u64;
+        for db in [
+            &self.main,
+            &self.exp,
+            &self.tagidx,
+            &self.tag_meta,
+            &self.jobs,
+            &self.meta,
+        ] {
+            let stat = db.stat(txn).map_err(StoreError::from_heed)?;
+            pages += stat.branch_pages as u64 + stat.leaf_pages as u64 + stat.overflow_pages as u64;
+        }
+        Ok(pages * page_size)
+    }
+
+    /// Fraction of the map in use, the input to the capacity watermarks.
+    pub fn utilisation_in(&self, txn: &RoTxn<'_, WithoutTls>) -> Result<f64> {
+        Ok(self.used_bytes_in(txn)? as f64 / self.env.info().map_size as f64)
+    }
+
+    /// Current capacity pressure, as last measured by the writer's maintenance
+    /// pass. Read on the write path to reject early, so a full store fails fast
+    /// instead of queueing work it cannot commit.
+    pub fn pressure(&self) -> Pressure {
+        Pressure::from_u8(self.pressure.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_pressure(&self, pressure: Pressure) {
+        self.pressure.store(pressure as u8, Ordering::Relaxed);
     }
 
     /// Advances the oldest outstanding tag-reclamation job by up to `budget`
@@ -940,8 +1127,8 @@ impl LmdbEngine {
             .entries as u64;
         let pending_reclaims = self.pending_jobs(&rtxn)?;
 
-        let page_size = stat.page_size as u64;
-        let used_bytes = (info.last_page_number as u64 + 1) * page_size;
+        let used_bytes = self.used_bytes_in(&rtxn)?;
+        let _ = stat;
 
         Ok(StoreStats {
             entries,

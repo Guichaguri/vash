@@ -39,6 +39,14 @@ pub struct ServerConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct StoreConfig {
     pub path: PathBuf,
+    /// Independent LMDB environments, and therefore the ceiling on concurrent
+    /// writers. `0` picks `min(num_cpus, 8)`.
+    ///
+    /// Fixed once a database exists: changing it would route every key to a
+    /// different environment, so startup refuses to open a mismatched store
+    /// rather than silently losing the whole cache.
+    pub shards: usize,
+    /// Map size **per shard**, not in total.
     pub map_size_mb: usize,
     pub max_readers: u32,
     pub durability: Durability,
@@ -47,6 +55,34 @@ pub struct StoreConfig {
     pub write: WriteConfig,
     pub ttl: TtlConfig,
     pub tags: TagConfig,
+    pub eviction: EvictionConfig,
+}
+
+/// Capacity watermarks, as fractions of a shard's map in use.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EvictionConfig {
+    /// Reclamation stops waiting for its interval and runs continuously.
+    pub soft: f64,
+    /// Live records start being evicted, soonest-to-expire first.
+    pub hard: f64,
+    /// Writes are refused with `CAPACITY_FULL`; reads and deletes still work.
+    pub critical: f64,
+    /// Records evicted per pass, bounding how long a pass holds the write
+    /// transaction.
+    pub batch: usize,
+}
+
+impl Default for EvictionConfig {
+    fn default() -> Self {
+        let defaults = cache_store::EvictionConfig::default();
+        Self {
+            soft: defaults.soft,
+            hard: defaults.hard,
+            critical: defaults.critical,
+            batch: defaults.batch,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -147,6 +183,11 @@ pub struct ObservabilityConfig {
     /// `json` or `pretty`.
     pub log_format: String,
     pub log_level: String,
+    /// Address for `/metrics`, `/health` and `/stats`. Empty disables them.
+    ///
+    /// A separate port from cache traffic, so it can be bound to a private
+    /// interface and a flood of scrapes cannot crowd out real requests.
+    pub admin_listen: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -179,9 +220,11 @@ impl Default for StoreConfig {
             durability: Durability::default(),
             max_value_bytes: cache_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
+            shards: 0,
             write: WriteConfig::default(),
             ttl: TtlConfig::default(),
             tags: TagConfig::default(),
+            eviction: EvictionConfig::default(),
         }
     }
 }
@@ -191,6 +234,7 @@ impl Default for ObservabilityConfig {
         Self {
             log_format: "pretty".into(),
             log_level: "info".into(),
+            admin_listen: "127.0.0.1:9090".into(),
         }
     }
 }
@@ -206,7 +250,14 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.store.map_size_mb > 0, "store.map_size_mb must be > 0");
+        let map_size = self.store.map_size_mb * 1024 * 1024;
+        anyhow::ensure!(
+            map_size >= cache_store::config::MIN_MAP_SIZE,
+            "store.map_size_mb is {} MiB, but the minimum is {} MiB: below that, LMDB can \
+             report a full map permanently even after everything has been deleted",
+            self.store.map_size_mb,
+            cache_store::config::MIN_MAP_SIZE / (1024 * 1024)
+        );
         anyhow::ensure!(self.store.max_readers > 0, "store.max_readers must be > 0");
         // Bounded by u32 because the drain on shutdown reacquires every permit
         // at once, and `Semaphore::acquire_many` counts in u32.
@@ -269,12 +320,51 @@ impl Config {
             self.store.tags.reclaim_batch > 0,
             "store.tags.reclaim_batch must be > 0"
         );
+
+        let evict = &self.store.eviction;
+        anyhow::ensure!(
+            (0.0..1.0).contains(&evict.soft)
+                && (0.0..1.0).contains(&evict.hard)
+                && (0.0..=1.0).contains(&evict.critical),
+            "store.eviction watermarks must be fractions between 0 and 1"
+        );
+        // Out of order, the levels would fight: eviction would trigger before
+        // reclamation, or writes would be refused before anything was freed.
+        anyhow::ensure!(
+            evict.soft < evict.hard && evict.hard < evict.critical,
+            "store.eviction watermarks must increase: soft ({}) < hard ({}) < critical ({})",
+            evict.soft,
+            evict.hard,
+            evict.critical
+        );
+        anyhow::ensure!(evict.batch > 0, "store.eviction.batch must be > 0");
         Ok(())
+    }
+
+    /// Shards actually used, resolving the `0` default.
+    ///
+    /// Capped at 4 rather than 8. Sharding buys concurrent *writers* and
+    /// nothing else — LMDB reads are already lock-free and concurrent within
+    /// one environment — so it only pays when the writer thread is the
+    /// bottleneck. When commits are disk-bound, which the default `relaxed`
+    /// durability makes likely, more environments fragment I/O across the same
+    /// device and measured throughput *falls*. Four is a compromise that helps
+    /// where sharding helps without punishing the disk-bound case; see the
+    /// benchmark in the README before raising it.
+    pub fn shard_count(&self) -> usize {
+        match self.store.shards {
+            0 => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(4),
+            n => n,
+        }
     }
 
     pub fn store_config(&self) -> cache_store::StoreConfig {
         cache_store::StoreConfig {
             path: self.store.path.clone(),
+            shards: self.shard_count(),
             map_size: self.store.map_size_mb * 1024 * 1024,
             max_readers: self.store.max_readers,
             durability: self.store.durability.into(),
@@ -289,6 +379,12 @@ impl Config {
                 sweep_interval_ms: self.store.ttl.sweep_interval_ms,
                 sweep_batch: self.store.ttl.sweep_batch,
                 reclaim_batch: self.store.tags.reclaim_batch,
+                eviction: cache_store::EvictionConfig {
+                    soft: self.store.eviction.soft,
+                    hard: self.store.eviction.hard,
+                    critical: self.store.eviction.critical,
+                    batch: self.store.eviction.batch,
+                },
             },
         }
     }

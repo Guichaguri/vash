@@ -2,7 +2,12 @@
 
 /// Bumped when the arrangement of sub-databases changes incompatibly. The
 /// record layout has its own version, in `cache_core::record`.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// - 1: initial layout.
+/// - 2: records that never expire are indexed too, so the capacity evictor can
+///   reach them. A version-1 database would be under-indexed and those records
+///   could never be evicted, so it is rejected rather than opened.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Maximum named sub-databases. Fixed at environment-open time and impossible
 /// to raise afterwards without reopening, so it is sized now for every
@@ -39,4 +44,12 @@ pub mod meta_key {
     pub const EPOCH: &[u8] = b"epoch";
     /// High-water mark of handed-out CAS values.
     pub const CAS_WATERMARK: &[u8] = b"cas_watermark";
+    /// This environment's position in the shard set, and the size of that set.
+    ///
+    /// Both are validated on open. Reopening with a different shard count would
+    /// route keys to different environments, so every existing key would read
+    /// as a miss while still occupying space — a silent, total cache loss. It
+    /// is a hard error instead.
+    pub const SHARD_INDEX: &[u8] = b"shard_index";
+    pub const SHARD_COUNT: &[u8] = b"shard_count";
 }

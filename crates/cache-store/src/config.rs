@@ -1,5 +1,18 @@
 use std::path::PathBuf;
 
+/// Smallest map size allowed, per shard.
+///
+/// Below roughly 4 MiB, LMDB can reach a state where it reports `MDB_MAP_FULL`
+/// permanently even after everything has been deleted: the free list needs
+/// pages of its own to record freed pages, and on a map that small there are
+/// none to spare. The store then refuses every write for good.
+///
+/// Measured on this workload (4 KiB values, sustained overfill): 2 and 3 MiB
+/// wedge, 4 MiB limps, 6 MiB and up recover cleanly. The limit is set well
+/// clear of that, and is still negligible for any real deployment — the map is
+/// a lazy reservation, not an allocation.
+pub const MIN_MAP_SIZE: usize = 16 * 1024 * 1024;
+
 /// How aggressively LMDB is asked to get data onto stable storage.
 ///
 /// A cache can trade durability for speed in a way a system of record cannot:
@@ -38,6 +51,14 @@ pub struct StoreConfig {
     /// Ceiling on registered tag names. The registry is held entirely in RAM,
     /// so without a limit a client inventing tag names is a memory leak.
     pub max_tags: usize,
+    /// Independent LMDB environments to run.
+    ///
+    /// LMDB permits one writer per environment, so this is the ceiling on
+    /// concurrent writers. Fixed at creation: changing it would route every key
+    /// somewhere else, and opening a database with a different count is refused.
+    ///
+    /// `map_size` applies to **each** shard, not to the total.
+    pub shards: usize,
     pub write: WriteConfig,
 }
 
@@ -62,6 +83,35 @@ pub struct WriteConfig {
     /// outstanding these run back to back rather than once per interval, so
     /// this bounds transaction length, not drain rate.
     pub reclaim_batch: usize,
+    pub eviction: EvictionConfig,
+}
+
+/// Capacity watermarks, as fractions of the LMDB map in use.
+///
+/// Each level does strictly more than the one below it. See plan §6.
+#[derive(Clone, Copy, Debug)]
+pub struct EvictionConfig {
+    /// Reclamation stops waiting for its interval and runs continuously.
+    pub soft: f64,
+    /// Live records start being evicted, soonest-to-expire first, until usage
+    /// falls back under `soft`.
+    pub hard: f64,
+    /// Writes are refused with `CAPACITY_FULL`. Reads and deletes still work.
+    pub critical: f64,
+    /// Records evicted per pass, bounding how long one pass holds the write
+    /// transaction.
+    pub batch: usize,
+}
+
+impl Default for EvictionConfig {
+    fn default() -> Self {
+        Self {
+            soft: 0.75,
+            hard: 0.88,
+            critical: 0.96,
+            batch: 512,
+        }
+    }
 }
 
 impl Default for WriteConfig {
@@ -73,6 +123,7 @@ impl Default for WriteConfig {
             sweep_interval_ms: 100,
             sweep_batch: 512,
             reclaim_batch: 512,
+            eviction: EvictionConfig::default(),
         }
     }
 }
@@ -88,6 +139,7 @@ impl Default for StoreConfig {
             wipe_on_start: false,
             bucket_granularity_ms: 1000,
             max_tags: 100_000,
+            shards: 1,
             write: WriteConfig::default(),
         }
     }

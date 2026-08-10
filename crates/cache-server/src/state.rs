@@ -10,6 +10,7 @@ pub struct ServerState {
     /// `FLUSH` is a remote cache-wipe primitive, so it is off unless
     /// deliberately enabled.
     pub flush_enabled: bool,
+    pub metrics: crate::metrics::ServerMetrics,
 }
 
 impl ServerState {
@@ -18,6 +19,7 @@ impl ServerState {
             store,
             info,
             flush_enabled,
+            metrics: crate::metrics::ServerMetrics::default(),
         })
     }
 }

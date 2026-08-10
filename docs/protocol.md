@@ -194,6 +194,11 @@ Notation: `u16`/`u32`/`u64` are little-endian; `bytes[n]` is a raw byte run.
 `max_key_len` and `max_value_len` are the server's configured limits; a client
 should enforce them locally rather than discovering them through errors.
 
+`shards` is how many independent storage environments back the server. It
+matters to a client for one reason: it decides whether a multi-key write is
+atomic. With `shards = 1` a `SET_MANY` is all-or-nothing; above that it is
+atomic per shard only.
+
 **Capability bits:**
 
 | Bit | Name | Meaning |
@@ -307,13 +312,20 @@ single consistent snapshot.
 **Response body** on `OK`: `count` u32, then `count` × `cas` u64, in request
 order.
 
-The whole batch is applied in **one transaction: either all of it lands or none
-of it does**. There is no per-item status, because everything rejectable per
-item — key length, value size, tag limits — is rejected while decoding, which
-fails the whole frame with `BAD_REQUEST` or `TOO_LARGE`.
+There is no per-item status, because everything rejectable per item — key
+length, value size, tag limits — is rejected while decoding, which fails the
+whole frame with `BAD_REQUEST` or `TOO_LARGE`.
 
-Later items overwrite earlier ones within a batch; CAS tokens increase in
-request order.
+**Atomicity is per shard, not per batch.** Keys are distributed across
+independent storage environments, and each commits its own transaction, so a
+batch touching three shards is three commits: a failure in one leaves the others
+applied. Within a single shard it is still all or nothing. Read `shards` from
+the [handshake](#hello-0x01) to know which applies — with `shards = 1` a batch
+is fully atomic.
+
+Later items overwrite earlier ones within a batch. **CAS tokens do not increase
+across a batch** when there is more than one shard, because each shard numbers
+independently; see [CAS tokens](#cas-tokens).
 
 ### `DELETE_MANY` (0x22)
 
@@ -619,9 +631,15 @@ yet. Reclamation is a background process and lags by design.
 
 ## CAS tokens
 
-A `u64` that increases on every write to a key, unique across the whole server,
-and monotonic across restarts. It never repeats — a restart skips forward rather
-than reusing a range.
+A `u64` that is **unique across the whole server** and never repeats — a restart
+skips forward rather than reusing a range.
+
+Ordering is guaranteed **per key**: every write to a given key gets a token
+higher than the one before it, which is all compare-and-swap depends on. Tokens
+are *not* globally ordered: each shard numbers independently and the values are
+striped so they cannot collide, so two keys in different shards say nothing
+about which was written first. A client must treat a token as an opaque version
+for one key, never as a clock.
 
 Zero is not a valid token. Compare-and-swap is available through the memcached
 `cas` command and the `ms … C<cas>` flag.

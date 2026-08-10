@@ -2,7 +2,7 @@
 //!
 //! LMDB allows one writer per environment. Rather than fight that, every write
 //! is funnelled to one thread that packs as many as it can into a single
-//! transaction. The commit cost — the expensive part — is then amortised across
+//! transaction. The commit cost â€” the expensive part â€” is then amortised across
 //! the whole batch instead of being paid per operation.
 //!
 //! The batch is **whatever had already queued while the previous commit was in
@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::SweepStats;
 use crate::config::WriteConfig;
-use crate::engine::{LmdbEngine, PreparedSet};
+use crate::engine::{LmdbEngine, PreparedSet, Pressure};
 use crate::error::{Result, StoreError};
 
 pub(crate) enum WriteOp {
@@ -53,7 +53,7 @@ impl WriteOp {
     /// Individual key operations this job carries.
     ///
     /// Counted rather than treating one job as one unit, because a `SET_MANY`
-    /// of 256 is 256 writes sharing a commit — which is exactly what the batch
+    /// of 256 is 256 writes sharing a commit â€” which is exactly what the batch
     /// metric is supposed to show.
     fn item_count(&self) -> usize {
         match self {
@@ -122,6 +122,8 @@ pub(crate) struct WriterMetrics {
     pub sweep_lag_ms: AtomicU64,
     /// Records freed by tag reclamation, as opposed to expiry sweeping.
     pub tag_reclaimed: AtomicU64,
+    /// Live records dropped to reclaim space under capacity pressure.
+    pub evicted: AtomicU64,
 }
 
 /// Client handle onto the writer thread.
@@ -319,7 +321,7 @@ fn writer_loop(
             std::thread::sleep(Duration::from_micros(config.linger_us));
         }
 
-        // Take whatever else has arrived. This — and not a timer — is what
+        // Take whatever else has arrived. This â€” and not a timer â€” is what
         // forms the batch.
         while batch.len() < config.max_batch {
             match rx.try_recv() {
@@ -345,6 +347,24 @@ fn writer_loop(
             &mut reclaim_pending,
         ) {
             Ok(()) => {}
+            Err(e) if e.is_capacity() => {
+                // The map is full. The batch that hit it was aborted, and with
+                // it the maintenance pass that would have freed space — so
+                // without this the store would never recover: every subsequent
+                // write would open a transaction, hit the same wall, and abort
+                // it again.
+                //
+                // Marking the pressure critical first means callers are
+                // refused before they reach the queue, so the emergency
+                // reclaim below is not competing with a stream of doomed
+                // writes.
+                warn!("store is full; refusing writes and reclaiming space");
+                engine.set_pressure(Pressure::Critical);
+                if let Err(e) = free_space(&engine, &config, &metrics) {
+                    error!(error = %e, "could not reclaim space from a full store");
+                }
+                reclaim_pending = true;
+            }
             Err(e) => {
                 error!(error = %e, "write batch failed");
                 // A failed commit says nothing about whether work remains, and
@@ -399,15 +419,39 @@ fn commit_batch(
 
     let mut outcomes = Vec::with_capacity(batch_size);
     let mut effects: Vec<PostCommit> = Vec::new();
+    let mut poisoned: Option<StoreError> = None;
+
     for job in batch.iter_mut() {
-        outcomes.push(apply(engine, &mut wtxn, &mut job.op, &mut effects));
+        let outcome = apply(engine, &mut wtxn, &mut job.op, &mut effects);
+        if let Err(e) = &outcome
+            && e.poisons_transaction()
+        {
+            poisoned = Some(e.clone_shallow());
+        }
+        let stop = poisoned.is_some();
+        outcomes.push(outcome);
+        if stop {
+            break;
+        }
+    }
+
+    // One failed operation invalidates the transaction, so nothing in this
+    // batch can land. Abort and tell every caller, rather than pressing on and
+    // surfacing MDB_BAD_TXN for writes that were never even attempted.
+    if let Some(err) = poisoned {
+        drop(wtxn);
+        for job in batch.drain(..) {
+            let _ = job.reply.send(Err(err.clone_shallow()));
+        }
+        return Err(err);
     }
 
     let mut sweep_stats = None;
     let mut reclaim_stats = None;
+    let mut evicted = 0usize;
     if maintenance {
-        // Neither failure may lose the user writes sharing this transaction;
-        // both simply retry next interval.
+        // None of these failures may lose the user writes sharing this
+        // transaction; they simply retry next interval.
         match engine.sweep(&mut wtxn, config.sweep_batch) {
             Ok(stats) => sweep_stats = Some(stats),
             Err(e) => warn!(error = %e, "sweep failed"),
@@ -416,6 +460,17 @@ fn commit_batch(
             Ok(stats) => reclaim_stats = stats,
             Err(e) => warn!(error = %e, "tag reclamation failed"),
         }
+
+        // Eviction comes last so it measures usage after the free work has
+        // been done, and only evicts live data if reclaiming dead data was not
+        // enough.
+        evicted = match apply_pressure(engine, &mut wtxn, config) {
+            Ok(freed) => freed,
+            Err(e) => {
+                warn!(error = %e, "eviction failed");
+                0
+            }
+        };
     }
 
     let mut needs_sync = false;
@@ -460,6 +515,10 @@ fn commit_batch(
                 report_sweep(stats);
             }
 
+            if evicted > 0 {
+                metrics.evicted.fetch_add(evicted as u64, Ordering::Relaxed);
+            }
+
             // Only a committed reclamation pass counts, and only an unfinished
             // one keeps the loop hot.
             *reclaim_pending = match reclaim_stats {
@@ -482,6 +541,10 @@ fn commit_batch(
                 // No job to work on.
                 None => false,
             };
+
+            // Still evicting means still over the hard watermark, so the loop
+            // must keep working rather than wait out the idle interval.
+            *reclaim_pending |= evicted > 0;
             if needs_sync && let Err(e) = engine.sync() {
                 error!(error = %e, "explicit sync failed");
             }
@@ -501,6 +564,98 @@ fn commit_batch(
             Err(err)
         }
     }
+}
+
+/// Frees space in a transaction of its own, after a batch failed because the
+/// map was full.
+///
+/// Its own transaction because the failed one is gone, and a smaller retry
+/// because the deletions themselves need pages: on a copy-on-write B-tree,
+/// removing a record dirties the path to it, so an eviction batch sized for
+/// normal running can be too large to commit on a full map.
+fn free_space(engine: &LmdbEngine, config: &WriteConfig, metrics: &WriterMetrics) -> Result<()> {
+    for budget in [config.eviction.batch, config.eviction.batch / 8, 8] {
+        let budget = budget.max(1);
+        let mut wtxn = engine.write_txn()?;
+
+        let swept = engine
+            .sweep(&mut wtxn, budget)
+            .map(|s| s.reclaimed)
+            .unwrap_or(0);
+        let evicted = engine
+            .evict(&mut wtxn, budget)
+            .map(|s| s.reclaimed)
+            .unwrap_or(0);
+
+        match wtxn.commit() {
+            Ok(()) => {
+                let freed = swept + evicted;
+                metrics.evicted.fetch_add(evicted as u64, Ordering::Relaxed);
+                info!(freed, budget, "reclaimed space from a full store");
+                return Ok(());
+            }
+            // Too big to commit even as a deletion; try a smaller bite.
+            Err(e) => {
+                debug!(budget, error = %e, "eviction batch did not fit; retrying smaller")
+            }
+        }
+    }
+
+    Err(StoreError::CapacityFull)
+}
+
+/// Measures capacity pressure and, past the hard watermark, evicts to get back
+/// under the soft one. Returns how many records were freed.
+///
+/// The measurement is taken inside the write transaction, so it reflects the
+/// space this batch just consumed rather than a stale reading.
+fn apply_pressure(
+    engine: &LmdbEngine,
+    wtxn: &mut heed::RwTxn,
+    config: &WriteConfig,
+) -> Result<usize> {
+    let limits = &config.eviction;
+    // Measured inside this transaction, so it reflects the space this batch
+    // just consumed and the pages the sweep just freed.
+    let utilisation = engine.utilisation_in(wtxn)?;
+
+    let level = if utilisation >= limits.critical {
+        Pressure::Critical
+    } else if utilisation >= limits.hard {
+        Pressure::Hard
+    } else if utilisation >= limits.soft {
+        Pressure::Soft
+    } else {
+        Pressure::Normal
+    };
+
+    let previous = engine.pressure();
+    engine.set_pressure(level);
+    if level != previous {
+        // Worth a line at info: crossing a watermark is the explanation for a
+        // sudden change in hit rate or a burst of CAPACITY_FULL.
+        info!(
+            from = previous.as_str(),
+            to = level.as_str(),
+            utilisation = format!("{utilisation:.3}"),
+            "capacity pressure changed"
+        );
+    }
+
+    if level < Pressure::Hard {
+        return Ok(0);
+    }
+
+    let stats = engine.evict(wtxn, limits.batch)?;
+    if stats.reclaimed > 0 {
+        debug!(
+            evicted = stats.reclaimed,
+            scanned = stats.scanned,
+            utilisation = format!("{utilisation:.3}"),
+            "evicted to reclaim space"
+        );
+    }
+    Ok(stats.reclaimed)
 }
 
 fn apply(

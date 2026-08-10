@@ -32,6 +32,8 @@ impl TestServer {
         config.server.listen = "127.0.0.1:0".parse().unwrap();
         config.store.path = dir.path().join("db");
         config.store.map_size_mb = 64;
+        // Port 0: these run in parallel and would otherwise fight over 9090.
+        config.observability.admin_listen = "127.0.0.1:0".into();
         tweak(&mut config);
 
         let server = Server::bind(config).await.expect("binding");

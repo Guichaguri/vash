@@ -1,4 +1,4 @@
-﻿//! Storage-engine tests, driven directly against the `Store` trait.
+//! Storage-engine tests, driven directly against the `Store` trait.
 //!
 //! These cover behaviour that is invisible from the wire â€” expiry-index
 //! bookkeeping, sweeper reclamation, group commit â€” and would otherwise only be
@@ -114,14 +114,29 @@ fn a_ttl_write_adds_exactly_one_expiry_entry() {
 }
 
 #[test]
-fn a_write_without_a_ttl_adds_no_expiry_entry() {
+fn a_write_without_a_ttl_is_indexed_too() {
+    // Indexed so the capacity evictor can reach it: a record outside the index
+    // can never be chosen as a victim, so a cache of TTL-less keys would fill
+    // up with nothing to free.
     let h = Harness::new();
     h.set(b"k", b"v", 0);
-    assert_eq!(
-        h.expiry_entries(),
-        0,
-        "keys that never expire must not be indexed"
-    );
+    assert_eq!(h.expiry_entries(), 1);
+}
+
+#[test]
+fn a_record_without_a_ttl_is_never_swept() {
+    // Being in the index must not make it expire — it sorts after every real
+    // expiry time, so the sweeper stops before reaching it.
+    let h = Harness::with(|c| c.write.sweep_interval_ms = 5);
+
+    h.set(b"forever", b"v", 0);
+    h.set(b"doomed", b"v", 1);
+
+    h.wait_for("the expiring key to be reclaimed", |h| h.entries() == 1);
+    std::thread::sleep(Duration::from_millis(100)); // several more sweeps
+
+    assert_eq!(h.get(b"forever").as_deref(), Some(&b"v"[..]));
+    assert_eq!(h.entries(), 1);
 }
 
 #[test]
@@ -151,17 +166,21 @@ fn overwriting_with_a_different_ttl_replaces_the_entry() {
 }
 
 #[test]
-fn dropping_a_ttl_removes_the_index_entry() {
-    let h = Harness::new();
-    h.set(b"k", b"v", 60);
+fn dropping_a_ttl_moves_the_index_entry_rather_than_duplicating_it() {
+    let h = Harness::with(|c| c.write.sweep_interval_ms = 5);
+    h.set(b"k", b"v", 1);
     assert_eq!(h.expiry_entries(), 1);
 
     h.set(b"k", b"v", 0);
     assert_eq!(
         h.expiry_entries(),
-        0,
-        "a key that no longer expires must leave the index"
+        1,
+        "the old entry must be replaced, not added to"
     );
+
+    // And the record must outlive the TTL it used to have.
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"v"[..]));
 }
 
 #[test]
@@ -205,8 +224,8 @@ fn the_sweeper_leaves_live_records_alone() {
     assert_eq!(h.get(b"forever").as_deref(), Some(&b"v"[..]));
     assert_eq!(
         h.expiry_entries(),
-        1,
-        "only the long key should remain indexed"
+        2,
+        "both survivors stay indexed — the TTL-less one so it remains evictable"
     );
 }
 
@@ -278,7 +297,9 @@ fn touch_can_clear_a_ttl() {
     h.set(b"k", b"v", 1);
     assert!(h.store().touch(Key::new(b"k").unwrap(), 0).unwrap());
 
-    assert_eq!(h.expiry_entries(), 0);
+    // Still one entry — it moved to the never-expires bucket rather than
+    // leaving the index, so the record stays evictable.
+    assert_eq!(h.expiry_entries(), 1);
     std::thread::sleep(Duration::from_millis(1_200));
     assert_eq!(h.get(b"k").as_deref(), Some(&b"v"[..]));
 }
@@ -832,6 +853,257 @@ fn tags_still_work_after_a_flush() {
     h.set_tagged(b"k", b"v", 0, &[b"t"]);
     assert!(h.store().delete_by_tag(b"t").unwrap());
     assert!(h.get(b"k").is_none());
+}
+
+// ---- sharding --------------------------------------------------------------
+
+#[test]
+fn a_sharded_store_behaves_like_a_single_one() {
+    let h = Harness::with(|c| c.shards = 4);
+
+    for i in 0..500u32 {
+        h.set(format!("k{i}").as_bytes(), format!("v{i}").as_bytes(), 0);
+    }
+    for i in 0..500u32 {
+        assert_eq!(
+            h.get(format!("k{i}").as_bytes()).as_deref(),
+            Some(format!("v{i}").as_bytes()),
+            "k{i} must be readable from whichever shard owns it"
+        );
+    }
+    assert_eq!(h.entries(), 500, "every key lands in exactly one shard");
+}
+
+#[test]
+fn batches_are_reassembled_into_request_order_across_shards() {
+    // The failure this guards against is subtle and silent: results coming back
+    // grouped by shard rather than in the order the client asked.
+    let h = Harness::with(|c| c.shards = 8);
+
+    let keys: Vec<String> = (0..64).map(|i| format!("key{i}")).collect();
+    let sets: Vec<Set<'_>> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| Set {
+            key: Key::new(key.as_bytes()).unwrap(),
+            value: if i % 3 == 0 { b"a" } else { b"b" },
+            ttl_secs: 0,
+            mc_flags: 0,
+            tags: Vec::new(),
+            mode: cache_core::SetMode::Set,
+        })
+        .collect();
+    h.store().set_many(&sets).unwrap();
+
+    // Delete every third key so hits and misses interleave.
+    let lookups: Vec<Key<'_>> = keys
+        .iter()
+        .map(|k| Key::new(k.as_bytes()).unwrap())
+        .collect();
+    let doomed: Vec<Key<'_>> = lookups.iter().step_by(2).copied().collect();
+    let deleted = h.store().delete_many(&doomed).unwrap();
+    assert!(deleted.iter().all(|hit| *hit));
+
+    let values = h.store().get_many(&lookups).unwrap();
+    assert_eq!(values.len(), lookups.len());
+    for (i, value) in values.iter().enumerate() {
+        if i % 2 == 0 {
+            assert!(value.is_none(), "key{i} was deleted");
+        } else {
+            let expected: &[u8] = if i % 3 == 0 { b"a" } else { b"b" };
+            assert_eq!(
+                value.as_ref().map(|v| v.data.to_vec()).as_deref(),
+                Some(expected),
+                "key{i} came back in the wrong slot"
+            );
+        }
+    }
+}
+
+#[test]
+fn cas_tokens_are_unique_across_shards() {
+    use std::collections::HashSet;
+
+    // Each shard counts independently, so the raw counters collide; the tokens
+    // are striped by shard to stay unique server-wide.
+    let h = Harness::with(|c| c.shards = 8);
+    let tokens: HashSet<u64> = (0..400u32)
+        .map(|i| h.set(format!("k{i}").as_bytes(), b"v", 0))
+        .collect();
+
+    assert_eq!(
+        tokens.len(),
+        400,
+        "cas tokens must not repeat between shards"
+    );
+}
+
+#[test]
+fn tags_invalidate_across_every_shard() {
+    // A tag's keys are spread by key hash, so an invalidation that reached only
+    // one shard would leave most of them being served.
+    let h = Harness::with(|c| c.shards = 4);
+
+    for i in 0..200u32 {
+        h.set_tagged(format!("k{i}").as_bytes(), b"v", 0, &[b"everything"]);
+    }
+    assert!(h.store().delete_by_tag(b"everything").unwrap());
+
+    for i in 0..200u32 {
+        assert!(
+            h.get(format!("k{i}").as_bytes()).is_none(),
+            "k{i} survived the invalidation"
+        );
+    }
+}
+
+#[test]
+fn reopening_with_a_different_shard_count_is_refused() {
+    // Silently accepting it would route every key elsewhere: the data would
+    // still occupy disk while every read missed.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StoreConfig {
+        path: dir.path().join("db"),
+        map_size: 32 * 1024 * 1024,
+        shards: 4,
+        ..StoreConfig::default()
+    };
+
+    let store = LmdbStore::open(&config).unwrap();
+    store
+        .set(&Set {
+            key: Key::new(b"k").unwrap(),
+            value: b"v",
+            ttl_secs: 0,
+            mc_flags: 0,
+            tags: Vec::new(),
+            mode: cache_core::SetMode::Set,
+        })
+        .unwrap();
+    store.close();
+
+    config.shards = 8;
+    let Err(err) = LmdbStore::open(&config) else {
+        panic!("must refuse a changed shard count");
+    };
+    assert!(
+        err.to_string().contains("shard"),
+        "the error should say why: {err}"
+    );
+}
+
+// ---- capacity --------------------------------------------------------------
+
+#[test]
+fn a_sustained_overfill_evicts_instead_of_failing() {
+    // The M4 exit criterion. A map far smaller than the data written, filled
+    // continuously: the store must shed old records and keep serving rather
+    // than wedge or lose its mind.
+    let h = Harness::with(|c| {
+        c.map_size = cache_store::config::MIN_MAP_SIZE;
+        c.write.sweep_interval_ms = 1;
+        c.write.eviction.batch = 64;
+    });
+
+    // Several times the map, written continuously.
+    let value = vec![b'x'; 16 * 1024];
+    let total = 4_000u32;
+    let mut accepted = 0usize;
+    let mut refused = 0usize;
+    let mut accepted_late = 0usize;
+
+    for i in 0..total {
+        let key = format!("overfill{i}");
+        let result = h.store().set(&Set {
+            key: Key::new(key.as_bytes()).unwrap(),
+            value: &value,
+            ttl_secs: 0,
+            mc_flags: 0,
+            tags: Vec::new(),
+            mode: cache_core::SetMode::Set,
+        });
+        match result {
+            Ok(_) => {
+                accepted += 1;
+                if i >= total * 3 / 4 {
+                    accepted_late += 1;
+                }
+            }
+            // Refusing under critical pressure is a legitimate outcome; a panic
+            // or a corrupt store is not.
+            Err(cache_store::StoreError::CapacityFull) => refused += 1,
+            Err(e) => panic!("write {i} failed unexpectedly: {e}"),
+        }
+    }
+
+    // The point is not how many writes got through — that depends on how fast
+    // eviction keeps up — but that the store was *still accepting them at the
+    // end*. A cache that filled up and stopped would score zero here.
+    assert!(
+        accepted_late > 0,
+        "no writes were accepted in the last quarter: the store filled up and stayed full \
+         ({accepted} accepted, {refused} refused overall)"
+    );
+    assert!(
+        h.store().stats().unwrap().evicted > 0,
+        "nothing was evicted, so the map must have been big enough after all"
+    );
+
+    // Still usable afterwards: reads work, and writing again succeeds once
+    // eviction has caught up.
+    h.wait_for("pressure to fall back", |h| {
+        h.store()
+            .set(&Set {
+                key: Key::new(b"after-the-storm").unwrap(),
+                value: b"v",
+                ttl_secs: 0,
+                mc_flags: 0,
+                tags: Vec::new(),
+                mode: cache_core::SetMode::Set,
+            })
+            .is_ok()
+    });
+    assert_eq!(h.get(b"after-the-storm").as_deref(), Some(&b"v"[..]));
+
+    println!("overfill: {accepted} accepted, {refused} refused under pressure");
+}
+
+#[test]
+fn eviction_takes_the_soonest_to_expire_first() {
+    let h = Harness::with(|c| {
+        c.map_size = cache_store::config::MIN_MAP_SIZE;
+        c.write.sweep_interval_ms = 1;
+        c.write.eviction.batch = 32;
+    });
+
+    // A long-lived key written first; it must outlast the short-lived flood
+    // even though it is older.
+    h.set(b"long-lived", b"keep-me", 86_400);
+
+    // Comfortably more than the map holds, so eviction has to run.
+    let value = vec![b'x'; 16 * 1024];
+    for i in 0..1_600u32 {
+        let key = format!("churn{i}");
+        let _ = h.store().set(&Set {
+            key: Key::new(key.as_bytes()).unwrap(),
+            value: &value,
+            // Sooner than the long-lived key, so these are taken first.
+            ttl_secs: 600,
+            mc_flags: 0,
+            tags: Vec::new(),
+            mode: cache_core::SetMode::Set,
+        });
+    }
+
+    assert!(
+        h.store().stats().unwrap().evicted > 0,
+        "the test needs eviction to have happened"
+    );
+    assert_eq!(
+        h.get(b"long-lived").as_deref(),
+        Some(&b"keep-me"[..]),
+        "eviction should have taken the sooner-expiring records first"
+    );
 }
 
 #[test]

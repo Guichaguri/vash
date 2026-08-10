@@ -23,17 +23,27 @@ pub mod expiry;
 pub mod lmdb;
 pub mod reclaim;
 pub mod schema;
+mod shard;
 pub mod tags;
 mod writer;
 
 use cache_core::{Key, Set, Stored, Value};
 
-pub use config::{Durability, StoreConfig, WriteConfig};
+pub use config::{Durability, EvictionConfig, StoreConfig, WriteConfig};
+pub use engine::Pressure;
 pub use error::{Result, StoreError};
 pub use lmdb::LmdbStore;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StoreStats {
+    /// Environments in the shard set.
+    pub shards: u32,
+    /// Highest capacity pressure across them.
+    pub pressure: &'static str,
+    /// Live records dropped to reclaim space, as opposed to expired or
+    /// tag-invalidated ones. A non-zero and rising value means the store is
+    /// too small for its working set.
+    pub evicted: u64,
     pub entries: u64,
     /// Live entries in the expiry index. Compared against `entries`, this is
     /// how much of the keyspace carries a TTL — and, if it drifts far above,
@@ -68,6 +78,33 @@ pub struct StoreStats {
     pub sweep_lag_ms: u64,
     /// Records freed by tag reclamation, as opposed to expiry sweeping.
     pub tag_reclaimed: u64,
+}
+
+impl Default for StoreStats {
+    fn default() -> Self {
+        Self {
+            shards: 0,
+            pressure: "normal",
+            evicted: 0,
+            entries: 0,
+            expiry_entries: 0,
+            tag_index_entries: 0,
+            tags: 0,
+            pending_reclaims: 0,
+            map_size: 0,
+            used_bytes: 0,
+            utilisation: 0.0,
+            readers_in_use: 0,
+            max_readers: 0,
+            epoch: 0,
+            commits: 0,
+            committed_ops: 0,
+            sweeps: 0,
+            reclaimed: 0,
+            sweep_lag_ms: 0,
+            tag_reclaimed: 0,
+        }
+    }
 }
 
 impl StoreStats {
