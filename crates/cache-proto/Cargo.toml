@@ -1,0 +1,13 @@
+[package]
+name = "cache-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cache-core.workspace = true
+
+bytes.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true

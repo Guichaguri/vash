@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+
+# Local database directories
+/data
+*.mdb
+*.mdb-lock
+
+# IDE
+/.idea
+/.vscode
+
+# Local overrides
+/kached.local.toml

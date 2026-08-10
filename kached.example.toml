@@ -1,0 +1,31 @@
+# Example configuration. Every key shown is one M0 actually honours; unknown
+# keys are rejected at startup rather than silently ignored.
+#
+#   kached --config kached.example.toml
+
+[server]
+listen = "127.0.0.1:11311"
+# Connections beyond this are refused rather than queued: a client told "no"
+# can fall back to the origin, a client left waiting cannot.
+max_connections = 10000
+read_buffer = 16384
+
+[store]
+path = "data"
+# An address-space reservation, not a preallocation — verified on both Linux
+# and Windows — so a generous value costs nothing until the data arrives.
+map_size_mb = 4096
+max_readers = 128
+
+# durable   fsync on every commit
+# relaxed   skips the meta-page sync; loses at most the last few transactions
+#           on an OS crash and cannot corrupt the database
+# ephemeral no syncing; fastest, and a crash means starting empty
+durability = "relaxed"
+
+max_value_bytes = 1048576
+wipe_on_start = false
+
+[observability]
+log_format = "pretty"   # or "json"
+log_level = "info"      # overridden by RUST_LOG when set
