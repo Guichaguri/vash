@@ -61,6 +61,7 @@ impl Server {
             info,
             config.protocol.flush_enabled,
             cluster,
+            config.store.inline_reads,
         );
 
         let listener = TcpListener::bind(config.server.listen)

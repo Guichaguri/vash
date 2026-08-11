@@ -12,3 +12,11 @@
 
 # Local overrides
 /kached.local.toml
+
+# Fuzzing. `fuzz/seeds` is committed — it is generated from the encoders by
+# `cargo run -p cache-proto --example seed_corpus` and is what the targets start
+# from. `corpus` is what libFuzzer grows from those at runtime, and `artifacts`
+# is where it drops a crashing input; neither belongs in the repository.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

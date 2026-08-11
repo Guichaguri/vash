@@ -53,6 +53,23 @@ pub struct StoreConfig {
     pub durability: Durability,
     pub max_value_bytes: usize,
     pub wipe_on_start: bool,
+    /// Run read-only requests on the network worker instead of handing them to
+    /// the storage tier.
+    ///
+    /// The hand-off exists so that a read which page-faults blocks a thread
+    /// that is allowed to block, rather than an async worker serving other
+    /// connections. That is the right default and stays the default.
+    ///
+    /// It is also, measurably, the most expensive thing in a request. A hop
+    /// costs two thread wake-ups, which the plan estimated at ~200ns and which
+    /// measure far higher on Windows — enough that a `PING`, which does no work
+    /// at all, spends tens of microseconds of CPU. Turning this on removes the
+    /// hop for reads only; writes always go to the storage tier, because they
+    /// wait on the writer queue by design.
+    ///
+    /// Turn it on when the working set is resident — when it is not, a cold
+    /// read stalls every connection sharing that worker.
+    pub inline_reads: bool,
     pub write: WriteConfig,
     pub ttl: TtlConfig,
     pub tags: TagConfig,
@@ -286,6 +303,7 @@ impl Default for StoreConfig {
             durability: Durability::default(),
             max_value_bytes: cache_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
+            inline_reads: false,
             shards: 0,
             write: WriteConfig::default(),
             ttl: TtlConfig::default(),

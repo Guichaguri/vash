@@ -84,3 +84,86 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # These two parsers are the only code that reads bytes from unauthenticated
+  # strangers, so they get coverage-guided fuzzing on every PR rather than only
+  # the property tests. A short run per target catches regressions; the nightly
+  # job below is what actually explores.
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [kcp_decode, memcached_text, memcached_meta, record_header]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> target"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # Seeded from the committed corpus so the budget goes on the body
+      # decoders rather than on rediscovering what a valid frame looks like.
+      - name: Fuzz ${{ matrix.target }}
+        run: >
+          cargo fuzz run ${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
+          -- -max_total_time=120 -print_final_stats=1
+      - name: Upload any crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+
+  # The release artefact: one static binary that runs on any Linux, and the
+  # scratch image built from it. Built on every PR so a packaging break is
+  # caught by the change that caused it rather than at release time.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --bin kached --target x86_64-unknown-linux-musl
+
+      # A "static" binary that turns out to be dynamically linked is a problem
+      # discovered on the target machine, so it is asserted here instead.
+      - name: Check the binary is actually static
+        run: |
+          file target/x86_64-unknown-linux-musl/release/kached
+          ldd target/x86_64-unknown-linux-musl/release/kached 2>&1 | grep -q "not a dynamic executable" \
+            || { echo "kached is dynamically linked"; exit 1; }
+
+      - name: Check it runs and serves
+        run: |
+          ./target/x86_64-unknown-linux-musl/release/kached \
+            --listen 127.0.0.1:11311 --data /tmp/kached-pkg --ephemeral &
+          for _ in $(seq 40); do
+            (echo -n "" >/dev/tcp/127.0.0.1/11311) 2>/dev/null && break
+            sleep 0.2
+          done
+          printf 'set k 0 0 5\r\nhello\r\nget k\r\nquit\r\n' | timeout 5 nc 127.0.0.1 11311 | grep -q hello
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kached-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/kached
+
+      - name: Build the container image
+        run: docker build -t kached:ci .
+      - name: Check the image serves
+        run: |
+          docker run -d --name kached-ci -p 11312:11311 kached:ci \
+            --listen 0.0.0.0:11311 --data /var/lib/kached --ephemeral
+          for _ in $(seq 40); do
+            (echo -n "" >/dev/tcp/127.0.0.1/11312) 2>/dev/null && break
+            sleep 0.25
+          done
+          printf 'version\r\nquit\r\n' | timeout 5 nc 127.0.0.1 11312 | grep -q VERSION
+          docker rm -f kached-ci

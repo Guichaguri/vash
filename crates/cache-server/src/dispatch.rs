@@ -9,7 +9,42 @@ use tracing::{error, warn};
 use crate::metrics::ErrorClass;
 use crate::state::ServerState;
 
-/// Executes a memcached command, rendering the reply in that dialect.
+/// Executes every complete memcached command in `block`, appending the replies.
+///
+/// The block was already measured by the caller to end on a command boundary,
+/// so parsing here cannot run short; re-parsing rather than passing the parsed
+/// form across is what keeps the borrowed key and value slices from crossing a
+/// task boundary.
+pub fn execute_memcached_block(state: &ServerState, block: &[u8], out: &mut Vec<u8>) -> Closing {
+    use cache_proto::memcached::{Outcome, ProtocolError, parse};
+
+    let mut rest = block;
+    while !rest.is_empty() {
+        match parse(rest) {
+            Ok(Outcome::Command(parsed)) => {
+                let consumed = parsed.consumed;
+                if execute_memcached(state, &parsed, out) == Closing::Yes {
+                    // `quit`: nothing after it on this connection matters.
+                    return Closing::Yes;
+                }
+                rest = &rest[consumed..];
+            }
+            Err(ProtocolError::Recoverable { response, consumed }) => {
+                cache_proto::memcached::encode::encode_error(out, response);
+                rest = &rest[consumed..];
+            }
+            // Unreachable: the caller only includes whole commands. Stopping
+            // rather than looping keeps a logic slip from spinning a core.
+            Ok(Outcome::Incomplete) | Err(ProtocolError::Fatal(_)) => {
+                error!("a memcached block did not end on a command boundary");
+                break;
+            }
+        }
+    }
+    Closing::No
+}
+
+/// Executes one memcached command, rendering the reply in that dialect.
 ///
 /// Shares [`execute`] with the KCP path: the storage layer never learns which
 /// wire format a request arrived on.
@@ -65,15 +100,15 @@ fn memcached_error(status: Status) -> cache_proto::memcached::ErrorKind {
     }
 }
 
-/// Decodes and executes one complete frame, returning the encoded response.
+/// Decodes and executes one complete frame, appending the encoded response.
 ///
-/// Runs on a blocking thread, and takes ownership of the frame bytes, so the
-/// borrowed key and value slices produced by the decoder never cross a task
-/// boundary and never need copying. An empty return means "send nothing" — a
-/// `NO_REPLY` request.
-pub fn execute_frame(state: &ServerState, frame: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-
+/// Runs on a blocking thread, and borrows the frame bytes, so the key and value
+/// slices produced by the decoder never cross a task boundary and never need
+/// copying. Appends nothing for a `NO_REPLY` request.
+///
+/// Takes the output buffer rather than returning one so a pipelined batch
+/// builds a single response buffer instead of one allocation per frame.
+pub fn execute_frame_into(state: &ServerState, frame: &[u8], out: &mut Vec<u8>) {
     match decode(frame) {
         Ok(Decoded::Request { request, .. }) => {
             let result = execute(state, &request.command);
@@ -82,14 +117,12 @@ pub fn execute_frame(state: &ServerState, frame: &[u8]) -> Vec<u8> {
                 if let Err(status) = result {
                     warn!(?status, opcode = ?request.opcode, "no-reply request failed");
                 }
-                return out;
+                return;
             }
 
             match result {
-                Ok(reply) => encode_reply(&mut out, request.opcode, request.request_id, &reply),
-                Err(status) => {
-                    encode_error(&mut out, request.opcode as u8, request.request_id, status)
-                }
+                Ok(reply) => encode_reply(out, request.opcode, request.request_id, &reply),
+                Err(status) => encode_error(out, request.opcode as u8, request.request_id, status),
             }
         }
 
@@ -101,19 +134,17 @@ pub fn execute_frame(state: &ServerState, frame: &[u8]) -> Vec<u8> {
             ..
         }) => {
             warn!(request_id, opcode, detail, "rejected malformed request");
-            encode_error(&mut out, opcode, request_id, status);
+            encode_error(out, opcode, request_id, status);
         }
 
         // The caller only passes frames whose length it already validated, so
         // neither of these is reachable. Answering rather than panicking keeps a
         // logic slip from taking the process down.
         Ok(Decoded::Incomplete { .. }) | Err(DecodeError::Fatal { .. }) => {
-            error!("frame passed to execute_frame was not a complete, valid frame");
-            encode_error(&mut out, 0, 0, Status::Internal);
+            error!("frame passed to execute_frame_into was not a complete, valid frame");
+            encode_error(out, 0, 0, Status::Internal);
         }
     }
-
-    out
 }
 
 fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> {

@@ -9,3 +9,6 @@ license.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 zerocopy.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

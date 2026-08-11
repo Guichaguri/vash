@@ -6,6 +6,14 @@ use cache_server::{Config, Server};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+/// The request path allocates per request — a response buffer, and a copy of
+/// the value out of the memory map — from as many threads as there are cores.
+/// The system allocator is a contended global under that shape; mimalloc is
+/// per-thread with a free list per size class, which is the shape that matches.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "kached", version, about = "A tag-aware cache server")]
 struct Cli {

@@ -1,0 +1,48 @@
+[package]
+name = "cache-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cache-core = { path = "../crates/cache-core" }
+cache-proto = { path = "../crates/cache-proto" }
+libfuzzer-sys = "0.4"
+
+# Detached from the workspace on purpose. Building these needs a nightly
+# toolchain and libFuzzer, so a plain `cargo test` at the root must not try.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "kcp_decode"
+path = "fuzz_targets/kcp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcached_text"
+path = "fuzz_targets/memcached_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcached_meta"
+path = "fuzz_targets/memcached_meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_header"
+path = "fuzz_targets/record_header.rs"
+test = false
+doc = false
+bench = false

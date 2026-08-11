@@ -1,0 +1,20 @@
+# The build context is uploaded to the daemon before anything runs, so what is
+# not needed to compile does not belong in it. `target/` alone is several GB and
+# would be discarded by the build anyway — the image compiles from source.
+target/
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/
+
+# Local databases. Copying one in would also make every build cache-miss.
+data/
+*.mdb
+
+.git/
+.github/
+.idea/
+docs/
+tests/
+packaging/
+*.md
+!README.md

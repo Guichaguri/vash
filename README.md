@@ -7,12 +7,13 @@ Wire protocols: [docs/protocol.md](docs/protocol.md) — enough detail to write 
 client against. Design and rationale: [docs/plan.md](docs/plan.md). Original
 brief: [docs/project.md](docs/project.md).
 
-**Status: M5 complete.** Speaks both its own binary protocol and the memcached
-text and meta protocols, on the same port. TTLs with background reclamation,
-group-committed writes across independent shards, constant-time tag
-invalidation that propagates across a cluster, capacity eviction, and Prometheus
-metrics. Not yet production-usable — see
-[What works today](#what-works-today).
+**Status: M6 complete — feature work done.** Speaks both its own binary protocol
+and the memcached text and meta protocols, on the same port. TTLs with
+background reclamation, group-committed writes across independent shards,
+constant-time tag invalidation that propagates across a cluster, capacity
+eviction, Prometheus metrics, continuous fuzzing of both parsers, and a static
+binary you can ship. See [Performance](#performance) for what it does and what
+it does not.
 
 ## Quick start
 
@@ -51,6 +52,99 @@ will not be: upstream deprecated it in favour of the meta commands.
 The on-disk record format is already the final one — epoch, TTL, CAS and the tag
 table are all written today — so later milestones add behaviour without a
 migration.
+
+## Performance
+
+Measured on a 12-core Windows 11 dev box with NVMe, **with the load generator on
+the same machine** talking over loopback — so client and server compete for the
+same cores and the same memory bus. Every number here is a floor, and the
+latency figures are the most distorted of them. Reproduce with:
+
+```bash
+cargo run --release -p cache-bench --bin load -- --workload get --connections 16 --pipeline 128
+```
+
+Run-to-run variance is large — around ±25% between identical runs, because the
+client is competing with the server — so treat these as magnitudes rather than
+figures. Pipelined, 16 connections, 64-byte values, 4 shards, syncing off:
+
+| Workload | ops/s |
+|---|---:|
+| `PING` (touches no storage) | 4,040,000 |
+| `GET` | 1,280,000 |
+| Mixed, 9 reads : 1 write | 306,000 |
+| `SET` | 40,000 |
+
+`GET` by value size: 2,040,000 at 64 B, 1,820,000 at 256 B, 920,000–1,030,000 at
+1 KiB, 337,000 at 4 KiB. The fall with size is data movement, not per-request
+work — 4 KiB at 337k ops/s is 1.4 GB/s of value bytes leaving the process while
+the client reads them on the same memory bus.
+
+Closed-loop latency, one request in flight per connection, 1 KiB values:
+
+| connections | ops/s | p50 | p99 | p99.9 |
+|---:|---:|---:|---:|---:|
+| 8 | 34,900 | 0.20 ms | **0.66 ms** | 1.20 ms |
+| 32 | 27,900 | 0.93 ms | 4.20 ms | 7.10 ms |
+| 128 | 20,900 | 5.80 ms | 12.90 ms | 17.00 ms |
+
+Against the goals set in [plan.md](docs/plan.md) §13 before any of it was built:
+
+- **GET ≥ 1M ops/s — met**, including at the 1 KiB the goal names, though that
+  one lands close enough to the line that the variance straddles it.
+- **`DELETE_BY_TAG` < 1 ms regardless of cardinality — met.** See
+  [below](#tag-invalidation).
+- **p99 < 1 ms at 500k ops/s — half met, and not measurable as stated.** p99 is
+  0.66 ms, but at 35k ops/s: closed-loop throughput on one machine is bounded by
+  round trips, and reaching 500k that way needs a client that is not fighting
+  the server for cores. Latency degrades with connection count from there, which
+  is queueing on a saturated box rather than anything the server chose.
+- **SET ≥ 250k ops/s — not met, and the goal was wrong.** Writes go through a
+  copy-on-write B-tree that commits to a disk. M4 measured where that ceiling
+  is: with syncing on, throughput is set by the device, and sharding makes it
+  *worse* by splitting one disk between more environments. Group commit is doing
+  its job — throughput tracks batch size — but the limit is underneath it. Tens
+  of thousands of writes a second is what this design gives on this hardware,
+  and the number worth stating beside it is the 9:1 mixed workload at 306k.
+
+Two things that were expected to matter and did not, which is worth as much as
+the things that did:
+
+- **`store.inline_reads`**, which runs reads on the network worker instead of
+  handing them to the storage threads, measured within noise of the hand-off
+  (1.18M against 1.28M — the difference is smaller than the variance). It stays
+  off by default and stays available, because the hand-off cost it removes is a
+  property of the platform's thread wake-ups rather than of this code.
+- **mimalloc** was expected to be worth 10–20% on allocation-heavy connection
+  handling. Measured: 1.13M against 1.11M ops/s. It ships as an opt-in feature
+  rather than the default.
+
+### The thing that mattered
+
+Reads were capped at 86,000 ops/s by a flag that existed to serve a design that
+was never built. `read_txn_without_tls()` makes a read transaction `Send` so a
+hand-rolled reader pool could pass one between threads; that pool was replaced
+in M1 by the runtime's blocking pool, where a transaction is created and dropped
+inside a single call and never crosses a thread. Nothing needed it — and without
+thread-local storage, every transaction has to claim a slot in a shared reader
+table behind a process-wide mutex.
+
+The lookups really are lock-free. The transaction around them was not:
+
+```bash
+cargo run --release -p cache-store --example txn_bench
+```
+
+| threads | without TLS | with TLS |
+|---:|---:|---:|
+| 1 | 343,756 | 948,333 |
+| 4 | 100,915 | 2,842,614 |
+| 16 | 90,734 | **5,303,410** |
+
+Read that column twice: without thread-local slots, adding threads made reads
+*slower*. Deleting one method call took the server from 86,000 to over a million
+GETs a second — the single largest change in the project, and it was a line of
+setup nobody had measured.
 
 ## Write throughput
 
@@ -111,7 +205,10 @@ Two further caveats, both visible in the numbers above:
   for a different count rather than silently turning the cache into a miss.
 
 The default is `min(num_cpus, 4)`. Measure on your own hardware before raising
-it.
+it. M6 re-measured this end to end, through the socket rather than against the
+store directly, and it came out the same shape: pipelined `SET` with syncing off
+went 43k → 57k → 64k → 35k ops/s at 1, 2, 4 and 8 shards. Four is where it stops
+paying.
 
 ## Tag invalidation
 
@@ -290,6 +387,24 @@ crates/cache-client   KCP client, and the integration-test driver
 either side of it. Both protocols decode into the same `Command` type, so the
 storage engine never learns which wire format a request arrived on.
 
+## Deploying
+
+A single static binary with no runtime dependencies, or a `scratch` image
+holding nothing but it:
+
+```bash
+cargo build --release --bin kached --target x86_64-unknown-linux-musl
+docker build -t kached .
+```
+
+[`packaging/kached.service`](packaging/kached.service) is a hardened systemd
+unit. [docs/operations.md](docs/operations.md) covers sizing, tuning, what to
+alert on, and what each failure mode looks like from outside.
+
+**There is no authentication.** Anyone who can reach the cache port can read and
+write any key and invalidate any tag — and cluster peers use that same port.
+Bind it to a private network.
+
 ## Development
 
 ```bash
@@ -300,3 +415,38 @@ cargo fmt --all --check
 
 Requires a C toolchain, because `heed` compiles LMDB from source — MSVC Build
 Tools on Windows, `build-essential` on Linux.
+
+### Testing the parsers
+
+The two wire parsers are the only code that reads bytes from unauthenticated
+strangers, so they get more than example-based tests. Property tests run on
+every `cargo test` and state the invariants the connection loop depends on: that
+decoding is total, that a rejected command always consumes a non-zero, in-bounds
+number of bytes — a zero would spin a core forever on one bad byte — and that
+`peek_frame_len` and the decoder agree on where a frame ends.
+
+Coverage-guided fuzzing runs in CI on every change, seeded from a corpus
+generated out of the encoders so it cannot drift from them:
+
+```bash
+cargo run -p cache-proto --example seed_corpus -- fuzz/seeds
+cargo +nightly fuzz run kcp_decode fuzz/seeds/kcp_decode
+```
+
+Targets: `kcp_decode`, `memcached_text`, `memcached_meta`, `record_header`.
+
+### Benchmarks
+
+```bash
+cargo bench -p cache-bench                                  # per-request hot path
+cargo run --release -p cache-bench --bin load -- --help     # end to end over a socket
+cargo run --release -p cache-store --example read_bench     # the read path, no socket
+cargo run --release -p cache-store --example txn_bench      # transaction cost alone
+cargo run --release -p cache-store --example write_bench    # group commit and sharding
+cargo run --release -p cache-store --example tag_bench      # the O(1) invalidation claim
+```
+
+The micro-benchmarks price a request before any storage work happens: decoding a
+`GET` is 15.6 ns against 99.8 ns for the same request in the memcached text
+protocol, parsing a stored record is 12.5 ns and flat in its tag count, and the
+liveness check is 1.5 ns untagged rising to 16.8 ns with the full 32 tags.

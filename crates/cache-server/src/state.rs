@@ -16,6 +16,9 @@ pub struct ServerState {
     /// Present even with no peers configured, so `CLUSTER` and `/stats` have
     /// something truthful to report and dispatch has no special case.
     pub cluster: Arc<Cluster>,
+    /// Read-only requests skip the hop to the storage tier. See
+    /// [`crate::config::StoreConfig::inline_reads`].
+    pub inline_reads: bool,
 }
 
 impl ServerState {
@@ -24,6 +27,7 @@ impl ServerState {
         info: ServerInfo,
         flush_enabled: bool,
         cluster: Arc<Cluster>,
+        inline_reads: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -31,6 +35,7 @@ impl ServerState {
             flush_enabled,
             metrics: crate::metrics::ServerMetrics::default(),
             cluster,
+            inline_reads,
         })
     }
 }

@@ -44,6 +44,22 @@ durability = "relaxed"
 max_value_bytes = 1048576
 wipe_on_start = false
 
+# Run read-only requests on the network worker instead of handing them to the
+# storage threads.
+#
+# The hand-off exists so a read that page-faults blocks a thread allowed to
+# block, rather than an async worker serving other connections.
+#
+# Measured on the development machine this makes no difference — the gain is
+# inside the run-to-run variance — so it is off, and worth leaving off unless
+# your own measurements disagree. What it removes is the cost of a thread
+# wake-up, which varies by platform far more than anything in this code.
+#
+# If you turn it on, turn it on because the working set is resident: when it is
+# not, a cold read stalls every connection sharing that worker. Writes always
+# take the hand-off, because they wait on the writer queue by design.
+inline_reads = false
+
 [store.write]
 # LMDB permits one writer, so writes scale only by sharing transactions. A batch
 # is whatever queued while the previous commit was in flight.

@@ -1,0 +1,69 @@
+# systemd unit for kached.
+#
+#   install -m0755 kached /usr/local/bin/kached
+#   install -m0644 packaging/kached.service /etc/systemd/system/
+#   install -m0644 kached.example.toml /etc/kached.toml
+#   systemctl daemon-reload && systemctl enable --now kached
+#
+# The hardening below is not decoration. This process listens on a port, parses
+# bytes from anonymous clients, and needs nothing else from the machine — so
+# everything else is taken away.
+
+[Unit]
+Description=kached cache server
+Documentation=https://github.com/guichaguri/cache-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/kached --config /etc/kached.toml
+Restart=on-failure
+RestartSec=1s
+
+# A cache is reconstructible by definition, so a hung process should be shot
+# rather than nursed: the client's fallback path is cheaper than the wait.
+TimeoutStopSec=30s
+KillSignal=SIGINT
+
+DynamicUser=yes
+StateDirectory=kached
+StateDirectoryMode=0700
+
+# The database is memory-mapped, so the map size is address space rather than
+# resident memory. `MemoryMax` therefore bounds what is actually resident, and
+# LMDB simply evicts pages under pressure rather than failing.
+#
+# MemoryMax=8G
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0077
+
+# Connections are the resource that runs out first, and each one is a file
+# descriptor. Keep this above server.max_connections with room for the
+# database, the listeners and the cluster peers.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

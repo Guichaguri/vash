@@ -51,7 +51,7 @@ Kept deliberately small. Every dependency on the request path must earn its plac
 | Hashing (in-memory) | `foldhash` | Fastest general-purpose hasher for `HashMap`; not stable across runs, so in-memory only. |
 | Hashing (stable) | `xxhash-rust` (XXH3) | Shard selection must be stable across restarts and across nodes. **Never use `ahash`/`foldhash` for this** — they are randomly seeded per process. |
 | Struct↔bytes | `zerocopy` | Record headers and frame headers parsed by transmute-with-validation, no field-by-field decode. |
-| Allocator | `mimalloc` | 10–20% on allocation-heavy connection handling vs. system malloc; better than jemalloc on Windows, which matters for dev. |
+| Allocator | `mimalloc` | 10–20% on allocation-heavy connection handling vs. system malloc; better than jemalloc on Windows, which matters for dev. **Measured in M6: worth nothing on this workload** (1.13M vs 1.11M ops/s), so it ships as an opt-in feature rather than the default. |
 
 ### Supporting
 
@@ -72,8 +72,10 @@ Kept deliberately small. Every dependency on the request path must earn its plac
 - **`moka` / `dashmap` as a value cache in front of LMDB.** LMDB is memory-mapped; hot pages already
   live in the OS page cache. An application-level value cache stores a *second copy* of the same bytes,
   halving effective RAM, and adds a coherence problem on every write and invalidation. LMDB's mmap **is**
-  the in-memory tier. (A tiny hot-key cache stays on the table as a measured, flag-gated optimisation in
-  M6 — not before there is a benchmark demanding it.)
+  the in-memory tier. (A tiny hot-key cache stayed on the table as a measured, flag-gated optimisation
+  for M6. **The benchmark never demanded it**: with thread-local reader slots a lookup costs about
+  200 ns and scales linearly to 5.3M/s across sixteen threads, so a hot-key cache would be adding a
+  coherence problem to save a couple of hundred nanoseconds. Not built.)
 - **`nom` / `winnow` for protocol parsing.** See §7.
 - **`serde` on the wire.** Hand-rolled fixed-layout framing is faster and version-stable. `serde` is for
   the config file only.
@@ -532,9 +534,41 @@ the async runtime's **bounded blocking pool** rather than a hand-rolled reader p
 satisfies the property this section is about — a page fault stalls a blocking thread, never a runtime
 worker — with less machinery. The consequence is that `server.max_blocking_threads` is the ceiling on
 concurrent readers, and therefore on LMDB reader slots in use: `store.max_readers` must exceed it or
-reads fail with `MDB_READERS_FULL` under load. Startup refuses a config where it does not. A dedicated
-reader pool stays on the table for M6, if benchmarks show the blocking pool's handoff costs enough to
-justify it.
+reads fail with `MDB_READERS_FULL` under load. Startup refuses a config where it does not.
+
+**Two corrections found while measuring this (M6):**
+
+1. **`read_txn_without_tls()` was the single largest cost in the system, and it was paying for a
+   design that was never built.** The flag exists to make a `RoTxn` `Send` so the hand-rolled reader
+   pool above could move one between threads. That pool was replaced by the blocking pool in M1,
+   where a transaction is created and dropped inside one call and never crosses a thread — so
+   nothing needed it. What it cost: without thread-local storage, every `mdb_txn_begin` claims a slot
+   in a shared reader table behind a process-wide mutex, which turns the read path from lock-free
+   into serialised. The lookups really are lock-free, as this section claims; the *transaction around
+   them* was not. Measured by `examples/txn_bench`: **344k lookups/s on one thread falling to 91k on
+   sixteen without TLS, against 948k rising to 5.3M with it** — a 58× difference at sixteen threads,
+   and the difference between negative and linear scaling. Removing the flag took reads through the
+   whole server from 86k to 1.13M ops/s. The cost of the fix is that a thread holds its reader slot
+   until it exits, which is exactly what the `max_readers > max_blocking_threads` rule above already
+   guarantees room for.
+
+2. **The hand-off turned out not to matter, once the transaction cost above was gone.**
+   `store.inline_reads` — which this section proposed and defaulted off — now exists, and measures
+   *within noise* of the hand-off: 1.18M against 1.28M ops/s on `GET`, against a run-to-run variance
+   of roughly ±25% on a box where the load generator is competing with the server. It stays off by
+   default and stays available, because what it removes is a property of the platform's thread
+   wake-ups rather than of this code, and because the premise it trades on — a resident working set
+   — is the operator's to assert. Writes never take it: they wait on the writer queue by design.
+
+   This is worth recording as a **near-miss**. The hop was the obvious suspect and the first thing
+   measured; it looked like a 30% win in one campaign and turned out to be an artifact of a disk that
+   had quietly filled up. The genuine cause was one line of environment setup, and the only reason it
+   was found is that `examples/txn_bench` measured the transaction and the lookup separately instead
+   of measuring "a read".
+
+Requests are also handed over **in batches rather than one at a time**: whatever complete frames a
+single read produced cross to the storage tier together. Pipelining is what makes that worth having,
+and it costs the unpipelined case nothing.
 
 ### Reads
 
@@ -850,6 +884,60 @@ resident working set):
 - `DELETE_BY_TAG`: < 1 ms regardless of tag cardinality (this is the O(1) claim, and it is the headline
   benchmark)
 - Cold start to serving: < 1 s for a 10 GB database (mmap, so no load phase)
+
+### Measured (M6)
+
+Not the hardware the goals were written for: a 12-core Windows 11 dev box, NVMe, with the load
+generator **on the same machine** competing for the same cores and talking over loopback. That
+inflates nothing and depresses two things badly — closed-loop latency, and any throughput number
+that moves a lot of bytes. Read them as a floor.
+
+Run-to-run variance is roughly ±25% between identical runs, for the same reason, so these are
+magnitudes rather than figures.
+
+| Goal | Measured | Verdict |
+|---|---|---|
+| GET ≥ 1M ops/s | 2.04M at 64 B, 1.82M at 256 B, 0.92–1.03M at the 1 KiB the goal names | Met, though 1 KiB straddles the line |
+| GET p99 < 1 ms at 500k ops/s | p99 0.66 ms — but at 35k ops/s. Closed-loop throughput on one box is bounded by round trips | **Half met, not measurable as stated** |
+| SET ≥ 250k ops/s | ~40k with syncing off; 12.4k in `relaxed` (M4) | **Not met** — see below |
+| `DELETE_BY_TAG` < 1 ms | 197µs–1.77ms, flat across 100 → 500,000 keys (M4) | Met |
+| Cold start < 1 s for 10 GB | Not measured at that size | Unverified |
+
+**The SET goal was wrong, and the honest revision is to say so rather than to keep chasing it.**
+250k writes/s through a copy-on-write B-tree that fsyncs would need the commit cost to vanish, and
+M4 already measured where it actually goes: with syncing on, throughput is set by the device, and
+sharding makes it *worse* by fragmenting one disk between more environments. Group commit is doing
+its job — throughput tracks batch size exactly as §9 predicted — but the ceiling is the storage
+engine and the disk, not the code above them. A realistic goal for this design on this hardware is
+tens of thousands of writes a second in `relaxed`, and the number to state alongside it is the
+read-to-write ratio a cache actually sees: at 9:1 the mixed workload measured 271k ops/s.
+
+**The GET goal is met.** Throughput falls with value size — 337k ops/s at 4 KiB — but that is data
+movement rather than per-request work: it is 1.4 GB/s of value bytes leaving the process with the
+client reading them on the same memory bus. The value is still copied three times on the read path
+(out of the map, into the reply, into the write buffer) where §8 promised one. Removing the first
+means encoding the response while the read transaction is still open, which trades away the clean
+`Store`/`Reply` boundary; it is the obvious next move and was deliberately not made.
+
+**What M6 actually found**, in order of size:
+
+1. **`read_txn_without_tls()` was the ceiling on every read**, and it was there to serve a design
+   that was never built. 86k → 1.28M ops/s through the whole server. See §9.
+2. **The native protocol is about 6× cheaper to parse than the text one** — 15.6ns against 99.8ns to
+   decode a `GET`, and 67ns against 452ns to encode a 1 KiB hit. That is §3's "text framing costs",
+   measured.
+3. **The hot path is otherwise where it should be**: parsing a record is 12.5ns and flat in tag
+   count, the liveness check is 1.5ns untagged and 16.8ns with the full 32 tags, and decoding a
+   `SET` does not scale with the value — the zero-copy claims in §8 hold.
+4. **Two expected wins were not wins.** The hand-off to the storage tier (§9) and `mimalloc` (§2)
+   both measured within noise. Recording that is worth as much as recording the one that worked:
+   both were plausible, both had a number attached in advance, and neither survived being measured.
+
+**A methodological note, because it nearly produced wrong numbers.** An earlier campaign measured
+`inline_reads` as a 30% win and GET at 648k. Both were artifacts of a disk that had silently filled
+to 26 MB free during the run. The tell was that re-running a single measurement after freeing space
+moved it by 60%, which no code change explains. Benchmarks on a shared machine need the machine
+checked as well as the code — and any result that survives only one run is not a result.
 
 ---
 

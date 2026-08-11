@@ -1,0 +1,29 @@
+[package]
+name = "cache-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cache-core.workspace = true
+cache-proto.workspace = true
+cache-server.workspace = true
+
+anyhow.workspace = true
+bytes.workspace = true
+tempfile = "3"
+tokio.workspace = true
+
+[dev-dependencies]
+divan = "0.1"
+xxhash-rust.workspace = true
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[[bin]]
+name = "load"
+path = "src/load.rs"

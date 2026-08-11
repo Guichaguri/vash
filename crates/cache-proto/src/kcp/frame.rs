@@ -108,6 +108,22 @@ pub enum Opcode {
 }
 
 impl Opcode {
+    /// Whether executing this opcode can only read.
+    ///
+    /// A read never waits on the writer queue, so it is the only work that may
+    /// run on an async runtime worker rather than being handed to the storage
+    /// tier (see `store.inline_reads`). Being wrong in the permissive direction
+    /// would let a write block the whole runtime behind the writer queue, so
+    /// this lists what is known to be safe rather than excluding what is not —
+    /// an opcode added later is a write until someone says otherwise.
+    #[inline]
+    pub fn is_read_only(self) -> bool {
+        matches!(
+            self,
+            Self::Hello | Self::Ping | Self::Get | Self::GetMany | Self::Cluster | Self::Stats
+        )
+    }
+
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0x01 => Self::Hello,

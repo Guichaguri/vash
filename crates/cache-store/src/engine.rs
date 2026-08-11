@@ -1,4 +1,4 @@
-//! LMDB operations, with no threading of their own.
+﻿//! LMDB operations, with no threading of their own.
 //!
 //! Every write method takes the transaction it should act in, so the writer
 //! thread can pack many of them into one commit (see [`crate::writer`]). Keeping
@@ -14,7 +14,7 @@ use cache_core::{
     patch_cas, record::NEVER, validate_value,
 };
 use heed::types::Bytes as HeedBytes;
-use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
+use heed::{AnyTls, Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls};
 use tracing::{info, warn};
 
 use crate::config::{Durability, StoreConfig};
@@ -45,7 +45,7 @@ pub enum Pressure {
     Soft = 1,
     /// Actively evicting live records to get back under the soft mark.
     Hard = 2,
-    /// Writes are refused. Reads and deletes still work — a delete frees space,
+    /// Writes are refused. Reads and deletes still work â€” a delete frees space,
     /// so refusing it would be self-defeating.
     Critical = 3,
 }
@@ -74,7 +74,7 @@ impl Pressure {
 ///
 /// The distinction matters after the commit: a created tag has to be published
 /// into the in-memory registry as a new entry, a raised one only needs its
-/// counter advanced, and an unchanged one needs nothing at all — which is the
+/// counter advanced, and an unchanged one needs nothing at all â€” which is the
 /// common case, since a peer that is already up to date receives the same
 /// generation over and over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +115,8 @@ fn validate_tag_name(name: &[u8]) -> Result<()> {
 
 /// A record encoded and ready to store, still missing its CAS token.
 ///
-/// Built on the calling thread so that the value copy and the record framing —
-/// the expensive part of a write — happen in parallel across connections, and
+/// Built on the calling thread so that the value copy and the record framing â€”
+/// the expensive part of a write â€” happen in parallel across connections, and
 /// the single writer thread is left with only the B-tree work.
 pub struct PreparedSet {
     pub key: Box<[u8]>,
@@ -126,7 +126,7 @@ pub struct PreparedSet {
 }
 
 pub struct LmdbEngine {
-    env: Env<WithoutTls>,
+    env: Env<WithTls>,
     main: Db,
     exp: Db,
     tagidx: Db,
@@ -171,9 +171,25 @@ impl LmdbEngine {
         // own locking, which the lock file in the same directory enforces.
         let env = unsafe {
             EnvOpenOptions::new()
-                // Detaches read transactions from thread-local storage so a
-                // RoTxn is Send. Required by the storage-tier design, plan §9.
-                .read_txn_without_tls()
+                // Thread-local reader slots, which is LMDB's fast path and the
+                // single biggest thing measured in M6.
+                //
+                // Plan Â§9 specified `read_txn_without_tls()` so a `RoTxn` would
+                // be `Send` and a hand-rolled reader pool could move one
+                // between threads. That pool was never built â€” reads run on the
+                // blocking pool, where a transaction is created and dropped
+                // inside one call and never crosses a thread â€” so the flag was
+                // being paid for and not used. And it is not cheap: without
+                // TLS, every `mdb_txn_begin` claims a slot in a shared reader
+                // table behind a process-wide mutex, which turns the read path
+                // from lock-free into serialised. Measured by
+                // `examples/txn_bench`: 344k lookups/s on one thread falling to
+                // 91k on sixteen, against 948k rising to 5.3M with TLS.
+                //
+                // The cost is that a thread holds its reader slot until it
+                // exits, so the slot table has to cover every thread that can
+                // read at once. That is exactly the `store.max_readers >
+                // server.max_blocking_threads` rule startup already enforces.
                 .flags(env_flags(config.durability))
                 .map_size(config.map_size)
                 .max_dbs(MAX_DBS)
@@ -310,7 +326,7 @@ impl LmdbEngine {
         self.env.write_txn().map_err(StoreError::from_heed)
     }
 
-    pub fn read_txn(&self) -> Result<RoTxn<'_, WithoutTls>> {
+    pub fn read_txn(&self) -> Result<RoTxn<'_, WithTls>> {
         self.env.read_txn().map_err(StoreError::from_heed)
     }
 
@@ -342,7 +358,7 @@ impl LmdbEngine {
 
     fn read_record(
         &self,
-        txn: &RoTxn<'_, WithoutTls>,
+        txn: &RoTxn<'_, AnyTls>,
         lookup: &TagLookup<'_>,
         key: &[u8],
     ) -> Result<Option<Value>> {
@@ -373,7 +389,7 @@ impl LmdbEngine {
     }
 
     /// Resolves a whole batch inside one read transaction, so every key in a
-    /// `GET_MANY` sees the same consistent snapshot — and under a single tag
+    /// `GET_MANY` sees the same consistent snapshot â€” and under a single tag
     /// registry lock rather than one per key.
     pub fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {
         let rtxn = self.read_txn()?;
@@ -432,7 +448,7 @@ impl LmdbEngine {
         // Each shard counts independently, so the raw counters collide across
         // shards. Striping them keeps every token unique server-wide, which is
         // what clients are told to expect, while staying strictly increasing
-        // within a shard — and therefore within any single key, which is the
+        // within a shard â€” and therefore within any single key, which is the
         // only ordering compare-and-swap depends on.
         Ok(counter * self.shard_count as u64 + self.shard_index as u64)
     }
@@ -666,7 +682,7 @@ impl LmdbEngine {
 
     /// Re-stamps a record's expiry without the client resending the value.
     ///
-    /// LMDB values are immutable blobs, so this rewrites the record — the value
+    /// LMDB values are immutable blobs, so this rewrites the record â€” the value
     /// is copied within the transaction. That is the cost of `TOUCH` being a
     /// bandwidth optimisation rather than a storage one.
     pub fn apply_touch(&self, wtxn: &mut RwTxn, key: &[u8], ttl_secs: u32) -> Result<bool> {
@@ -721,7 +737,7 @@ impl LmdbEngine {
     /// seen the tag and invalidated it. Starting from it keeps the generation
     /// uniform across a node's shards. Starting from zero instead would mean a
     /// record written here captured a *lower* number than the node reports to
-    /// its peers, and the first gossip round would kill it — an invalidation of
+    /// its peers, and the first gossip round would kill it â€” an invalidation of
     /// a record that was written after the last invalidation.
     pub fn apply_create_tag(
         &self,
@@ -754,7 +770,7 @@ impl LmdbEngine {
     ///
     /// **Merges by maximum**, never assigns, which is what makes an
     /// invalidation received from a peer idempotent, order-independent and safe
-    /// to retry — see [`cache_core::cluster`]. It is also how a local
+    /// to retry â€” see [`cache_core::cluster`]. It is also how a local
     /// invalidation is applied, so both paths share one implementation and one
     /// set of consequences.
     pub fn apply_merge_tag(
@@ -778,7 +794,7 @@ impl LmdbEngine {
 
         let Some((id, current)) = existing else {
             // Nothing here can carry a tag this shard has never registered, so
-            // there is no reclamation to queue — only the registration itself,
+            // there is no reclamation to queue â€” only the registration itself,
             // so that records written from now on capture the right number.
             let (id, generation) = self.apply_create_tag(wtxn, name, generation)?;
             return Ok(TagMerge::Created { id, generation });
@@ -847,7 +863,7 @@ impl LmdbEngine {
     /// Empties the cache, returning the new flush epoch.
     ///
     /// The epoch bump and the clear do different jobs, and both are needed. The
-    /// clear frees the space — an epoch bump alone would leak every record
+    /// clear frees the space â€” an epoch bump alone would leak every record
     /// without a TTL, since nothing would ever come looking for them. The epoch
     /// closes the MVCC window: a read transaction opened before this commit
     /// still sees the old snapshot, and comparing those records against the new
@@ -882,14 +898,14 @@ impl LmdbEngine {
     /// expired.
     ///
     /// Takes them from the front of the expiry index, which is soonest-to-expire
-    /// first and never-expiring last. That ordering is free — the index already
-    /// exists for TTLs — and it is the right policy for a cache: a TTL is the
+    /// first and never-expiring last. That ordering is free â€” the index already
+    /// exists for TTLs â€” and it is the right policy for a cache: a TTL is the
     /// client's own statement of how long a value is worth keeping, so the item
     /// dying in three seconds is the cheapest thing in the store to lose.
     ///
     /// Deliberately not LRU. Tracking recency means writing on every read, which
     /// on a single-writer engine would put every GET behind the write queue.
-    /// See plan §6.
+    /// See plan Â§6.
     pub fn evict(&self, wtxn: &mut RwTxn, budget: usize) -> Result<SweepStats> {
         self.drain_expiry_index(wtxn, budget, Victims::Anything)
     }
@@ -992,15 +1008,15 @@ impl LmdbEngine {
     /// Bytes genuinely occupied, excluding pages on the free list.
     ///
     /// **Not** `last_page_number`. LMDB never returns freed pages to the OS nor
-    /// lowers its high-water mark — a deleted record's pages go onto a free
-    /// list for reuse — so a high-water measure only ever rises. Using it for
+    /// lowers its high-water mark â€” a deleted record's pages go onto a free
+    /// list for reuse â€” so a high-water measure only ever rises. Using it for
     /// the capacity watermarks meant pressure could never fall, and the evictor
     /// would keep going until the cache was empty.
     ///
     /// Summed from the sub-databases' own page counts, which is exactly the
     /// non-free total, and works inside the caller's transaction rather than
     /// needing one of its own.
-    pub fn used_bytes_in(&self, txn: &RoTxn<'_, WithoutTls>) -> Result<u64> {
+    pub fn used_bytes_in(&self, txn: &RoTxn<'_, AnyTls>) -> Result<u64> {
         let page_size = self.env.stat().page_size as u64;
         let mut pages = 0u64;
         for db in [
@@ -1018,7 +1034,7 @@ impl LmdbEngine {
     }
 
     /// Fraction of the map in use, the input to the capacity watermarks.
-    pub fn utilisation_in(&self, txn: &RoTxn<'_, WithoutTls>) -> Result<f64> {
+    pub fn utilisation_in(&self, txn: &RoTxn<'_, AnyTls>) -> Result<f64> {
         Ok(self.used_bytes_in(txn)? as f64 / self.env.info().map_size as f64)
     }
 
@@ -1116,7 +1132,7 @@ impl LmdbEngine {
             //
             // This pass can share a transaction with the very `DELETE_BY_TAG`
             // that queued it, and the registry is only updated *after* that
-            // commits — so the in-memory generation still reads as the old one
+            // commits â€” so the in-memory generation still reads as the old one
             // here. Trusting it would mark every record live, advance the
             // cursor past them, and leak them permanently. The job carries the
             // target precisely so this decision needs no RAM state.
@@ -1124,7 +1140,7 @@ impl LmdbEngine {
                 Some(tag) => tag.generation.get() < job.target_generation,
                 None => {
                     // The record no longer carries this tag, so the entry is
-                    // litter — but the record itself is somebody else's.
+                    // litter â€” but the record itself is somebody else's.
                     self.tagidx
                         .delete(wtxn, &index_key)
                         .map_err(StoreError::from_heed)?;
@@ -1133,8 +1149,8 @@ impl LmdbEngine {
                 }
             };
 
-            // A record the registry already knows to be dead — expired, flushed
-            // or invalidated via another tag — is fair game too. RAM can lag
+            // A record the registry already knows to be dead â€” expired, flushed
+            // or invalidated via another tag â€” is fair game too. RAM can lag
             // behind the truth but never runs ahead of it, so "dead" is always
             // trustworthy even when "alive" is not.
             let known_dead = {
@@ -1210,7 +1226,7 @@ impl LmdbEngine {
         Ok(Some((u32::from_be_bytes(id), Job::decode(raw_job)?)))
     }
 
-    pub fn pending_jobs(&self, txn: &RoTxn<'_, WithoutTls>) -> Result<u64> {
+    pub fn pending_jobs(&self, txn: &RoTxn<'_, AnyTls>) -> Result<u64> {
         Ok(self.jobs.stat(txn).map_err(StoreError::from_heed)?.entries as u64)
     }
 
@@ -1268,7 +1284,7 @@ impl LmdbEngine {
     }
 }
 
-fn create_db(env: &Env<WithoutTls>, wtxn: &mut RwTxn, name: &str) -> Result<Db> {
+fn create_db(env: &Env<WithTls>, wtxn: &mut RwTxn, name: &str) -> Result<Db> {
     env.create_database(wtxn, Some(name))
         .map_err(StoreError::from_heed)
 }

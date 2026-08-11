@@ -32,5 +32,17 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+# Off by default, against plan §2, which expected 10-20% from it on
+# allocation-heavy connection handling. Measured on this workload it is worth
+# nothing: 1.13M against 1.11M ops/s on 64-byte GETs and 537k against 540k on
+# 1 KiB — noise in both directions. Kept as an option because the result is a
+# statement about this workload on this platform, not about allocators.
+#
+#   cargo build --release --bin kached --features mimalloc
+default = []
+
 [dev-dependencies]
 tempfile = "3"
