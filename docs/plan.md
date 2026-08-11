@@ -135,6 +135,11 @@ Fixed 12-byte header, little-endian, so it decodes as a single `zerocopy` cast:
 the ordinary port — a peer is just another VCP client — which meant no second listener, no second
 codec and no second thing to fuzz.
 
+`LIST_KEYS 0x50` and `LIST_TAGS 0x51` are specified but not built (M8). They open a new group
+rather than extending `0x3x`, whose members are whole-keyspace *mutations*. Both are administrative:
+paginated, gated off by default, and permitted to be a linear scan. The per-opcode implementation
+contract for the whole set lives in `docs/opcodes.md`.
+
 **Status codes:** `OK 0`, `NOT_FOUND 1`, `EXISTS 2`, `BAD_REQUEST 3`, `TOO_LARGE 4`, `UNAUTHORIZED 5`,
 `OVERLOADED 6`, `CAPACITY_FULL 7`, `UNSUPPORTED 8`, `INTERNAL 9`.
 
@@ -473,6 +478,7 @@ vash-server/
     ├── project.md
     ├── plan.md                 # this file
     ├── protocol.md             # normative VCP spec
+    ├── opcodes.md              # per-opcode implementation contract
     ├── storage.md              # on-disk format, sub-database schemas
     └── operations.md           # tuning, capacity planning, failure modes
 ```
@@ -954,6 +960,7 @@ checked as well as the code — and any result that survives only one run is not
 | **M5** | Cluster: peer list, tag fan-out, anti-entropy gossip, `CLUSTER` opcode | Invalidation converges across a 3-node cluster including a partitioned/restarted node |
 | **M6** | Perf hardening, fuzz corpus, benchmark suite, packaging (static musl binary, Docker, systemd), docs | Performance goals in §13 met or consciously revised with data |
 | **M7** | Redis protocol: RESP2/RESP3 framing, the string and expiry command subset, `HELLO` negotiation | Real Redis clients drive the supported commands unchanged; the read-modify-write seam is documented rather than hidden |
+| **M8** | Listing: `LIST_KEYS`/`LIST_TAGS`, glob matching, pagination, the `listing_enabled` gate and `LISTING` capability bit | Paging covers a sharded keyspace without missing a live key or holding a read txn past its scan budget; disabled by default and fuzzed |
 
 ---
 

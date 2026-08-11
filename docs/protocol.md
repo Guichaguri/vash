@@ -9,7 +9,9 @@ sufficient for implementing a client without reading the server source.
 - [Redis](#redis-compatibility) — the RESP subset, in RESP2 and RESP3.
 
 Design rationale for these choices lives in [plan.md](plan.md) §3 and §7; this
-document describes only what is on the wire.
+document describes only what is on the wire. How each VCP opcode is implemented
+— the path from socket to storage engine, what is validated where, and what it
+costs — is in [opcodes.md](opcodes.md).
 
 **Protocol version:** 1. **Default port:** 11311.
 
@@ -147,10 +149,13 @@ requests, which produce none.
 | `0x30` | `DELETE_BY_TAG` | yes |
 | `0x31` | `FLUSH` | yes, if enabled server-side |
 | `0x40` | `TAG_SYNC` | yes — peer-to-peer, see [Cluster](#cluster) |
+| `0x50` | `LIST_KEYS` | planned — see [opcodes.md](opcodes.md#list_keys-0x50) |
+| `0x51` | `LIST_TAGS` | planned — see [opcodes.md](opcodes.md#list_tags-0x51) |
 
 An unknown opcode is answered with `UNSUPPORTED` (8), an empty body, and the
 **original opcode byte echoed**, so the client can still correlate. The
-connection stays open.
+connection stays open. That is what a server of this generation answers to the
+planned opcodes, so a client can probe for them safely.
 
 ## Status codes
 
@@ -216,10 +221,13 @@ atomic per shard only.
 | `0x01` | `TAGS` | Tags and `DELETE_BY_TAG` are available. |
 | `0x02` | `MEMCACHED` | The memcached protocol is served on this port. |
 | `0x04` | `CLUSTER` | An invalidation sent here reaches the rest of the cluster. |
+| `0x08` | `LISTING` | Planned. `LIST_KEYS` and `LIST_TAGS` are enabled here. |
 
 `CLUSTER` is set only when this node has peers configured **and** is set to
 forward — not merely because the build supports it. A client seeing it clear
-must invalidate on every node itself.
+must invalidate on every node itself. `LISTING` follows the same rule: it
+reports that the commands are enabled on this node, not that the build knows
+them.
 
 Unlisted bits are reserved; ignore them.
 
@@ -315,8 +323,13 @@ Each item is one byte, then a payload only if that byte is 1:
 | if found: `mc_flags` u32, `cas` u64, `value_len` u32, value `bytes[value_len]` |
 
 Results are in **request order**, one slot per requested key, so duplicates in
-the request produce duplicates in the reply. All keys are resolved against a
-single consistent snapshot.
+the request produce duplicates in the reply.
+
+**The snapshot is per shard, not per batch**, for the same reason `SET_MANY`'s
+atomicity is: keys are distributed across independent storage environments and
+each is read in its own transaction. Every key owned by one shard is resolved
+against one consistent snapshot; keys in different shards are read at slightly
+different instants. With `shards = 1` the whole batch is one snapshot.
 
 ### `SET_MANY` (0x21)
 

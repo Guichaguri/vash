@@ -4,8 +4,9 @@ A cache server built on LMDB, with TTLs, tag-based invalidation, and memcached
 and Redis protocol compatibility.
 
 Wire protocols: [docs/protocol.md](docs/protocol.md) — enough detail to write a
-client against. Design and rationale: [docs/plan.md](docs/plan.md). Original
-brief: [docs/project.md](docs/project.md).
+client against. Per-opcode implementation contract:
+[docs/opcodes.md](docs/opcodes.md). Design and rationale:
+[docs/plan.md](docs/plan.md). Original brief: [docs/project.md](docs/project.md).
 
 **Status: M6 complete — feature work done.** Speaks its own binary protocol, the
 memcached text and meta protocols, and a subset of Redis in RESP2 and RESP3, all
