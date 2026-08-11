@@ -144,6 +144,19 @@ pub trait Store: Send + Sync + 'static {
     /// Resolves many keys against a single consistent snapshot.
     fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>>;
 
+    /// A live key's expiry deadline in unix milliseconds, **without copying its
+    /// value**.
+    ///
+    /// `None` for a key that is not live, `Some(NEVER)` for one with no expiry.
+    /// This is what the commands that never look at the value — `EXISTS`,
+    /// `TYPE`, `TTL`, `PERSIST`, `EXPIRE`, and `KEEPTTL` on a write — use
+    /// instead of [`Store::get`], which would copy a megabyte out of the map to
+    /// read eight bytes of header and discard the rest.
+    fn deadline(&self, key: Key<'_>) -> Result<Option<u64>>;
+
+    /// [`Store::deadline`] over a batch, against one consistent snapshot.
+    fn deadlines(&self, keys: &[Key<'_>]) -> Result<Vec<Option<u64>>>;
+
     /// Stores a value unconditionally, returning its new CAS token.
     ///
     /// Ignores `set.mode`; use [`Store::store`] for guarded writes.

@@ -155,13 +155,26 @@ pub fn parse<'a>(
             noreply: false,
             style: ResponseStyle::Quit,
         })),
-        // Accepted and ignored: it only controls server-side log verbosity.
-        b"verbosity" => Ok(Outcome::Command(Parsed {
-            command: Command::Version,
-            consumed,
-            noreply: has_noreply(tokens),
-            style: ResponseStyle::Version,
-        })),
+        // Accepted and ignored: it only sets server-side log verbosity, which
+        // this server does not take from the wire. The level is still required,
+        // and the reply is `OK` — upstream answers that, not `VERSION`.
+        b"verbosity" => {
+            let level = tokens
+                .next()
+                .filter(|token| *token != b"noreply")
+                .ok_or_else(|| fail(ErrorKind::Error))?;
+            if parse_u64(Some(level)).is_none() {
+                return Err(fail(ErrorKind::Client(BAD_LINE)));
+            }
+            Ok(Outcome::Command(Parsed {
+                // Carries no work; `ResponseStyle::Ok` discards the reply and
+                // writes `OK` whatever the command was.
+                command: Command::Version,
+                consumed,
+                noreply: has_noreply(tokens),
+                style: ResponseStyle::Ok,
+            }))
+        }
 
         // An empty line is a malformed command, not an unknown one — which is
         // the distinction memcached draws, and it shows up in practice after a

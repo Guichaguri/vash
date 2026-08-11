@@ -524,6 +524,27 @@ async fn the_meta_ttl_flag_reports_a_real_remaining_lifetime() {
     );
 }
 
+#[tokio::test]
+async fn verbosity_is_accepted_and_answers_ok() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    // Upstream answers `OK`. Answering `VERSION …` here made a client that
+    // checks the reply believe the command had failed.
+    assert_eq!(c.line("verbosity 1\r\n").await, "OK\r\n");
+    assert_eq!(c.line("verbosity 0\r\n").await, "OK\r\n");
+
+    // The level is not optional, and it has to be a number.
+    assert_eq!(c.line("verbosity\r\n").await, "ERROR\r\n");
+    assert_eq!(
+        c.line("verbosity loud\r\n").await,
+        "CLIENT_ERROR bad command line format\r\n"
+    );
+
+    // `version` still reports the version, which is the command that should.
+    assert!(c.line("version\r\n").await.starts_with("VERSION "));
+}
+
 /// The one place the 30-day overloading survives. VCP and Redis read a long
 /// TTL as an offset; memcached's clients have expected a timestamp since 2003,
 /// and the differential suite compares this against a real server.

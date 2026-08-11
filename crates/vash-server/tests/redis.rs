@@ -243,6 +243,74 @@ async fn exists_counts_a_key_once_per_mention() {
 }
 
 #[tokio::test]
+async fn type_reports_string_or_none() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.call(&["SET", "k", "v"], "+OK\r\n").await;
+    // A simple string in both RESP2 and RESP3, and never a null: `none` is the
+    // answer for a key that is not there.
+    c.call(&["TYPE", "k"], "+string\r\n").await;
+    c.call(&["TYPE", "missing"], "+none\r\n").await;
+
+    // Everything this server stores is a string, whatever wrote it.
+    c.call(&["INCR", "n"], ":1\r\n").await;
+    c.call(&["TYPE", "n"], "+string\r\n").await;
+
+    // An expired key is not there, so it is `none` rather than `string`.
+    c.call(&["SET", "gone", "v", "PX", "1"], "+OK\r\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    c.call(&["TYPE", "gone"], "+none\r\n").await;
+
+    c.call(
+        &["TYPE"],
+        "-ERR wrong number of arguments for 'type' command\r\n",
+    )
+    .await;
+    c.call(
+        &["TYPE", "a", "b"],
+        "-ERR wrong number of arguments for 'type' command\r\n",
+    )
+    .await;
+}
+
+/// `now + millis` overflows `i64` for these, which panicked the connection's
+/// task in debug and wrapped to a deadline in the past in release — storing the
+/// key pre-expired, the opposite of what was asked. Redis refuses a deadline it
+/// cannot represent, so this does too.
+#[tokio::test]
+async fn an_expiry_too_far_out_to_represent_is_refused() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    const MAX: &str = "9223372036854775807";
+
+    c.call(
+        &["SET", "k", "v", "PX", MAX],
+        "-ERR invalid expire time in 'set' command\r\n",
+    )
+    .await;
+    c.call(&["EXISTS", "k"], ":0\r\n").await;
+
+    c.call(
+        &["MSETEX", "1", "a", "1", "PX", MAX],
+        "-ERR invalid expire time in 'msetex' command\r\n",
+    )
+    .await;
+    c.call(&["EXISTS", "a"], ":0\r\n").await;
+
+    c.call(
+        &["INCREX", "n", "PX", MAX],
+        "-ERR invalid expire time in 'increx' command\r\n",
+    )
+    .await;
+
+    // The connection is still usable, which is the other half of the bug.
+    c.call(&["SET", "k", "v", "EX", "60"], "+OK\r\n").await;
+    c.call(&["TTL", "k"], ":60\r\n").await;
+}
+
+#[tokio::test]
 async fn msetex_applies_all_or_nothing() {
     let server = TestServer::start().await;
     let mut c = server.connect().await;

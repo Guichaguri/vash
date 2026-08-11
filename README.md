@@ -385,10 +385,10 @@ redis-cli -p 11311 SET key value
 redis-cli -3 -p 11311 INCREX ratelimit:42 BYINT 1 UBOUND 100 EX 60 ENX
 ```
 
-Supported: `GET` `SET` `DEL` `UNLINK` `MSET` `MGET` `MSETEX` `EXISTS` `EXPIRE`
-`EXPIREAT` `PERSIST` `TTL` `APPEND` `INCR` `INCRBY` `DECR` `DECRBY`
+Supported: `GET` `SET` `DEL` `UNLINK` `MSET` `MGET` `MSETEX` `EXISTS` `TYPE`
+`EXPIRE` `EXPIREAT` `PERSIST` `TTL` `APPEND` `INCR` `INCRBY` `DECR` `DECRBY`
 `INCRBYFLOAT` `INCREX`, plus `HELLO`, `PING` and `QUIT` to negotiate and keep a
-connection. `SET` takes `NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`;
+connection. `TYPE` answers `string` or `none` — every value here is a string. `SET` takes `NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`;
 `EXPIRE` and `EXPIREAT` take `NX`/`XX`/`GT`/`LT`; `INCREX` takes its full option
 set. Anything else answers `unknown command`, which is how a client library
 discovers a feature is missing.

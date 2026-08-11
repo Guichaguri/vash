@@ -82,6 +82,7 @@ pub fn is_read_only(command: &Command<'_>) -> bool {
         Command::Get { .. }
             | Command::MGet { .. }
             | Command::Exists { .. }
+            | Command::Type { .. }
             | Command::Ttl { .. }
             | Command::Ping { .. }
             | Command::Hello { .. }
@@ -201,6 +202,11 @@ const NOT_FINITE: &str = "increment would produce NaN or Infinity";
 /// Redis accepts any binary key of any length; this store has LMDB's ceiling
 /// and rejects the empty key. Both are documented divergences.
 const INVALID_KEY: &str = "invalid key";
+/// Redis names the command in this one, so there is a constant per command that
+/// can produce it rather than a formatted string.
+const INVALID_EXPIRE_SET: &str = "invalid expire time in 'set' command";
+const INVALID_EXPIRE_MSETEX: &str = "invalid expire time in 'msetex' command";
+const INVALID_EXPIRE_INCREX: &str = "invalid expire time in 'increx' command";
 
 type Answered = Result<(), Failure>;
 
@@ -276,10 +282,19 @@ fn run(
             // Redis counts a key once per time it is named, so duplicates are
             // not folded together.
             let keys = keys_of(keys.iter().copied())?;
-            let values = state.store.get_many(&keys)?;
-            let live = values.iter().filter(|value| value.is_some()).count() as u64;
-            state.metrics.read(live, values.len() as u64 - live);
+            let found = state.store.deadlines(&keys)?;
+            let live = found.iter().filter(|entry| entry.is_some()).count() as u64;
+            state.metrics.read(live, found.len() as u64 - live);
             encode::integer(out, live as i64);
+            Ok(())
+        }
+
+        Command::Type { key } => {
+            let live = state.store.deadline(key_of(key)?)?.is_some();
+            state.metrics.read(u64::from(live), u64::from(!live));
+            // Redis answers with a simple string in both RESP2 and RESP3, and
+            // `none` rather than a null for a key that is not there.
+            encode::simple(out, if live { "string" } else { "none" });
             Ok(())
         }
 
@@ -321,7 +336,7 @@ fn run(
                     let mut combined = Vec::with_capacity(existing.data.len() + value.len());
                     combined.extend_from_slice(&existing.data);
                     combined.extend_from_slice(value);
-                    (combined, keep_ttl(existing))
+                    (combined, keep_ttl(existing.expires_at_ms))
                 }
                 None => (value.to_vec(), 0),
             };
@@ -342,11 +357,11 @@ fn run(
 
         Command::Persist { key } => {
             let key = key_of(key)?;
-            let Some(current) = state.store.get(key)? else {
+            let Some(current) = state.store.deadline(key)? else {
                 state.metrics.read(0, 1);
                 return answer_bool(out, false);
             };
-            if current.expires_at_ms.unwrap_or(vash_core::NEVER) == vash_core::NEVER {
+            if current == vash_core::NEVER {
                 state.metrics.read(1, 0);
                 return answer_bool(out, false);
             }
@@ -356,14 +371,14 @@ fn run(
         }
 
         Command::Ttl { key } => {
-            let value = state.store.get(key_of(key)?)?;
+            let deadline = state.store.deadline(key_of(key)?)?;
             state
                 .metrics
-                .read(u64::from(value.is_some()), u64::from(value.is_none()));
+                .read(u64::from(deadline.is_some()), u64::from(deadline.is_none()));
 
-            let answer = match value {
+            let answer = match deadline {
                 None => TTL_MISSING,
-                Some(value) => match value.expires_at_ms.unwrap_or(vash_core::NEVER) {
+                Some(deadline) => match deadline {
                     vash_core::NEVER => TTL_PERSISTENT,
                     at => {
                         // Redis rounds the remaining milliseconds to the
@@ -397,21 +412,25 @@ fn execute_set(
 ) -> Answered {
     let key = key_of(set.key)?;
 
-    // `GET` needs the old value and `KEEPTTL` needs the old deadline, so both
-    // cost a read Redis does not pay. One read serves them together.
-    let previous = if set.return_previous || set.expiry == Expiry::Keep {
+    // `GET` needs the old value, which is a read Redis does not pay for.
+    let previous = if set.return_previous {
         state.store.get(key)?
     } else {
         None
     };
 
-    let ttl_secs = match set.expiry {
-        // Redis discards any existing TTL on a plain `SET`.
-        Expiry::Unset | Expiry::Persist => 0,
-        Expiry::After(millis) => ttl_from_deadline(now_ms() as i64 + millis),
-        Expiry::At(millis) => ttl_from_deadline(millis),
-        Expiry::Keep => previous.as_ref().map_or(0, keep_ttl),
+    let deadline = if set.return_previous {
+        // Already read; a miss means there is no deadline to keep either.
+        previous.as_ref().and_then(|value| value.expires_at_ms)
+    } else if set.expiry == Expiry::Keep {
+        // `KEEPTTL` wants the old deadline and not the old value, so it reads
+        // the header alone rather than copying the value out to discard it.
+        state.store.deadline(key)?
+    } else {
+        None
     };
+
+    let ttl_secs = ttl_for(set.expiry, now_ms() as i64, deadline, INVALID_EXPIRE_SET)?;
 
     let outcome = state.store.store(&vash_core::Set {
         key,
@@ -451,11 +470,12 @@ fn execute_msetex(
 ) -> Answered {
     let keys = keys_of(pairs.iter().map(|(key, _)| *key))?;
 
-    // The guard and `KEEPTTL` both need to know what is already there. Under
-    // concurrency this read and the write below are not one step — see the
-    // module note.
+    // The guard and `KEEPTTL` both need to know what is already there — but
+    // neither needs the values, only whether they exist and when they go away.
+    // Under concurrency this read and the write below are not one step — see
+    // the module note.
     let current = if condition != Condition::Always || expiry == Expiry::Keep {
-        state.store.get_many(&keys)?
+        state.store.deadlines(&keys)?
     } else {
         Vec::new()
     };
@@ -477,18 +497,11 @@ fn execute_msetex(
         .zip(pairs)
         .enumerate()
         .map(|(index, (key, (_, value)))| {
-            let ttl_secs = match expiry {
-                Expiry::Unset | Expiry::Persist => 0,
-                Expiry::After(millis) => ttl_from_deadline(now + millis),
-                Expiry::At(millis) => ttl_from_deadline(millis),
-                Expiry::Keep => current
-                    .get(index)
-                    .and_then(Option::as_ref)
-                    .map_or(0, keep_ttl),
-            };
-            vash_core::Set::plain(*key, value, ttl_secs)
+            let deadline = current.get(index).copied().flatten();
+            let ttl_secs = ttl_for(expiry, now, deadline, INVALID_EXPIRE_MSETEX)?;
+            Ok(vash_core::Set::plain(*key, value, ttl_secs))
         })
-        .collect();
+        .collect::<Result<_, Failure>>()?;
 
     state.store.set_many(&sets)?;
     state.metrics.write();
@@ -504,7 +517,7 @@ fn execute_expire(
     out: &mut Vec<u8>,
 ) -> Answered {
     let key = key_of(key)?;
-    let Some(current) = state.store.get(key)? else {
+    let Some(current) = state.store.deadline(key)? else {
         state.metrics.read(0, 1);
         return answer_bool(out, false);
     };
@@ -519,7 +532,7 @@ fn execute_expire(
 
     // A key with no expiry is infinitely far off, which is what makes `GT`
     // never apply to one and `LT` always apply.
-    let existing = match current.expires_at_ms.unwrap_or(vash_core::NEVER) {
+    let existing = match current {
         vash_core::NEVER => None,
         at => Some(at as i64),
     };
@@ -553,7 +566,7 @@ fn execute_expire(
 fn execute_incr(state: &ServerState, key: &[u8], delta: Number, out: &mut Vec<u8>) -> Answered {
     let key = key_of(key)?;
     let current = state.store.get(key)?;
-    let ttl_secs = current.as_ref().map_or(0, keep_ttl);
+    let ttl_secs = keep_ttl(current.as_ref().and_then(|value| value.expires_at_ms));
 
     let updated = match delta {
         Number::Int(delta) => {
@@ -655,16 +668,18 @@ fn execute_increx(
         }
     };
 
-    let existing_ttl = current.as_ref().map_or(0, keep_ttl);
+    let deadline = current.as_ref().and_then(|value| value.expires_at_ms);
+    let existing_ttl = keep_ttl(deadline);
     let ttl_secs = match op.expiry {
         // No expiry option: the lifetime is left alone.
         None => existing_ttl,
         Some(Expiry::Persist) => 0,
         // `ENX`: a key that already has a deadline keeps it.
         Some(_) if op.only_if_persistent && existing_ttl != 0 => existing_ttl,
-        Some(Expiry::After(millis)) => ttl_from_deadline(now_ms() as i64 + millis),
-        Some(Expiry::At(millis)) => ttl_from_deadline(millis),
+        // Neither is an `INCREX` option, so the parser cannot produce them;
+        // both would mean "leave the lifetime alone" if one ever arrived.
         Some(Expiry::Unset | Expiry::Keep) => existing_ttl,
+        Some(expiry) => ttl_for(expiry, now_ms() as i64, deadline, INVALID_EXPIRE_INCREX)?,
     };
 
     write_number(state, key, value, ttl_secs)?;
@@ -762,13 +777,46 @@ fn now_ms() -> u64 {
     vash_core::Clock::new().now_ms()
 }
 
-/// The `ttl_secs` that reproduces a value's current deadline, for the commands
+/// The `ttl_secs` that reproduces a key's current deadline, for the commands
 /// that must not disturb it.
-fn keep_ttl(value: &vash_core::Value) -> u32 {
-    match value.expires_at_ms.unwrap_or(vash_core::NEVER) {
+///
+/// Takes the deadline rather than the value: `KEEPTTL` never looks at what is
+/// stored, only at when it goes away.
+fn keep_ttl(deadline: Option<u64>) -> u32 {
+    match deadline.unwrap_or(vash_core::NEVER) {
         vash_core::NEVER => 0,
         at => ttl_from_deadline(at as i64),
     }
+}
+
+/// The `ttl_secs` an expiry option asks for, against the key's current
+/// deadline.
+///
+/// One definition for `SET`, `MSETEX` and `INCREX`, which offer the same option
+/// set and each used to spell this out again.
+///
+/// `now` is a parameter rather than read here so that a batch stamps every key
+/// in it against one instant, and `invalid_expire` is the command's own name in
+/// Redis's wording for the single case this refuses.
+fn ttl_for(
+    expiry: Expiry,
+    now: i64,
+    deadline: Option<u64>,
+    invalid_expire: &'static str,
+) -> Result<u32, Failure> {
+    Ok(match expiry {
+        // Redis discards any existing TTL on a plain `SET`.
+        Expiry::Unset | Expiry::Persist => 0,
+        // Checked, not saturating: `PX 9223372036854775807` overflows this, and
+        // Redis refuses a deadline it cannot represent rather than silently
+        // storing a different one.
+        Expiry::After(millis) => ttl_from_deadline(
+            now.checked_add(millis)
+                .ok_or_else(|| Failure::client(invalid_expire))?,
+        ),
+        Expiry::At(millis) => ttl_from_deadline(millis),
+        Expiry::Keep => keep_ttl(deadline),
+    })
 }
 
 /// Converts an absolute deadline in unix milliseconds into the `ttl_secs` the

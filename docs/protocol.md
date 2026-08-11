@@ -520,7 +520,7 @@ All are implemented with upstream semantics.
 | `flush_all [delay] [noreply]` | `OK`, or `CLIENT_ERROR` when disabled |
 | `stats` | `STAT <name> <value>` lines, then `END` |
 | `version` | `VERSION <string>` |
-| `verbosity <level> [noreply]` | accepted and ignored |
+| `verbosity <level> [noreply]` | `OK` — accepted and ignored |
 | `quit` | connection closes, no response |
 
 Storage commands are followed by exactly `<bytes>` of data and then `\r\n`. The
@@ -666,6 +666,7 @@ exceptions.
 | Over-long key on `get` | error line, then a stray empty line | error line only | The extra line leaves a pipelining client counting one more response than it sent commands. |
 | `flush_all` | always available | disabled unless enabled in config | It empties the cache for anyone who can reach the port. |
 | `flush_all <delay>` | defers the flush | delay parsed and ignored; flush is immediate | A deferred wipe needs a scheduler; every client that sends one sends 0. |
+| `decr` below the stored width | rewrites in place and pads the value with trailing spaces, so `100` decremented by `95` reads back as `5␠␠` | stores `5`, at its own length | The padding is an artefact of updating an item in place without resizing it. Both reply `5`, and both parse back to `5`; only a client comparing raw bytes can tell. |
 | `me` output | full internal item dump | `cas`, `size`, `fetch` only | The rest describes internals vash does not have. |
 | `stats` fields | full counter set | a subset, plus `vash_*` | Reporting an unmeasured counter as zero would mislead a dashboard. |
 | Meta flags `b h l x I E R N` | implemented | `CLIENT_ERROR unsupported flag` | See [Refused flags](#refused-flags). |
@@ -737,6 +738,7 @@ together rather than last-one-wins.
 | `MSET` | `MSET key value [key value …]` |
 | `MSETEX` | `MSETEX numkeys key value [key value …] [NX \| XX] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` |
 | `EXISTS` | `EXISTS key [key …]` — counts a key once per mention |
+| `TYPE` | `TYPE key` — `+string` or `+none`; every value here is a string |
 | `EXPIRE` | `EXPIRE key seconds [NX \| XX \| GT \| LT]` |
 | `EXPIREAT` | `EXPIREAT key unix-time-seconds [NX \| XX \| GT \| LT]` |
 | `PERSIST` | `PERSIST key` |

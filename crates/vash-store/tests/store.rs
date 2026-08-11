@@ -823,6 +823,47 @@ fn the_tag_registry_is_bounded() {
 }
 
 #[test]
+fn deadlines_agree_with_get_without_reading_the_value() {
+    let h = Harness::new();
+
+    h.set(b"forever", b"v", 0);
+    h.set(b"expiring", b"v", 600);
+    h.set_tagged(b"tagged", b"v", 0, &[b"t"]);
+
+    let keys = [
+        Key::new(b"forever").unwrap(),
+        Key::new(b"expiring").unwrap(),
+        Key::new(b"absent").unwrap(),
+    ];
+    let deadlines = h.store().deadlines(&keys).unwrap();
+
+    assert_eq!(deadlines[0], Some(vash_core::NEVER), "no expiry");
+    assert!(
+        deadlines[1].is_some_and(|at| at > vash_core::NEVER),
+        "a real deadline, got {:?}",
+        deadlines[1]
+    );
+    assert_eq!(deadlines[2], None, "absent");
+
+    // Whatever hides a key from `get` must hide it here too, or `EXISTS` and
+    // `TTL` would answer for records `GET` refuses to serve.
+    h.store().delete_by_tag(b"t").unwrap();
+    assert_eq!(h.get(b"tagged"), None);
+    assert_eq!(
+        h.store().deadline(Key::new(b"tagged").unwrap()).unwrap(),
+        None,
+        "a tag-invalidated record is absent to both"
+    );
+
+    h.store().flush().unwrap();
+    assert_eq!(
+        h.store().deadline(Key::new(b"forever").unwrap()).unwrap(),
+        None,
+        "a flushed record is absent to both"
+    );
+}
+
+#[test]
 fn tags_per_record_are_bounded_by_the_default() {
     let h = Harness::new();
     let names: Vec<String> = (0..=vash_core::DEFAULT_MAX_TAGS)

@@ -356,12 +356,19 @@ impl LmdbEngine {
 
     // ---- reads -------------------------------------------------------------
 
-    fn read_record(
+    /// Looks a key up, applies the liveness check, and hands the caller
+    /// whatever it needs off the record.
+    ///
+    /// Generic over the projection so the reads that want only the header —
+    /// `EXISTS`, `TYPE`, `TTL`, `PERSIST`, `EXPIRE` — share one definition of
+    /// "live" with `GET` without also paying for `GET`'s copy of the value.
+    fn read_alive<'txn, T>(
         &self,
-        txn: &RoTxn<'_, AnyTls>,
+        txn: &'txn RoTxn<'_, AnyTls>,
         lookup: &TagLookup<'_>,
         key: &[u8],
-    ) -> Result<Option<Value>> {
+        project: impl FnOnce(&RecordRef<'txn>) -> T,
+    ) -> Result<Option<T>> {
         let Some(blob) = self.main.get(txn, key).map_err(StoreError::from_heed)? else {
             return Ok(None);
         };
@@ -374,12 +381,21 @@ impl LmdbEngine {
             return Ok(None);
         }
 
-        Ok(Some(Value {
+        Ok(Some(project(&record)))
+    }
+
+    fn read_record(
+        &self,
+        txn: &RoTxn<'_, AnyTls>,
+        lookup: &TagLookup<'_>,
+        key: &[u8],
+    ) -> Result<Option<Value>> {
+        self.read_alive(txn, lookup, key, |record| Value {
             data: Bytes::copy_from_slice(record.value),
             mc_flags: record.mc_flags(),
             cas: record.cas(),
             expires_at_ms: Some(record.expires_at_ms()),
-        }))
+        })
     }
 
     pub fn get(&self, key: Key<'_>) -> Result<Option<Value>> {
@@ -396,6 +412,24 @@ impl LmdbEngine {
         let lookup = self.tags.lookup();
         keys.iter()
             .map(|key| self.read_record(&rtxn, &lookup, key.as_bytes()))
+            .collect()
+    }
+
+    /// A live key's deadline, without copying its value.
+    ///
+    /// `None` means not live; `Some(NEVER)` means live with no expiry.
+    pub fn deadline(&self, key: Key<'_>) -> Result<Option<u64>> {
+        let rtxn = self.read_txn()?;
+        let lookup = self.tags.lookup();
+        self.read_alive(&rtxn, &lookup, key.as_bytes(), RecordRef::expires_at_ms)
+    }
+
+    /// [`Engine::deadline`] over a batch, against one snapshot.
+    pub fn deadlines(&self, keys: &[Key<'_>]) -> Result<Vec<Option<u64>>> {
+        let rtxn = self.read_txn()?;
+        let lookup = self.tags.lookup();
+        keys.iter()
+            .map(|key| self.read_alive(&rtxn, &lookup, key.as_bytes(), RecordRef::expires_at_ms))
             .collect()
     }
 

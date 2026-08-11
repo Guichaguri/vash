@@ -34,8 +34,11 @@ pub(crate) enum WriteOp {
     /// other writes to the same key.
     ConditionalSet(PreparedSet, SetMode),
     Delete(Vec<Box<[u8]>>),
+    /// Re-stamps every key with the same TTL. A batch because memcached's
+    /// `gat` takes a key list, and one round trip through the writer per key
+    /// means one commit per key.
     Touch {
-        key: Box<[u8]>,
+        keys: Vec<Box<[u8]>>,
         ttl_secs: u32,
     },
     Incr {
@@ -67,8 +70,8 @@ impl WriteOp {
         match self {
             Self::Set(items) => items.len(),
             Self::Delete(keys) => keys.len(),
+            Self::Touch { keys, .. } => keys.len(),
             Self::ConditionalSet(..)
-            | Self::Touch { .. }
             | Self::Incr { .. }
             | Self::DeleteByTag(_)
             | Self::MergeTag { .. }
@@ -83,7 +86,7 @@ pub(crate) enum WriteOutcome {
     Cas(Vec<u64>),
     Conditional(Stored),
     Deleted(Vec<bool>),
-    Touched(bool),
+    Touched(Vec<bool>),
     /// `None` when the key was absent.
     Counter(Option<u64>),
     /// `None` when the tag was never registered, so nothing referenced it.
@@ -231,12 +234,14 @@ impl Writer {
     }
 
     pub fn touch(&self, key: Key<'_>, ttl_secs: u32) -> Result<bool> {
-        let op = WriteOp::Touch {
-            key: key.as_bytes().into(),
-            ttl_secs,
-        };
-        match self.submit(op)? {
-            WriteOutcome::Touched(hit) => Ok(hit),
+        let hits = self.touch_many(vec![key.as_bytes().into()], ttl_secs)?;
+        Ok(hits.first().copied().unwrap_or(false))
+    }
+
+    /// Re-stamps a batch in one transaction, in request order.
+    pub fn touch_many(&self, keys: Vec<Box<[u8]>>, ttl_secs: u32) -> Result<Vec<bool>> {
+        match self.submit(WriteOp::Touch { keys, ttl_secs })? {
+            WriteOutcome::Touched(hits) => Ok(hits),
             _ => Err(StoreError::Corrupt(
                 "writer returned the wrong reply".into(),
             )),
@@ -709,8 +714,10 @@ fn apply(
         WriteOp::ConditionalSet(prepared, mode) => Ok(WriteOutcome::Conditional(
             engine.apply_conditional_set(wtxn, prepared, *mode)?,
         )),
-        WriteOp::Touch { key, ttl_secs } => Ok(WriteOutcome::Touched(
-            engine.apply_touch(wtxn, key, *ttl_secs)?,
+        WriteOp::Touch { keys, ttl_secs } => Ok(WriteOutcome::Touched(
+            keys.iter()
+                .map(|key| engine.apply_touch(wtxn, key, *ttl_secs))
+                .collect::<Result<Vec<bool>>>()?,
         )),
         WriteOp::Incr {
             key,

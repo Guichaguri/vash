@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use vash_core::{Key, Set, Stored, Value};
 
 use crate::config::StoreConfig;
-use crate::engine::Pressure;
+use crate::engine::{LmdbEngine, Pressure};
 use crate::error::Result;
 use crate::shard::Shards;
 use crate::{Store, StoreStats};
@@ -106,6 +106,42 @@ impl LmdbStore {
         Ok(())
     }
 
+    /// Runs a batch read per shard and reassembles the results in request
+    /// order.
+    ///
+    /// Shared by every batch read: the grouping, the fast path for the
+    /// single-shard case and the scatter-gather do not depend on what each key
+    /// resolves to, only on which shard owns it.
+    fn read_batch<T: Clone + Default>(
+        &self,
+        keys: &[Key<'_>],
+        read: impl Fn(&LmdbEngine, &[Key<'_>]) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        if self.shards.len() == 1 {
+            return read(&self.shards.all()[0].engine, keys);
+        }
+
+        let mut results = vec![T::default(); keys.len()];
+        for (index, group) in self
+            .shards
+            .group(keys, |key| key.as_bytes())
+            .iter()
+            .enumerate()
+        {
+            if group.is_empty() {
+                continue;
+            }
+            let shard_keys: Vec<Key<'_>> = group.iter().map(|(_, key)| **key).collect();
+            for ((position, _), value) in group
+                .iter()
+                .zip(read(&self.shards.all()[index].engine, &shard_keys)?)
+            {
+                results[*position] = value;
+            }
+        }
+        Ok(results)
+    }
+
     /// The generation this node holds for a tag name: the highest any of its
     /// shards has, or `None` if none has ever seen it.
     ///
@@ -130,30 +166,15 @@ impl Store for LmdbStore {
     }
 
     fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {
-        if self.shards.len() == 1 {
-            return self.shards.all()[0].engine.get_many(keys);
-        }
+        self.read_batch(keys, LmdbEngine::get_many)
+    }
 
-        // Each shard resolves its own keys against one snapshot; results are
-        // written back into the caller's positions so the reply stays in
-        // request order.
-        let mut results: Vec<Option<Value>> = vec![None; keys.len()];
-        for (index, group) in self
-            .shards
-            .group(keys, |key| key.as_bytes())
-            .iter()
-            .enumerate()
-        {
-            if group.is_empty() {
-                continue;
-            }
-            let shard_keys: Vec<Key<'_>> = group.iter().map(|(_, key)| **key).collect();
-            let values = self.shards.all()[index].engine.get_many(&shard_keys)?;
-            for ((position, _), value) in group.iter().zip(values) {
-                results[*position] = value;
-            }
-        }
-        Ok(results)
+    fn deadline(&self, key: Key<'_>) -> Result<Option<u64>> {
+        self.shards.for_key(key.as_bytes()).engine.deadline(key)
+    }
+
+    fn deadlines(&self, keys: &[Key<'_>]) -> Result<Vec<Option<u64>>> {
+        self.read_batch(keys, LmdbEngine::deadlines)
     }
 
     fn set(&self, set: &Set<'_>) -> Result<u64> {
@@ -224,10 +245,31 @@ impl Store for LmdbStore {
         // Read first so the reply reflects the values as they were found, then
         // re-stamp only the keys that were actually live.
         let values = self.get_many(keys)?;
-        for (key, value) in keys.iter().zip(&values) {
-            if value.is_some() {
-                self.touch(*key, ttl_secs)?;
+        let live: Vec<Key<'_>> = keys
+            .iter()
+            .zip(&values)
+            .filter(|(_, value)| value.is_some())
+            .map(|(key, _)| *key)
+            .collect();
+        if live.is_empty() {
+            return Ok(values);
+        }
+
+        // One writer round trip per shard, not one per key: a `gat` over ten
+        // keys used to queue ten operations and wait for ten commits.
+        for (index, group) in self
+            .shards
+            .group(&live, |key| key.as_bytes())
+            .iter()
+            .enumerate()
+        {
+            if group.is_empty() {
+                continue;
             }
+            let owned = group.iter().map(|(_, key)| key.as_bytes().into()).collect();
+            self.shards.all()[index]
+                .writer
+                .touch_many(owned, ttl_secs)?;
         }
         Ok(values)
     }

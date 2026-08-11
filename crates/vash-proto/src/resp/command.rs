@@ -53,6 +53,13 @@ pub enum Command<'a> {
     Exists {
         keys: Vec<&'a [u8]>,
     },
+    /// `TYPE key`. Every value this server stores is a string, so the answer is
+    /// only ever `string` or `none` — but a client library that probes the type
+    /// before deciding how to read a key needs to be told that rather than
+    /// meeting `unknown command`.
+    Type {
+        key: &'a [u8],
+    },
     Append {
         key: &'a [u8],
         value: &'a [u8],
@@ -259,6 +266,10 @@ pub fn parse_command<'a>(
 
         b"EXISTS" => Command::Exists {
             keys: at_least(args, 2, "exists", consumed)?[1..].to_vec(),
+        },
+
+        b"TYPE" => Command::Type {
+            key: exactly(args, 2, "type", consumed)?[1],
         },
 
         b"APPEND" => {
