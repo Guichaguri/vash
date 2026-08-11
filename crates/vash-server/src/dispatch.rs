@@ -110,7 +110,8 @@ fn memcached_error(status: Status) -> vash_proto::memcached::ErrorKind {
 /// builds a single response buffer instead of one allocation per frame.
 pub fn execute_frame_into(state: &ServerState, frame: &[u8], out: &mut Vec<u8>) {
     match decode(frame) {
-        Ok(Decoded::Request { request, .. }) => {
+        Ok(Decoded::Request { mut request, .. }) => {
+            offsets_to_store_ttls(&mut request.command);
             let result = execute(state, &request.command);
 
             if request.no_reply {
@@ -144,6 +145,32 @@ pub fn execute_frame_into(state: &ServerState, frame: &[u8], out: &mut Vec<u8>) 
             error!("frame passed to execute_frame_into was not a complete, valid frame");
             encode_error(out, 0, 0, Status::Internal);
         }
+    }
+}
+
+/// Rewrites a decoded VCP request's TTLs from plain offsets into the overloaded
+/// form the store reads.
+///
+/// VCP's `ttl_secs` is an offset at every magnitude — it is a new protocol and
+/// owes memcached's clients nothing. The store's field is memcached's
+/// `exptime`, where an offset past 30 days is instead an absolute stamp, so
+/// without this a VCP client asking for 60 days would get a deadline in 1970
+/// and a value that was gone the moment it landed.
+///
+/// Applied here, on the VCP side of the fork, rather than in the decoder: the
+/// translation needs the clock, and a decoder that reads the clock is one whose
+/// output no longer round-trips against its encoder.
+fn offsets_to_store_ttls(command: &mut Command<'_>) {
+    let clock = vash_core::Clock::new();
+    match command {
+        Command::Set(set) => set.ttl_secs = clock.ttl_from_offset(set.ttl_secs),
+        Command::SetMany(sets) => {
+            for set in sets {
+                set.ttl_secs = clock.ttl_from_offset(set.ttl_secs);
+            }
+        }
+        Command::Touch { ttl_secs, .. } => *ttl_secs = clock.ttl_from_offset(*ttl_secs),
+        _ => {}
     }
 }
 

@@ -285,7 +285,7 @@ otherwise. A record that has expired but not yet been reclaimed reports
 
 | Offset | Field |
 |---|---|
-| 0 | `ttl_secs` u32 |
+| 0 | `ttl_secs` u32 — see [TTL](#ttl-semantics) |
 | 4 | key bytes, to the end of the body |
 
 `OK` if the key was live, `NOT_FOUND` otherwise. The value is unchanged; its CAS
@@ -815,24 +815,32 @@ best-effort rate limiter rather than an exact one.
 
 # Shared semantics
 
-These apply identically to all three protocols.
+These apply to all three protocols, identically except where noted.
 
 ## TTL semantics
 
-The TTL field is overloaded exactly as memcached's `exptime` is:
+`0` means "never expires" on all three protocols, and an expired item is
+**never served**, whether or not its space has been reclaimed yet — reclamation
+is a background process and lags by design.
 
-| Value | Meaning |
-|---|---|
-| `0` | Never expires. |
-| `1` … `2592000` (30 days) | Relative offset in seconds. |
-| `> 2592000` | **Absolute unix timestamp** in seconds, not an offset. |
-| negative (memcached text only) | Already expired. |
+How a *non-zero* TTL is read is the one thing that differs between them,
+because memcached's `exptime` overloads the field:
 
-VCP carries the TTL as a `u32` and has no negative form; the memcached adapter
-translates a negative `exptime` into a sentinel the store understands.
+| Value | memcached | VCP | Redis |
+|---|---|---|---|
+| `1` … `2592000` (30 days) | Relative offset in seconds. | Relative offset in seconds. | Relative offset, in the unit the option names. |
+| `> 2592000` | **Absolute unix timestamp** in seconds, not an offset. | Relative offset in seconds, same as any other. | Relative offset, same as any other. |
+| negative | Already expired. | Not representable: the field is a `u32`. | `SET … EX` refuses it; `EXPIRE` deletes the key. |
 
-An expired item is **never served**, whether or not its space has been reclaimed
-yet. Reclamation is a background process and lags by design.
+Only memcached flips to a timestamp past 30 days, and only because its clients
+expect it to. On VCP a TTL is an offset at every magnitude, so `ttl_secs` of
+`5184000` is sixty days from now rather than a date in March 1970. Redis has
+separate options for the two forms — `EX`/`PX` for an offset, `EXAT`/`PXAT` for
+a stamp — and neither one changes meaning with its magnitude.
+
+The furthest deadline any of them can express is in 2106, the ceiling of the
+`u32` of unix seconds the store keeps internally. A longer TTL is stored as that
+ceiling rather than refused.
 
 ## CAS tokens
 

@@ -115,7 +115,11 @@ impl Client {
         }
     }
 
-    /// Stores a value, returning its CAS token. `ttl_secs` of 0 means no expiry.
+    /// Stores a value, returning its CAS token.
+    ///
+    /// `ttl_secs` of 0 means no expiry. Anything else is an offset in seconds
+    /// at any magnitude: unlike memcached's `exptime`, a TTL past 30 days is
+    /// still a TTL and not a unix timestamp.
     pub async fn set(&mut self, key: &[u8], value: &[u8], ttl_secs: u32) -> Result<u64> {
         self.set_tagged(key, value, ttl_secs, &[]).await
     }

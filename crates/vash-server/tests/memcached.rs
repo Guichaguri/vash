@@ -524,6 +524,41 @@ async fn the_meta_ttl_flag_reports_a_real_remaining_lifetime() {
     );
 }
 
+/// The one place the 30-day overloading survives. VCP and Redis read a long
+/// TTL as an offset; memcached's clients have expected a timestamp since 2003,
+/// and the differential suite compares this against a real server.
+#[tokio::test]
+async fn an_exptime_past_thirty_days_is_an_absolute_timestamp() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Well past the threshold, so it can only be read as a stamp — and an hour
+    // out, so reading it as an offset instead would be a lifetime of decades.
+    let stamp = now + 3_600;
+    assert_eq!(
+        c.line(&format!("set k 0 {stamp} 1\r\nx\r\n")).await,
+        "STORED\r\n"
+    );
+
+    let response = c.line("mg k t\r\n").await;
+    let ttl: i64 = response
+        .trim_end()
+        .rsplit(" t")
+        .next()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("expected a ttl token, got {response:?}"));
+
+    assert!(
+        (3_590..=3_600).contains(&ttl),
+        "expected roughly an hour remaining, got {ttl}"
+    );
+}
+
 #[tokio::test]
 async fn meta_flags_that_are_not_implemented_are_refused() {
     let server = TestServer::start().await;

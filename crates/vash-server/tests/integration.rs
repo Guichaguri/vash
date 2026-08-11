@@ -106,6 +106,21 @@ impl TestServer {
         self.dir.path().join("db")
     }
 
+    /// A live key's deadline in unix milliseconds. `None` if it is absent,
+    /// `Some(NEVER)` if it has no expiry.
+    ///
+    /// Read from the store because VCP does not report a remaining lifetime on
+    /// the wire — the memcached `t` flag is the only way to ask over a socket.
+    fn deadline_ms(&self, key: &[u8]) -> Option<u64> {
+        use vash_store::Store;
+        self.store
+            .as_ref()
+            .expect("store handle released")
+            .get(vash_core::Key::new(key).expect("a valid key"))
+            .expect("reading the key")
+            .and_then(|value| value.expires_at_ms)
+    }
+
     /// Records currently on disk, including any the sweeper has not reached.
     fn entries(&self) -> u64 {
         use vash_store::Store;
@@ -961,6 +976,41 @@ async fn touch_extends_a_lifetime_over_the_wire() {
         .unwrap()
         .expect("survived its original ttl");
     assert_eq!(&got.data[..], b"payload");
+}
+
+/// memcached reads an `exptime` past 30 days as an absolute unix timestamp.
+/// VCP does not: its `ttl_secs` is an offset at every magnitude, so a TTL a
+/// client would plausibly ask for — a quarter, a year — must not be read back
+/// as a date in 1970 and expire the value on arrival.
+#[tokio::test]
+async fn a_vcp_ttl_past_thirty_days_is_still_an_offset() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    const NINETY_DAYS: u32 = 90 * 24 * 60 * 60;
+    let before = vash_core::Clock::new().now_ms();
+    client.set(b"quarter", b"v", NINETY_DAYS).await.unwrap();
+
+    assert!(
+        client.get(b"quarter").await.unwrap().is_some(),
+        "a 90-day value must survive being written"
+    );
+
+    let deadline = server.deadline_ms(b"quarter").expect("a live key");
+    let expected = before + NINETY_DAYS as u64 * 1_000;
+    assert!(
+        deadline >= expected && deadline <= expected + 2_000,
+        "expected roughly 90 days out ({expected}), got {deadline}"
+    );
+
+    // And `TOUCH` reads its TTL the same way, or a long-lived key could not be
+    // extended without resending the value.
+    client.touch(b"quarter", NINETY_DAYS * 2).await.unwrap();
+    let extended = server.deadline_ms(b"quarter").expect("still live");
+    assert!(
+        extended > deadline,
+        "touch should have pushed the deadline out, got {extended} from {deadline}"
+    );
 }
 
 #[tokio::test]

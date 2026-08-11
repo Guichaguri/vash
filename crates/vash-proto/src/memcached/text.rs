@@ -306,6 +306,11 @@ fn parse_keys<'a>(
 /// expired". The absolute form is converted by the caller's clock; here it is
 /// passed through, and the server treats anything past the threshold as
 /// absolute.
+///
+/// That overloading is memcached's alone. It reaches the store untranslated only
+/// because the store's field happens to speak the same encoding — the other two
+/// protocols convert at their own adapter, so a 60-day TTL over VCP or Redis
+/// stays a 60-day TTL.
 fn parse_exptime(token: Option<&[u8]>, consumed: usize) -> Result<u32, ProtocolError> {
     let fail = || ProtocolError::Recoverable {
         response: ErrorKind::Client("bad command line format"),

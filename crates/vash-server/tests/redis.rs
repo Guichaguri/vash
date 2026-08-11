@@ -295,6 +295,36 @@ async fn ttl_distinguishes_absent_from_persistent() {
     c.call(&["TTL", "k"], ":1000\r\n").await;
 }
 
+/// Redis has separate options for an offset and a stamp, so neither form
+/// changes meaning with its magnitude — unlike memcached's `exptime`, whose
+/// 30-day threshold must not leak into this dialect.
+#[tokio::test]
+async fn a_redis_ttl_past_thirty_days_is_still_an_offset() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    // 90 days, comfortably past memcached's threshold and an entirely ordinary
+    // thing for a Redis client to ask for.
+    const NINETY_DAYS: &str = "7776000";
+
+    c.call(&["SET", "k", "v", "EX", NINETY_DAYS], "+OK\r\n")
+        .await;
+    c.call(&["GET", "k"], "$1\r\nv\r\n").await;
+    let ttl = c.line(&["TTL", "k"]).await;
+    assert!(
+        ttl == ":7776000\r\n" || ttl == ":7775999\r\n",
+        "expected 90 days remaining, got {ttl:?}"
+    );
+
+    // `EXPIRE` reads the same field and must agree.
+    c.call(&["EXPIRE", "k", NINETY_DAYS], ":1\r\n").await;
+    let ttl = c.line(&["TTL", "k"]).await;
+    assert!(
+        ttl == ":7776000\r\n" || ttl == ":7775999\r\n",
+        "expected 90 days remaining, got {ttl:?}"
+    );
+}
+
 #[tokio::test]
 async fn expire_conditions_follow_the_current_deadline() {
     let server = TestServer::start().await;

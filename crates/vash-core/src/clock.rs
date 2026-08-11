@@ -3,9 +3,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Threshold above which a TTL is an absolute unix timestamp rather than a
 /// relative offset, in seconds (30 days).
 ///
-/// This is memcached's rule, and it applies to every protocol rather than being
-/// translated at the memcached adapter: two different interpretations of the
-/// same field is exactly how a value ends up with the wrong lifetime.
+/// This is memcached's rule, and it is the encoding the store's `ttl_secs`
+/// field speaks — one interpretation, in one place, because two of them is
+/// exactly how a value ends up with the wrong lifetime.
+///
+/// It is *not* what every protocol exposes. Only the memcached adapter passes a
+/// client's TTL through untranslated, because only memcached clients expect the
+/// overloading; VCP and RESP take an offset at every magnitude and convert at
+/// their adapter, through [`Clock::ttl_from_offset`] and `ttl_from_deadline`
+/// respectively.
 pub const MAX_TTL_SECS: u32 = 60 * 60 * 24 * 30;
 
 /// TTL sentinel meaning "already expired".
@@ -64,6 +70,30 @@ impl Clock {
             secs => self.now_ms() + (secs as u64) * 1000,
         }
     }
+
+    /// Encodes a plain relative offset in seconds as the `ttl_secs` above.
+    ///
+    /// The protocols that do not share memcached's overloading pass their TTL
+    /// through here: an offset past [`MAX_TTL_SECS`] is handed on as the
+    /// absolute stamp it means, rather than being read back as a date in 1970
+    /// and expiring the value on the spot.
+    ///
+    /// An offset at or below the threshold is already unambiguous and passes
+    /// through untouched, which keeps the clock out of the common path.
+    #[inline]
+    pub fn ttl_from_offset(&self, offset_secs: u32) -> u32 {
+        if offset_secs <= MAX_TTL_SECS {
+            return offset_secs;
+        }
+
+        // Rounded up, so the deadline is never *shorter* than what was asked
+        // for. At these magnitudes the millisecond is noise either way.
+        let stamp = self.now_ms().div_ceil(1000) + offset_secs as u64;
+
+        // `u32::MAX` is the already-expired sentinel, so the furthest offset
+        // this can express lands one second short of it, in 2106.
+        u32::try_from(stamp).unwrap_or(u32::MAX).min(u32::MAX - 1)
+    }
 }
 
 /// Expiry stamp used for "already expired": the earliest value that is not
@@ -112,5 +142,35 @@ mod tests {
         // And a value just under the threshold is still relative.
         let relative = clock.expiry_from_ttl(MAX_TTL_SECS);
         assert!(relative >= clock.now_ms());
+    }
+
+    #[test]
+    fn a_short_offset_needs_no_translation() {
+        let clock = Clock::new();
+        assert_eq!(clock.ttl_from_offset(0), 0);
+        assert_eq!(clock.ttl_from_offset(60), 60);
+        assert_eq!(clock.ttl_from_offset(MAX_TTL_SECS), MAX_TTL_SECS);
+    }
+
+    #[test]
+    fn a_long_offset_becomes_the_stamp_it_means() {
+        let clock = Clock::new();
+        // 90 days: a perfectly ordinary TTL, and one that would otherwise be
+        // read as a timestamp in April 1970.
+        let offset = 90 * 24 * 60 * 60;
+        let before = clock.now_ms();
+        let expiry = clock.expiry_from_ttl(clock.ttl_from_offset(offset));
+
+        assert!(expiry >= before + offset as u64 * 1000);
+        assert!(expiry <= clock.now_ms() + (offset as u64 + 1) * 1000);
+    }
+
+    #[test]
+    fn the_furthest_offset_stops_short_of_the_expired_sentinel() {
+        let clock = Clock::new();
+        let encoded = clock.ttl_from_offset(u32::MAX);
+
+        assert_ne!(encoded, TTL_ALREADY_EXPIRED, "must not read as expired");
+        assert!(clock.expiry_from_ttl(encoded) > clock.now_ms());
     }
 }
