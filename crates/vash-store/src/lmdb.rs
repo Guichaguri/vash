@@ -18,12 +18,14 @@ use crate::{Store, StoreStats};
 /// N concurrent writers.
 pub struct LmdbStore {
     shards: Shards,
+    max_tags_per_record: usize,
 }
 
 impl LmdbStore {
     pub fn open(config: &StoreConfig) -> Result<Self> {
         Ok(Self {
             shards: Shards::open(config)?,
+            max_tags_per_record: config.max_tags_per_record,
         })
     }
 
@@ -51,6 +53,19 @@ impl LmdbStore {
         self.shards.close();
     }
 
+    /// Checks every set against the configured per-record tag limit.
+    ///
+    /// Runs before registration, not with the rest of write validation in
+    /// `prepare_set`: a write that is going to be refused must not leave its
+    /// tag names behind in the registry, where they would count against the
+    /// name ceiling for the life of the process.
+    fn check_tag_counts(&self, sets: &[Set<'_>]) -> Result<()> {
+        for set in sets {
+            vash_core::validate_tags(set.tags.len(), self.max_tags_per_record)?;
+        }
+        Ok(())
+    }
+
     /// Registers any tag names the owning shard has not seen.
     ///
     /// A record may never reference a tag that is not durably registered **in
@@ -62,6 +77,8 @@ impl LmdbStore {
     /// Each name is registered at the generation the rest of the node already
     /// holds for it rather than at zero — see [`LmdbStore::node_generation`].
     fn ensure_tags_registered(&self, sets: &[Set<'_>]) -> Result<()> {
+        self.check_tag_counts(sets)?;
+
         for shard_items in self.shards.group(sets, |set| set.key.as_bytes()) {
             let mut missing: Vec<(Box<[u8]>, u64)> = Vec::new();
             let mut shard = None;

@@ -25,7 +25,8 @@ pub use command::{
 pub use error::{CoreError, Result};
 pub use key::{Key, MAX_KEY_LEN};
 pub use record::{
-    MAX_TAG_LEN, MAX_TAGS, NEVER, RECORD_CAS_OFFSET, RECORD_HEADER_LEN, RECORD_VERSION, RecordMeta,
-    RecordRef, TagRef, encode_record, patch_cas, record_len,
+    ABSOLUTE_MAX_TAGS, DEFAULT_MAX_TAGS, MAX_TAG_LEN, NEVER, RECORD_CAS_OFFSET, RECORD_HEADER_LEN,
+    RECORD_VERSION, RecordMeta, RecordRef, TagRef, encode_record, patch_cas, record_len,
+    validate_tags,
 };
 pub use value::{ABSOLUTE_MAX_VALUE_LEN, DEFAULT_MAX_VALUE_LEN, validate_value};

@@ -87,6 +87,13 @@ sweep_batch = 512
 # The registry lives entirely in RAM, so without a ceiling a client inventing
 # tag names is a memory leak.
 max_tags = 100000
+# Tags one record may carry. Each one costs 12 bytes inside every copy of the
+# record, a tag-index row on every write, and a generation comparison on every
+# read of the key — the liveness check is O(tags) and runs before anything is
+# served. Raising this trades read latency and write throughput for more tags
+# per key; 255 is the hard ceiling, because the record header counts them in a
+# single byte.
+max_per_record = 32
 # Tag-index entries examined per reclamation pass. While an invalidation is
 # still being cleaned up these passes run back to back, so this bounds
 # transaction length rather than drain rate.

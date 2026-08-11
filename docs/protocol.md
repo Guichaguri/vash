@@ -253,7 +253,7 @@ empty body. A VCP `GET` does **not** report the remaining TTL; use the memcached
 |---|---|
 | 0 | `ttl_secs` u32 — see [TTL](#ttl-semantics) |
 | 4 | `key_len` u16 |
-| 6 | `tag_count` u8 — at most 32 |
+| 6 | `tag_count` u8 — see [tags](#tags) for the limit |
 | 7 | `reserved` u8 — zero |
 | 8 | `value_len` u32 |
 | 12 | key `bytes[key_len]` |
@@ -859,10 +859,25 @@ Zero is not a valid token. Compare-and-swap is available through the memcached
 
 ## Tags
 
-A tag is a 1–255 byte name. A record may carry up to **32** tags, attached at
-write time. Tags are registered on first use; the registry is bounded
-(`store.tags.max_tags`, default 100000) and a write that would exceed it fails
-with `CAPACITY_FULL`.
+A tag is a 1–255 byte name, attached at write time.
+
+Two limits apply, both configurable:
+
+| Limit | Setting | Default | On breach |
+|---|---|---|---|
+| Tags on one record | `store.tags.max_per_record` | 32 | `BAD_REQUEST` |
+| Distinct names registered | `store.tags.max_tags` | 100000 | `CAPACITY_FULL` |
+
+`max_per_record` cannot exceed **255**: the record header counts tags in a single
+byte, and a server configured past that refuses to start. The default is 32
+because every tag costs 12 bytes in each copy of the record, a tag-index row on
+every write, and one comparison on every read of the key — the liveness check is
+O(tags) and runs before anything is served. Lowering it later is safe: records
+already carrying more stay readable and touchable, and only new writes are
+refused.
+
+Names are registered on first use. The registry lives entirely in RAM, which is
+what `max_tags` bounds.
 
 Invalidation is a generation bump, so it costs the same for ten keys or a
 million. The ordering guarantee a client can rely on:

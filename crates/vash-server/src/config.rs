@@ -109,6 +109,10 @@ pub struct TagConfig {
     /// Ceiling on registered tag names. The registry is held entirely in RAM,
     /// so without a limit a client inventing tag names is a memory leak.
     pub max_tags: usize,
+    /// Ceiling on the tags one record may carry. Every tag costs bytes in the
+    /// record, a tag-index row per write, and a comparison on every read of the
+    /// key, so this bounds what a single client can charge the read path.
+    pub max_per_record: usize,
     /// Tag-index entries examined per reclamation pass. While a job is
     /// outstanding these run back to back, so this bounds transaction length
     /// rather than drain rate.
@@ -120,6 +124,7 @@ impl Default for TagConfig {
         let defaults = vash_store::StoreConfig::default();
         Self {
             max_tags: defaults.max_tags,
+            max_per_record: defaults.max_tags_per_record,
             reclaim_batch: defaults.write.reclaim_batch,
         }
     }
@@ -401,6 +406,16 @@ impl Config {
             "store.tags.max_tags must be > 0"
         );
         anyhow::ensure!(
+            self.store.tags.max_per_record > 0,
+            "store.tags.max_per_record must be > 0"
+        );
+        anyhow::ensure!(
+            self.store.tags.max_per_record <= vash_core::ABSOLUTE_MAX_TAGS,
+            "store.tags.max_per_record exceeds the absolute limit of {}, \
+             which the record header cannot describe",
+            vash_core::ABSOLUTE_MAX_TAGS
+        );
+        anyhow::ensure!(
             self.store.tags.reclaim_batch > 0,
             "store.tags.reclaim_batch must be > 0"
         );
@@ -478,6 +493,7 @@ impl Config {
             wipe_on_start: self.store.wipe_on_start,
             bucket_granularity_ms: self.store.ttl.bucket_granularity_ms,
             max_tags: self.store.tags.max_tags,
+            max_tags_per_record: self.store.tags.max_per_record,
             write: vash_store::WriteConfig {
                 max_batch: self.store.write.max_batch,
                 queue_depth: self.store.write.queue_depth,
@@ -503,6 +519,15 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().unwrap();
+    }
+
+    /// The shipped example is the documentation for every setting, and
+    /// `deny_unknown_fields` means a key renamed in one place and not the other
+    /// makes it unusable. Cheaper to catch here than in someone's deployment.
+    #[test]
+    fn the_example_file_parses_and_validates() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vash.example.toml");
+        Config::load(&path).expect("vash.example.toml must be a usable config");
     }
 
     #[test]
@@ -546,5 +571,25 @@ mod tests {
         let mut config = Config::default();
         config.store.max_value_bytes = vash_core::ABSOLUTE_MAX_VALUE_LEN + 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_per_record_tag_limit_stays_within_what_the_header_can_describe() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.store.tags.max_per_record, 32,
+            "the documented default"
+        );
+
+        config.store.tags.max_per_record = vash_core::ABSOLUTE_MAX_TAGS;
+        assert!(config.validate().is_ok(), "the ceiling itself is allowed");
+
+        // `tag_count` is a `u8`, so anything past this would be truncated on
+        // its way to disk and read back as a different record.
+        config.store.tags.max_per_record = vash_core::ABSOLUTE_MAX_TAGS + 1;
+        assert!(config.validate().is_err());
+
+        config.store.tags.max_per_record = 0;
+        assert!(config.validate().is_err(), "a store that refuses every tag");
     }
 }

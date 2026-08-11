@@ -378,10 +378,11 @@ fn decode_set<'a>(c: &mut Cursor<'a>) -> Result<Set<'a>, (Status, &'static str)>
         "set body is shorter than its declared value",
     ))?;
 
+    // No check against the configured limit here: `tag_count` is a `u8`, so the
+    // field itself already bounds this at `ABSOLUTE_MAX_TAGS`, and the limit is
+    // store policy that a decoder has no business knowing. A frame over it is
+    // refused by the store with the same `BAD_REQUEST` this would have sent.
     let tag_count = header.tag_count as usize;
-    if tag_count > vash_core::MAX_TAGS {
-        return Err((Status::BadRequest, "too many tags"));
-    }
 
     let mut tags = Vec::with_capacity(tag_count);
     for _ in 0..tag_count {

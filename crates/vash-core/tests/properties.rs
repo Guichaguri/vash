@@ -8,13 +8,15 @@
 use proptest::prelude::*;
 use vash_core::record::{RECORD_HEADER_LEN, RecordHeader, TAG_REF_LEN};
 use vash_core::{
-    MAX_TAGS, NEVER, RecordMeta, RecordRef, TagRef, encode_record, patch_cas, record_len,
+    ABSOLUTE_MAX_TAGS, NEVER, RecordMeta, RecordRef, TagRef, encode_record, patch_cas, record_len,
 };
 
 fn tags() -> impl Strategy<Value = Vec<TagRef>> {
     proptest::collection::vec(
         (any::<u32>(), any::<u64>()).prop_map(|(id, generation)| TagRef::new(id, generation)),
-        0..=MAX_TAGS,
+        // The format ceiling, not the configured limit: `encode_record` accepts
+        // anything the header can describe, and that is what these cover.
+        0..=ABSOLUTE_MAX_TAGS,
     )
 }
 

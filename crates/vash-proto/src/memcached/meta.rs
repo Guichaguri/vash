@@ -273,7 +273,10 @@ fn collect<'a>(
                     if name.len() > vash_core::MAX_TAG_LEN {
                         return Err(fail("tag name too long"));
                     }
-                    if out.tags.len() >= vash_core::MAX_TAGS {
+                    // The format ceiling, not the configured limit: a text flag
+                    // carries no count, so the parser has to stop the list
+                    // growing without bound. The store applies its own limit.
+                    if out.tags.len() >= vash_core::ABSOLUTE_MAX_TAGS {
                         return Err(fail("too many tags"));
                     }
                     out.tags.push(name);

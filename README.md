@@ -481,4 +481,5 @@ cargo run --release -p vash-store --example tag_bench      # the O(1) invalidati
 The micro-benchmarks price a request before any storage work happens: decoding a
 `GET` is 15.6 ns against 99.8 ns for the same request in the memcached text
 protocol, parsing a stored record is 12.5 ns and flat in its tag count, and the
-liveness check is 1.5 ns untagged rising to 16.8 ns with the full 32 tags.
+liveness check is 1.5 ns untagged rising to 16.8 ns at 32 tags — the default
+`store.tags.max_per_record`, and the reason that default is where it is.

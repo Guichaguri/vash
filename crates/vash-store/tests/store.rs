@@ -81,6 +81,22 @@ impl Harness {
         self.store().stats().unwrap().tag_index_entries
     }
 
+    fn registered_tags(&self) -> u64 {
+        self.store().stats().unwrap().tags
+    }
+
+    /// A tagged write that is allowed to fail, for the limit tests.
+    fn try_set_tagged(&self, key: &[u8], tags: &[&[u8]]) -> vash_store::Result<u64> {
+        self.store().set(&Set {
+            key: Key::new(key).unwrap(),
+            value: b"v",
+            ttl_secs: 0,
+            mc_flags: 0,
+            tags: tags.to_vec(),
+            mode: vash_core::SetMode::Set,
+        })
+    }
+
     fn pending_reclaims(&self) -> u64 {
         self.store().stats().unwrap().pending_reclaims
     }
@@ -803,6 +819,56 @@ fn the_tag_registry_is_bounded() {
     assert!(
         matches!(err, Err(vash_store::StoreError::TagLimit(4))),
         "an unbounded RAM registry is a leak a client could drive: {err:?}"
+    );
+}
+
+#[test]
+fn tags_per_record_are_bounded_by_the_default() {
+    let h = Harness::new();
+    let names: Vec<String> = (0..=vash_core::DEFAULT_MAX_TAGS)
+        .map(|i| format!("t{i}"))
+        .collect();
+    let refs: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+
+    h.try_set_tagged(b"at-the-limit", &refs[..vash_core::DEFAULT_MAX_TAGS])
+        .expect("the limit itself must be allowed");
+
+    let err = h.try_set_tagged(b"over", &refs);
+    assert!(
+        matches!(
+            err,
+            Err(vash_store::StoreError::Core(
+                vash_core::CoreError::TooManyTags { max: 32, .. }
+            ))
+        ),
+        "32 is the default per-record tag limit: {err:?}"
+    );
+}
+
+#[test]
+fn the_per_record_tag_limit_is_configurable() {
+    let h = Harness::with(|c| c.max_tags_per_record = 2);
+
+    h.try_set_tagged(b"k", &[b"a", b"b"]).expect("within two");
+
+    let err = h.try_set_tagged(b"k", &[b"a", b"b", b"c"]);
+    assert!(
+        matches!(
+            err,
+            Err(vash_store::StoreError::Core(
+                vash_core::CoreError::TooManyTags { count: 3, max: 2 }
+            ))
+        ),
+        "the configured limit must be the one enforced: {err:?}"
+    );
+
+    // The refused write must not have left its names behind: the registry is
+    // RAM-resident and capped, so a rejected write that still registered would
+    // be a leak a client could drive on purpose.
+    assert_eq!(
+        h.registered_tags(),
+        2,
+        "only the names of writes that were accepted may be registered"
     );
 }
 

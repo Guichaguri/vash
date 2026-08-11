@@ -40,9 +40,31 @@ pub const RECORD_VERSION: u8 = 1;
 pub const RECORD_HEADER_LEN: usize = 28;
 pub const TAG_REF_LEN: usize = 12;
 
-/// Maximum tags attachable to a single record. Bounded because `tag_count` is a
-/// `u8` and because the liveness check is O(tags) on every read.
-pub const MAX_TAGS: usize = 32;
+/// Default ceiling on the tags attachable to a single record.
+///
+/// Policy, and configurable. Every tag costs 12 bytes inside every copy of the
+/// record, one tag-index row per write on the shard's single writer thread, and
+/// one generation comparison on every read of the key — the liveness check is
+/// O(tags) and runs before anything is served. At 32 those stay small
+/// (measured: 1.5ns untagged against 16.8ns fully tagged); raising it trades
+/// read latency and write throughput for more tags per key.
+pub const DEFAULT_MAX_TAGS: usize = 32;
+
+/// Hard ceiling on the configurable limit: `tag_count` is a `u8`, so a wider
+/// tag table cannot be written down at all.
+pub const ABSOLUTE_MAX_TAGS: usize = u8::MAX as usize;
+
+/// Checks a tag count against a configured limit.
+///
+/// Separate from [`encode_record`], which only enforces the format ceiling, so
+/// the policy limit can be applied before a write does any work — including
+/// before it registers tag names it turns out not to be allowed to use.
+pub fn validate_tags(count: usize, max: usize) -> Result<()> {
+    if count > max {
+        return Err(CoreError::TooManyTags { count, max });
+    }
+    Ok(())
+}
 
 /// Maximum tag name length, in bytes. Tag names are LMDB keys in the registry.
 pub const MAX_TAG_LEN: usize = 255;
@@ -219,12 +241,10 @@ pub fn encode_record(
     tags: &[TagRef],
     value: &[u8],
 ) -> Result<()> {
-    if tags.len() > MAX_TAGS {
-        return Err(CoreError::TooManyTags {
-            count: tags.len(),
-            max: MAX_TAGS,
-        });
-    }
+    // Only the format ceiling. The configured limit is policy and is applied
+    // by the store before it gets here, so a record already on disk still
+    // re-encodes — on a `TOUCH`, say — after that limit has been lowered.
+    validate_tags(tags.len(), ABSOLUTE_MAX_TAGS)?;
 
     let header = RecordHeader {
         version: RECORD_VERSION,
@@ -406,12 +426,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_too_many_tags() {
-        let tags = vec![TagRef::new(1, 1); MAX_TAGS + 1];
+    fn encoding_rejects_a_tag_table_the_header_cannot_describe() {
+        let tags = vec![TagRef::new(1, 1); ABSOLUTE_MAX_TAGS + 1];
         let mut buf = Vec::new();
         assert!(matches!(
             encode_record(&mut buf, RecordMeta::default(), &tags, b"v").unwrap_err(),
             CoreError::TooManyTags { .. }
+        ));
+    }
+
+    #[test]
+    fn encoding_accepts_anything_the_header_can_describe() {
+        // The configured limit is the store's business. A record written when
+        // it was higher must still re-encode after it has been lowered.
+        let tags = vec![TagRef::new(1, 1); DEFAULT_MAX_TAGS + 1];
+        let mut buf = Vec::new();
+        encode_record(&mut buf, RecordMeta::default(), &tags, b"v").expect("within the format");
+        assert_eq!(
+            RecordRef::parse(&buf).expect("valid").tags.len(),
+            DEFAULT_MAX_TAGS + 1
+        );
+    }
+
+    #[test]
+    fn validate_tags_counts_against_the_limit_it_is_given() {
+        assert!(validate_tags(4, 4).is_ok());
+        assert!(matches!(
+            validate_tags(5, 4).unwrap_err(),
+            CoreError::TooManyTags { count: 5, max: 4 }
         ));
     }
 }

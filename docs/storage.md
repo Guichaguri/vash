@@ -59,7 +59,7 @@ the value. All integers little-endian, all fields unaligned.
 ```
 offset  size  field
      0     1  version           record format version (1)
-     1     1  tag_count         0..=32
+     1     1  tag_count         0..=255; policy caps it lower, default 32
      2     2  reserved          zero
      4     4  epoch             flush epoch at write time
      8     4  mc_flags          memcached client flags, stored verbatim

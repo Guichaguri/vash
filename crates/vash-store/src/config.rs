@@ -51,6 +51,14 @@ pub struct StoreConfig {
     /// Ceiling on registered tag names. The registry is held entirely in RAM,
     /// so without a limit a client inventing tag names is a memory leak.
     pub max_tags: usize,
+    /// Ceiling on the tags a single record may carry. Bounded by
+    /// [`ABSOLUTE_MAX_TAGS`], which the record header cannot exceed.
+    ///
+    /// Lowering it below what existing records carry is safe: it refuses new
+    /// writes, and leaves what is already stored readable and touchable.
+    ///
+    /// [`ABSOLUTE_MAX_TAGS`]: vash_core::ABSOLUTE_MAX_TAGS
+    pub max_tags_per_record: usize,
     /// Independent LMDB environments to run.
     ///
     /// LMDB permits one writer per environment, so this is the ceiling on
@@ -139,6 +147,7 @@ impl Default for StoreConfig {
             wipe_on_start: false,
             bucket_granularity_ms: 1000,
             max_tags: 100_000,
+            max_tags_per_record: vash_core::DEFAULT_MAX_TAGS,
             shards: 1,
             write: WriteConfig::default(),
         }
