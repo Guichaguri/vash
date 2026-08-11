@@ -246,13 +246,13 @@ check at startup enforces.
 
 The alternative claims a slot per transaction from a shared table behind a
 process-wide mutex, which turns the read path from lock-free into serialised.
-Measured by `cargo run --release -p cache-store --example txn_bench`: 344k
+Measured by `cargo run --release -p vash-store --example txn_bench`: 344k
 lookups/s on one thread falling to 91k on sixteen, against 948k rising to 5.3M
 with thread-local slots.
 
 A process that dies without releasing its slots leaves them stale; LMDB reclaims
 them on the next open. A *live* process that leaks them cannot, which is why
-`kached_readers_in_use` is worth an alert.
+`vash_readers_in_use` is worth an alert.
 
 ## Space and its accounting
 
@@ -274,11 +274,11 @@ MiB limps, 6 MiB and up recover cleanly.
 
 ## Changing the format
 
-- **Record layout** → bump `RECORD_VERSION` in `cache-core/src/record.rs`. A
+- **Record layout** → bump `RECORD_VERSION` in `vash-core/src/record.rs`. A
   record whose version does not match is rejected by `RecordRef::parse`, so old
   records read as corrupt rather than as garbage.
 - **Sub-database arrangement** → bump `SCHEMA_VERSION` in
-  `cache-store/src/schema.rs`. A database with a different version is refused at
+  `vash-store/src/schema.rs`. A database with a different version is refused at
   open.
 
 Neither has a migration path, and for a cache that is the right answer: the data

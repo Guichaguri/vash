@@ -3,16 +3,16 @@
 
 Runs a real client library (pymemcache) against a server and checks the
 behaviour a client actually depends on. It is written to pass against **both**
-kached and a real memcached, so any divergence shows up as a failure here
+vash and a real memcached, so any divergence shows up as a failure here
 rather than in someone's production cache.
 
     pip install pymemcache
-    python memcached_compat.py 127.0.0.1:11311        # kached
+    python memcached_compat.py 127.0.0.1:11311        # vash
     python memcached_compat.py 127.0.0.1:11211        # real memcached
 
 Options:
-    --flush     also exercise flush_all (kached needs protocol.flush_enabled)
-    --tags      also exercise the tag extension (kached only)
+    --flush     also exercise flush_all (vash needs protocol.flush_enabled)
+    --tags      also exercise the tag extension (vash only)
 """
 
 import argparse
@@ -205,7 +205,7 @@ def run(addr, do_flush, do_tags):
         check("flush_all empties the cache", flush_empties)
 
     if do_tags:
-        # Extension: not part of memcached, so only run against kached.
+        # Extension: not part of memcached, so only run against vash.
         raw = make_client(addr)
 
         def tag_invalidation():

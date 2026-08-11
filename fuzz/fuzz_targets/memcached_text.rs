@@ -12,8 +12,8 @@
 
 #![no_main]
 
-use cache_proto::memcached::{Outcome, ProtocolError, parse};
 use libfuzzer_sys::fuzz_target;
+use vash_proto::memcached::{Outcome, ProtocolError, parse};
 
 fuzz_target!(|data: &[u8]| {
     match parse(data) {

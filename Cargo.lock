@@ -119,90 +119,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "cache-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "cache-core",
- "cache-proto",
- "cache-server",
- "divan",
- "tempfile",
- "tokio",
- "xxhash-rust",
-]
-
-[[package]]
-name = "cache-client"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "cache-core",
- "cache-proto",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "cache-core"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "proptest",
- "thiserror",
- "zerocopy",
-]
-
-[[package]]
-name = "cache-proto"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "cache-core",
- "memchr",
- "proptest",
- "thiserror",
- "zerocopy",
-]
-
-[[package]]
-name = "cache-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "cache-client",
- "cache-core",
- "cache-proto",
- "cache-store",
- "clap",
- "crossbeam-channel",
- "mimalloc",
- "serde",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "cache-store"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "cache-core",
- "crossbeam-channel",
- "heed",
- "tempfile",
- "thiserror",
- "tracing",
- "xxhash-rust",
-]
-
-[[package]]
 name = "cc"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1330,6 +1246,90 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vash-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "divan",
+ "tempfile",
+ "tokio",
+ "vash-core",
+ "vash-proto",
+ "vash-server",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "vash-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+ "tokio",
+ "vash-core",
+ "vash-proto",
+]
+
+[[package]]
+name = "vash-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
+name = "vash-proto"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "memchr",
+ "proptest",
+ "thiserror",
+ "vash-core",
+ "zerocopy",
+]
+
+[[package]]
+name = "vash-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "crossbeam-channel",
+ "mimalloc",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "vash-client",
+ "vash-core",
+ "vash-proto",
+ "vash-store",
+]
+
+[[package]]
+name = "vash-store"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "heed",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "vash-core",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "wait-timeout"

@@ -1,4 +1,4 @@
-# kached
+# vash
 
 A cache server built on LMDB, with TTLs, tag-based invalidation and memcached
 protocol compatibility.
@@ -18,23 +18,23 @@ it does not.
 ## Quick start
 
 ```bash
-cargo run --bin kached -- --listen 127.0.0.1:11311 --data ./data
+cargo run --bin vash-server -- --listen 127.0.0.1:11311 --data ./data
 ```
 
 In another terminal:
 
 ```bash
-cargo run -p cache-client --example smoke -- 127.0.0.1:11311
+cargo run -p vash-client --example smoke -- 127.0.0.1:11311
 ```
 
 Run with `--ephemeral` to start from an empty database and skip syncing, or
-`--config kached.example.toml` for the full configuration surface.
+`--config vash.example.toml` for the full configuration surface.
 
 ## What works today
 
 | | Status |
 |---|---|
-| `HELLO`, `PING`, `GET`, `SET`, `DELETE`, `TOUCH` over KCP | Working |
+| `HELLO`, `PING`, `GET`, `SET`, `DELETE`, `TOUCH` over VCP | Working |
 | `GET_MANY`, `SET_MANY`, `DELETE_MANY` | Working — one transaction per batch, all-or-nothing |
 | TTLs | Enforced on read, and reclaimed in the background by the sweeper |
 | Group commit | Working — see [benchmark](#write-throughput) |
@@ -61,7 +61,7 @@ same cores and the same memory bus. Every number here is a floor, and the
 latency figures are the most distorted of them. Reproduce with:
 
 ```bash
-cargo run --release -p cache-bench --bin load -- --workload get --connections 16 --pipeline 128
+cargo run --release -p vash-bench --bin load -- --workload get --connections 16 --pipeline 128
 ```
 
 Run-to-run variance is large — around ±25% between identical runs, because the
@@ -132,7 +132,7 @@ table behind a process-wide mutex.
 The lookups really are lock-free. The transaction around them was not:
 
 ```bash
-cargo run --release -p cache-store --example txn_bench
+cargo run --release -p vash-store --example txn_bench
 ```
 
 | threads | without TLS | with TLS |
@@ -152,7 +152,7 @@ LMDB permits one writer per environment, so writes scale only by fitting more of
 them into each transaction. Measured with:
 
 ```bash
-cargo run --release -p cache-store --example write_bench
+cargo run --release -p vash-store --example write_bench
 ```
 
 20,000 writes of a 256-byte value, `relaxed` durability, one environment
@@ -218,7 +218,7 @@ tags had when written, and a read compares those against the registry in RAM —
 no extra disk lookup, no walk over the affected keys.
 
 ```bash
-cargo run --release -p cache-store --example tag_bench
+cargo run --release -p vash-store --example tag_bench
 ```
 
 | keys carrying the tag | `DELETE_BY_TAG` | background reclaim |
@@ -265,7 +265,7 @@ stopped at whichever node the client happened to call would leave most of the
 affected keys being served.
 
 ```bash
-kached --listen 0.0.0.0:11311 --peer 10.0.0.2:11311 --peer 10.0.0.3:11311
+vash-server --listen 0.0.0.0:11311 --peer 10.0.0.2:11311 --peer 10.0.0.3:11311
 ```
 
 Two mechanisms, and the second is the one that makes it correct:
@@ -316,18 +316,18 @@ curl -s localhost:9090/stats
 
 `/health` returns 503 when a shard has hit critical pressure and is refusing
 writes — the process is up, but it is not doing its job. The counters worth
-alerting on are `kached_evicted_total` rising (the cache is too small for its
-working set), `kached_sweep_lag_ms` growing (reclamation is losing to expiry),
-`kached_readers_in_use` approaching `kached_readers_max`, and — in a cluster —
-`kached_cluster_last_exchange_age_ms` growing past a few gossip intervals, which
+alerting on are `vash_evicted_total` rising (the cache is too small for its
+working set), `vash_sweep_lag_ms` growing (reclamation is losing to expiry),
+`vash_readers_in_use` approaching `vash_readers_max`, and — in a cluster —
+`vash_cluster_last_exchange_age_ms` growing past a few gossip intervals, which
 means this node is drifting out of step with its peers.
 
 ## Memcached compatibility
 
 Both protocols share one port. The dialect is settled by the connection's first
-byte — KCP opens with a `HELLO` frame (`0x01`), every memcached command opens
+byte — VCP opens with a `HELLO` frame (`0x01`), every memcached command opens
 with a lowercase letter — so nothing is re-parsed and the two cannot be
-confused. A key written by a memcached client is readable by a KCP client and
+confused. A key written by a memcached client is readable by a VCP client and
 the other way round, client flags included.
 
 Existing memcached clients need no changes:
@@ -347,7 +347,7 @@ classic dialect) to invalidate one. Clients that never send them are unaffected.
 
 ### How compatibility is checked
 
-Two suites, both run in CI against **real memcached** as well as against kached,
+Two suites, both run in CI against **real memcached** as well as against vash,
 so a divergence fails the build rather than someone's cache.
 
 **Client library** — drives `pymemcache` through the behaviour clients actually
@@ -355,7 +355,7 @@ depend on:
 
 ```bash
 pip install pymemcache
-cargo run --release --bin kached -- --listen 127.0.0.1:11311 --data ./data --ephemeral
+cargo run --release --bin vash-server -- --listen 127.0.0.1:11311 --data ./data --ephemeral
 python tests/compat/memcached_compat.py 127.0.0.1:11311 --tags
 ```
 
@@ -370,20 +370,20 @@ python tests/compat/differential.py --reference 127.0.0.1:11211 --subject 127.0.
 
 Current result: **37 of 38 probes byte-identical**, with one deliberate
 divergence recorded in the script — for an over-long key memcached emits a stray
-empty line after the error, which kached does not reproduce because it would
+empty line after the error, which vash does not reproduce because it would
 leave a pipelining client counting one more response than it sent commands.
 
 ## Layout
 
 ```
-crates/cache-core     domain types, on-disk record format, no I/O
-crates/cache-store    LMDB adapter behind the `Store` trait
-crates/cache-proto    wire codecs (KCP + memcached); byte-slice in, `Command` out
-crates/cache-server   network tier, dispatch, config, the `kached` binary
-crates/cache-client   KCP client, and the integration-test driver
+crates/vash-core     domain types, on-disk record format, no I/O
+crates/vash-store    LMDB adapter behind the `Store` trait
+crates/vash-proto    wire codecs (VCP + memcached); byte-slice in, `Command` out
+crates/vash-server   network tier, dispatch, config, the `vash-server` binary
+crates/vash-client   VCP client, and the integration-test driver
 ```
 
-`cache-core` defines the domain; `cache-store` and `cache-proto` are adapters on
+`vash-core` defines the domain; `vash-store` and `vash-proto` are adapters on
 either side of it. Both protocols decode into the same `Command` type, so the
 storage engine never learns which wire format a request arrived on.
 
@@ -393,11 +393,11 @@ A single static binary with no runtime dependencies, or a `scratch` image
 holding nothing but it:
 
 ```bash
-cargo build --release --bin kached --target x86_64-unknown-linux-musl
-docker build -t kached .
+cargo build --release --bin vash-server --target x86_64-unknown-linux-musl
+docker build -t vash .
 ```
 
-[`packaging/kached.service`](packaging/kached.service) is a hardened systemd
+[`packaging/vash.service`](packaging/vash.service) is a hardened systemd
 unit. [docs/operations.md](docs/operations.md) covers sizing, tuning, what to
 alert on, and what each failure mode looks like from outside.
 
@@ -429,21 +429,21 @@ Coverage-guided fuzzing runs in CI on every change, seeded from a corpus
 generated out of the encoders so it cannot drift from them:
 
 ```bash
-cargo run -p cache-proto --example seed_corpus -- fuzz/seeds
-cargo +nightly fuzz run kcp_decode fuzz/seeds/kcp_decode
+cargo run -p vash-proto --example seed_corpus -- fuzz/seeds
+cargo +nightly fuzz run vcp_decode fuzz/seeds/vcp_decode
 ```
 
-Targets: `kcp_decode`, `memcached_text`, `memcached_meta`, `record_header`.
+Targets: `vcp_decode`, `memcached_text`, `memcached_meta`, `record_header`.
 
 ### Benchmarks
 
 ```bash
-cargo bench -p cache-bench                                  # per-request hot path
-cargo run --release -p cache-bench --bin load -- --help     # end to end over a socket
-cargo run --release -p cache-store --example read_bench     # the read path, no socket
-cargo run --release -p cache-store --example txn_bench      # transaction cost alone
-cargo run --release -p cache-store --example write_bench    # group commit and sharding
-cargo run --release -p cache-store --example tag_bench      # the O(1) invalidation claim
+cargo bench -p vash-bench                                  # per-request hot path
+cargo run --release -p vash-bench --bin load -- --help     # end to end over a socket
+cargo run --release -p vash-store --example read_bench     # the read path, no socket
+cargo run --release -p vash-store --example txn_bench      # transaction cost alone
+cargo run --release -p vash-store --example write_bench    # group commit and sharding
+cargo run --release -p vash-store --example tag_bench      # the O(1) invalidation claim
 ```
 
 The micro-benchmarks price a request before any storage work happens: decoding a

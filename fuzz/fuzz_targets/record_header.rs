@@ -17,8 +17,8 @@
 
 #![no_main]
 
-use cache_core::{RecordRef, record_len};
 use libfuzzer_sys::fuzz_target;
+use vash_core::{RecordRef, record_len};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(record) = RecordRef::parse(data) else {

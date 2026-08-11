@@ -1,6 +1,6 @@
-# Cache Server — Technical Plan
+# vash — Technical Plan
 
-Working name: **kachedb** (binary `kached`). Rename freely; it only appears in crate names.
+Working name: **vash** (binary `vash-server`). Rename freely; it only appears in crate names.
 
 This document turns [project.md](project.md) into a set of concrete, defensible engineering decisions.
 Every section states the decision first, then the reasoning, then the rejected alternatives.
@@ -85,7 +85,7 @@ Kept deliberately small. Every dependency on the request path must earn its plac
 
 ## 3. Protocol — **dedicated binary protocol, with memcached as a compatibility surface**
 
-**Decision: a dedicated binary protocol (`KCP`) is the primary interface. The memcached text and meta
+**Decision: a dedicated binary protocol (`VCP`) is the primary interface. The memcached text and meta
 protocols are supported for drop-in compatibility, on the same port via first-byte detection.**
 
 ### Why not extend memcached
@@ -104,7 +104,7 @@ ones are simply rejected, so new ones can be added. But it cannot deliver what t
 So: a real protocol for clients that want the features, plus honest memcached compatibility for
 everyone else.
 
-### KCP frame
+### VCP frame
 
 Fixed 12-byte header, little-endian, so it decodes as a single `zerocopy` cast:
 
@@ -132,7 +132,7 @@ Fixed 12-byte header, little-endian, so it decodes as a single `zerocopy` cast:
 `DELETE_BY_TAG 0x30`, `FLUSH 0x31`, `TAG_SYNC 0x40`.
 
 `TAG_SYNC` was added in M5 for peer-to-peer traffic (§10). Peers speak the ordinary protocol on
-the ordinary port — a peer is just another KCP client — which meant no second listener, no second
+the ordinary port — a peer is just another VCP client — which meant no second listener, no second
 codec and no second thing to fuzz.
 
 **Status codes:** `OK 0`, `NOT_FOUND 1`, `EXISTS 2`, `BAD_REQUEST 3`, `TOO_LARGE 4`, `UNAUTHORIZED 5`,
@@ -154,8 +154,8 @@ tags supported, cluster peers). Version negotiation up front means no per-frame 
 
 ### Memcached surface
 
-Same port. On the first byte of a connection: `0x00..0x7F` printable ASCII → memcached text; a valid KCP
-opcode is distinguished by the fact that KCP requires `HELLO` (`0x01`) as the first frame, which is not a
+Same port. On the first byte of a connection: `0x00..0x7F` printable ASCII → memcached text; a valid VCP
+opcode is distinguished by the fact that VCP requires `HELLO` (`0x01`) as the first frame, which is not a
 printable character. Unambiguous, zero cost after the first byte. A separate port is available via config
 for anyone who prefers explicit separation.
 
@@ -411,16 +411,16 @@ and `mc-crusher` — not against our own understanding of the spec.
 
 ## 8. Code organisation
 
-A Cargo workspace. The boundary that matters: **`cache-core` defines the domain; `cache-store` and
-`cache-proto` are interchangeable adapters on either side of it.** Both protocols compile down to the
+A Cargo workspace. The boundary that matters: **`vash-core` defines the domain; `vash-store` and
+`vash-proto` are interchangeable adapters on either side of it.** Both protocols compile down to the
 same `Command`/`Reply` types, so the storage engine has no idea which wire format a request arrived on,
 and the protocol crates have no idea what LMDB is.
 
 ```
-cache-server/
+vash-server/
 ├── Cargo.toml                  # workspace
 ├── crates/
-│   ├── cache-core/             # domain. no I/O, no async, no dependencies of consequence
+│   ├── vash-core/             # domain. no I/O, no async, no dependencies of consequence
 │   │   ├── key.rs              # Key newtype, length validation (LMDB max key = 511 bytes)
 │   │   ├── value.rs            # Value, size limits
 │   │   ├── record.rs           # on-disk record header layout, liveness check (zerocopy)
@@ -429,7 +429,7 @@ cache-server/
 │   │   ├── command.rs          # Command / Reply — THE boundary type
 │   │   └── error.rs
 │   │
-│   ├── cache-store/            # storage adapter
+│   ├── vash-store/            # storage adapter
 │   │   ├── lib.rs              # Store trait (the libmdbx escape hatch)
 │   │   ├── lmdb/
 │   │   │   ├── env.rs          # env setup, flags, map sizing, integrity check on boot
@@ -442,8 +442,8 @@ cache-server/
 │   │   ├── reclaim.rs          # resumable tag reclaimer
 │   │   └── evict.rs            # watermarks, victim selection, frequency sketch
 │   │
-│   ├── cache-proto/            # wire adapters. pure codecs: bytes in, Command out
-│   │   ├── kcp/                # native binary protocol
+│   ├── vash-proto/            # wire adapters. pure codecs: bytes in, Command out
+│   │   ├── vcp/                # native binary protocol
 │   │   │   ├── frame.rs        # header (zerocopy)
 │   │   │   ├── decode.rs
 │   │   │   └── encode.rs
@@ -453,7 +453,7 @@ cache-server/
 │   │   │   └── encode.rs
 │   │   └── detect.rs           # first-byte protocol detection
 │   │
-│   ├── cache-server/           # the binary: everything with a socket or a thread
+│   ├── vash-server/           # the binary: everything with a socket or a thread
 │   │   ├── main.rs
 │   │   ├── config.rs
 │   │   ├── listener.rs         # accept loops, SO_REUSEPORT
@@ -463,20 +463,20 @@ cache-server/
 │   │   ├── admin.rs            # /metrics, /health, /stats
 │   │   └── shutdown.rs         # drain, final sync
 │   │
-│   ├── cache-client/           # Rust KCP client. also the integration-test driver
-│   └── cache-bench/            # divan/criterion harnesses
+│   ├── vash-client/           # Rust VCP client. also the integration-test driver
+│   └── vash-bench/            # divan/criterion harnesses
 │
-├── fuzz/                       # kcp_decode, memcached_text, memcached_meta, record_header
+├── fuzz/                       # vcp_decode, memcached_text, memcached_meta, record_header
 ├── tests/                      # cross-crate integration + memcached client compat
 └── docs/
     ├── project.md
     ├── plan.md                 # this file
-    ├── protocol.md             # normative KCP spec
+    ├── protocol.md             # normative VCP spec
     ├── storage.md              # on-disk format, sub-database schemas
     └── operations.md           # tuning, capacity planning, failure modes
 ```
 
-**On-disk record layout** (`cache-core/record.rs`), 28-byte header, zero-copy value slice:
+**On-disk record layout** (`vash-core/record.rs`), 28-byte header, zero-copy value slice:
 
 ```
 version u8 | tag_count u8 | _reserved u16 | epoch u32 | mc_flags u32
@@ -485,7 +485,7 @@ expires_at_ms u64 | cas u64
 value bytes                                          // returned as a borrowed slice
 ```
 
-`mc_flags` is the memcached 32-bit client flags field, stored so a value written by a KCP client and
+`mc_flags` is the memcached 32-bit client flags field, stored so a value written by a VCP client and
 read by a memcached client round-trips correctly. `cas` doubles as the memcached CAS token and as the
 version used to detect stale expiry-index entries (§4).
 
@@ -638,7 +638,7 @@ The default is therefore `min(num_cpus, 4)` rather than the 8 this section origi
 Consequences, accepted deliberately:
 
 - **Multi-key operations are grouped by shard and executed in parallel**, then fanned back in. With
-  out-of-order KCP responses this is a throughput *gain*, not a cost.
+  out-of-order VCP responses this is a throughput *gain*, not a cost.
 - **Batches are not atomic across shards.** A `SET_MANY` spanning shards can be partially visible. For a
   cache this is a non-issue and the protocol documents it explicitly.
 - **The tag registry is replicated to every shard** (it is small, and it must be, since a tagged record
@@ -781,7 +781,7 @@ max_key_bytes = 511               # LMDB hard limit
 max_value_bytes = 1_048_576       # 1 MiB, memcached-compatible default
 
 [store]
-path = "/var/lib/kached"
+path = "/var/lib/vash"
 shards = 0                        # 0 = min(num_cpus, 8)
 map_size_gb = 64                  # per shard; sparse on Linux, PREALLOCATED ON WINDOWS
 readers_per_shard = 4
@@ -869,8 +869,8 @@ sweeper lag growth, and any `OVERLOADED`.
 |---|---|
 | Unit | Per-module, especially record encode/decode and liveness evaluation |
 | Property | `proptest` round-trips for both codecs and the record header; TTL/tag/epoch liveness invariants |
-| **Fuzzing** | `cargo-fuzz` on `kcp_decode`, `memcached_text`, `memcached_meta`, `record_header`. **Non-negotiable** — these parse bytes from unauthenticated clients. Run in CI on every PR, plus a long-running nightly. |
-| Integration | Real server over a real socket via `cache-client`; TTL expiry, tag invalidation, eviction under pressure, restart persistence |
+| **Fuzzing** | `cargo-fuzz` on `vcp_decode`, `memcached_text`, `memcached_meta`, `record_header`. **Non-negotiable** — these parse bytes from unauthenticated clients. Run in CI on every PR, plus a long-running nightly. |
+| Integration | Real server over a real socket via `vash-client`; TTL expiry, tag invalidation, eviction under pressure, restart persistence |
 | **Compatibility** | Real memcached clients — `libmemcached`, `pymemcache`, `php-memcached` — run against our server *and* against real memcached, comparing outputs |
 | Chaos | `kill -9` mid-write and verify recovery in each durability mode; disk-full; map-full; reader-slot exhaustion; peer partition during tag fan-out |
 | Load | `memtier_benchmark` and `rpc-perf` in CI on a fixed runner, with regression gates on throughput and p99 |
@@ -945,7 +945,7 @@ checked as well as the code — and any result that survives only one run is not
 
 | # | Scope | Exit criteria |
 |---|---|---|
-| **M0** | Workspace, config, `Store` trait, LMDB env, single-shard GET/SET/DELETE, KCP framing, `cache-client` | End-to-end round-trip over a socket; CI green |
+| **M0** | Workspace, config, `Store` trait, LMDB env, single-shard GET/SET/DELETE, VCP framing, `vash-client` | End-to-end round-trip over a socket; CI green |
 | **M1** | TTL: `exp` index, sweeper, lazy checks, `TOUCH`; batch ops; group commit | Expired keys never served; sweeper reclaims within one interval; write throughput scales with batch size |
 | **M2** | Tags: registry, generations, `DELETE_BY_TAG`, `tagidx`, resumable reclaimer; global epoch/`FLUSH` | `DELETE_BY_TAG` is O(1) under benchmark; reclaimer resumes correctly across restart |
 | **M3** | Memcached text + meta protocols, first-byte detection, tag flag extension | Real-client compat suite passes against both our server and memcached |

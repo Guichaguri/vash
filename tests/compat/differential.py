@@ -100,7 +100,7 @@ KNOWN_DIVERGENCES = {
     "key too long": (
         "memcached emits a stray empty line after the error (verified at 251, "
         "400 bytes, and with several bad keys), then carries on normally. "
-        "kached sends the error alone. Reproducing an extra protocol line "
+        "vash sends the error alone. Reproducing an extra protocol line "
         "would mean a pipelining client counts one more response than it sent "
         "commands, so this one is not copied."
     ),
@@ -158,7 +158,7 @@ class Server:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", required=True, help="real memcached, host:port")
-    parser.add_argument("--subject", required=True, help="kached, host:port")
+    parser.add_argument("--subject", required=True, help="vash, host:port")
     args = parser.parse_args()
 
     reference = Server(args.reference)
@@ -188,13 +188,13 @@ def main():
             known.append(name)
             print(f"  known {name}")
             print(f"        memcached: {expected!r}")
-            print(f"        kached   : {actual!r}")
+            print(f"        vash     : {actual!r}")
             print(f"        why: {KNOWN_DIVERGENCES[name]}")
         else:
             differences.append((name, commands, expected, actual))
             print(f"  DIFF  {name}")
             print(f"        memcached: {expected!r}")
-            print(f"        kached   : {actual!r}")
+            print(f"        vash     : {actual!r}")
 
     print(f"\n{same} identical, {len(known)} known divergences, {len(differences)} unexpected")
 

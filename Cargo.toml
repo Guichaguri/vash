@@ -1,12 +1,12 @@
 ﻿[workspace]
 resolver = "3"
 members = [
-    "crates/cache-core",
-    "crates/cache-store",
-    "crates/cache-proto",
-    "crates/cache-server",
-    "crates/cache-client",
-    "crates/cache-bench",
+    "crates/vash-core",
+    "crates/vash-store",
+    "crates/vash-proto",
+    "crates/vash-server",
+    "crates/vash-client",
+    "crates/vash-bench",
 ]
 
 [workspace.package]
@@ -14,14 +14,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/guichaguri/cache-server"
+repository = "https://github.com/guichaguri/vash"
 
 [workspace.dependencies]
-cache-core = { path = "crates/cache-core" }
-cache-store = { path = "crates/cache-store" }
-cache-proto = { path = "crates/cache-proto" }
-cache-client = { path = "crates/cache-client" }
-cache-server = { path = "crates/cache-server" }
+vash-core = { path = "crates/vash-core" }
+vash-store = { path = "crates/vash-store" }
+vash-proto = { path = "crates/vash-proto" }
+vash-client = { path = "crates/vash-client" }
+vash-server = { path = "crates/vash-server" }
 
 heed = "0.22.1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }

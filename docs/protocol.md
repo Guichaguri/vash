@@ -1,9 +1,9 @@
 # Protocol reference
 
-Normative specification of the two protocols kached speaks, written to be
+Normative specification of the two protocols vash speaks, written to be
 sufficient for implementing a client without reading the server source.
 
-- [KCP](#kcp--the-native-binary-protocol) — the native binary protocol.
+- [VCP](#vcp--the-native-binary-protocol) — the native binary protocol.
 - [Memcached](#memcached-compatibility) — what is supported, what is extended,
   and where behaviour deliberately differs from upstream.
 
@@ -16,7 +16,7 @@ document describes only what is on the wire.
 
 ## Choosing between them
 
-Both protocols are served on the **same port**. Use KCP for anything new: it is
+Both protocols are served on the **same port**. Use VCP for anything new: it is
 cheaper to parse, supports batch operations in one round trip, and exposes tags
 natively. Use the memcached protocol when an existing client library must work
 unchanged.
@@ -28,20 +28,20 @@ once, and never revisits the decision:
 
 | First byte | Dialect |
 |---|---|
-| `0x01` | KCP (the `HELLO` opcode) |
+| `0x01` | VCP (the `HELLO` opcode) |
 | `a`–`z` (`0x61`–`0x7A`) | memcached |
 | anything else | connection closed immediately |
 
-This is why **a KCP connection must open with a `HELLO` frame**. Sending any
+This is why **a VCP connection must open with a `HELLO` frame**. Sending any
 other opcode first closes the connection, because the leading byte would be
 ambiguous. There is no in-band negotiation beyond this.
 
-Values are shared: a key written by a memcached client is readable by a KCP
+Values are shared: a key written by a memcached client is readable by a VCP
 client and vice versa, including its client-flags field.
 
 ---
 
-# KCP — the native binary protocol
+# VCP — the native binary protocol
 
 All integers are **little-endian** and **unaligned**. There is no padding beyond
 fields explicitly named `reserved`, which must be written as zero and ignored on
@@ -97,7 +97,7 @@ inbound frames.
 2. Send `HELLO`. This must be the first frame.
 3. Check `protocol_version` in the reply and the capability bits.
 4. Issue commands.
-5. Close the socket. There is no `QUIT` opcode in KCP.
+5. Close the socket. There is no `QUIT` opcode in VCP.
 
 A `HELLO` carrying a version other than `1` is answered with
 `UNSUPPORTED` (8) and the connection stays open, so a client can report a clear
@@ -149,7 +149,7 @@ connection stays open.
 |---|---|---|
 | 0 | `OK` | Success. |
 | 1 | `NOT_FOUND` | Key absent or no longer live; also an unregistered tag on `DELETE_BY_TAG`. |
-| 2 | `EXISTS` | Reserved for CAS mismatch. Not emitted over KCP today. |
+| 2 | `EXISTS` | Reserved for CAS mismatch. Not emitted over VCP today. |
 | 3 | `BAD_REQUEST` | Malformed body, empty key, oversized batch. |
 | 4 | `TOO_LARGE` | Key, value or tag over its limit. |
 | 5 | `UNAUTHORIZED` | Command disabled by configuration (`FLUSH`). |
@@ -157,11 +157,11 @@ connection stays open.
 | 7 | `CAPACITY_FULL` | The store is out of space, or the tag registry is full. |
 | 8 | `UNSUPPORTED` | Unknown or unimplemented opcode, or an unsupported protocol version. |
 | 9 | `INTERNAL` | Server-side failure. Details are logged, not sent. |
-| 10 | `NOT_STORED` | Reserved for a guarded write whose condition failed. Not emitted over KCP today. |
-| 11 | `NOT_NUMERIC` | Reserved for arithmetic on a non-numeric value. Not emitted over KCP today. |
+| 10 | `NOT_STORED` | Reserved for a guarded write whose condition failed. Not emitted over VCP today. |
+| 11 | `NOT_NUMERIC` | Reserved for arithmetic on a non-numeric value. Not emitted over VCP today. |
 
 Codes 2, 10 and 11 are defined so that conditional writes and arithmetic can be
-added to KCP without a wire change; today they arise only through the memcached
+added to VCP without a wire change; today they arise only through the memcached
 adapter. **Clients should handle unknown status codes as generic failures**
 rather than rejecting the frame.
 
@@ -233,7 +233,7 @@ prefix, because `body_len` already gives it.
 | 12 | `value` bytes, to the end of the body |
 
 A miss — absent, expired, flushed or tag-invalidated — is `NOT_FOUND` with an
-empty body. A KCP `GET` does **not** report the remaining TTL; use the memcached
+empty body. A VCP `GET` does **not** report the remaining TTL; use the memcached
 `mg` command with the `t` flag if that is needed.
 
 ### `SET` (0x11)
@@ -255,10 +255,10 @@ empty body. A KCP `GET` does **not** report the remaining TTL; use the memcached
 
 Notes:
 
-- A KCP `SET` is unconditional. `add`/`replace`/`append`/`prepend`/`cas`
+- A VCP `SET` is unconditional. `add`/`replace`/`append`/`prepend`/`cas`
   semantics are reachable only through the memcached protocol.
-- A KCP `SET` always stores `mc_flags` as **0**; there is no flags field in the
-  body. A value written over KCP and read by a memcached client therefore has
+- A VCP `SET` always stores `mc_flags` as **0**; there is no flags field in the
+  body. A value written over VCP and read by a memcached client therefore has
   flags 0. Write it over `ms` with an `F` flag if the flags field matters.
 - Tag names must be 1–255 bytes. Unknown tag names are registered on first use.
 
@@ -469,18 +469,18 @@ write to an empty store.
 
 # Memcached compatibility
 
-kached speaks the classic text protocol and the meta commands. The **legacy
+vash speaks the classic text protocol and the meta commands. The **legacy
 binary protocol (magic `0x80`) is not implemented and will not be** — upstream
 deprecated it in favour of the meta commands.
 
 Compatibility is checked in CI two ways: a real client library
-(`pymemcache`) driven against both kached and real memcached, and a byte-for-byte
+(`pymemcache`) driven against both vash and real memcached, and a byte-for-byte
 differential that sends identical command sequences to both and compares raw
 responses. See `tests/compat/`.
 
 ## Limits
 
-| | kached | Notes |
+| | vash | Notes |
 |---|---|---|
 | Key length | 250 bytes | memcached's limit, enforced even though the storage engine allows 511. |
 | Key charset | no spaces, no control bytes, no `0x7f` | Same as memcached. |
@@ -525,16 +525,16 @@ framing is **length-delimited, not line-delimited**: a value may contain `\r\n`.
 ### `stats`
 
 A subset of memcached's counters — only what is actually measured — plus
-kached's own under a `kached_` prefix. Nothing is reported as a plausible zero
+vash's own under a `vash_` prefix. Nothing is reported as a plausible zero
 just to fill the field out.
 
 `pid`, `version`, `pointer_size`, `curr_items`, `bytes`, `limit_maxbytes`, and:
-`kached_utilisation`, `kached_expiry_entries`, `kached_tags`,
-`kached_tag_index_entries`, `kached_pending_reclaims`, `kached_commits`,
-`kached_committed_ops`, `kached_mean_batch`, `kached_sweeps`,
-`kached_reclaimed`, `kached_tag_reclaimed`, `kached_sweep_lag_ms`,
-`kached_epoch`, `kached_readers_in_use`, `kached_cluster_mode`,
-`kached_cluster_peers`, `kached_cluster_peers_reachable`.
+`vash_utilisation`, `vash_expiry_entries`, `vash_tags`,
+`vash_tag_index_entries`, `vash_pending_reclaims`, `vash_commits`,
+`vash_committed_ops`, `vash_mean_batch`, `vash_sweeps`,
+`vash_reclaimed`, `vash_tag_reclaimed`, `vash_sweep_lag_ms`,
+`vash_epoch`, `vash_readers_in_use`, `vash_cluster_mode`,
+`vash_cluster_peers`, `vash_cluster_peers_reachable`.
 
 ## Meta commands
 
@@ -600,8 +600,8 @@ parsing. Any other unrecognised flag gets `CLIENT_ERROR invalid flag`.
 ## Extensions
 
 Two commands and one flag are **not part of the memcached protocol**. Clients
-that never use them are unaffected; the `TAGS` capability bit in the KCP
-handshake and the `kached_tags` stat both indicate support.
+that never use them are unaffected; the `TAGS` capability bit in the VCP
+handshake and the `vash_tags` stat both indicate support.
 
 | | Form | Response |
 |---|---|---|
@@ -652,13 +652,13 @@ server has no way to know how much to skip.
 Everything else is byte-identical in the differential suite; these are the
 exceptions.
 
-| Behaviour | memcached | kached | Why |
+| Behaviour | memcached | vash | Why |
 |---|---|---|---|
 | Over-long key on `get` | error line, then a stray empty line | error line only | The extra line leaves a pipelining client counting one more response than it sent commands. |
 | `flush_all` | always available | disabled unless enabled in config | It empties the cache for anyone who can reach the port. |
 | `flush_all <delay>` | defers the flush | delay parsed and ignored; flush is immediate | A deferred wipe needs a scheduler; every client that sends one sends 0. |
-| `me` output | full internal item dump | `cas`, `size`, `fetch` only | The rest describes internals kached does not have. |
-| `stats` fields | full counter set | a subset, plus `kached_*` | Reporting an unmeasured counter as zero would mislead a dashboard. |
+| `me` output | full internal item dump | `cas`, `size`, `fetch` only | The rest describes internals vash does not have. |
+| `stats` fields | full counter set | a subset, plus `vash_*` | Reporting an unmeasured counter as zero would mislead a dashboard. |
 | Meta flags `b h l x I E R N` | implemented | `CLIENT_ERROR unsupported flag` | See [Refused flags](#refused-flags). |
 | Eviction under memory pressure | LRU | TTL-ordered | See [plan.md](plan.md) §6. |
 
@@ -679,7 +679,7 @@ The TTL field is overloaded exactly as memcached's `exptime` is:
 | `> 2592000` | **Absolute unix timestamp** in seconds, not an offset. |
 | negative (memcached text only) | Already expired. |
 
-KCP carries the TTL as a `u32` and has no negative form; the memcached adapter
+VCP carries the TTL as a `u32` and has no negative form; the memcached adapter
 translates a negative `exptime` into a sentinel the store understands.
 
 An expired item is **never served**, whether or not its space has been reclaimed
@@ -767,7 +767,7 @@ The `CLUSTER` opcode reports a node's peer list and their reachability.
 
 A 32-bit field stored verbatim alongside the value, for client libraries that
 encode a type tag in it. Set it with memcached `set`'s `<flags>` argument or the
-meta `F` flag. **A KCP `SET` always stores 0**, since the KCP body has no flags
+meta `F` flag. **A VCP `SET` always stores 0**, since the VCP body has no flags
 field.
 
 ## Durability

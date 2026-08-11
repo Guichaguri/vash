@@ -1,9 +1,9 @@
 # Operations
 
-Running kached: what to set, what to watch, and what each failure looks like
+Running vash: what to set, what to watch, and what each failure looks like
 from the outside.
 
-Configuration reference: [kached.example.toml](../kached.example.toml), which
+Configuration reference: [vash.example.toml](../vash.example.toml), which
 documents every key inline. Wire behaviour: [protocol.md](protocol.md). On-disk
 format: [storage.md](storage.md).
 
@@ -12,12 +12,12 @@ format: [storage.md](storage.md).
 ## Deploying
 
 ```bash
-kached --config /etc/kached.toml
+vash-server --config /etc/vash.toml
 ```
 
 A single static binary with no runtime dependencies. Three ways to run it:
 
-- **systemd** — [`packaging/kached.service`](../packaging/kached.service),
+- **systemd** — [`packaging/vash.service`](../packaging/vash.service),
   hardened and using `DynamicUser`.
 - **Container** — the [`Dockerfile`](../Dockerfile) builds a `scratch` image
   holding nothing but the binary.
@@ -38,7 +38,7 @@ write any key, invalidate any tag, and — because peer traffic uses the same po
 — raise any tag's generation. Bind it to a private network. Set
 `observability.admin_listen = ""` to switch the admin port off entirely.
 
-`flush_all` and the KCP `FLUSH` are off unless enabled: they empty the whole
+`flush_all` and the VCP `FLUSH` are off unless enabled: they empty the whole
 cache for anyone who can reach the port.
 
 ## Sizing
@@ -64,7 +64,7 @@ cover every thread that can read at once.
 ## Tuning
 
 Nothing here needs changing to get a working server. Change one thing at a time
-and measure — `cargo run --release -p cache-bench --bin load -- --help` drives a
+and measure — `cargo run --release -p vash-bench --bin load -- --help` drives a
 real server over a real socket.
 
 | Setting | Raise it when | Costs |
@@ -117,22 +117,22 @@ not doing its job, which is what a load balancer needs to know.
 
 | Signal | Means | Do |
 |---|---|---|
-| `kached_evicted_total` rising | Live data is being dropped: the cache is too small for its working set | Raise `map_size_mb`, or accept the hit rate |
-| `kached_errors_total{class="capacity"}` | Writes are being refused | Same, urgently |
-| `kached_sweep_lag_ms` growing | Reclamation is losing to expiry | Lower `sweep_interval_ms`, raise `sweep_batch` |
-| `kached_readers_in_use` near `kached_readers_max` | Reader slots are about to run out; reads will start failing | Raise `max_readers`, or lower `max_blocking_threads` |
-| `kached_errors_total{class="overloaded"}` | The write queue is full | The writer is saturated: shard, or slow down |
-| `kached_cluster_last_exchange_age_ms` > a few gossip intervals | This node is drifting from its peers | Check peer reachability |
-| `kached_cluster_peers_reachable` < `kached_cluster_peers` | A peer is down; its invalidations are not arriving | Check that node |
+| `vash_evicted_total` rising | Live data is being dropped: the cache is too small for its working set | Raise `map_size_mb`, or accept the hit rate |
+| `vash_errors_total{class="capacity"}` | Writes are being refused | Same, urgently |
+| `vash_sweep_lag_ms` growing | Reclamation is losing to expiry | Lower `sweep_interval_ms`, raise `sweep_batch` |
+| `vash_readers_in_use` near `vash_readers_max` | Reader slots are about to run out; reads will start failing | Raise `max_readers`, or lower `max_blocking_threads` |
+| `vash_errors_total{class="overloaded"}` | The write queue is full | The writer is saturated: shard, or slow down |
+| `vash_cluster_last_exchange_age_ms` > a few gossip intervals | This node is drifting from its peers | Check peer reachability |
+| `vash_cluster_peers_reachable` < `vash_cluster_peers` | A peer is down; its invalidations are not arriving | Check that node |
 
 ### Watch, but do not alert
 
-- **`kached_hits_total` / `kached_misses_total`** — the hit rate is a property
+- **`vash_hits_total` / `vash_misses_total`** — the hit rate is a property
   of the workload, not of the server's health.
-- **`kached_committed_ops_total / kached_commits_total`** — the mean write batch
+- **`vash_committed_ops_total / vash_commits_total`** — the mean write batch
   size. If it is near 1 under write load, group commit is not amortising
   anything and the writer is not the bottleneck.
-- **`kached_utilisation`** — crossing 0.75 is normal and means reclamation went
+- **`vash_utilisation`** — crossing 0.75 is normal and means reclamation went
   continuous. Crossing 0.88 means live data is being evicted.
 
 ## Failure modes
@@ -165,14 +165,14 @@ limit — check the mean batch size to tell which.
 
 Reads fail with an LMDB error. A process that died without releasing its slots
 has them reclaimed on the next open; a live process that leaks them does not.
-Watch `kached_readers_in_use` against `kached_readers_max`.
+Watch `vash_readers_in_use` against `vash_readers_max`.
 
 ### A peer is unreachable
 
 Fan-out to it fails and is counted; anti-entropy retries every gossip interval.
 Nothing is lost — generations merge by maximum, so the invalidation is delivered
 whenever the peer comes back. Meanwhile that node serves data another node has
-invalidated. `kached_cluster_peers_reachable` is the signal.
+invalidated. `vash_cluster_peers_reachable` is the signal.
 
 ### The database will not open
 

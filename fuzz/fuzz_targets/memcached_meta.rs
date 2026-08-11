@@ -16,8 +16,8 @@
 
 #![no_main]
 
-use cache_proto::memcached::{Outcome, ProtocolError, parse};
 use libfuzzer_sys::fuzz_target;
+use vash_proto::memcached::{Outcome, ProtocolError, parse};
 
 const VERBS: [&[u8]; 7] = [b"mg", b"ms", b"md", b"mn", b"ma", b"me", b"mdt"];
 

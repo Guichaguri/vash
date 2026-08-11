@@ -1,5 +1,5 @@
 [package]
-name = "cache-fuzz"
+name = "vash-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -8,8 +8,8 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-cache-core = { path = "../crates/cache-core" }
-cache-proto = { path = "../crates/cache-proto" }
+vash-core = { path = "../crates/vash-core" }
+vash-proto = { path = "../crates/vash-proto" }
 libfuzzer-sys = "0.4"
 
 # Detached from the workspace on purpose. Building these needs a nightly
@@ -20,8 +20,8 @@ libfuzzer-sys = "0.4"
 debug = 1
 
 [[bin]]
-name = "kcp_decode"
-path = "fuzz_targets/kcp_decode.rs"
+name = "vcp_decode"
+path = "fuzz_targets/vcp_decode.rs"
 test = false
 doc = false
 bench = false

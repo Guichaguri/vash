@@ -1,0 +1,170 @@
+# Example configuration. Every key shown is one the server actually honours;
+# unknown keys are rejected at startup rather than silently ignored.
+#
+#   vash-server --config vash.example.toml
+
+[server]
+listen = "127.0.0.1:11311"
+# Connections beyond this are refused rather than queued: a client told "no"
+# can fall back to the origin, a client left waiting cannot.
+max_connections = 10000
+read_buffer = 16384
+# Ceiling on concurrent store operations, and therefore on LMDB reader slots in
+# use. store.max_readers must exceed it, or reads fail with MDB_READERS_FULL
+# under load; startup refuses a config where it does not.
+max_blocking_threads = 128
+
+[store]
+path = "data"
+
+# Independent LMDB environments, and therefore the ceiling on concurrent
+# writers. 0 picks min(num_cpus, 8).
+#
+# Fixed once a database exists: changing it would route every key to a different
+# environment, so startup refuses to open a store built for a different count
+# rather than silently turning the whole cache into a miss.
+shards = 0
+
+# Map size PER SHARD, not in total. An address-space reservation rather than a
+# preallocation — verified on both Linux and Windows — so a generous value costs
+# nothing until the data arrives.
+#
+# The minimum is 16 MiB: below roughly 4 MiB, LMDB can report a full map
+# permanently even after everything has been deleted, because the free list
+# needs pages of its own to record freed pages.
+map_size_mb = 4096
+max_readers = 256
+
+# durable   fsync on every commit
+# relaxed   skips the meta-page sync; loses at most the last few transactions
+#           on an OS crash and cannot corrupt the database
+# ephemeral no syncing; fastest, and a crash means starting empty
+durability = "relaxed"
+
+max_value_bytes = 1048576
+wipe_on_start = false
+
+# Run read-only requests on the network worker instead of handing them to the
+# storage threads.
+#
+# The hand-off exists so a read that page-faults blocks a thread allowed to
+# block, rather than an async worker serving other connections.
+#
+# Measured on the development machine this makes no difference — the gain is
+# inside the run-to-run variance — so it is off, and worth leaving off unless
+# your own measurements disagree. What it removes is the cost of a thread
+# wake-up, which varies by platform far more than anything in this code.
+#
+# If you turn it on, turn it on because the working set is resident: when it is
+# not, a cold read stalls every connection sharing that worker. Writes always
+# take the hand-off, because they wait on the writer queue by design.
+inline_reads = false
+
+[store.write]
+# LMDB permits one writer, so writes scale only by sharing transactions. A batch
+# is whatever queued while the previous commit was in flight.
+max_batch = 1024
+# Writes beyond this many queued are refused with OVERLOADED rather than piling
+# up behind a writer that is already saturated.
+queue_depth = 4096
+# Artificial delay before sealing a batch. Zero adds no latency when idle and
+# still batches under load; raise it only to trade latency for throughput.
+linger_us = 0
+
+[store.ttl]
+# Expiry-index buckets round up to this. Coarser means fewer distinct index keys
+# and less write amplification. It never delays a read from seeing a key as
+# expired — reads check the record's exact timestamp.
+bucket_granularity_ms = 1000
+# The sweeper shares the writer's transaction, so reclamation costs no extra
+# commit. This is also how long the writer waits for work before waking to
+# sweep, which makes idle sweeps free.
+sweep_interval_ms = 100
+# Bounds how long one reclamation pass can hold the write transaction.
+sweep_batch = 512
+
+[store.tags]
+# The registry lives entirely in RAM, so without a ceiling a client inventing
+# tag names is a memory leak.
+max_tags = 100000
+# Tag-index entries examined per reclamation pass. While an invalidation is
+# still being cleaned up these passes run back to back, so this bounds
+# transaction length rather than drain rate.
+reclaim_batch = 512
+
+[store.eviction]
+# Capacity watermarks, as fractions of a shard's map in use. Each level does
+# strictly more than the one below, and they must increase.
+#
+# soft     reclamation stops waiting for its interval and runs continuously
+# hard     live records start being evicted, soonest-to-expire first
+# critical writes are refused with CAPACITY_FULL; reads and deletes still work
+#
+# Eviction is TTL-ordered, not LRU: a TTL is the client's own statement of how
+# long a value is worth keeping, and tracking recency would mean writing on
+# every read. Records with no TTL sort last and go only after everything else.
+soft = 0.75
+hard = 0.88
+critical = 0.96
+# Records evicted per pass, bounding how long a pass holds the write transaction.
+batch = 512
+
+[protocol]
+# FLUSH / flush_all empties the whole cache for anyone who can reach the port.
+# Off unless deliberately enabled; --enable-flush does the same from the CLI.
+#
+# The memcached text and meta protocols are always available: they share the
+# port with the native protocol and are told apart by the connection's first
+# byte, so there is nothing to turn on.
+flush_enabled = false
+
+[cluster]
+# Other nodes' cache ports. Nodes are otherwise shared-nothing — clients shard
+# the keyspace, nothing is replicated — and tag invalidation is the only thing
+# that crosses a node boundary, because a tag's keys are spread across every
+# node. Repeatable --peer flags override this list.
+#
+# Membership is one-sided and static: peers are configured on the *sending*
+# node, so a node that lists nobody can still be somebody else's target. Listing
+# yourself is harmless but wasted work.
+peers = []
+
+# local       no fan-out; the client invalidates on every node itself
+# fanout      reply immediately, forward in the background
+# fanout_sync reply once reachable peers have applied it
+#
+# Under fanout there is a window in which another node still serves records the
+# invalidation covered — and, symmetrically, in which a record written there is
+# treated as pre-invalidation and dropped. Both err towards a miss.
+delete_by_tag = "fanout"
+
+# Every node exchanges tag generations with each of its peers this often, on a
+# timer per peer so one unresponsive node cannot slow convergence between the
+# healthy ones. This is the backstop that fan-out sits on top of: it is what
+# repairs a node that was down, partitioned or restarted, so it is also the
+# staleness bound when a fan-out message is lost.
+gossip_interval_ms = 5000
+
+# Per exchange, including connecting. Also how long fanout_sync waits for
+# acknowledgements before answering the client anyway — an unreachable peer must
+# not hold up a write that has already committed locally.
+fanout_timeout_ms = 2000
+
+# Invalidations queued per peer before further ones are dropped. Dropping is
+# safe rather than merely tolerable: generations merge by maximum, so
+# anti-entropy delivers whatever fan-out lost. An unbounded queue against a dead
+# peer would not be.
+queue_depth = 1024
+
+[observability]
+log_format = "pretty"   # or "json"
+log_level = "info"      # overridden by RUST_LOG when set
+
+# /metrics (Prometheus), /health and /stats (JSON).
+#
+# A separate port from cache traffic, so it can be bound to a private interface
+# and a flood of scrapes cannot crowd out real requests. Empty disables it.
+#
+# /health returns 503 when a shard has reached critical pressure and is
+# refusing writes: the process is up, but it is not doing its job.
+admin_listen = "127.0.0.1:9090"

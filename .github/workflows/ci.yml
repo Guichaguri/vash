@@ -45,7 +45,7 @@ jobs:
           sudo apt-get install -y memcached
           python3 -m pip install --user pymemcache
 
-      - run: cargo build --release --bin kached
+      - run: cargo build --release --bin vash-server
 
       # Baseline first: if the suite does not pass against upstream memcached,
       # the suite is wrong, not the server.
@@ -58,9 +58,9 @@ jobs:
           done
           python3 tests/compat/memcached_compat.py 127.0.0.1:11211 --flush
 
-      - name: Against kached
+      - name: Against vash
         run: |
-          ./target/release/kached --listen 127.0.0.1:11311 --data /tmp/kached \
+          ./target/release/vash-server --listen 127.0.0.1:11311 --data /tmp/vash \
             --ephemeral --enable-flush &
           for _ in $(seq 40); do
             (echo -n "" >/dev/tcp/127.0.0.1/11311) 2>/dev/null && break
@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [kcp_decode, memcached_text, memcached_meta, record_header]
+        target: [vcp_decode, memcached_text, memcached_meta, record_header]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -130,20 +130,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install the musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --bin kached --target x86_64-unknown-linux-musl
+      - run: cargo build --release --bin vash-server --target x86_64-unknown-linux-musl
 
       # A "static" binary that turns out to be dynamically linked is a problem
       # discovered on the target machine, so it is asserted here instead.
       - name: Check the binary is actually static
         run: |
-          file target/x86_64-unknown-linux-musl/release/kached
-          ldd target/x86_64-unknown-linux-musl/release/kached 2>&1 | grep -q "not a dynamic executable" \
-            || { echo "kached is dynamically linked"; exit 1; }
+          file target/x86_64-unknown-linux-musl/release/vash-server
+          ldd target/x86_64-unknown-linux-musl/release/vash-server 2>&1 | grep -q "not a dynamic executable" \
+            || { echo "vash-server is dynamically linked"; exit 1; }
 
       - name: Check it runs and serves
         run: |
-          ./target/x86_64-unknown-linux-musl/release/kached \
-            --listen 127.0.0.1:11311 --data /tmp/kached-pkg --ephemeral &
+          ./target/x86_64-unknown-linux-musl/release/vash-server \
+            --listen 127.0.0.1:11311 --data /tmp/vash-pkg --ephemeral &
           for _ in $(seq 40); do
             (echo -n "" >/dev/tcp/127.0.0.1/11311) 2>/dev/null && break
             sleep 0.2
@@ -152,18 +152,18 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kached-x86_64-unknown-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/kached
+          name: vash-server-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/vash-server
 
       - name: Build the container image
-        run: docker build -t kached:ci .
+        run: docker build -t vash:ci .
       - name: Check the image serves
         run: |
-          docker run -d --name kached-ci -p 11312:11311 kached:ci \
-            --listen 0.0.0.0:11311 --data /var/lib/kached --ephemeral
+          docker run -d --name vash-ci -p 11312:11311 vash:ci \
+            --listen 0.0.0.0:11311 --data /var/lib/vash-server --ephemeral
           for _ in $(seq 40); do
             (echo -n "" >/dev/tcp/127.0.0.1/11312) 2>/dev/null && break
             sleep 0.25
           done
           printf 'version\r\nquit\r\n' | timeout 5 nc 127.0.0.1 11312 | grep -q VERSION
-          docker rm -f kached-ci
+          docker rm -f vash-ci

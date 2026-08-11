@@ -15,7 +15,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "cache-core"
+name = "vash-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -24,20 +24,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "cache-fuzz"
+name = "vash-fuzz"
 version = "0.0.0"
 dependencies = [
- "cache-core",
- "cache-proto",
+ "vash-core",
+ "vash-proto",
  "libfuzzer-sys",
 ]
 
 [[package]]
-name = "cache-proto"
+name = "vash-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "cache-core",
+ "vash-core",
  "memchr",
  "thiserror",
  "zerocopy",
