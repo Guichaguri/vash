@@ -1,0 +1,7 @@
+*3
+$6
+INCRBY
+$7
+counter
+$2
+-5

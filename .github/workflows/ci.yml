@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [vcp_decode, memcached_text, memcached_meta, record_header]
+        target: [vcp_decode, memcached_text, memcached_meta, resp_decode, record_header]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

@@ -459,6 +459,7 @@ vash-server/
 │   │   ├── listener.rs         # accept loops, SO_REUSEPORT
 │   │   ├── conn.rs             # per-connection state machine, pipelining, backpressure
 │   │   ├── dispatch.rs         # Command → shard routing, batch fan-out/fan-in
+│   │   ├── resp.rs             # Redis commands, composed from Store operations
 │   │   ├── cluster/            # peer list, tag fan-out, anti-entropy (§10)
 │   │   ├── admin.rs            # /metrics, /health, /stats
 │   │   └── shutdown.rs         # drain, final sync
@@ -466,7 +467,7 @@ vash-server/
 │   ├── vash-client/           # Rust VCP client. also the integration-test driver
 │   └── vash-bench/            # divan/criterion harnesses
 │
-├── fuzz/                       # vcp_decode, memcached_text, memcached_meta, record_header
+├── fuzz/                       # vcp_decode, memcached_text, memcached_meta, resp_decode, record_header
 ├── tests/                      # cross-crate integration + memcached client compat
 └── docs/
     ├── project.md
@@ -869,7 +870,7 @@ sweeper lag growth, and any `OVERLOADED`.
 |---|---|
 | Unit | Per-module, especially record encode/decode and liveness evaluation |
 | Property | `proptest` round-trips for both codecs and the record header; TTL/tag/epoch liveness invariants |
-| **Fuzzing** | `cargo-fuzz` on `vcp_decode`, `memcached_text`, `memcached_meta`, `record_header`. **Non-negotiable** — these parse bytes from unauthenticated clients. Run in CI on every PR, plus a long-running nightly. |
+| **Fuzzing** | `cargo-fuzz` on `vcp_decode`, `memcached_text`, `memcached_meta`, `resp_decode`, `record_header`. **Non-negotiable** — these parse bytes from unauthenticated clients. Run in CI on every PR, plus a long-running nightly. |
 | Integration | Real server over a real socket via `vash-client`; TTL expiry, tag invalidation, eviction under pressure, restart persistence |
 | **Compatibility** | Real memcached clients — `libmemcached`, `pymemcache`, `php-memcached` — run against our server *and* against real memcached, comparing outputs |
 | Chaos | `kill -9` mid-write and verify recovery in each durability mode; disk-full; map-full; reader-slot exhaustion; peer partition during tag fan-out |
@@ -952,6 +953,7 @@ checked as well as the code — and any result that survives only one run is not
 | **M4** | Sharding, capacity watermarks and eviction, full metrics, admin endpoints | Throughput scales with shard count; server survives a sustained overfill |
 | **M5** | Cluster: peer list, tag fan-out, anti-entropy gossip, `CLUSTER` opcode | Invalidation converges across a 3-node cluster including a partitioned/restarted node |
 | **M6** | Perf hardening, fuzz corpus, benchmark suite, packaging (static musl binary, Docker, systemd), docs | Performance goals in §13 met or consciously revised with data |
+| **M7** | Redis protocol: RESP2/RESP3 framing, the string and expiry command subset, `HELLO` negotiation | Real Redis clients drive the supported commands unchanged; the read-modify-write seam is documented rather than hidden |
 
 ---
 

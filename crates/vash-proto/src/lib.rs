@@ -6,10 +6,14 @@
 //! and it is the only code in the system that reads bytes from unauthenticated
 //! clients, so it is where the security budget goes.
 //!
-//! The memcached adapter arrives in M3; the module layout leaves room for it
-//! beside `vcp` rather than inside it, because the two share only `vash_core`.
+//! Each dialect sits beside the others rather than inside one of them, because
+//! they share only `vash_core`. `vcp` and `memcached` decode into
+//! `vash_core::Command`; `resp` has a command type of its own, because Redis's
+//! string commands do not map one-to-one onto storage operations — see that
+//! module and `vash_server::resp`.
 
 pub mod memcached;
+pub mod resp;
 pub mod vcp;
 
 /// Which dialect a connection is speaking.
@@ -17,19 +21,28 @@ pub mod vcp;
 pub enum Protocol {
     Vcp,
     Memcached,
+    /// Redis, in either RESP2 or RESP3 — the request framing is the same and
+    /// the reply dialect is negotiated later with `HELLO`.
+    Resp,
 }
 
 /// Decides a connection's protocol from its very first byte.
 ///
 /// VCP requires `HELLO` as its opening frame, so a connection starts with the
-/// opcode `0x01`. Every memcached command begins with a lowercase letter. The
-/// two sets cannot overlap, so one byte settles it and nothing is re-parsed.
+/// opcode `0x01`. Every memcached command begins with a lowercase letter. A
+/// RESP request is always an array, so it starts with `*`. The three sets
+/// cannot overlap, so one byte settles it and nothing is re-parsed.
+///
+/// This is also why RESP *inline* commands are not accepted: `get foo\r\n` is a
+/// valid inline Redis command and a valid memcached one, and no amount of
+/// look-ahead makes that choice for us. See [`resp`].
 ///
 /// Returns `None` while the buffer is still empty.
 pub fn detect(buf: &[u8]) -> Option<Result<Protocol, UnknownProtocol>> {
     let first = *buf.first()?;
     Some(match first {
         b if b == vcp::Opcode::Hello as u8 => Ok(Protocol::Vcp),
+        b'*' => Ok(Protocol::Resp),
         b'a'..=b'z' => Ok(Protocol::Memcached),
         other => Err(UnknownProtocol(other)),
     })
@@ -77,6 +90,15 @@ mod tests {
             detect(&[vcp::Opcode::Get as u8]),
             Some(Err(UnknownProtocol(vcp::Opcode::Get as u8)))
         );
+    }
+
+    #[test]
+    fn resp_requests_are_recognised() {
+        // Always an array, so always `*`. The inline form a telnet session
+        // would send is deliberately not accepted — it is indistinguishable
+        // from memcached.
+        assert_eq!(detect(b"*1\r\n$4\r\nPING\r\n"), Some(Ok(Protocol::Resp)));
+        assert_eq!(detect(b"get foo\r\n"), Some(Ok(Protocol::Memcached)));
     }
 
     #[test]

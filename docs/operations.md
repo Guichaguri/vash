@@ -30,7 +30,7 @@ Flags override the config file: `--listen`, `--data`, `--peer` (repeatable),
 
 | Port | Default | Expose to |
 |---|---|---|
-| Cache | 11311 | Clients **and cluster peers**. Both protocols share it. |
+| Cache | 11311 | Clients **and cluster peers**. All three protocols share it. |
 | Admin | 9090 | Your monitoring only. |
 
 **There is no authentication.** Anyone who can reach the cache port can read and

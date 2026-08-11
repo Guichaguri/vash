@@ -41,3 +41,28 @@ The server will provide a simple and intuitive API for clients to interact with 
 ### Memcached Protocol Support
 
 The server will support the Memcached protocol, allowing clients that are already using Memcached to interact with our cache server without any changes to their existing code. This compatibility will make it easier for clients to adopt our cache server and take advantage of its features.
+
+### Redis Protocol Support
+
+The server will also support a subset of the Redis protocol, enabling clients that are familiar with Redis to interact with our cache server using the same commands and data structures. This compatibility will provide flexibility for clients who prefer Redis and want to leverage its features while benefiting from our cache server's performance and capabilities.
+
+Commands:
+- SET
+- GET
+- DEL
+- UNLINK
+- MSET
+- MGET
+- MSETEX
+- EXISTS
+- EXPIRE
+- EXPIREAT
+- PERSIST
+- TTL
+- APPEND
+- DECR
+- DECRBY
+- INCR
+- INCRBY
+- INCRBYFLOAT
+- INCREX

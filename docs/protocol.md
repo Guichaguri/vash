@@ -1,11 +1,12 @@
 # Protocol reference
 
-Normative specification of the two protocols vash speaks, written to be
+Normative specification of the three protocols vash speaks, written to be
 sufficient for implementing a client without reading the server source.
 
 - [VCP](#vcp--the-native-binary-protocol) — the native binary protocol.
 - [Memcached](#memcached-compatibility) — what is supported, what is extended,
   and where behaviour deliberately differs from upstream.
+- [Redis](#redis-compatibility) — the RESP subset, in RESP2 and RESP3.
 
 Design rationale for these choices lives in [plan.md](plan.md) §3 and §7; this
 document describes only what is on the wire.
@@ -16,10 +17,10 @@ document describes only what is on the wire.
 
 ## Choosing between them
 
-Both protocols are served on the **same port**. Use VCP for anything new: it is
-cheaper to parse, supports batch operations in one round trip, and exposes tags
-natively. Use the memcached protocol when an existing client library must work
-unchanged.
+All three protocols are served on the **same port**. Use VCP for anything new:
+it is cheaper to parse, supports batch operations in one round trip, and exposes
+tags natively. Use the memcached or Redis protocol when an existing client
+library must work unchanged.
 
 ### First-byte detection
 
@@ -29,6 +30,7 @@ once, and never revisits the decision:
 | First byte | Dialect |
 |---|---|
 | `0x01` | VCP (the `HELLO` opcode) |
+| `*` (`0x2A`) | Redis (RESP; a request is always an array) |
 | `a`–`z` (`0x61`–`0x7A`) | memcached |
 | anything else | connection closed immediately |
 
@@ -36,8 +38,15 @@ This is why **a VCP connection must open with a `HELLO` frame**. Sending any
 other opcode first closes the connection, because the leading byte would be
 ambiguous. There is no in-band negotiation beyond this.
 
-Values are shared: a key written by a memcached client is readable by a VCP
-client and vice versa, including its client-flags field.
+It is also why **RESP inline commands are not accepted**: `get foo\r\n` is a
+valid inline Redis command *and* a valid memcached one, and no amount of
+look-ahead settles which was meant. Every real Redis client library sends the
+array form, so nothing is lost but the ability to drive the server by hand from
+`telnet` — for which the memcached dialect is right there.
+
+Values are shared across all three: a key written by a memcached client is
+readable by a VCP or Redis client and vice versa, including its client-flags
+field.
 
 ---
 
@@ -664,9 +673,149 @@ exceptions.
 
 ---
 
+# Redis compatibility
+
+A subset of the Redis string and expiry commands, enough for a cache. There are
+no lists, hashes, sets, sorted sets, streams, transactions, scripting, pub/sub,
+`SCAN`, `SELECT` or replication commands, and there never will be — see
+[plan.md](plan.md) §16.
+
+## Framing
+
+Requests are RESP arrays of bulk strings, exactly as the protocol specifies:
+
+```text
+*<argc>\r\n$<len>\r\n<arg>\r\n$<len>\r\n<arg>\r\n…
+```
+
+Command names and option tokens are ASCII and case-insensitive. Arguments are
+binary-safe and length-delimited, so a value may contain CRLF.
+
+- `*0\r\n` is accepted and skipped, as Redis does.
+- **Inline commands are not supported.** See
+  [First-byte detection](#first-byte-detection).
+- An argument may be up to the server's `max_value_bytes`; a request may carry
+  up to 8200 arguments. Both are checked before anything is allocated.
+
+## RESP2 and RESP3
+
+Both, on the same connection, negotiated with `HELLO`. A connection starts at
+RESP2 and moves to RESP3 when the client sends `HELLO 3`; there is no way back,
+and no client asks for one.
+
+Requests are identical in the two dialects, so only replies differ. For this
+command set that is three things:
+
+| | RESP2 | RESP3 |
+|---|---|---|
+| Null (a miss, a skipped `SET`) | `$-1\r\n` | `_\r\n` |
+| `HELLO` reply | flat array of 14 items | map of 7 pairs |
+| `INCREX` in `BYFLOAT` mode | bulk strings | doubles (`,1.75\r\n`) |
+
+`INCRBYFLOAT` answers with a bulk string in **both**, which is Redis's own
+inconsistency, not ours.
+
+`HELLO` reports `server: redis` and `version: 7.4.0-vash`. The name is Redis's
+because client libraries branch on it and an unfamiliar one sends some of them
+down an error path; the suffix is what tells a human what they are talking to.
+The reported `id` is always `0` — connections are not registered anywhere, and
+there is no `CLIENT` command to use one with.
+
+## Command reference
+
+`numkeys`, options and their arguments follow the Redis documentation exactly
+unless noted. Where a command takes options they may appear in any order, and
+mutually exclusive ones (`NX`/`XX`, the expiry family) are a syntax error
+together rather than last-one-wins.
+
+| Command | Supported form |
+|---|---|
+| `GET` | `GET key` |
+| `SET` | `SET key value [NX \| XX] [GET] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` |
+| `DEL` / `UNLINK` | `DEL key [key …]` — identical here; reclamation is always the background reclaimer's job |
+| `MGET` | `MGET key [key …]` |
+| `MSET` | `MSET key value [key value …]` |
+| `MSETEX` | `MSETEX numkeys key value [key value …] [NX \| XX] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` |
+| `EXISTS` | `EXISTS key [key …]` — counts a key once per mention |
+| `EXPIRE` | `EXPIRE key seconds [NX \| XX \| GT \| LT]` |
+| `EXPIREAT` | `EXPIREAT key unix-time-seconds [NX \| XX \| GT \| LT]` |
+| `PERSIST` | `PERSIST key` |
+| `TTL` | `TTL key` — `-2` absent, `-1` no expiry |
+| `APPEND` | `APPEND key value` — creates the key, keeps an existing deadline |
+| `INCR` / `DECR` | `INCR key` |
+| `INCRBY` / `DECRBY` | `INCRBY key increment` |
+| `INCRBYFLOAT` | `INCRBYFLOAT key increment` |
+| `INCREX` | `INCREX key [BYFLOAT inc \| BYINT inc] [LBOUND lb] [UBOUND ub] [SATURATE] [EX s \| PX ms \| EXAT ts \| PXAT ms \| PERSIST] [ENX]` |
+| `HELLO` | `HELLO [protover]` |
+| `PING` | `PING [message]` |
+| `QUIT` | `QUIT` |
+
+Anything else is answered `-ERR unknown command '…'` and the connection carries
+on, which is how a client library discovers a feature is missing.
+
+Numbers follow Redis's own `string2ll`, not Rust's `parse`: no `+`, no leading
+zeros, no surrounding whitespace. The same rule judges command arguments and
+stored counters, so a value `INCR` accepts is exactly a value it can write back.
+
+## Errors
+
+| Reply | When |
+|---|---|
+| `-ERR unknown command '…'` | Outside the subset above. |
+| `-ERR wrong number of arguments for '…' command` | Arity. |
+| `-ERR syntax error` | Unknown or conflicting options. |
+| `-ERR invalid expire time in '…' command` | A non-positive `EX`/`PX`/`EXAT`/`PXAT`, or one that does not fit. |
+| `-ERR value is not an integer or out of range` | A stored value or argument that is not an integer. |
+| `-ERR value is not a valid float` | The float equivalent. |
+| `-ERR increment or decrement would overflow` | `INCR`-family arithmetic past `i64`. |
+| `-ERR increment would produce NaN or Infinity` | `INCRBYFLOAT` past the float range. |
+| `-ERR invalid key` | Empty, or past this server's 511-byte key limit. |
+| `-OOM command not allowed when used memory > 'maxmemory'` | The map is full. Clients treat `OOM` as "back off", which is right. |
+| `-NOPROTO unsupported protocol version` | `HELLO` with anything but 2 or 3. |
+| `-ERR Protocol error: …` | Framing that cannot be resynchronised. Sent, **then** the connection closes. |
+
+A rejected command consumes exactly its own bytes, so one bad command in a
+pipeline produces one error line in the position it occupied and everything
+after it is still read correctly.
+
+## Deliberate divergences from Redis
+
+| Behaviour | Redis | vash | Why |
+|---|---|---|---|
+| Inline commands | accepted | connection is read as memcached | The first byte picks the dialect; see above. |
+| Expiry precision | milliseconds | rounded to the nearest second, never to the past | The store's deadline field is whole seconds. `PX 100` therefore buys up to a full second — too long rather than too short, since a key that vanishes as it is written is the worse failure. |
+| `SET … IFEQ/IFNE/IFDEQ/IFDNE` | supported | `-ERR … are not supported` | Value-conditional writes need a compare inside the write transaction, and the digest forms need a `DIGEST` command that does not exist here. Named explicitly rather than reported as a syntax error. |
+| `HELLO … AUTH/SETNAME` | supported | `-ERR … are not supported` | There is no auth and no client registry. Accepting `AUTH` would tell a client it had authenticated. |
+| Empty key (`SET "" v`) | allowed | `-ERR invalid key` | LMDB has no empty key. |
+| Keys over 511 bytes | allowed | `-ERR invalid key` | LMDB's compile-time `MDB_MAXKEYSIZE`; see [storage.md](storage.md). |
+| `INCRBYFLOAT` precision | 80-bit `long double` | 64-bit `f64` | Rust has no 80-bit float. The last digits of a long chain of increments can differ. |
+| Arithmetic and `APPEND` atomicity | atomic (single-threaded) | **read-modify-write, not atomic** | See below. |
+| Eviction under memory pressure | configurable LRU/LFU | TTL-ordered | See [plan.md](plan.md) §6. |
+| Databases (`SELECT`) | 16 | one | A cache does not need a namespace it cannot see into. |
+
+### Atomicity
+
+The Redis adapter is a **protocol layer only**: it composes the storage
+operations the engine already has rather than adding new ones. Commands that
+need a read and a write therefore have a seam between them, and two clients
+touching the same key at the same moment can lose an update where Redis, being
+single-threaded, cannot.
+
+This affects `APPEND`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `INCRBYFLOAT`,
+`INCREX`, `SET … GET`, `SET … KEEPTTL`, `EXPIRE`/`EXPIREAT` with a condition,
+and `MSETEX` with `NX`/`XX`. It does **not** affect plain `GET`, `SET`, `MGET`,
+`MSET`, `DEL`, `UNLINK`, `EXISTS`, `TTL` or `PERSIST`.
+
+Closing the seam means new primitives inside the shard writer, which already
+serialises everything on one thread — so the fix is cheap in principle and is a
+storage-engine change, not a protocol one. Until then, treat `INCREX` as a
+best-effort rate limiter rather than an exact one.
+
+---
+
 # Shared semantics
 
-These apply identically to both protocols.
+These apply identically to all three protocols.
 
 ## TTL semantics
 

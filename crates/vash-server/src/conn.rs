@@ -29,6 +29,10 @@ pub async fn handle(
     let mut read_buf = BytesMut::with_capacity(read_buffer);
     let mut write_buf: Vec<u8> = Vec::with_capacity(read_buffer);
     let mut protocol: Option<Protocol> = None;
+    // Redis connections start at RESP2 and move to RESP3 only if the client
+    // asks. Per-connection state, because that is exactly what `HELLO`
+    // negotiates.
+    let mut resp_version = vash_proto::resp::Version::default();
 
     loop {
         // Shutdown is only ever noticed *here*, between requests, where nothing
@@ -71,6 +75,9 @@ pub async fn handle(
         let keep_going = match protocol.expect("set above") {
             Protocol::Vcp => drain_vcp(&state, &mut read_buf, &mut write_buf).await?,
             Protocol::Memcached => drain_memcached(&state, &mut read_buf, &mut write_buf).await?,
+            Protocol::Resp => {
+                drain_resp(&state, &mut read_buf, &mut resp_version, &mut write_buf).await?
+            }
         };
 
         if !write_buf.is_empty() {
@@ -237,4 +244,78 @@ async fn drain_memcached(
 
     write_buf.extend_from_slice(&response);
     Ok(closing == Closing::No && !fatal)
+}
+
+/// Handles every complete RESP command in the buffer.
+///
+/// The same two-pass shape as [`drain_memcached`], for the same reason: measure
+/// the span of whole commands first, then execute the lot in one hop to the
+/// storage tier. RESP framing is length-delimited like memcached's storage
+/// commands, so again only the parser can say where a command ends.
+///
+/// `version` is threaded through rather than kept in the executor because a
+/// `HELLO` changes how every *later* reply on this connection is rendered,
+/// including ones in the same pipelined block.
+async fn drain_resp(
+    state: &Arc<ServerState>,
+    read_buf: &mut BytesMut,
+    version: &mut vash_proto::resp::Version,
+    write_buf: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    use vash_proto::resp;
+
+    let mut complete = 0usize;
+    let mut fatal = None;
+    let mut all_reads = true;
+
+    loop {
+        match resp::parse(&read_buf[complete..]) {
+            Ok(resp::Outcome::Incomplete) => break,
+            Ok(resp::Outcome::Command(parsed)) => {
+                all_reads &= crate::resp::is_read_only(&parsed.command);
+                complete += parsed.consumed;
+            }
+            // Counted in, not handled here: the error has to land in the
+            // response stream in the position the bad command occupied, which
+            // only the executor knows how to do.
+            Err(resp::ProtocolError::Recoverable { consumed, .. }) => complete += consumed,
+            Err(resp::ProtocolError::Fatal(detail)) => {
+                debug!(detail, "closing connection: RESP framing is unrecoverable");
+                fatal = Some(detail);
+                break;
+            }
+        }
+    }
+
+    let mut closing = Closing::No;
+    if complete > 0 {
+        let block: Bytes = read_buf.split_to(complete).freeze();
+
+        if state.inline_reads && all_reads {
+            closing = crate::resp::execute_block(state, &block, version, write_buf);
+        } else {
+            let state = Arc::clone(state);
+            let mut negotiating = *version;
+            let (response, done, negotiated) = tokio::task::spawn_blocking(move || {
+                let mut out = Vec::with_capacity(64);
+                let done = crate::resp::execute_block(&state, &block, &mut negotiating, &mut out);
+                (out, done, negotiating)
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+
+            *version = negotiated;
+            write_buf.extend_from_slice(&response);
+            closing = done;
+        }
+    }
+
+    // Redis answers a protocol error and *then* hangs up, so the client learns
+    // why instead of seeing a bare disconnect. The reply goes after whatever
+    // the commands before it produced, which is the position it occupied.
+    if let Some(detail) = fatal {
+        resp::encode::protocol_error(write_buf, detail);
+        return Ok(false);
+    }
+    Ok(closing == Closing::No)
 }

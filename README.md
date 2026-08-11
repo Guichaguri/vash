@@ -1,19 +1,19 @@
 # vash
 
-A cache server built on LMDB, with TTLs, tag-based invalidation and memcached
-protocol compatibility.
+A cache server built on LMDB, with TTLs, tag-based invalidation, and memcached
+and Redis protocol compatibility.
 
 Wire protocols: [docs/protocol.md](docs/protocol.md) — enough detail to write a
 client against. Design and rationale: [docs/plan.md](docs/plan.md). Original
 brief: [docs/project.md](docs/project.md).
 
-**Status: M6 complete — feature work done.** Speaks both its own binary protocol
-and the memcached text and meta protocols, on the same port. TTLs with
-background reclamation, group-committed writes across independent shards,
-constant-time tag invalidation that propagates across a cluster, capacity
-eviction, Prometheus metrics, continuous fuzzing of both parsers, and a static
-binary you can ship. See [Performance](#performance) for what it does and what
-it does not.
+**Status: M6 complete — feature work done.** Speaks its own binary protocol, the
+memcached text and meta protocols, and a subset of Redis in RESP2 and RESP3, all
+on the same port. TTLs with background reclamation, group-committed writes across
+independent shards, constant-time tag invalidation that propagates across a
+cluster, capacity eviction, Prometheus metrics, continuous fuzzing of every
+parser, and a static binary you can ship. See [Performance](#performance) for
+what it does and what it does not.
 
 ## Quick start
 
@@ -41,6 +41,7 @@ Run with `--ephemeral` to start from an empty database and skip syncing, or
 | Tags, `DELETE_BY_TAG`, `FLUSH` | Working — invalidation is constant time, see [benchmark](#tag-invalidation) |
 | Memcached text protocol | Working — `get`/`gets`/`set`/`add`/`replace`/`append`/`prepend`/`cas`/`delete`/`touch`/`gat`/`gats`/`incr`/`decr`/`stats`/`version`/`flush_all`/`quit` |
 | Memcached meta protocol | Working — `mg`/`ms`/`md`/`ma`/`mn`/`me`, core flag set |
+| Redis protocol (RESP2 + RESP3) | Working — string and expiry commands; the read-modify-write ones are [not atomic](docs/protocol.md#atomicity) |
 | Sharding | Working — independent environments, one writer each |
 | Capacity watermarks and eviction | Working — TTL-ordered, never LRU |
 | Metrics and admin endpoints | Working — `/metrics`, `/health`, `/stats` |
@@ -324,11 +325,12 @@ means this node is drifting out of step with its peers.
 
 ## Memcached compatibility
 
-Both protocols share one port. The dialect is settled by the connection's first
-byte — VCP opens with a `HELLO` frame (`0x01`), every memcached command opens
-with a lowercase letter — so nothing is re-parsed and the two cannot be
-confused. A key written by a memcached client is readable by a VCP client and
-the other way round, client flags included.
+All three protocols share one port. The dialect is settled by the connection's
+first byte — VCP opens with a `HELLO` frame (`0x01`), a RESP request opens with
+`*`, every memcached command opens with a lowercase letter — so nothing is
+re-parsed and they cannot be confused. A key written by a memcached client is
+readable by a VCP or Redis client and the other way round, client flags
+included.
 
 Existing memcached clients need no changes:
 
@@ -373,19 +375,49 @@ divergence recorded in the script — for an over-long key memcached emits a str
 empty line after the error, which vash does not reproduce because it would
 leave a pipelining client counting one more response than it sent commands.
 
+## Redis compatibility
+
+A subset of the Redis string and expiry commands, on the same port, in RESP2 and
+RESP3. Existing clients connect unchanged:
+
+```bash
+redis-cli -p 11311 SET key value
+redis-cli -3 -p 11311 INCREX ratelimit:42 BYINT 1 UBOUND 100 EX 60 ENX
+```
+
+Supported: `GET` `SET` `DEL` `UNLINK` `MSET` `MGET` `MSETEX` `EXISTS` `EXPIRE`
+`EXPIREAT` `PERSIST` `TTL` `APPEND` `INCR` `INCRBY` `DECR` `DECRBY`
+`INCRBYFLOAT` `INCREX`, plus `HELLO`, `PING` and `QUIT` to negotiate and keep a
+connection. `SET` takes `NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`;
+`EXPIRE` and `EXPIREAT` take `NX`/`XX`/`GT`/`LT`; `INCREX` takes its full option
+set. Anything else answers `unknown command`, which is how a client library
+discovers a feature is missing.
+
+Two things to know before pointing a real workload at it. Expiry is rounded to
+whole seconds, because that is what the store's deadline field holds — so
+`PX 100` buys up to a full second rather than 100 ms. And the commands that read
+then write — the arithmetic family, `APPEND`, `SET … GET`, conditional `EXPIRE`
+— are **not atomic**, because this is a protocol adapter over the existing
+storage engine rather than a new set of engine primitives. Both are covered in
+[docs/protocol.md](docs/protocol.md#deliberate-divergences-from-redis), with the
+full divergence list.
+
 ## Layout
 
 ```
 crates/vash-core     domain types, on-disk record format, no I/O
 crates/vash-store    LMDB adapter behind the `Store` trait
-crates/vash-proto    wire codecs (VCP + memcached); byte-slice in, `Command` out
+crates/vash-proto    wire codecs (VCP + memcached + RESP); byte-slice in, command out
 crates/vash-server   network tier, dispatch, config, the `vash-server` binary
 crates/vash-client   VCP client, and the integration-test driver
 ```
 
 `vash-core` defines the domain; `vash-store` and `vash-proto` are adapters on
-either side of it. Both protocols decode into the same `Command` type, so the
-storage engine never learns which wire format a request arrived on.
+either side of it. VCP and memcached decode into the same `Command` type, so the
+storage engine never learns which wire format a request arrived on. The Redis
+adapter is the exception: its string commands do not map one-to-one onto storage
+operations, so it composes them in `vash-server::resp` instead — see
+[docs/protocol.md](docs/protocol.md#atomicity) for what that costs.
 
 ## Deploying
 

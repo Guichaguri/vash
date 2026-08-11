@@ -141,6 +141,83 @@ fn memcached_seeds(root: &Path) {
     }
 }
 
+fn resp_seeds(root: &Path) {
+    let dir = root.join("resp_decode");
+
+    /// A RESP request array, which is the only request shape the server takes.
+    fn request(args: &[&str]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            out.extend_from_slice(arg.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    for (name, args) in [
+        ("hello", &["HELLO", "3"][..]),
+        ("ping", &["PING"]),
+        ("get", &["GET", "foo"]),
+        ("set", &["SET", "foo", "hello"]),
+        (
+            "set_options",
+            &["SET", "foo", "hello", "NX", "GET", "EX", "60"],
+        ),
+        ("set_keepttl", &["SET", "foo", "hello", "XX", "KEEPTTL"]),
+        ("del", &["DEL", "a", "b", "c"]),
+        ("unlink", &["UNLINK", "a"]),
+        ("mset", &["MSET", "a", "1", "b", "2"]),
+        ("mget", &["MGET", "a", "b", "c"]),
+        (
+            "msetex",
+            &["MSETEX", "2", "a", "1", "b", "2", "NX", "EX", "30"],
+        ),
+        ("exists", &["EXISTS", "a", "b"]),
+        ("expire", &["EXPIRE", "foo", "60", "GT"]),
+        ("expireat", &["EXPIREAT", "foo", "1700000000"]),
+        ("persist", &["PERSIST", "foo"]),
+        ("ttl", &["TTL", "foo"]),
+        ("append", &["APPEND", "foo", "bar"]),
+        ("incr", &["INCR", "counter"]),
+        ("incrby", &["INCRBY", "counter", "-5"]),
+        ("incrbyfloat", &["INCRBYFLOAT", "counter", "0.25"]),
+        // The widest option list in the command set, which is where the
+        // ordering and mutual-exclusion rules have the most room to be wrong.
+        (
+            "increx",
+            &[
+                "INCREX", "hits", "BYINT", "1", "LBOUND", "0", "UBOUND", "100", "SATURATE", "EX",
+                "60", "ENX",
+            ],
+        ),
+        (
+            "increx_float",
+            &["INCREX", "f", "BYFLOAT", "0.5", "PERSIST"],
+        ),
+        ("unknown", &["LPUSH", "k", "v"]),
+    ] {
+        write(&dir, name, &request(args));
+    }
+
+    // The framing cases. A value containing CRLF must not be read as another
+    // command, and the command after it must still be found.
+    let mut embedded = request(&["SET", "k", "a\r\nb"]);
+    embedded.extend_from_slice(&request(&["PING"]));
+    write(&dir, "embedded_crlf", &embedded);
+
+    let mut pipelined = request(&["GET", "a"]);
+    pipelined.extend_from_slice(&request(&["GET", "b"]));
+    pipelined.extend_from_slice(&request(&["PING"]));
+    write(&dir, "pipelined", &pipelined);
+
+    // Redis accepts an empty array as a no-op, so the parser has to skip it
+    // and still find what follows.
+    let mut empty = b"*0\r\n".to_vec();
+    empty.extend_from_slice(&request(&["PING"]));
+    write(&dir, "empty_array", &empty);
+}
+
 fn record_seeds(root: &Path) {
     use vash_core::{RecordMeta, TagRef, encode_record};
 
@@ -180,6 +257,7 @@ fn main() {
 
     vcp_seeds(root);
     memcached_seeds(root);
+    resp_seeds(root);
     record_seeds(root);
 
     println!("wrote the seed corpus to {}", root.display());
