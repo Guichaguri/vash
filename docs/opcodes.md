@@ -557,13 +557,35 @@ implementation is explicitly permitted to be a linear scan.
 whole-keyspace *mutations*; grouping a listing next to them invites the
 assumption that the same gate and the same danger apply in the same way.
 
+### One shape for both
+
+**Decision: `LIST_KEYS` and `LIST_TAGS` take the same request body and return
+the same response body, field for field.** They differ only in what the entries
+name and where the server reads them from. One decoder, one validator, one
+matcher, one pagination loop — in the server, in `vash-client`, and in whatever
+tooling drives them.
+
+The unification is not free, and the price is named here rather than discovered
+later: `scanned` and `TRUNCATED` are load-bearing for a keyspace scan and nearly
+vacuous for a RAM-resident tag table, which never exhausts a budget. They are
+still *true* there, just uninteresting — which is a different thing from a field
+that is false, and the line this project already draws when it refuses to report
+an unmeasured `stats` counter as a plausible zero.
+
+**Two opcodes rather than one `LIST` with a subject byte.** The subject would
+have to be validated, would need an error path for an unknown value, and would
+put both commands behind one entry in the opcode table, one metrics label and
+one `is_read_only` answer. An unknown *opcode* already has all of that, for
+free, and the table stays self-describing. Symmetry of layout is worth having;
+symmetry that erases which command was called is not.
+
 ### Shared request layout
 
-Both take the same 16-byte header followed by an optional pattern:
+A 16-byte header followed by an optional pattern:
 
 | Offset | Field |
 |---|---|
-| 0 | `limit` u32 — maximum entries in the reply |
+| 0 | `limit` u32 — maximum entries in the reply, 1–1024 |
 | 4 | `offset` u64 — entries to skip |
 | 12 | `pattern_len` u16 |
 | 14 | `reserved` u16 — zero |
@@ -574,9 +596,47 @@ through `reserved`, and silently ignoring a trailing field would let a client
 believe something took effect that this build never read.
 
 `limit` of 0 is `BAD_REQUEST` — a client asking for nothing is a bug, not a
-cheap way to probe a count. `limit` above the per-command ceiling is
-`BAD_REQUEST` rather than silently clamped, for the same reason: a client that
-asked for 10000 and got 1024 back with no indication would page incorrectly.
+cheap way to probe a count. `limit` above 1024 is `BAD_REQUEST` rather than
+silently clamped, for the same reason: a client that asked for 10000 and got
+1024 back with no indication would page incorrectly. One ceiling for both
+commands, so a client's paging logic has no per-command case; a tag table large
+enough to feel it is a table nobody reads interactively anyway.
+
+### Shared response layout
+
+On `OK`:
+
+| Offset | Field |
+|---|---|
+| 0 | `count` u32 — entries in this page |
+| 4 | `flags` u8 — bit 0 `MORE`, bit 1 `TRUNCATED` |
+| 5 | `reserved` u8 × 3 — zero |
+| 8 | `scanned` u64 — entries examined to produce this page |
+| 16 | `next_offset` u64 — the `offset` to send for the next page |
+| 24 | `count` × entry |
+
+An entry is `version` u64, `name_len` u16, `name` bytes — **`TAG_SYNC`'s entry
+layout, byte for byte**, so a client that already decodes a digest reuses that
+code for both commands.
+
+`version` is the u64 the server holds for that name: the record's CAS token for
+a key, the tag's generation for a tag. Both are opaque monotonic version
+numbers, which is exactly what CAS is already documented to be — comparable
+against an earlier reading of the *same* name and against nothing else. Two
+listings diffed by version is how a client sees what changed, and it is the only
+metadata that is genuinely free: the record header is parsed for the liveness
+check whether or not the CAS is sent, and the tag generation is the value being
+listed.
+
+`MORE` is set whenever the walk stopped for any reason other than reaching the
+end. A client pages by echoing `next_offset` back and stops when `MORE` is
+clear — the same loop for both commands.
+
+**No `total` field.** It would be honest for tags, where the whole population is
+in RAM, and unaffordable for keys, where it means a full scan. Rather than carry
+a field that is meaningful in one command and a placeholder in the other, there
+is none: the registry size is already reported as `vash_tags` in `stats` and on
+the metrics port, and a listing is not the place to learn a count.
 
 ### Pattern matching
 
@@ -655,18 +715,11 @@ currently measures; M8 is the milestone that gives it a reason to exist.
 
 Lists the keys a `GET` would currently hit.
 
-**Request** — the shared layout. `limit` ceiling **1024**.
-
-**Response body** on `OK`:
-
-| Offset | Field |
-|---|---|
-| 0 | `count` u32 — keys in this page |
-| 4 | `flags` u8 — bit 0 `MORE`, bit 1 `TRUNCATED` |
-| 5 | `reserved` u8 × 3 — zero |
-| 8 | `scanned` u64 — records examined |
-| 16 | `next_offset` u64 — the `offset` to send for the next page |
-| 24 | `count` × (`key_len` u16, key bytes) |
+**Body** — the shared request and response layouts above. `name` is the key,
+`version` is its CAS token, and `scanned` counts records walked — including the
+dead and non-matching ones, which is what makes it worth reporting: a page of 10
+keys that cost 90000 records to find is the signal that a pattern is not
+selective.
 
 **Order.** Shard index major, LMDB key order within a shard. With `shards = 1`
 that is plain lexicographic order over the whole keyspace; above that it is not,
@@ -717,11 +770,13 @@ miss.
 counters, since a hit ratio computed over scanned records would be meaningless
 and would corrupt a real one. `scanned` is worth its own counter.
 
-**Deliberately not included in the reply:** value, TTL, CAS, size, tag names. A
-listing carrying them is `GET_MANY` with extra steps and an unbounded frame
-size; the two-step "list, then get what you care about" is what keeps the reply
-size a function of the key length alone. The TTL and CAS of one key are already
-reachable through the memcached `mg … t c` flags.
+**Deliberately not included in the reply:** value, TTL, size, tag names. A
+listing carrying them is `GET_MANY` with extra steps and a frame size set by the
+data rather than by the request; the two-step "list, then get what you care
+about" is what keeps a page's size a function of the key lengths alone. The CAS
+is the exception, and only because it is 8 fixed bytes already in hand — see the
+shared response layout. The TTL and tags of one key are reachable through the
+memcached `mg … t` flag and `me`.
 
 **The one optimisation deliberately not made:** a pattern with a literal prefix
 (`session:*`) could seek each shard's `main` cursor to that prefix and stop at
@@ -735,24 +790,21 @@ version does not depend on it and building both means maintaining both.
 Lists the tag registry: every name this node has registered, with the generation
 it holds.
 
-**Request** — the shared layout. `limit` ceiling **4096**.
-
-**Response body** on `OK`:
-
-| Offset | Field |
-|---|---|
-| 0 | `count` u32 — entries in this page |
-| 4 | `total` u32 — matching entries in the registry, before `limit` and `offset` |
-| 8 | `count` × (`generation` u64, `name_len` u16, name bytes) |
-
-The entry layout is `TAG_SYNC`'s, byte for byte, so a client that already
-decodes a digest reuses that code.
+**Body** — the shared request and response layouts above. `name` is the tag
+name, `version` is its generation, and `scanned` counts registry entries
+considered.
 
 **Execute** — entirely from RAM. The registry is loaded fully at boot and lives
 as an array plus a name index; `tag_generations()` already merges it across
 shards by maximum, which is the same value the node reports to peers. No
-transaction is opened and no page can fault, which is why this command can
-report `total` honestly and `LIST_KEYS` cannot: the whole population is in hand.
+transaction is opened, no page can fault, and no reader slot is taken — the
+whole population is in hand before the first entry is matched.
+
+That is why `TRUNCATED` is never set here and `scanned` never exceeds the
+registry size: the scan budget exists to bound a walk over the map, and there is
+no map to walk. The fields are carried anyway so that both listings decode
+identically, and a client that checks `TRUNCATED` is not wrong to, merely never
+surprised.
 
 Sorted **lexicographically by name**. Registration order is per-shard and
 differs between nodes, so it would make two nodes' listings incomparable —
@@ -770,8 +822,14 @@ The listing is this node's view. Generations converge across the cluster within
 one gossip interval, so a difference between two nodes' listings is either
 convergence in flight or a peer that cannot be reached — `CLUSTER` says which.
 
-**Statuses** — as `LIST_KEYS`. `MORE`/`TRUNCATED` have no analogue and there is
-no flags field: with `total` in hand a client knows exactly whether more remains.
+**Statuses** — as `LIST_KEYS`. Never `NOT_FOUND`: a pattern matching no tag is
+`count = 0`.
+
+**Pagination** — `offset` counts matching entries, and because the population is
+a stable sorted array rather than a live keyspace, paging is consistent within
+one call and only as consistent as the registry between calls. A tag registered
+mid-sequence can shift later pages by one entry; nothing removes a tag today, so
+an entry never disappears from under a pager.
 
 **Metrics** — `other`.
 
