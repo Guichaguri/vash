@@ -104,7 +104,7 @@ pub fn execute_block(
 ///
 /// Note what is missing: every arithmetic command rewrites its key, and so does
 /// `APPEND`, despite both reading first.
-pub fn is_read_only(command: &Command<'_>) -> bool {
+pub fn inline_safe(command: &Command<'_>) -> bool {
     matches!(
         command,
         Command::Get { .. }
@@ -247,6 +247,7 @@ fn authenticate(
 ///
 /// Carries the wire error and how it should be counted, so every failure path
 /// reports both and neither can be forgotten.
+#[derive(Debug)]
 struct Failure {
     code: &'static str,
     message: &'static str,
@@ -894,4 +895,115 @@ fn ttl_from_deadline(deadline_ms: i64) -> u32 {
     // `u32::MAX` is the already-expired sentinel, so the furthest deadline this
     // can express is one second short of it — some time in 2106.
     u32::try_from(seconds).unwrap_or(u32::MAX).min(u32::MAX - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vash_proto::resp::command::{Credential, Set as RespSet};
+
+    /// Every Redis command that touches storage, in one place.
+    ///
+    /// Deliberately a `Vec` of concrete commands rather than a match on the
+    /// enum: what is being checked is that the *shortcut* agrees with the
+    /// *translation*, and a match would let a new variant be added to both
+    /// without ever being compared.
+    fn storage_commands() -> Vec<Command<'static>> {
+        let set = |condition, expiry, return_previous| {
+            Command::Set(RespSet {
+                key: b"k",
+                value: b"v",
+                condition,
+                expiry,
+                return_previous,
+            })
+        };
+        vec![
+            Command::Ping { message: None },
+            Command::Get { key: b"k" },
+            Command::MGet { keys: vec![b"k"] },
+            Command::Exists { keys: vec![b"k"] },
+            Command::Type { key: b"k" },
+            Command::Ttl { key: b"k" },
+            Command::Delete { keys: vec![b"k"] },
+            set(Condition::Always, Expiry::Unset, false),
+            set(Condition::IfAbsent, Expiry::Keep, true),
+            Command::MSet {
+                pairs: vec![(b"k".as_slice(), b"v".as_slice())],
+            },
+            Command::MSetEx {
+                pairs: vec![(b"k".as_slice(), b"v".as_slice())],
+                condition: Condition::IfAbsent,
+                expiry: Expiry::After(1000),
+            },
+            Command::Append {
+                key: b"k",
+                value: b"v",
+            },
+            Command::Expire {
+                key: b"k",
+                expiry: Expiry::After(1000),
+                condition: ExpireCondition::IfLater,
+            },
+            Command::Persist { key: b"k" },
+            Command::Incr {
+                key: b"k",
+                delta: Number::Int(1),
+            },
+            Command::IncrEx(IncrEx {
+                key: b"k",
+                delta: Number::Int(1),
+                lower: None,
+                upper: None,
+                saturate: false,
+                expiry: None,
+                only_if_persistent: false,
+            }),
+        ]
+    }
+
+    /// The shortcut this module uses to decide where a command may run must
+    /// agree with the domain's answer for the command it translates into.
+    ///
+    /// Two judgements about one fact is the shape that drifts, and the cost of
+    /// drift here is a write executed on a runtime worker, blocking it and every
+    /// connection it serves. See `vash-proto/tests/read_only.rs` for the same
+    /// check on the VCP side.
+    #[test]
+    fn the_shortcut_agrees_with_the_domain() {
+        for command in storage_commands() {
+            let translated = translate(&command).expect("a storage command translates");
+            assert_eq!(
+                inline_safe(&command),
+                translated.inline_safe(),
+                "{command:?} is classified differently by the shortcut and by the domain"
+            );
+        }
+    }
+
+    /// The connection commands never reach the boundary, so there is nothing to
+    /// compare them against — but they must all be inline-safe, because none of
+    /// them touches storage and refusing them a worker would cost a thread hop
+    /// on every handshake.
+    #[test]
+    fn the_connection_commands_are_inline_safe() {
+        let credential = Credential {
+            name: None,
+            secret: b"s",
+        };
+        for command in [
+            Command::Quit,
+            Command::Auth(credential),
+            Command::Hello {
+                version: Some(3),
+                auth: None,
+            },
+        ] {
+            assert!(inline_safe(&command), "{command:?} must be inline-safe");
+            assert!(
+                translate(&command).is_err(),
+                "{command:?} must not reach the storage boundary"
+            );
+        }
+    }
 }

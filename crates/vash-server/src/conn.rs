@@ -9,7 +9,7 @@ use vash_proto::vcp::{FrameLen, peek_frame_len};
 use vash_proto::{Protocol, detect};
 
 use crate::auth::ConnAuth;
-use crate::dispatch::{Closing, execute_frame_into, execute_memcached_block};
+use crate::dispatch::{Closing, execute_memcached_block};
 use crate::state::ServerState;
 
 /// Most bytes an unauthenticated connection may have buffered, or ask the
@@ -117,20 +117,53 @@ pub async fn handle(
             }
         }
 
+        // One drain for all three dialects. What differs is the measuring —
+        // only a dialect's own parser can say where its commands end — and what
+        // a fatal framing error owes the client. Everything after that point is
+        // identical, and used to be written out three times.
         let keep_going = match protocol.expect("set above") {
             Protocol::Vcp => {
-                drain_vcp(&state, &mut conn_auth, &mut read_buf, &mut write_buf).await?
-            }
-            Protocol::Memcached => {
-                drain_memcached(&state, &mut conn_auth, &mut read_buf, &mut write_buf).await?
-            }
-            Protocol::Resp => {
-                drain_resp(
+                // Ordered so an authenticated connection never touches the lock.
+                let gated = !conn_auth.is_authenticated() && state.auth.current().required();
+                drain(
                     &state,
                     &mut conn_auth,
                     &mut read_buf,
-                    &mut resp_version,
                     &mut write_buf,
+                    &mut (),
+                    |buf| measure_vcp(buf, gated),
+                    |state, conn, block, (), out| {
+                        crate::dispatch::execute_vcp_block(state, conn, block, out)
+                    },
+                    |_, _| {},
+                )
+                .await?
+            }
+            Protocol::Memcached => {
+                drain(
+                    &state,
+                    &mut conn_auth,
+                    &mut read_buf,
+                    &mut write_buf,
+                    &mut (),
+                    measure_memcached,
+                    |state, conn, block, (), out| execute_memcached_block(state, conn, block, out),
+                    |_, _| {},
+                )
+                .await?
+            }
+            Protocol::Resp => {
+                drain(
+                    &state,
+                    &mut conn_auth,
+                    &mut read_buf,
+                    &mut write_buf,
+                    &mut resp_version,
+                    measure_resp,
+                    crate::resp::execute_block,
+                    // Redis answers a protocol error and *then* hangs up, so the
+                    // client learns why instead of seeing a bare disconnect.
+                    vash_proto::resp::encode::protocol_error,
                 )
                 .await?
             }
@@ -163,266 +196,227 @@ pub async fn handle(
     }
 }
 
-/// Handles every complete VCP frame in the buffer. Returns `false` when the
-/// connection must close.
+/// How much of the read buffer forms whole commands, and what that implies.
 ///
-/// **Every buffered frame goes to the storage tier in one hop.** The hop is a
-/// thread handoff, and a handoff costs far more than executing a cached
-/// request: measured on Windows, one per frame capped a pipelined connection at
-/// roughly 5k operations a second no matter how deep the pipeline, because the
-/// depth bought nothing — the frames were still crossing to the pool one at a
-/// time. Amortising it over whatever arrived in a single read is what makes
-/// pipelining worth anything, and it costs the unpipelined case nothing: one
-/// frame in the buffer is still one hop.
-async fn drain_vcp(
+/// The one thing each dialect works out for itself, because only its own parser
+/// knows where a command ends — and for the storage commands of all three that
+/// is length-delimited rather than line-delimited, since a value may contain
+/// anything, CRLF included.
+#[derive(Debug)]
+struct Measured {
+    /// Bytes at the front of the buffer that form complete commands.
+    complete: usize,
+    /// Every one of them can be answered without touching the writer.
+    all_reads: bool,
+    /// Framing is unrecoverable; the connection closes once any reply is out.
+    fatal: Option<&'static str>,
+    /// Total length of the command still arriving, so the buffer can be sized
+    /// for it once rather than grown repeatedly.
+    reserve: usize,
+}
+
+impl Default for Measured {
+    fn default() -> Self {
+        Self {
+            complete: 0,
+            all_reads: true,
+            fatal: None,
+            reserve: 0,
+        }
+    }
+}
+
+/// Executes a block of one dialect's commands, rendering the replies.
+type RunBlock<S> = fn(&ServerState, &mut ConnAuth, &[u8], &mut S, &mut Vec<u8>) -> Closing;
+
+/// Executes one block of whole commands in whichever tier is safe for it.
+///
+/// **The one place the hand-off to the storage tier happens, and the one place
+/// the connection's mutable state crosses it.** That state — the authentication,
+/// and for Redis the negotiated dialect — has to travel into the block and back
+/// out, because an `AUTH` and the commands it authorises can arrive in a single
+/// pipelined read, so it must take effect *within* a block rather than between
+/// reads. Copying it back is the step that is easy to forget and silent when
+/// forgotten: a lost authentication looks like a client that simply has to try
+/// again. There is one of these so it can only be got wrong once.
+///
+/// **Every buffered command goes over in one hop.** The hop is a thread handoff,
+/// and a handoff costs far more than executing a cached request: measured on
+/// Windows, one per frame capped a pipelined connection at roughly 5k operations
+/// a second no matter how deep the pipeline, because the depth bought nothing.
+/// Amortising it over whatever arrived in a single read is what makes pipelining
+/// worth anything, and it costs the unpipelined case nothing — one command in
+/// the buffer is still one hop.
+async fn run_block<S: Copy + Send + 'static>(
     state: &Arc<ServerState>,
     conn_auth: &mut ConnAuth,
-    read_buf: &mut BytesMut,
+    dialect: &mut S,
+    block: Bytes,
     write_buf: &mut Vec<u8>,
-) -> std::io::Result<bool> {
-    let mut frames: Vec<Bytes> = Vec::new();
-    let mut closing = false;
-
-    // Ordered so an authenticated connection never touches the lock.
-    let gated = !conn_auth.is_authenticated() && state.auth.current().required();
-
-    loop {
-        match peek_frame_len(read_buf) {
-            FrameLen::Incomplete { needed } => {
-                // `needed` comes from the frame header, which an
-                // unauthenticated stranger controls: without this, one 12-byte
-                // header claiming a 64 MiB body reserves 64 MiB before anything
-                // has been presented. The buffered-bytes check in `handle`
-                // cannot cover it, because this reserves against a length that
-                // has not arrived.
-                if gated && needed > PRE_AUTH_MAX_BUFFERED {
-                    debug!(needed, "closing: unauthenticated frame is too large");
-                    closing = true;
-                    break;
-                }
-                read_buf.reserve(needed.saturating_sub(read_buf.len()));
-                break;
-            }
-            FrameLen::TooLarge => {
-                debug!("closing connection: frame length exceeds the maximum");
-                closing = true;
-                break;
-            }
-            // `split_to` hands the frame's bytes over by reference count. No
-            // copy, and the decoded key and value borrow directly from it.
-            FrameLen::Complete(len) => frames.push(read_buf.split_to(len).freeze()),
-        }
-    }
-
-    if frames.is_empty() {
-        return Ok(!closing);
-    }
-
-    // Reads may run here; anything that can write must not, because a write
-    // waits on the shard's writer queue and would block this worker — and every
-    // other connection it serves — behind it.
-    if state.inline_reads && frames.iter().all(|frame| is_read_only(frame)) {
-        for frame in &frames {
-            execute_frame_into(state, conn_auth, frame, write_buf);
-        }
-        return Ok(!closing);
+    inline: bool,
+    run: RunBlock<S>,
+) -> std::io::Result<Closing> {
+    if inline {
+        return Ok(run(state, conn_auth, &block, dialect, write_buf));
     }
 
     let state = Arc::clone(state);
-    // Carried into the blocking task and copied back, exactly as `drain_resp`
-    // does with the negotiated version — and for the same reason: an `AUTH` and
-    // the commands it authorises can arrive in one pipelined read, so it has to
-    // take effect within a block rather than between reads.
     let mut authenticating = conn_auth.clone();
+    let mut negotiating = *dialect;
+
     // Store operations can page-fault or wait on the writer queue, neither of
-    // which may happen on a runtime worker.
-    let (response, authenticated) = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::with_capacity(frames.len() * 64);
-        for frame in &frames {
-            execute_frame_into(&state, &mut authenticating, frame, &mut out);
-        }
-        (out, authenticating)
+    // which may happen on a runtime worker. The block is re-parsed on the
+    // blocking thread so the borrowed key and value slices never cross a task
+    // boundary.
+    let (response, closing, authenticated, negotiated) = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(64);
+        let closing = run(
+            &state,
+            &mut authenticating,
+            &block,
+            &mut negotiating,
+            &mut out,
+        );
+        (out, closing, authenticating, negotiating)
     })
     .await
     .map_err(std::io::Error::other)?;
 
     *conn_auth = authenticated;
+    *dialect = negotiated;
     write_buf.extend_from_slice(&response);
-    Ok(!closing)
+    Ok(closing)
 }
 
-/// Whether a frame can be answered without any chance of writing.
-///
-/// Decided from the opcode byte alone — the frame is not decoded twice. An
-/// unknown opcode is treated as a write, so a byte nobody recognises takes the
-/// safe path rather than the fast one.
-fn is_read_only(frame: &[u8]) -> bool {
-    frame
-        .first()
-        .and_then(|byte| vash_proto::vcp::Opcode::from_u8(*byte))
-        .is_some_and(|opcode| opcode.is_read_only())
-}
-
-/// The memcached equivalent, decided from the already-parsed command.
-///
-/// Note what is missing: `gat` re-stamps a TTL and `incr` rewrites the value,
-/// so despite reading like retrievals they are writes.
-fn is_read_only_command(command: &vash_core::Command<'_>) -> bool {
-    use vash_core::Command;
-    matches!(
-        command,
-        Command::Get { .. } | Command::GetMany(_) | Command::Version | Command::Stats
-    )
-}
-
-/// Handles every complete memcached command in the buffer.
-///
-/// Measures the span of whole commands first, then executes the lot in one hop
-/// to the storage tier — see [`drain_vcp`] for why the hop count is what
-/// matters. Only the parser can say where a command ends, because a storage
-/// command's framing is length-delimited rather than line-delimited: a value
-/// may contain CRLF.
-async fn drain_memcached(
+/// Handles every complete command in the buffer. Returns `false` to close.
+#[expect(clippy::too_many_arguments)]
+async fn drain<S: Copy + Send + 'static>(
     state: &Arc<ServerState>,
     conn_auth: &mut ConnAuth,
     read_buf: &mut BytesMut,
     write_buf: &mut Vec<u8>,
+    dialect: &mut S,
+    measure: impl Fn(&[u8]) -> Measured,
+    run: RunBlock<S>,
+    on_fatal: fn(&mut Vec<u8>, &'static str),
 ) -> std::io::Result<bool> {
-    let mut complete = 0usize;
-    let mut fatal = false;
-    let mut all_reads = true;
+    let measured = measure(read_buf);
+    let mut closing = measured.fatal.is_some();
 
+    if measured.complete > 0 {
+        // `split_to` hands the bytes over by reference count. No copy, and the
+        // decoded keys and values borrow directly from them.
+        let block = read_buf.split_to(measured.complete).freeze();
+
+        // Reads may run on this worker; anything that can write must not,
+        // because a write waits on the shard's writer queue and would block the
+        // worker — and every other connection it serves — behind it.
+        let inline = state.inline_reads && measured.all_reads;
+        if run_block(state, conn_auth, dialect, block, write_buf, inline, run).await?
+            == Closing::Yes
+        {
+            closing = true;
+        }
+    }
+
+    if measured.reserve > 0 {
+        read_buf.reserve(measured.reserve.saturating_sub(read_buf.len()));
+    }
+
+    // Written after whatever the commands before it produced, which is the
+    // position the bad framing occupied.
+    if let Some(detail) = measured.fatal {
+        debug!(detail, "closing connection: framing is unrecoverable");
+        on_fatal(write_buf, detail);
+    }
+    Ok(!closing)
+}
+
+/// Measures VCP frames from their length headers, without decoding a body.
+fn measure_vcp(buf: &[u8], gated: bool) -> Measured {
+    let mut measured = Measured::default();
     loop {
-        match memcached::parse(&read_buf[complete..]) {
+        match peek_frame_len(&buf[measured.complete..]) {
+            FrameLen::Complete(len) => {
+                let frame = &buf[measured.complete..measured.complete + len];
+                measured.all_reads &= is_read_only_frame(frame);
+                measured.complete += len;
+            }
+            FrameLen::Incomplete { needed } => {
+                // `needed` comes from the frame header, which an unauthenticated
+                // stranger controls: without this, one 12-byte header claiming a
+                // 64 MiB body reserves 64 MiB before anything has been
+                // presented. The buffered-bytes check in `handle` cannot cover
+                // it, because this reserves against a length that has not
+                // arrived.
+                if gated && needed > PRE_AUTH_MAX_BUFFERED {
+                    measured.fatal = Some("unauthenticated frame is too large");
+                } else {
+                    measured.reserve = needed;
+                }
+                break;
+            }
+            FrameLen::TooLarge => {
+                measured.fatal = Some("frame length exceeds the maximum");
+                break;
+            }
+        }
+    }
+    measured
+}
+
+/// Whether a VCP frame can be answered without any chance of writing.
+///
+/// Decided from the opcode byte alone — the frame is not decoded twice. An
+/// unknown opcode is treated as a write, so a byte nobody recognises takes the
+/// safe path rather than the fast one. That this table agrees with
+/// [`vash_core::Command::is_read_only`] is pinned by a test in `vash-proto`.
+fn is_read_only_frame(frame: &[u8]) -> bool {
+    frame
+        .first()
+        .and_then(|byte| vash_proto::vcp::Opcode::from_u8(*byte))
+        .is_some_and(|opcode| opcode.inline_safe())
+}
+
+fn measure_memcached(buf: &[u8]) -> Measured {
+    let mut measured = Measured::default();
+    loop {
+        match memcached::parse(&buf[measured.complete..]) {
             Ok(Outcome::Incomplete) => break,
             Ok(Outcome::Command(parsed)) => {
-                all_reads &= is_read_only_command(&parsed.command);
-                complete += parsed.consumed;
+                measured.all_reads &= parsed.command.inline_safe();
+                measured.complete += parsed.consumed;
             }
             // Counted in, not handled here: the error line has to land in the
             // response stream in the position the bad command occupied, which
             // only the executor knows how to do.
-            Err(ProtocolError::Recoverable { consumed, .. }) => complete += consumed,
+            Err(ProtocolError::Recoverable { consumed, .. }) => measured.complete += consumed,
             Err(ProtocolError::Fatal(detail)) => {
-                debug!(
-                    detail,
-                    "closing connection: memcached framing is unrecoverable"
-                );
-                fatal = true;
+                measured.fatal = Some(detail);
                 break;
             }
         }
     }
-
-    if complete == 0 {
-        return Ok(!fatal);
-    }
-
-    if state.inline_reads && all_reads {
-        let block: Bytes = read_buf.split_to(complete).freeze();
-        let closing = execute_memcached_block(state, conn_auth, &block, write_buf);
-        return Ok(closing == Closing::No && !fatal);
-    }
-
-    let block: Bytes = read_buf.split_to(complete).freeze();
-    let state = Arc::clone(state);
-    let mut authenticating = conn_auth.clone();
-
-    // Re-parsed on the blocking thread so the borrowed key and value slices
-    // never cross a task boundary, exactly as the VCP path does.
-    let (response, closing, authenticated) = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::with_capacity(64);
-        let closing = execute_memcached_block(&state, &mut authenticating, &block, &mut out);
-        (out, closing, authenticating)
-    })
-    .await
-    .map_err(std::io::Error::other)?;
-
-    *conn_auth = authenticated;
-    write_buf.extend_from_slice(&response);
-    Ok(closing == Closing::No && !fatal)
+    measured
 }
 
-/// Handles every complete RESP command in the buffer.
-///
-/// The same two-pass shape as [`drain_memcached`], for the same reason: measure
-/// the span of whole commands first, then execute the lot in one hop to the
-/// storage tier. RESP framing is length-delimited like memcached's storage
-/// commands, so again only the parser can say where a command ends.
-///
-/// `version` is threaded through rather than kept in the executor because a
-/// `HELLO` changes how every *later* reply on this connection is rendered,
-/// including ones in the same pipelined block.
-async fn drain_resp(
-    state: &Arc<ServerState>,
-    conn_auth: &mut ConnAuth,
-    read_buf: &mut BytesMut,
-    version: &mut vash_proto::resp::Version,
-    write_buf: &mut Vec<u8>,
-) -> std::io::Result<bool> {
+fn measure_resp(buf: &[u8]) -> Measured {
     use vash_proto::resp;
 
-    let mut complete = 0usize;
-    let mut fatal = None;
-    let mut all_reads = true;
-
+    let mut measured = Measured::default();
     loop {
-        match resp::parse(&read_buf[complete..]) {
+        match resp::parse(&buf[measured.complete..]) {
             Ok(resp::Outcome::Incomplete) => break,
             Ok(resp::Outcome::Command(parsed)) => {
-                all_reads &= crate::resp::is_read_only(&parsed.command);
-                complete += parsed.consumed;
+                measured.all_reads &= crate::resp::inline_safe(&parsed.command);
+                measured.complete += parsed.consumed;
             }
-            // Counted in, not handled here: the error has to land in the
-            // response stream in the position the bad command occupied, which
-            // only the executor knows how to do.
-            Err(resp::ProtocolError::Recoverable { consumed, .. }) => complete += consumed,
+            Err(resp::ProtocolError::Recoverable { consumed, .. }) => measured.complete += consumed,
             Err(resp::ProtocolError::Fatal(detail)) => {
-                debug!(detail, "closing connection: RESP framing is unrecoverable");
-                fatal = Some(detail);
+                measured.fatal = Some(detail);
                 break;
             }
         }
     }
-
-    let mut closing = Closing::No;
-    if complete > 0 {
-        let block: Bytes = read_buf.split_to(complete).freeze();
-
-        if state.inline_reads && all_reads {
-            closing = crate::resp::execute_block(state, conn_auth, &block, version, write_buf);
-        } else {
-            let state = Arc::clone(state);
-            let mut negotiating = *version;
-            let mut authenticating = conn_auth.clone();
-            let (response, done, negotiated, authenticated) =
-                tokio::task::spawn_blocking(move || {
-                    let mut out = Vec::with_capacity(64);
-                    let done = crate::resp::execute_block(
-                        &state,
-                        &mut authenticating,
-                        &block,
-                        &mut negotiating,
-                        &mut out,
-                    );
-                    (out, done, negotiating, authenticating)
-                })
-                .await
-                .map_err(std::io::Error::other)?;
-
-            *version = negotiated;
-            *conn_auth = authenticated;
-            write_buf.extend_from_slice(&response);
-            closing = done;
-        }
-    }
-
-    // Redis answers a protocol error and *then* hangs up, so the client learns
-    // why instead of seeing a bare disconnect. The reply goes after whatever
-    // the commands before it produced, which is the position it occupied.
-    if let Some(detail) = fatal {
-        resp::encode::protocol_error(write_buf, detail);
-        return Ok(false);
-    }
-    Ok(closing == Closing::No)
+    measured
 }

@@ -140,6 +140,58 @@ pub enum Command<'a> {
     Quit,
 }
 
+impl Command<'_> {
+    /// Whether an async runtime worker may execute this itself.
+    ///
+    /// **A safety predicate, not an optimisation hint.** A command that answers
+    /// `true` here may be run on a runtime worker instead of the blocking pool,
+    /// so answering `true` wrongly stalls that worker and every other connection
+    /// it serves — the failure the whole network/storage split exists to
+    /// prevent. When in doubt, answer `false`: the cost of being wrong that way
+    /// is one thread hop.
+    ///
+    /// Two different things disqualify a command, which is why this is not
+    /// simply "does it write":
+    ///
+    /// 1. **It can reach the shard writer.** `GetAndTouch` re-stamps a TTL and
+    ///    `Arithmetic` rewrites its value, so both are writes despite reading
+    ///    like retrievals; `TagSync` durably merges generations a peer reported.
+    /// 2. **It can hold the thread for a long time.** The listings never write a
+    ///    byte, and are still refused: a scan is bounded by `listing_max_scan`
+    ///    records, not by anything a worker should be blocked for. This is the
+    ///    case that makes the name of this method "inline safe" rather than
+    ///    "read only".
+    pub fn inline_safe(&self) -> bool {
+        match self {
+            // No storage effect at all.
+            Self::Hello { .. } | Self::Ping | Self::Stats | Self::Version | Self::Quit => true,
+            Self::Cluster => true,
+            // Short reads.
+            Self::Get { .. } | Self::GetMany(_) | Self::Deadline { .. } | Self::Deadlines(_) => {
+                true
+            }
+            // Reads, but long ones. See (2) above.
+            Self::ListKeys(_) | Self::ListTags(_) => false,
+            // Writes. Listed rather than caught by a wildcard so that a new
+            // command has to be classified deliberately: a variant that falls
+            // through to `false` by accident is merely slow, but one that falls
+            // through to `true` stalls a runtime worker.
+            Self::Set(_)
+            | Self::SetMany { .. }
+            | Self::Delete { .. }
+            | Self::DeleteMany(_)
+            | Self::Touch { .. }
+            | Self::Expire { .. }
+            | Self::Append { .. }
+            | Self::Arithmetic(_)
+            | Self::GetAndTouch { .. }
+            | Self::DeleteByTag { .. }
+            | Self::Flush
+            | Self::TagSync { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Set<'a> {
     pub key: Key<'a>,

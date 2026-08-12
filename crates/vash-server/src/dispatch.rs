@@ -258,6 +258,37 @@ fn memcached_error(status: Status) -> vash_proto::memcached::ErrorKind {
     }
 }
 
+/// Executes every complete VCP frame in `block`, appending the responses.
+///
+/// The block was already measured by the caller to end on a frame boundary, so
+/// the lengths here cannot run short. Its shape mirrors
+/// [`execute_memcached_block`] and `resp::execute_block` so that all three
+/// dialects can share one drain — see [`crate::conn`].
+///
+/// VCP has no command that closes the connection: `QUIT` is answered and the
+/// socket stays open, because a client that wants it gone can simply drop it.
+pub fn execute_vcp_block(
+    state: &ServerState,
+    conn: &mut ConnAuth,
+    block: &[u8],
+    out: &mut Vec<u8>,
+) -> Closing {
+    use vash_proto::vcp::{FrameLen, peek_frame_len};
+
+    let mut rest = block;
+    while !rest.is_empty() {
+        let FrameLen::Complete(len) = peek_frame_len(rest) else {
+            // Unreachable: the caller only includes whole frames. Stopping
+            // rather than looping keeps a logic slip from spinning a core.
+            error!("a VCP block did not end on a frame boundary");
+            break;
+        };
+        execute_frame_into(state, conn, &rest[..len], out);
+        rest = &rest[len..];
+    }
+    Closing::No
+}
+
 /// Decodes and executes one complete frame, appending the encoded response.
 ///
 /// Runs on a blocking thread, and borrows the frame bytes, so the key and value

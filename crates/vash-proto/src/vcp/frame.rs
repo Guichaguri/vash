@@ -133,7 +133,7 @@ impl Opcode {
     /// this ever grows a second caller that means "does not write", it has to be
     /// split rather than reused.
     #[inline]
-    pub fn is_read_only(self) -> bool {
+    pub fn inline_safe(self) -> bool {
         matches!(
             self,
             Self::Hello | Self::Ping | Self::Get | Self::GetMany | Self::Cluster | Self::Stats
