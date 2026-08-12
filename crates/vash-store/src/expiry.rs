@@ -21,6 +21,14 @@
 //! never earlier, and the record's exact timestamp is what the read path
 //! checks.
 
+use heed::RwTxn;
+use vash_core::RecordRef;
+
+use crate::SweepStats;
+use crate::engine::LmdbEngine;
+use crate::error::{Result, StoreError};
+use crate::reclaim;
+
 pub const EXPIRY_KEY_LEN: usize = 16;
 
 /// Bucket assigned to records that never expire.
@@ -76,6 +84,144 @@ pub fn decode_key(key: &[u8]) -> Option<(u64, u64)> {
         u64::from_be_bytes(key[..8].try_into().ok()?),
         u64::from_be_bytes(key[8..].try_into().ok()?),
     ))
+}
+
+// ---- the sweeper and the evictor ---------------------------------------
+//
+// The operations that walk the index encoded above. They live beside it because
+// the layout is what makes them cheap: big-endian keys mean LMDB's byte order
+// *is* time order, so both are a forward cursor walk from position zero, and the
+// first key tells the sweeper whether there is any work at all.
+
+/// Which records a pass over the expiry index is allowed to take.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Victims {
+    /// Sweeping: only records whose TTL has passed.
+    ExpiredOnly,
+    /// Evicting under capacity pressure: whatever comes first in the index.
+    Anything,
+}
+
+impl LmdbEngine {
+    /// Reclaims up to `budget` expired records.
+    ///
+    /// Walks the expiry index from the front and stops at the first bucket in
+    /// the future, so the cost is proportional to what has actually expired.
+    /// When nothing is due this is a single cursor seek.
+    pub fn sweep(&self, wtxn: &mut RwTxn, budget: usize) -> Result<SweepStats> {
+        self.drain_expiry_index(wtxn, budget, Victims::ExpiredOnly)
+    }
+
+    /// Frees up to `budget` records to reclaim space, whether or not they have
+    /// expired.
+    ///
+    /// Takes them from the front of the expiry index, which is soonest-to-expire
+    /// first and never-expiring last. That ordering is free â€” the index already
+    /// exists for TTLs â€” and it is the right policy for a cache: a TTL is the
+    /// client's own statement of how long a value is worth keeping, so the item
+    /// dying in three seconds is the cheapest thing in the store to lose.
+    ///
+    /// Deliberately not LRU. Tracking recency means writing on every read, which
+    /// on a single-writer engine would put every GET behind the write queue.
+    /// See plan Â§6.
+    pub fn evict(&self, wtxn: &mut RwTxn, budget: usize) -> Result<SweepStats> {
+        self.drain_expiry_index(wtxn, budget, Victims::Anything)
+    }
+
+    fn drain_expiry_index(
+        &self,
+        wtxn: &mut RwTxn,
+        budget: usize,
+        accept: Victims,
+    ) -> Result<SweepStats> {
+        let now_ms = self.now_ms();
+        let mut stats = SweepStats::default();
+
+        // Collected up front because LMDB will not let the cursor and the
+        // deletes share the transaction cleanly. `budget` bounds the memory.
+        let mut victims: Vec<([u8; crate::expiry::EXPIRY_KEY_LEN], Vec<u8>)> = Vec::new();
+        {
+            let iter = self.exp.iter(wtxn).map_err(StoreError::from_heed)?;
+            for entry in iter {
+                let (index_key, user_key) = entry.map_err(StoreError::from_heed)?;
+                let Some((bucket, _)) = crate::expiry::decode_key(index_key) else {
+                    return Err(StoreError::Corrupt(format!(
+                        "expiry index key is {} bytes, expected {}",
+                        index_key.len(),
+                        crate::expiry::EXPIRY_KEY_LEN
+                    )));
+                };
+
+                // A sweep stops at the first bucket in the future; an eviction
+                // keeps going, because it is freeing space rather than
+                // honouring TTLs.
+                if accept == Victims::ExpiredOnly && bucket > now_ms {
+                    stats.lag_ms = 0;
+                    break;
+                }
+                if victims.is_empty() && bucket <= now_ms {
+                    stats.lag_ms = now_ms.saturating_sub(bucket);
+                }
+
+                let mut owned = [0u8; crate::expiry::EXPIRY_KEY_LEN];
+                owned.copy_from_slice(index_key);
+                victims.push((owned, user_key.to_vec()));
+
+                if victims.len() >= budget {
+                    stats.budget_exhausted = true;
+                    break;
+                }
+            }
+        }
+
+        stats.scanned = victims.len();
+
+        for (index_key, user_key) in victims {
+            let (_, entry_cas) = crate::expiry::decode_key(&index_key).expect("validated above");
+
+            match self
+                .main
+                .get(wtxn, &user_key)
+                .map_err(StoreError::from_heed)?
+            {
+                Some(blob) => {
+                    let record = RecordRef::parse(blob)?;
+                    // The CAS check is what makes a stale entry harmless: if the
+                    // key was overwritten, this entry no longer describes the
+                    // record and must not delete it.
+                    let current = record.cas() == entry_cas;
+                    let take = current
+                        && match accept {
+                            Victims::ExpiredOnly => record.is_expired(now_ms),
+                            Victims::Anything => true,
+                        };
+
+                    if take {
+                        let tag_ids: Vec<u32> =
+                            record.tags.iter().map(|t| t.tag_id.get()).collect();
+                        self.main
+                            .delete(wtxn, &user_key)
+                            .map_err(StoreError::from_heed)?;
+                        for tag_id in tag_ids {
+                            self.tagidx
+                                .delete(wtxn, &reclaim::index_key(tag_id, &user_key))
+                                .map_err(StoreError::from_heed)?;
+                        }
+                        stats.reclaimed += 1;
+                    } else {
+                        stats.stale += 1;
+                    }
+                }
+                None => stats.stale += 1,
+            }
+
+            self.exp
+                .delete(wtxn, &index_key)
+                .map_err(StoreError::from_heed)?;
+        }
+
+        Ok(stats)
+    }
 }
 
 #[cfg(test)]

@@ -17,13 +17,19 @@
 //!
 //! Internally the crate is three layers:
 //!
-//! - [`engine`] — LMDB operations, each taking the transaction to act in.
+//! - [`engine`] — the environment handle, with each operation in the module
+//!   that owns the layout it walks: `env` opens it, `read` reads records,
+//!   `apply` writes them, and the sweeper, reclaimer, tag writes and listing
+//!   scan sit beside their own key encodings in [`expiry`], [`reclaim`],
+//!   [`tags`] and `listing`.
 //! - [`writer`] — the single writer thread, packing operations into shared
 //!   commits and running the expiry sweeper in the same transaction.
 //! - [`lmdb`] — the [`Store`] implementation composing the two.
 
+mod apply;
 pub mod config;
 pub mod engine;
+mod env;
 pub mod error;
 pub mod expiry;
 mod listing;
@@ -31,6 +37,8 @@ pub mod lmdb;
 /// An in-memory implementation, for tests. See [`memory::MemoryStore`].
 #[cfg(feature = "testing")]
 pub mod memory;
+mod queue;
+mod read;
 pub mod reclaim;
 pub mod schema;
 mod shard;
@@ -39,8 +47,9 @@ mod writer;
 
 use vash_core::{BatchGuard, ExpireGuard, Key, Listing, Set, Value};
 
+pub use apply::Written;
 pub use config::{Durability, EvictionConfig, StoreConfig, WriteConfig};
-pub use engine::{Pressure, Written};
+pub use engine::Pressure;
 pub use error::{Result, StoreError};
 pub use lmdb::LmdbStore;
 

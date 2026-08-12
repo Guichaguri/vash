@@ -28,7 +28,7 @@ use vash_core::{
     NEVER, Set, SetMode, Stored, TagGeneration, TtlChange, Value, arith,
 };
 
-use crate::engine::Written;
+use crate::apply::Written;
 use crate::error::{Result, StoreError};
 use crate::{Store, StoreStats};
 
