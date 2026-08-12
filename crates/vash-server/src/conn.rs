@@ -370,7 +370,7 @@ fn measure_vcp(buf: &[u8], gated: bool) -> Measured {
 /// Decided from the opcode byte alone — the frame is not decoded twice. An
 /// unknown opcode is treated as a write, so a byte nobody recognises takes the
 /// safe path rather than the fast one. That this table agrees with
-/// [`vash_core::Command::is_read_only`] is pinned by a test in `vash-proto`.
+/// [`vash_core::Command::inline_safe`] is pinned by a test in `vash-proto`.
 fn is_read_only_frame(frame: &[u8]) -> bool {
     frame
         .first()

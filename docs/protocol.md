@@ -20,8 +20,9 @@ costs — is in [opcodes.md](opcodes.md).
 ## Choosing between them
 
 All three protocols are served on the **same port**. Use VCP for anything new:
-it is cheaper to parse, supports batch operations in one round trip, and exposes
-tags natively. Use the memcached or Redis protocol when an existing client
+it is cheaper to parse, supports batch operations in one round trip, exposes
+tags natively, and is the only one that can pipeline without its replies being
+strictly ordered. Use the memcached or Redis protocol when an existing client
 library must work unchanged.
 
 ### First-byte detection
@@ -114,7 +115,56 @@ inbound frames.
 
 A `HELLO` carrying a version other than `1` is answered with
 `UNSUPPORTED` (8) and the connection stays open, so a client can report a clear
-error rather than hanging.
+error rather than hanging. The handshake is **advisory**: the server keeps no
+per-connection session state, so a client that ignores the refusal and issues
+commands anyway is served normally. Version negotiation exists so a client can
+fail loudly, not to gate access — do not rely on the server to stop you.
+
+An authenticated connection is **never idle-reaped**. There is no idle timeout
+and no server-side keepalive, so a pooled connection may sit unused
+indefinitely. Two things still close one without warning:
+
+- **Shutdown.** A draining server closes connections that are idle between
+  requests. Nothing is buffered and no reply is outstanding when it happens, so
+  a client loses at most a connection it was not using — but it does lose it,
+  and must reconnect rather than treat the close as fatal.
+- **The connection cap.** Past `server.max_connections` (default 10000) a new
+  connection is accepted and then dropped immediately, with no bytes sent. A
+  client sees a connect that succeeds and a read that returns EOF; that is
+  backpressure, not a broken server.
+
+### Pre-authentication limits
+
+These apply only while `AUTH_REQUIRED` is set and the connection has not yet
+authenticated. All four are enforced by closing the socket, most of them without
+a reply, so a client that trips one sees a bare disconnect and has to know why:
+
+| Limit | Default | On breach |
+|---|---|---|
+| Bytes buffered at once | 4096 | Connection closed, **no reply at all** — including to frames in that buffer the server had not run yet. |
+| An arriving frame's declared total length | 4096 | Complete frames ahead of it are executed and answered, then the connection closes. |
+| Time to authenticate | `auth.timeout_ms`, 5000 ms | Connection closed, no reply. |
+| Failed attempts on one connection | `auth.max_attempts`, 3 | The last refusal **is** sent, then the connection closes. |
+
+The 4096-byte ceilings are the ones that surprise a client author. Everything
+legal before authenticating is small — `HELLO` is 16 bytes on the wire and an
+`AUTH` at both ceilings is under 600 — so the budget is generous against honest
+traffic and deliberately useless to anyone holding a connection open with
+nothing presented.
+
+The consequence is concrete: **do not pipeline real work into the same write as
+`AUTH`.** Land more than 4096 bytes in one read and the connection is closed
+before the `AUTH` in that buffer is even looked at; land a frame header
+announcing a body past the ceiling and the handshake is answered but the socket
+still goes. Either way the client sees a half-finished handshake and a
+disconnect it has no status code for. Send `HELLO` and `AUTH`, wait for the
+`OK`, then pipeline freely.
+
+Concurrent *unauthenticated* connections are capped separately
+(`auth.max_unauthenticated_connections`, defaulting to a tenth of
+`server.max_connections`), so a stalled pool cannot consume the whole connection
+budget. Connections past that cap are dropped at accept, exactly as the overall
+cap does.
 
 ## Request correlation and pipelining
 
@@ -145,14 +195,18 @@ requests, which produce none.
 | `0x11` | `SET` | yes |
 | `0x12` | `DELETE` | yes |
 | `0x13` | `TOUCH` | yes |
+| `0x14` | `ARITHMETIC` | yes |
 | `0x20` | `GET_MANY` | yes |
 | `0x21` | `SET_MANY` | yes |
 | `0x22` | `DELETE_MANY` | yes |
 | `0x30` | `DELETE_BY_TAG` | yes |
 | `0x31` | `FLUSH` | yes, if enabled server-side |
 | `0x40` | `TAG_SYNC` | yes — peer-to-peer, see [Cluster](#cluster) |
-| `0x50` | `LIST_KEYS` | yes, if enabled server-side — see [opcodes.md](opcodes.md#list_keys-0x50) |
-| `0x51` | `LIST_TAGS` | yes, if enabled server-side — see [opcodes.md](opcodes.md#list_tags-0x51) |
+| `0x50` | `LIST_KEYS` | yes, if enabled server-side — see [Listings](#list_keys-0x50-and-list_tags-0x51) |
+| `0x51` | `LIST_TAGS` | yes, if enabled server-side — see [Listings](#list_keys-0x50-and-list_tags-0x51) |
+
+Opcode values are **permanent**: a value is never reused for a different
+command, and a retired one stays reserved.
 
 An unknown opcode is answered with `UNSUPPORTED` (8), an empty body, and the
 **original opcode byte echoed**, so the client can still correlate. The
@@ -167,18 +221,29 @@ connection stays open.
 | 2 | `EXISTS` | Reserved for CAS mismatch. Not emitted over VCP today. |
 | 3 | `BAD_REQUEST` | Malformed body, empty key, oversized batch. |
 | 4 | `TOO_LARGE` | Key, value or tag over its limit. |
-| 5 | `UNAUTHORIZED` | Refused by policy: the connection has not authenticated, or the command is disabled by configuration (`FLUSH`). |
+| 5 | `UNAUTHORIZED` | Refused by policy: the connection has not authenticated, or the command is disabled by configuration (`FLUSH`, `LIST_KEYS`, `LIST_TAGS`). |
 | 6 | `OVERLOADED` | Write queue full, or the server is shutting down. Retryable. |
-| 7 | `CAPACITY_FULL` | The store is out of space, or the tag registry is full. |
-| 8 | `UNSUPPORTED` | Unknown or unimplemented opcode, or an unsupported protocol version. |
+| 7 | `CAPACITY_FULL` | The store is out of space, or the tag registry is full. Retryable only after something frees space. |
+| 8 | `UNSUPPORTED` | Unknown or unimplemented opcode, an unsupported protocol version, or an `AUTH` mechanism this build does not have. |
 | 9 | `INTERNAL` | Server-side failure. Details are logged, not sent. |
 | 10 | `NOT_STORED` | Reserved for a guarded write whose condition failed. Not emitted over VCP today. |
-| 11 | `NOT_NUMERIC` | Reserved for arithmetic on a non-numeric value. Not emitted over VCP today. |
+| 11 | `NOT_NUMERIC` | Arithmetic on a value that is not a number in the requested domain, or a result that will not fit. See [`ARITHMETIC`](#arithmetic-0x14). |
 
-Codes 2, 10 and 11 are defined so that conditional writes and arithmetic can be
-added to VCP without a wire change; today they arise only through the memcached
-adapter. **Clients should handle unknown status codes as generic failures**
-rather than rejecting the frame.
+Codes 2 and 10 are defined so that conditional writes can be added to VCP
+without a wire change; today they arise only through the memcached adapter,
+because a VCP `SET` is always unconditional. **Clients should handle unknown
+status codes as generic failures** rather than rejecting the frame.
+
+Which statuses are worth retrying is worth stating plainly, because the
+distinction is what a client's retry policy should be built on:
+
+| Status | Retry |
+|---|---|
+| `OVERLOADED` (6) | Yes, with backoff. The condition is transient by construction. |
+| `CAPACITY_FULL` (7), `INTERNAL` (9) | Only with backoff and a ceiling; neither clears because you asked again quickly. |
+| `BAD_REQUEST` (3), `TOO_LARGE` (4), `UNSUPPORTED` (8) | Never. The same bytes will be refused the same way. |
+| `UNAUTHORIZED` (5) | Only after re-authenticating, and never in a loop — see the [abuse budget](#pre-authentication-limits). |
+| `NOT_FOUND` (1) | Not an error. A cache miss is the ordinary case. |
 
 Any response with a non-`OK` status has an **empty body**, with one exception:
 `NOT_FOUND` on `GET_MANY` does not occur — misses are reported per item inside
@@ -207,8 +272,14 @@ Notation: `u16`/`u32`/`u64` are little-endian; `bytes[n]` is a raw byte run.
 | 8 | `max_value_len` u32 |
 | 12 | `capabilities` u32 |
 
-`max_key_len` and `max_value_len` are the server's configured limits; a client
-should enforce them locally rather than discovering them through errors.
+Only the first four bytes of the request body are read; a longer one is accepted
+and the excess ignored. Decode the response by offset and tolerate a body
+**longer** than 16 bytes rather than requiring exactly 16.
+
+`max_value_len` is the server's configured limit. `max_key_len` is fixed at 511
+by the storage engine and is reported rather than configured. Enforce both
+locally rather than discovering them through errors — over `NO_REPLY` there is
+no error to discover.
 
 `shards` is how many independent storage environments back the server. It
 matters to a client for one reason: it decides whether a multi-key write is
@@ -236,8 +307,9 @@ Unlisted bits are reserved; ignore them.
 
 ### `PING` (0x02)
 
-Empty request body. Response is `OK` with an empty body. Does not touch storage,
-so it is a liveness check, not a health check.
+Empty request body — any body is accepted and ignored. Response is `OK` with an
+empty body. Does not touch storage, so it is a liveness check, not a health
+check.
 
 `PING` is **not** in the pre-authentication set. Everything it could tell an
 unauthenticated party `HELLO` already told them, and `/health` on the admin port
@@ -331,6 +403,12 @@ Notes:
   body. A value written over VCP and read by a memcached client therefore has
   flags 0. Write it over `ms` with an `F` flag if the flags field matters.
 - Tag names must be 1–255 bytes. Unknown tag names are registered on first use.
+- Keys and values are **binary-safe**: any byte, including NUL, and no encoding
+  is assumed. Only the memcached dialect restricts the key charset.
+- `value_len` of 0 is legal; an empty value is a value, and reads back as a hit
+  with a zero-length body.
+- A key outside 1–511 bytes is `BAD_REQUEST` (3) when empty and `TOO_LARGE` (4)
+  when over; a value past the server's ceiling is `TOO_LARGE` (4).
 
 ### `DELETE` (0x12)
 
@@ -352,6 +430,103 @@ otherwise. A record that has expired but not yet been reclaimed reports
 `OK` if the key was live, `NOT_FOUND` otherwise. The value is unchanged; its CAS
 token advances.
 
+### `ARITHMETIC` (0x14)
+
+An atomic read-modify-write on a counter. The read of the current value and the
+write of the new one happen **inside one transaction**, so concurrent clients
+cannot lose an update. One round trip, one storage operation.
+
+Counters are stored as their **decimal text**, which is what makes a plain `GET`
+of a counter return something readable and what lets all three dialects move the
+same counter. A value written by `SET` is a valid counter exactly when it parses
+in the requested domain.
+
+**Request body:** a fixed 32-byte prefix, then the key to the end of the body.
+
+| Offset | Field |
+|---|---|
+| 0 | `mode` u8 — the numeric domain |
+| 1 | `flags` u8 |
+| 2 | `on_bound` u8 |
+| 3 | `ttl_kind` u8 |
+| 4 | `ttl_secs` u32 — see [TTL](#ttl-semantics) |
+| 8 | `delta` u64 |
+| 16 | `lower` u64 |
+| 24 | `upper` u64 |
+| 32 | key bytes, to the end of the body |
+
+`mode` decides how the three eight-byte numbers are read. One fixed layout
+carries all three domains rather than a variable-length encoding, because this
+is a single-key operation on the hot path and sixteen wasted bytes cost less
+than a length prefix would.
+
+| `mode` | Domain | The three numbers |
+|---|---|---|
+| 0 `COUNTER` | Unsigned 64-bit: an increment wraps, a decrement floors at zero. memcached's `incr`/`decr`. | `delta` as `u64`; `lower` and `upper` are ignored |
+| 1 `INT` | Signed 64-bit | all three as `i64`, two's complement |
+| 2 `FLOAT` | `f64` | all three as IEEE-754 bit patterns |
+
+**`flags`:**
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 (`0x01`) | `CREATE_AT_ZERO` | An absent key reads as zero and is created. Clear means an absent key is `NOT_FOUND` and nothing is written. |
+| 1 (`0x02`) | `DECREMENT` | Subtract rather than add. **Counter mode only** — the other two carry the sign in `delta`. |
+
+**`on_bound`** — what happens when the result will not fit `lower..=upper`:
+
+| Value | Meaning |
+|---|---|
+| 0 | Fail. `NOT_NUMERIC` (11), nothing written. |
+| 1 | Skip. The value stays exactly where it is, the reply reports a zero increment, and **nothing is written — not even the deadline**. |
+| 2 | Clamp to whichever bound was breached, and store that. |
+
+An operation that wants no bounds passes the limits of its own type, which turns
+"overflowed" and "out of bounds" into one condition with one handler.
+
+**`ttl_kind`:**
+
+| Value | Meaning |
+|---|---|
+| 0 | Leave the deadline alone. A record created here gets none. |
+| 1 | Set it to `ttl_secs`. |
+| 2 | Set it only if the record currently has no deadline. |
+
+An unrecognised `mode`, `on_bound` or `ttl_kind` is `BAD_REQUEST` (3). None of
+them is defaulted: a byte this build does not know might mean the numbers below
+it are to be read as something else, and guessing would apply an operation the
+client did not ask for.
+
+**Response body** on `OK` (20 bytes):
+
+| Offset | Field |
+|---|---|
+| 0 | `mode` u8 — echoed from the request |
+| 1 | `wrote` u8 — 1 if anything was stored |
+| 2 | `reserved` u16 — zero |
+| 4 | `value` u64 — where the counter ended up |
+| 12 | `applied` u64 — how far it moved |
+
+`value` and `applied` are read in the domain `mode` names. **The mode is echoed
+rather than assumed**, so a client decodes the reply without having to remember
+what it asked for — which matters because replies may arrive out of order.
+
+`wrote` of 0 means a bound held the value where it was, so the key kept both its
+value and its lifetime. It is the only way to tell that apart from an increment
+that legitimately moved the counter by zero.
+
+Notes:
+
+- Tags and client flags **survive** an arithmetic write; the CAS token advances,
+  and the reply does not carry it. Read it with a `GET` if you need it.
+- The counter text is subject to the configured value ceiling like any other
+  value, though a 64-bit number never approaches it.
+
+**Statuses:** `NOT_FOUND` (1) for an absent key without `CREATE_AT_ZERO`;
+`NOT_NUMERIC` (11) for a stored value that does not parse in the requested
+domain and for a bound breached under `on_bound = 0`; `BAD_REQUEST` (3) for a
+malformed body or an unknown enum byte.
+
 ### `GET_MANY` (0x20)
 
 **Request body:**
@@ -360,6 +535,10 @@ token advances.
 |---|---|
 | 0 | `count` u32 — at most 4096 |
 | 4 | `count` × (`key_len` u16, key `bytes[key_len]`) |
+
+The 4096 ceiling is the same for all three batch opcodes, and it is checked
+**before `count` sizes any allocation**. A larger value is `BAD_REQUEST` (3), not
+a truncated batch. A `count` of 0 is legal and answers with an empty result.
 
 **Response body** on `OK`:
 
@@ -386,8 +565,8 @@ different instants. With `shards = 1` the whole batch is one snapshot.
 
 ### `SET_MANY` (0x21)
 
-**Request body:** `count` u32, then `count` repetitions of the `SET` body layout
-(header, key, value, tags) back to back.
+**Request body:** `count` u32 — at most 4096 — then `count` repetitions of the
+`SET` body layout (header, key, value, tags) back to back.
 
 **Response body** on `OK`: `count` u32, then `count` × `cas` u64, in request
 order.
@@ -484,6 +663,133 @@ if this node has never seen it. That makes the command **idempotent,
 order-independent and safe to retry**, which is the whole reason cluster
 invalidation needs no acknowledgement protocol. See [Cluster](#cluster).
 
+The reply is truncated at 8192 entries like the request, so a receiver with more
+to say than fits says the rest on the next gossip round.
+
+### `LIST_KEYS` (0x50) and `LIST_TAGS` (0x51)
+
+Administrative, paginated enumeration: `LIST_KEYS` lists the keys a `GET` would
+currently hit, `LIST_TAGS` lists the tag registry with the generation held for
+each name.
+
+Both are **off by default** and answer `UNAUTHORIZED` (5) unless the server has
+`protocol.listing_enabled`. The `LISTING` capability bit in the
+[handshake](#hello-0x01) is how a client tells "disabled here" apart from an
+older build that has never heard of the opcodes — check the bit rather than
+probing.
+
+They are diagnostic commands, not an index. A `LIST_KEYS` is a linear scan of
+the keyspace; nothing on a hot path should call either one, and no application
+feature should be built on them.
+
+**The two share a request body and a response body, field for field.** They
+differ only in what the entries name. One decoder, one pagination loop, one set
+of tests.
+
+**Request body** — a 12-byte header, then two optional variable-length fields:
+
+| Offset | Field |
+|---|---|
+| 0 | `limit` u32 — entries per page, 1–1024 |
+| 4 | `cursor_len` u16 |
+| 6 | `pattern_len` u16 |
+| 8 | `reserved` u32 — zero |
+| 12 | `cursor` bytes[`cursor_len`] — empty starts from the beginning |
+| 12 + `cursor_len` | `pattern` bytes[`pattern_len`] |
+
+**Bytes after the pattern are `BAD_REQUEST` (3).** Extension happens through
+`reserved`; silently ignoring a trailing field would let a client believe
+something took effect that this build never read.
+
+A `limit` of 0 or above 1024 is `BAD_REQUEST` rather than clamped — a client
+that asked for 10000 and silently got 1024 would page incorrectly. `pattern_len`
+may not exceed 511, and `cursor_len` may not exceed 519.
+
+**Response body** on `OK`:
+
+| Offset | Field |
+|---|---|
+| 0 | `count` u32 — entries in this page |
+| 4 | `flags` u8 — bit 0 `TRUNCATED` |
+| 5 | `reserved` u8 × 3 — zero |
+| 8 | `scanned` u64 — entries examined to produce this page |
+| 16 | `cursor_len` u16 — **0 when the listing is complete** |
+| 18 | `reserved` u16 — zero |
+| 20 | `cursor` bytes[`cursor_len`] |
+| 20 + `cursor_len` | `count` × entry |
+
+An entry is `version` u64, `name_len` u16, `name` bytes — **`TAG_SYNC`'s entry
+layout, byte for byte**, so a client that decodes a gossip digest reuses that
+code here.
+
+`version` is the u64 the server holds for that name: the record's CAS token for
+a key, the tag's generation for a tag. Both are opaque monotonic version
+numbers, comparable against an earlier reading of the *same* name and against
+nothing else. Diffing two listings by version is how a client sees what changed.
+
+`scanned` counts everything walked, including dead and non-matching entries: a
+page of 10 keys that cost 90000 records to find is how an operator learns a
+pattern is not selective. `TRUNCATED` says the page ended on the server's scan
+budget rather than on `limit`. It is **diagnostic only** — paging behaves
+identically either way, because a budget exhaustion still advances the cursor.
+
+#### Paging
+
+**An empty cursor in the reply means the listing is complete, and that is the
+whole termination rule.** There is no `MORE` flag, because a flag beside a field
+that is present exactly when there is more is one of the two lying eventually.
+
+The client loop is: send, consume the entries, resend with the cursor you were
+given, stop when it comes back empty. **Expect an empty last page** — a page
+that fills `limit` exactly and happens to have consumed the last entry still
+returns a cursor, because the server would have to walk one entry further to
+know otherwise. `count` may also be less than `limit` on a page that is not the
+last.
+
+**A cursor is opaque.** Never parse one, never construct one, never compare two:
+echo back exactly the bytes you were given. It is a saved position, not a handle
+— there is no server-side state, nothing to expire, and it survives a server
+restart. A malformed cursor is `BAD_REQUEST` (3), never a silent restart from
+the beginning.
+
+**Consistency.** A page is a snapshot of one shard at one instant; a sequence of
+pages is a snapshot of nothing. Do not infer a total from a listing, and do not
+read a key's absence from a page as evidence it does not exist. What *is*
+guaranteed, because resumption is by name rather than by count: **an entry that
+exists unchanged for the whole walk is returned exactly once.** Entries created
+behind the cursor are missed and ones created ahead of it are seen, but neither
+shifts the position of anything else.
+
+Order is shard-major, then key order within a shard — which is plain
+lexicographic order only when `shards = 1`. `LIST_TAGS` is sorted by name
+throughout, since the registry is in RAM and comparing two nodes' tag listings
+is a legitimate use.
+
+#### Patterns
+
+A byte-wise glob with two tokens and an escape, and deliberately nothing else:
+
+| Token | Meaning |
+|---|---|
+| `*` | any run of bytes, including empty |
+| `?` | exactly one byte |
+| `\x` | the literal byte `x`, for any `x` — this is how `*`, `?` and `\` are matched literally |
+| any other byte | itself |
+
+An empty pattern matches everything. Matching is byte-wise: no case folding, no
+UTF-8 interpretation, no character classes — `[a-z]` is five literal bytes. A
+pattern ending in a lone `\` is `BAD_REQUEST` (3) at decode time rather than a
+pattern that matches nothing.
+
+**Statuses:** `OK`; `BAD_REQUEST` (3) for a limit out of range, a malformed
+pattern or cursor, trailing bytes, or a short body; `UNAUTHORIZED` (5) when
+disabled; `INTERNAL` (9). **Never `NOT_FOUND`** — a pattern matching nothing is
+`count = 0`, because no matches is not a miss.
+
+Value, TTL, size and tag names are **deliberately not in the reply**. A listing
+carrying them is `GET_MANY` with extra steps and a frame size set by the data
+rather than by the request; list, then fetch what you care about.
+
 ## Worked example
 
 Bytes on the wire for a handshake, a write and a read. `→` is client-to-server.
@@ -531,14 +837,126 @@ write to an empty store.
 
 ## Client implementation checklist
 
+Requirements. A client that gets one of these wrong is wrong on the wire, not
+merely slow.
+
 - Send `HELLO` first; nothing else is accepted as an opening frame.
 - Buffer inbound bytes; a frame may arrive split across reads, and several may
   arrive in one. Read the 12-byte header, then wait for `body_len` more.
 - Reject an inbound `body_len` above 64 MiB and close the connection.
 - Correlate by `request_id`. Do not assume replies arrive in order.
 - Treat unknown status codes as failures, not as protocol errors.
+- Treat unknown *opcodes* in a reply as correlatable: the raw request byte is
+  echoed even when the server does not recognise it.
 - Enforce `max_key_len` and `max_value_len` from the handshake locally.
-- Expect no reply at all for `NO_REPLY` requests.
+- Expect no reply at all for `NO_REPLY` requests, including failures.
+- Expect a reply to `AUTH` even under `NO_REPLY`; it is the one opcode that
+  overrides the flag.
+- Write `reserved` fields as zero and ignore them on read. Send exactly the
+  bytes a body specifies: `AUTH` and the two listing bodies reject trailing
+  bytes with `BAD_REQUEST`, and the others ignoring them today is not a promise.
+- Do not pipeline anything but `HELLO` and `AUTH` before authentication
+  completes — see [pre-authentication limits](#pre-authentication-limits).
+
+## Recommendations
+
+Not requirements. These are the things that decide whether a client is fast and
+survivable, written down because each one has a reason in how the server is
+built rather than in general good taste.
+
+### Pipelining is where the throughput is
+
+**Whatever complete frames arrive in a single socket read cross to the storage
+tier together, in one thread handoff.** That handoff costs far more than
+executing a cached request: before it was amortised, one handoff per frame
+capped a pipelined connection at roughly 5k ops/s on Windows no matter how deep
+the pipeline, because the depth bought nothing. The number is platform-specific;
+the shape of the cost is not.
+
+The consequence for a client is direct: **coalesce outbound frames into one
+write.** Ten frames in one `write` are one handoff; ten frames in ten writes are
+probably ten. An unpipelined client pays the handoff per request and will not
+approach the server's ceiling however many connections it opens.
+
+- Buffer outbound frames and flush once per event-loop turn, or once per
+  batch the caller submitted, rather than writing each frame as it is built.
+- Set `TCP_NODELAY`. The server sets it on its side; Nagle on yours will batch
+  a request against the next one and add up to 40 ms for nothing.
+- Prefer `GET_MANY`/`SET_MANY`/`DELETE_MANY` over N single-key frames. One
+  frame, one handoff, one transaction per shard, and — for `GET_MANY` — one
+  consistent snapshot per shard rather than N unrelated ones.
+
+If the server has `store.inline_reads` enabled (it is off by default), a block
+in which **every** buffered frame is a read runs on the network worker and skips
+the handoff entirely. A single write mixed in sends the whole block down the
+slow path. A client that can group a burst of reads separately from its writes
+gets that for free; one that cannot loses nothing it had.
+
+### Connections
+
+- **Pool and keep them.** There is no idle timeout for an authenticated
+  connection, and accept is not on the server's hot path — it expects a handful
+  of connections that live for the life of the process, not a connection per
+  request.
+- **One in-flight map per connection**, keyed by `request_id`. A wrapping
+  counter is fine; ids need only be distinct among the requests currently in
+  flight on that connection.
+- **A timed-out request does not require tearing the connection down.**
+  Correlation is by id, so a late reply can be discarded. Bound the in-flight
+  map anyway, and drop the connection if it grows past what you are willing to
+  hold.
+- **Reconnect on EOF rather than treating it as fatal.** A drain, the connection
+  cap and every pre-auth limit all present as a bare disconnect.
+- On reconnect, re-run the whole opening sequence: `HELLO`, then `AUTH` if
+  `AUTH_REQUIRED` is set. There is no session to resume.
+- Do not attempt to switch dialect on a live connection. The first byte settles
+  it permanently; speaking VCP means opening with `HELLO`.
+
+### Correctness traps worth designing around
+
+- **`NO_REPLY` cannot tell you anything.** A rejected write is invisible to the
+  client and only logged server-side. Use it for writes whose loss you can
+  tolerate, and do not use a later reply as a completion barrier for earlier
+  `NO_REPLY` frames — replies are not ordered against them by contract.
+- **CAS is per key.** Tokens are unique server-wide and strictly increasing for
+  any one key, and say nothing across keys. Never treat one as a clock or a
+  sequence number for the store.
+- **Batch atomicity is per shard.** Read `shards` from the handshake. Above 1, a
+  `SET_MANY` spanning shards is several commits and a failure in one leaves the
+  others applied; below it, the batch is all-or-nothing. The key-to-shard
+  mapping is not part of this specification — do not try to compute it. If you
+  need batch atomicity, that is a deployment decision (`shards = 1`), not
+  something a client can arrange.
+- **Enforce the handshake's limits locally.** Discovering `max_value_len` by
+  sending a value and reading `TOO_LARGE` costs a round trip and, with
+  `NO_REPLY`, silently drops the write.
+- **TTL is an offset at every magnitude on VCP**, unlike memcached's `exptime`.
+  If your client also speaks the memcached dialect, do not share the TTL
+  conversion between the two.
+- **Keep the tag vocabulary small and bounded.** Names are registered on first
+  use, the registry is capped (`store.tags.max_tags`, default 100000) and
+  **nothing removes a tag today** — a flush does not, and neither does deleting
+  every record that carried it. A tag per user or per request will fill the
+  registry and start answering `CAPACITY_FULL` (7). Tags are for groups of keys
+  invalidated together, and a client library should make that hard to misuse.
+- **If the `CLUSTER` capability bit is clear, an invalidation stops at this
+  node.** A client that needs cluster-wide invalidation must send
+  `DELETE_BY_TAG` to every node itself.
+
+### Checking a client against this document
+
+The [worked example](#worked-example) above is real bytes and can be diffed
+directly. Beyond it, `vash-proto`'s `emit_vectors` example emits a conformance
+corpus — request and response frames with their decoded fields — generated from
+the server's own encoders:
+
+```
+cargo run -p vash-proto --example emit_vectors -- <output-dir>
+```
+
+Generating the corpus rather than writing it by hand is the point: a hand-written
+one encodes its author's reading of this document, which is the reading the
+corpus exists to check.
 
 ---
 
@@ -678,7 +1096,7 @@ just to fill the field out.
 | `s` | mg | Return the value size as `s<n>`. |
 | `k` | mg, ms, md, ma | Echo the key as `k<key>`. |
 | `O<token>` | all | Opaque token, echoed as `O<token>`. |
-| `q` | all | Quiet: suppress the response. |
+| `q` | all | Quiet: suppress the response **entirely**, including a hit on `mg`. See the divergence below. |
 | `u` | mg | Do not bump the LRU. Inert here — there is no LRU. |
 | `T<ttl>` | mg, ms, md | Set the TTL. On `mg` this makes it a get-and-touch. |
 | `F<flags>` | ms | Set the client-flags field. |
@@ -776,6 +1194,7 @@ exceptions.
 | `flush_all` | always available | disabled unless enabled in config | It empties the cache for anyone who can reach the port. |
 | `flush_all <delay>` | defers the flush | delay parsed and ignored; flush is immediate | A deferred wipe needs a scheduler; every client that sends one sends 0. |
 | `decr` below the stored width | rewrites in place and pads the value with trailing spaces, so `100` decremented by `95` reads back as `5␠␠` | stores `5`, at its own length | The padding is an artefact of updating an item in place without resizing it. Both reply `5`, and both parse back to `5`; only a client comparing raw bytes can tell. |
+| `mg … q` on a **hit** | returns the value; `q` suppresses only the `EN` of a miss | suppresses the whole reply, hit included | `q` is one `noreply` flag across every meta command here. It is not covered by the differential suite. **Do not use `q` with `mg` against vash** — the quiet-get-then-`mn` batching idiom returns nothing. |
 | `me` output | full internal item dump | `cas`, `size`, `fetch` only | The rest describes internals vash does not have. |
 | `stats` fields | full counter set | a subset, plus `vash_*` | Reporting an unmeasured counter as zero would mislead a dashboard. |
 | Meta flags `b h l x I E R N` | implemented | `CLIENT_ERROR unsupported flag` | See [Refused flags](#refused-flags). |
@@ -804,8 +1223,11 @@ binary-safe and length-delimited, so a value may contain CRLF.
 - `*0\r\n` is accepted and skipped, as Redis does.
 - **Inline commands are not supported.** See
   [First-byte detection](#first-byte-detection).
-- An argument may be up to the server's `max_value_bytes`; a request may carry
-  up to 8200 arguments. Both are checked before anything is allocated.
+- An argument may be up to 64 MiB and a request may carry up to 8200 arguments.
+  Both are checked before anything is allocated. The parser's ceiling is not the
+  store's: an argument between `store.max_value_bytes` (1 MiB by default) and
+  64 MiB parses fine and is then refused with `-ERR string exceeds maximum
+  allowed size`.
 
 ## RESP2 and RESP3
 
@@ -882,6 +1304,12 @@ stored counters, so a value `INCR` accepts is exactly a value it can write back.
 | `-ERR increment or decrement would overflow` | `INCR`-family arithmetic past `i64`. |
 | `-ERR increment would produce NaN or Infinity` | `INCRBYFLOAT` past the float range. |
 | `-ERR invalid key` | Empty, or past this server's 511-byte key limit. |
+| `-ERR string exceeds maximum allowed size` | A value past `store.max_value_bytes`. |
+| `-ERR numkeys should be greater than 0` / `-ERR too many keys` | `MSETEX` with a non-positive `numkeys`, or more than 4096 pairs. |
+| `-ERR LBOUND must be less than or equal to UBOUND` | `INCREX` with an empty range. |
+| `-ERR command disabled by configuration` | A command gated off server-side. |
+| `-ERR unsupported operation` / `-ERR invalid argument` / `-ERR internal error` | The remaining status codes, rendered in Redis's shape. |
+| `-ERR server is overloaded, try again` | Write queue full or shutting down. Retryable. |
 | `-OOM command not allowed when used memory > 'maxmemory'` | The map is full. Clients treat `OOM` as "back off", which is right. |
 | `-NOPROTO unsupported protocol version` | `HELLO` with anything but 2 or 3. |
 | `-NOAUTH Authentication required.` | Any command before authenticating. |

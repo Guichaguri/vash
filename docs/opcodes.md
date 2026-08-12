@@ -36,6 +36,7 @@ for a different command, and a retired one stays reserved.
 | `0x11` | [`SET`](#set-0x11) | implemented | write | shard writer |
 | `0x12` | [`DELETE`](#delete-0x12) | implemented | write | shard writer |
 | `0x13` | [`TOUCH`](#touch-0x13) | implemented | write | shard writer |
+| `0x14` | [`ARITHMETIC`](#arithmetic-0x14) | implemented | write | shard writer |
 | `0x20` | [`GET_MANY`](#get_many-0x20) | implemented | read | reader, per shard |
 | `0x21` | [`SET_MANY`](#set_many-0x21) | implemented | write | shard writer, per shard |
 | `0x22` | [`DELETE_MANY`](#delete_many-0x22) | implemented | write | shard writer, per shard |
@@ -86,7 +87,7 @@ connection at roughly 5k ops/s regardless of pipeline depth, because the depth
 bought nothing. Amortising it over a read costs the unpipelined case nothing.
 
 With `store.inline_reads = true` **and** every buffered frame's opcode passing
-`Opcode::is_read_only()`, the batch runs on the runtime worker instead. That
+`Opcode::inline_safe()`, the batch runs on the runtime worker instead. That
 predicate lists what is known to be safe rather than excluding what is not: an
 opcode added later is a write until someone says otherwise, because being wrong
 in the permissive direction would let a write block a runtime worker behind the
@@ -638,7 +639,7 @@ the [cursor](#cursors), means the same thing and costs the same order in both.
 **Two opcodes rather than one `LIST` with a subject byte.** The subject would
 have to be validated, would need an error path for an unknown value, and would
 put both commands behind one entry in the opcode table, one metrics label and
-one `is_read_only` answer. An unknown *opcode* already has all of that, for
+one `inline_safe` answer. An unknown *opcode* already has all of that, for
 free, and the table stays self-describing. Symmetry of layout is worth having;
 symmetry that erases which command was called is not.
 
@@ -860,7 +861,7 @@ contract as `CLUSTER`, which is set only when fan-out is genuinely configured.
 
 Both are read-only in the sense that matters to correctness — they never touch a
 writer queue — but they are **deliberately excluded from
-`Opcode::is_read_only()`**, so they always take the `spawn_blocking` hop and
+`Opcode::inline_safe()`**, so they always take the `spawn_blocking` hop and
 never run inline on a runtime worker. That predicate's real question is "is this
 cheap enough to run on a runtime worker", and a scan holding a read transaction
 for milliseconds is not, however read-only it is. If the predicate ever grows a
@@ -1017,7 +1018,7 @@ either.
 The checklist, in the order the compiler will find them for you:
 
 1. `vcp::frame::Opcode` — the variant, the value in `from_u8`, and a decision
-   about `is_read_only` (default to no).
+   about `inline_safe` (default to no).
 2. `vcp::decode` — a body decoder that **bounds every attacker-controlled length
    before it sizes an allocation**, returns `DecodeError::Body` so the connection
    survives a malformed frame, and stays a pure function of `&[u8]` with no
