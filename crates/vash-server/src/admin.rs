@@ -19,7 +19,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info};
-use vash_store::Store;
 
 use crate::metrics::render_prometheus;
 use crate::state::ServerState;

@@ -49,3 +49,6 @@ default = []
 
 [dev-dependencies]
 tempfile = "3"
+# The in-memory `Store`, so the server can be tested against something that is
+# not LMDB. A dev-dependency only: nothing in the shipped binary can reach it.
+vash-store = { workspace = true, features = ["testing"] }

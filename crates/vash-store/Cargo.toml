@@ -15,6 +15,11 @@ thiserror.workspace = true
 tracing.workspace = true
 xxhash-rust.workspace = true
 
+[features]
+# A second `Store` implementation, held in memory. Off by default: it is a test
+# double, not a cache, and nothing in a release build should be able to reach it.
+testing = []
+
 [dev-dependencies]
 tempfile = "3"
 

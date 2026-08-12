@@ -5,6 +5,12 @@
 //! behaviour and a growable map) is a contained swap if benchmarks demand it,
 //! and it is what lets the server be tested against an in-memory fake.
 //!
+//! Both claims are **checked** rather than asserted. The server is built against
+//! `Arc<dyn Store>`, and [`memory::MemoryStore`] — behind the `testing` feature —
+//! is a second implementation that `crates/vash-server/tests/store_seam.rs`
+//! drives the whole stack over. A caller that reaches past the trait stops
+//! compiling.
+//!
 //! The trait is **synchronous on purpose**. Reads can page-fault and writes
 //! block on the writer queue, so callers must run these on a thread that is
 //! allowed to block — never on an async runtime's worker. See plan §9.
@@ -22,6 +28,9 @@ pub mod error;
 pub mod expiry;
 mod listing;
 pub mod lmdb;
+/// An in-memory implementation, for tests. See [`memory::MemoryStore`].
+#[cfg(feature = "testing")]
+pub mod memory;
 pub mod reclaim;
 pub mod schema;
 mod shard;
@@ -138,6 +147,13 @@ pub struct SweepStats {
 }
 
 pub trait Store: Send + Sync + 'static {
+    /// Independent storage environments, and therefore concurrent writers.
+    ///
+    /// On the trait rather than on the implementation because it is advertised
+    /// in the `HELLO` handshake, which means the server needs it without knowing
+    /// what is underneath. An implementation with no sharding answers 1.
+    fn shard_count(&self) -> usize;
+
     /// Returns the value if the key is present **and live**. Expired, flushed
     /// and tag-invalidated records read as absent without being rewritten.
     fn get(&self, key: Key<'_>) -> Result<Option<Value>>;

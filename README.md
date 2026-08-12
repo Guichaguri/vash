@@ -423,7 +423,7 @@ full divergence list.
 
 ```
 crates/vash-core     domain types, on-disk record format, no I/O
-crates/vash-store    LMDB adapter behind the `Store` trait
+crates/vash-store    LMDB adapter behind the `Store` trait (+ an in-memory one for tests)
 crates/vash-proto    wire codecs (VCP + memcached + RESP); byte-slice in, command out
 crates/vash-server   network tier, dispatch, config, the `vash-server` binary
 crates/vash-client   VCP client, and the integration-test driver

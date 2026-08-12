@@ -36,6 +36,19 @@ pub struct Server {
     /// yet. Without it the pre-auth budget *is* the connection budget, and a
     /// stranger can fill it without presenting anything.
     pre_auth: Arc<Semaphore>,
+    /// The concrete store, when this server opened one itself.
+    ///
+    /// The only place the implementation is named, and it earns it: LMDB's
+    /// environment is *scheduled* for closing when the handle drops, and it
+    /// refuses to reopen a path still registered in the process — so an
+    /// in-process restart has to block until it is really gone. That is an
+    /// LMDB-specific lifecycle, so it lives with the code that chose LMDB
+    /// rather than on the trait, where every other implementation would have to
+    /// carry a method it has no use for.
+    ///
+    /// `None` when the store came from [`Server::bind_with`], where releasing it
+    /// is the caller's business.
+    lmdb: Option<Arc<LmdbStore>>,
 }
 
 impl Server {
@@ -45,9 +58,32 @@ impl Server {
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
         config.validate()?;
 
-        let store = LmdbStore::open(&config.store_config())
-            .with_context(|| format!("opening store at {}", config.store.path.display()))?;
-        let store = Arc::new(store);
+        let lmdb = Arc::new(
+            LmdbStore::open(&config.store_config())
+                .with_context(|| format!("opening store at {}", config.store.path.display()))?,
+        );
+
+        // The concrete handle is kept alongside the trait object for exactly one
+        // reason, and it is spelled out on the field: LMDB needs an explicit,
+        // blocking release that `Drop` does not give.
+        let mut server = Self::bind_with(config, Arc::clone(&lmdb) as Arc<dyn Store>).await?;
+        server.lmdb = Some(lmdb);
+        Ok(server)
+    }
+
+    /// Binds against a store the caller supplies.
+    ///
+    /// This is what makes the [`Store`] seam real rather than decorative: the
+    /// server is built against the trait, so a test can run the whole stack —
+    /// listener, protocol adapters, dispatch — over an in-memory implementation
+    /// and never open an environment. It is also the shape a `libmdbx` swap
+    /// would take, which is the reversibility the trait claims.
+    ///
+    /// Note what is *not* here: no `close`. Releasing the store is the business
+    /// of whoever opened it, which for [`Server::bind`] is the server itself and
+    /// for a caller of this function is the caller.
+    pub async fn bind_with(config: Config, store: Arc<dyn Store>) -> anyhow::Result<Self> {
+        config.validate()?;
 
         // Started before the listener so a peer that answers instantly on the
         // very first invalidation finds the tasks already running.
@@ -127,6 +163,7 @@ impl Server {
             state,
             connections: Arc::new(Semaphore::new(config.server.max_connections)),
             config,
+            lmdb: None,
         })
     }
 
@@ -138,7 +175,7 @@ impl Server {
         self.admin.as_ref().and_then(|l| l.local_addr().ok())
     }
 
-    pub fn store(&self) -> &Arc<LmdbStore> {
+    pub fn store(&self) -> &Arc<dyn Store> {
         &self.state.store
     }
 
@@ -155,6 +192,7 @@ impl Server {
             config,
             connections,
             pre_auth,
+            lmdb,
         } = self;
         let enforcing = state.auth.current().required();
 
@@ -282,12 +320,19 @@ impl Server {
             error!(error = %e, "final sync failed");
         }
 
-        // Release the LMDB environment. Dropping it only schedules the close,
-        // and LMDB refuses to reopen a path that is still registered in this
-        // process, so anything that restarts in-process needs the wait.
-        match Arc::try_unwrap(state).map(|state| Arc::try_unwrap(state.store)) {
-            Ok(Ok(store)) => store.close(),
-            _ => warn!("store still referenced at shutdown; environment left open"),
+        // Release the LMDB environment, if this server is the one that opened
+        // it. Dropping only schedules the close, and LMDB refuses to reopen a
+        // path still registered in this process, so anything that restarts
+        // in-process needs the wait.
+        //
+        // The state has to go first: it holds the trait object, which shares a
+        // reference count with the handle below.
+        if let Some(lmdb) = lmdb {
+            drop(state);
+            match Arc::try_unwrap(lmdb) {
+                Ok(store) => store.close(),
+                Err(_) => warn!("store still referenced at shutdown; environment left open"),
+            }
         }
 
         Ok(())

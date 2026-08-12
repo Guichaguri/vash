@@ -47,7 +47,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use vash_core::{ClusterInfo, ClusterMode, MAX_TAG_SYNC_ENTRIES, PeerInfo, TagGeneration};
-use vash_store::{LmdbStore, Store};
+use vash_store::Store;
 
 use crate::config::ClusterConfig;
 use crate::metrics::ClusterMetrics;
@@ -113,7 +113,7 @@ impl Cluster {
     /// Must be called from within the tokio runtime that will serve traffic.
     pub fn start(
         config: &ClusterConfig,
-        store: Arc<LmdbStore>,
+        store: Arc<dyn Store>,
         metrics: Arc<ClusterMetrics>,
     ) -> Arc<Self> {
         let mode = ClusterMode::from(config.delete_by_tag);
@@ -281,7 +281,7 @@ impl Cluster {
 async fn peer_loop(
     peer: Arc<Peer>,
     mut rx: mpsc::Receiver<PeerMessage>,
-    store: Arc<LmdbStore>,
+    store: Arc<dyn Store>,
     metrics: Arc<ClusterMetrics>,
     timeout: Duration,
     mut shutdown: watch::Receiver<bool>,
@@ -443,12 +443,12 @@ async fn try_exchange(
 ///
 /// On a blocking thread: merging is a write per shard, and a write may wait on
 /// the writer queue.
-async fn merge_into(store: &Arc<LmdbStore>, metrics: &ClusterMetrics, learned: Vec<TagGeneration>) {
+async fn merge_into(store: &Arc<dyn Store>, metrics: &ClusterMetrics, learned: Vec<TagGeneration>) {
     if learned.is_empty() {
         return;
     }
     let store = Arc::clone(store);
-    let applied = tokio::task::spawn_blocking(move || apply_merges(&store, &learned))
+    let applied = tokio::task::spawn_blocking(move || apply_merges(&*store, &learned))
         .await
         .unwrap_or(0);
     metrics.merged(applied);
@@ -458,7 +458,7 @@ async fn merge_into(store: &Arc<LmdbStore>, metrics: &ClusterMetrics, learned: V
 ///
 /// Shared with the receiving side of `TAG_SYNC`, so an invalidation learned by
 /// gossip and one received by fan-out go through exactly the same path.
-pub fn apply_merges(store: &LmdbStore, entries: &[TagGeneration]) -> u64 {
+pub fn apply_merges(store: &dyn Store, entries: &[TagGeneration]) -> u64 {
     let mut applied = 0;
     for entry in entries {
         // Generation 0 means "never invalidated anywhere", which carries no
@@ -494,7 +494,7 @@ pub fn apply_merges(store: &LmdbStore, entries: &[TagGeneration]) -> u64 {
 /// is reached every interval, rather than every `peers × interval`.
 async fn gossip_loop(
     peer: Arc<Peer>,
-    store: Arc<LmdbStore>,
+    store: Arc<dyn Store>,
     metrics: Arc<ClusterMetrics>,
     interval: Duration,
     timeout: Duration,
@@ -520,14 +520,14 @@ async fn gossip_loop(
 
 async fn gossip_round(
     peer: &Arc<Peer>,
-    store: &Arc<LmdbStore>,
+    store: &Arc<dyn Store>,
     metrics: &Arc<ClusterMetrics>,
     timeout: Duration,
     round: usize,
 ) {
     let digest_store = Arc::clone(store);
     let Ok(Ok(digest)) =
-        tokio::task::spawn_blocking(move || build_digest(&digest_store, round)).await
+        tokio::task::spawn_blocking(move || build_digest(&*digest_store, round)).await
     else {
         warn!("could not build a gossip digest");
         return;
@@ -570,7 +570,7 @@ async fn gossip_round(
 /// Past that the digest becomes a rotating window: convergence then takes more
 /// rounds, but every entry is eventually offered.
 fn build_digest(
-    store: &LmdbStore,
+    store: &dyn Store,
     offset: usize,
 ) -> vash_store::Result<(bool, Vec<TagGeneration>)> {
     let mut all: Vec<TagGeneration> = store

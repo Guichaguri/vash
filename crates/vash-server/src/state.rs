@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use vash_core::ServerInfo;
-use vash_store::LmdbStore;
+use vash_store::Store;
 
 use crate::auth::AuthState;
 use crate::cluster::Cluster;
 
 /// Everything a connection needs, shared by `Arc` across all of them.
 pub struct ServerState {
-    pub store: Arc<LmdbStore>,
+    pub store: Arc<dyn Store>,
     pub info: ServerInfo,
     /// Which commands are available and on what budget.
     ///
@@ -32,7 +32,7 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(
-        store: Arc<LmdbStore>,
+        store: Arc<dyn Store>,
         info: ServerInfo,
         protocol: crate::config::ProtocolConfig,
         auth: AuthState,

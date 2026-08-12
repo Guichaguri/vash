@@ -29,10 +29,6 @@ impl LmdbStore {
         })
     }
 
-    pub fn shard_count(&self) -> usize {
-        self.shards.len()
-    }
-
     /// Highest capacity pressure across the shards.
     ///
     /// The maximum rather than an average: one full shard rejects writes for
@@ -161,6 +157,10 @@ impl LmdbStore {
 }
 
 impl Store for LmdbStore {
+    fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
     fn get(&self, key: Key<'_>) -> Result<Option<Value>> {
         self.shards.for_key(key.as_bytes()).engine.get(key)
     }

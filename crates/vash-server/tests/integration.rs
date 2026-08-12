@@ -23,7 +23,7 @@ struct TestServer {
     ///
     /// An `Option` because it must be released before the server shuts down:
     /// the environment cannot close while another handle is outstanding.
-    store: Option<Arc<vash_store::LmdbStore>>,
+    store: Option<Arc<dyn vash_store::Store>>,
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -112,7 +112,6 @@ impl TestServer {
     /// Read from the store because VCP does not report a remaining lifetime on
     /// the wire — the memcached `t` flag is the only way to ask over a socket.
     fn deadline_ms(&self, key: &[u8]) -> Option<u64> {
-        use vash_store::Store;
         self.store
             .as_ref()
             .expect("store handle released")
@@ -123,7 +122,6 @@ impl TestServer {
 
     /// Records currently on disk, including any the sweeper has not reached.
     fn entries(&self) -> u64 {
-        use vash_store::Store;
         self.store
             .as_ref()
             .expect("store handle released")

@@ -7,7 +7,7 @@ use vash_proto::vcp::{
     AuthRequest, DecodeError, Decoded, Opcode, Status, decode, encode_error, encode_reply,
     encode_response,
 };
-use vash_store::{Store, StoreError};
+use vash_store::StoreError;
 
 use crate::auth::{ConnAuth, DEFAULT_NAME, Mechanism};
 use crate::metrics::ErrorClass;
@@ -779,7 +779,7 @@ fn tag_sync(
     state
         .cluster
         .metrics()
-        .merged(crate::cluster::apply_merges(&state.store, &offered));
+        .merged(crate::cluster::apply_merges(&*state.store, &offered));
 
     Ok(behind)
 }
