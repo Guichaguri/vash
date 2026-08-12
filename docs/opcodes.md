@@ -570,7 +570,8 @@ later: `scanned` and `TRUNCATED` are load-bearing for a keyspace scan and nearly
 vacuous for a RAM-resident tag table, which never exhausts a budget. They are
 still *true* there, just uninteresting — which is a different thing from a field
 that is false, and the line this project already draws when it refuses to report
-an unmeasured `stats` counter as a plausible zero.
+an unmeasured `stats` counter as a plausible zero. Every other field, including
+the [cursor](#cursors), means the same thing and costs the same order in both.
 
 **Two opcodes rather than one `LIST` with a subject byte.** The subject would
 have to be validated, would need an error path for an unknown value, and would
@@ -581,15 +582,16 @@ symmetry that erases which command was called is not.
 
 ### Shared request layout
 
-A 16-byte header followed by an optional pattern:
+A 12-byte header followed by two optional variable-length fields:
 
 | Offset | Field |
 |---|---|
 | 0 | `limit` u32 — maximum entries in the reply, 1–1024 |
-| 4 | `offset` u64 — entries to skip |
-| 12 | `pattern_len` u16 |
-| 14 | `reserved` u16 — zero |
-| 16 | `pattern` bytes[pattern_len] |
+| 4 | `cursor_len` u16 |
+| 6 | `pattern_len` u16 |
+| 8 | `reserved` u32 — zero |
+| 12 | `cursor` bytes[cursor_len] — empty to start from the beginning |
+| 12 + cursor_len | `pattern` bytes[pattern_len] |
 
 **Bytes after the pattern are rejected with `BAD_REQUEST`.** Extension happens
 through `reserved`, and silently ignoring a trailing field would let a client
@@ -609,11 +611,13 @@ On `OK`:
 | Offset | Field |
 |---|---|
 | 0 | `count` u32 — entries in this page |
-| 4 | `flags` u8 — bit 0 `MORE`, bit 1 `TRUNCATED` |
+| 4 | `flags` u8 — bit 0 `TRUNCATED` |
 | 5 | `reserved` u8 × 3 — zero |
 | 8 | `scanned` u64 — entries examined to produce this page |
-| 16 | `next_offset` u64 — the `offset` to send for the next page |
-| 24 | `count` × entry |
+| 16 | `cursor_len` u16 — 0 when the listing is complete |
+| 18 | `reserved` u16 — zero |
+| 20 | `cursor` bytes[cursor_len] |
+| 20 + cursor_len | `count` × entry |
 
 An entry is `version` u64, `name_len` u16, `name` bytes — **`TAG_SYNC`'s entry
 layout, byte for byte**, so a client that already decodes a digest reuses that
@@ -628,15 +632,114 @@ metadata that is genuinely free: the record header is parsed for the liveness
 check whether or not the CAS is sent, and the tag generation is the value being
 listed.
 
-`MORE` is set whenever the walk stopped for any reason other than reaching the
-end. A client pages by echoing `next_offset` back and stops when `MORE` is
-clear — the same loop for both commands.
+**An empty `cursor` means the listing is complete**, and that is the whole
+termination rule — there is no separate `MORE` flag, because a flag saying
+"there is more" alongside a field that is present exactly when there is more is
+one of them lying eventually. The client loop is: send, consume the entries,
+resend with the cursor you were given, stop when it comes back empty.
+
+A page that fills `limit` exactly and happens to have consumed the last entry
+still returns a cursor: the server would have to walk one entry further to know
+otherwise, and walking past the limit to save the client a round trip is the
+wrong trade for a command nobody calls in a loop. The final call returns
+`count = 0` with an empty cursor. Clients must expect that empty last page.
+
+`TRUNCATED` survives as a **diagnostic**, not as control flow: it says the page
+ended on the scan budget rather than on `limit`, which is how an operator learns
+their pattern is not selective. Paging behaves identically either way.
 
 **No `total` field.** It would be honest for tags, where the whole population is
 in RAM, and unaffordable for keys, where it means a full scan. Rather than carry
 a field that is meaningful in one command and a placeholder in the other, there
 is none: the registry size is already reported as `vash_tags` in `stats` and on
 the metrics port, and a listing is not the place to learn a count.
+
+### Cursors
+
+**Decision: pagination is by opaque cursor, and there is no `offset`.**
+
+A cursor here is **not a database cursor**. A `heed` cursor is a live position in
+a B-tree that borrows its read transaction, and keeping one alive between
+requests means keeping that transaction alive — which blocks LMDB from reusing
+freed pages and grows the file without bound. That is the footgun plan §9 calls
+out and `oldest_reader_age_ms` was proposed to alarm on. So what crosses the
+wire is **data**: a saved position the server seeks back to and walks on from.
+No handle, no session, no server-side table, nothing to expire.
+
+The pattern is already in the codebase. The tag reclaimer cannot hold a
+transaction across batches either, so a `Job` persists its position in the
+`jobs` sub-database and resumes with `Bound::Excluded` (`engine.rs`,
+`reclaim_step`). This is the same trick with the client holding the position
+instead of the `jobs` table.
+
+**Encoding.** Opaque to clients: never parse one, never construct one, never
+compare two — echo back exactly what was received. The server's encoding is:
+
+| Command | Cursor | Max |
+|---|---|---|
+| `LIST_KEYS` | `shard_index` u16 ‖ the last key returned | 513 bytes |
+| `LIST_TAGS` | the last name returned | 255 bytes |
+
+Resumption is **exclusive** — the next page begins strictly after the named
+entry. Inclusive would repeat one entry per page, which is the oldest bug in
+pagination.
+
+**Validation.** A cursor is untrusted input that steers a seek, so it decodes
+strictly: length-capped, shard index checked against the shard count, key length
+checked against `MAX_KEY_LEN`. A malformed cursor is `BAD_REQUEST` — never a
+panic, and **never a silent restart from the beginning**, which would spin a
+client's pager forever without ever saying why. It joins the fuzz corpus. The
+blast radius is small by construction: a cursor only chooses where a scan
+begins, and the scan reveals nothing the command does not already.
+
+A cursor survives a restart, since it is just a position. It is meaningless if
+the shard count changes — and the store already refuses to open a database whose
+recorded shard count disagrees with the configuration, so that cannot happen
+quietly.
+
+#### Why not an offset
+
+An `offset` was the original design and is gone from both commands. It is
+correct, and for `LIST_TAGS` it is even ideal — an index into a sorted array in
+RAM. It fails on the command that needs it most.
+
+Offset paging over `main` re-walks everything it skips, so paging a keyspace of
+N keys with a scan budget of B costs about N²/2B walked records: ~5× for a
+million keys, ~50× for ten million. **That is the same quadratic resumption M2
+found in `tagidx`** — where mapping `tag_id → [key]` as duplicates meant
+resuming a half-finished job re-walked every duplicate already processed, and
+the fix was a compound key that could be range-sought. Same shape, same fix, and
+there is no excuse for meeting it twice.
+
+Keeping `offset` for tags alone would fork the request layout that the rest of
+this section exists to share, to buy random access into a table whose size is
+already a metric. If a use for "jump to entry 5000" ever appears, it comes back
+as a second start mode in the `reserved` field, without a wire break.
+
+#### Why not a u64 cursor
+
+The first question anyone who knows Redis's `SCAN` will ask. `SCAN`'s cursor is
+a **hash-table bucket index**, and buckets are numbered, so 64 bits names one
+comfortably and the reverse-binary increment survives a rehash. Redis can do
+that precisely because its keyspace has no order. LMDB's does — that ordering is
+what lets the sweeper stop at the first future bucket and the reclaimer
+range-seek — and the price of an ordered keyspace is that a position **is** a
+key, up to 511 bytes of it.
+
+Every way to fit that into 64 bits fails:
+
+| Encoding | Why not |
+|---|---|
+| Hash of the last key | Not seekable in a key-ordered tree. Needs a hash-ordered index — a second B-tree. |
+| Shard ‖ first 7 bytes of the key | Cache keys are overwhelmingly `prefix:id`, so the prefix is shared by thousands. Resuming after it skips them all; resuming at it repeats them, and nothing says which were already sent. |
+| An ordinal — "I have walked N" | Correct, and it is the offset. Same re-walk, same quadratic. |
+| A handle into a server-side position table | Works, and costs the statelessness: per-connection memory, an eviction policy, and a `CURSOR_EXPIRED` path every client must handle. |
+| A dense per-record rowid | Works, and costs the write path: an id→key index maintained on every write, to serve a debugging command. |
+
+The bytes cost nothing worth this. Typical cache keys are 20–60 bytes, so a
+cursor is around 40; it rides on a page carrying up to 512 KB of entries, and it
+borrows from the frame rather than allocating. If a human-readable form is ever
+wanted, base64 in a CLI costs nothing and leaves the wire honest.
 
 ### Pattern matching
 
@@ -736,35 +839,42 @@ are skipped and counted only in `scanned`. The scan **never writes**, so it does
 not reclaim what it discovers to be dead — that stays the sweeper's and the
 reclaimer's job, and a listing must not be a way to trigger deletion.
 
-**Pagination.** `offset` counts *matching live keys*, not records walked, so
-paging is defined in terms of what the client sees rather than what the store
-happens to hold. Cost is therefore O(`offset` + `limit`) walked records, plus
-whatever dead or non-matching ones lie among them. That is accepted: this is a
-diagnostic command and the offset form is what makes it usable from a shell one
-page at a time.
+**Pagination.** The cursor is `shard_index ‖ last key returned`. A page resumes
+by seeking that shard's `main` cursor to `Bound::Excluded(key)` — an O(log n)
+descent, not a re-walk — draining that shard and then starting each later shard
+from its beginning. Shards before the cursor's are never touched again.
 
-`next_offset` is the position to resume from — `offset` plus the matching live
-keys this call skipped *or* returned. A client pages by echoing it back and
-stops when `MORE` is clear.
+Cost is therefore O(`limit`) *matching live* keys plus however many dead or
+non-matching records lie among them, and paging the whole keyspace is linear in
+it. No page pays for the pages before it.
 
 **Bounding.** A single call examines at most `protocol.listing_max_scan` records
-(default **100000**). Hitting it sets `TRUNCATED`, and `next_offset` still
-reflects the ground covered, so a client that keeps paging **makes progress**
-rather than re-scanning the same prefix forever. `MORE` is set whenever the walk
-stopped for any reason other than running off the end of the last shard.
+(default **100000**), which bounds how long one request can hold a read
+transaction. Hitting it sets `TRUNCATED` and returns whatever was collected —
+possibly nothing — with a cursor covering the ground walked, so the next call
+resumes past it. **A budget exhaustion always advances the cursor**, which is
+what guarantees a pager makes progress through a region of dead or non-matching
+records instead of stalling on it.
 
 **Consistency.** A page is a snapshot of one shard at one instant; a sequence of
-pages is not a snapshot of anything. Concurrent writes mean a key can be missed
-or repeated across pages, and `count` may be less than `limit` on a page that is
-not the last. Clients must not infer a total from a listing, and must not treat
-the absence of a key from a page as evidence it does not exist. There is no
-attempt to fix this — the fix is a long-lived read transaction across every
+pages is not a snapshot of anything. `count` may be less than `limit` on a page
+that is not the last. Clients must not infer a total from a listing, and must
+not treat the absence of a key from a page as evidence it does not exist. There
+is no attempt to fix this — the fix is a long-lived read transaction across every
 shard, which is the one thing LMDB deployments must never do.
 
+The cursor does narrow this usefully, and the guarantee is worth stating
+precisely. Because resumption is by key rather than by count, **a key that
+exists unchanged for the whole walk is returned exactly once**: entries inserted
+behind the cursor are missed and entries inserted ahead of it are seen, but
+neither shifts the position of anything else. Under offset paging a single
+insertion near the front would have shifted every later page by one and could
+skip an untouched key entirely.
+
 **Statuses** — `OK`, `BAD_REQUEST` (limit 0 or over the ceiling, malformed
-pattern, trailing bytes, short body), `UNAUTHORIZED` (disabled), `INTERNAL`.
-Never `NOT_FOUND`: an empty result is `count = 0`, because no matches is not a
-miss.
+pattern, malformed cursor, trailing bytes, short body), `UNAUTHORIZED`
+(disabled), `INTERNAL`. Never `NOT_FOUND`: an empty result is `count = 0`,
+because no matches is not a miss.
 
 **Metrics** — counted as `other`. A listing must not touch the hit/miss
 counters, since a hit ratio computed over scanned records would be meaningless
@@ -825,11 +935,16 @@ convergence in flight or a peer that cannot be reached — `CLUSTER` says which.
 **Statuses** — as `LIST_KEYS`. Never `NOT_FOUND`: a pattern matching no tag is
 `count = 0`.
 
-**Pagination** — `offset` counts matching entries, and because the population is
-a stable sorted array rather than a live keyspace, paging is consistent within
-one call and only as consistent as the registry between calls. A tag registered
-mid-sequence can shift later pages by one entry; nothing removes a tag today, so
-an entry never disappears from under a pager.
+**Pagination** — the cursor is the last name returned, and resumption is a
+binary search into the sorted snapshot: O(log t + `limit`), no re-walk. It is
+the same field, the same rule and the same client loop as `LIST_KEYS`; only the
+seek underneath differs, an array bisect rather than a B-tree descent.
+
+Resuming by name rather than by position also makes the listing stable against a
+concurrently registered tag: a new name lands wherever it sorts and shifts
+nothing, so every name present throughout the walk is returned exactly once.
+Nothing removes a tag today, so an entry never disappears from under a pager
+either.
 
 **Metrics** — `other`.
 
