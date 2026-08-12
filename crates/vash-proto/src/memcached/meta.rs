@@ -37,7 +37,7 @@
 //! from the letters upstream leaves unassigned; it is a single constant here,
 //! and clients that never send it are unaffected.
 
-use vash_core::{Command, Key, Set, SetMode};
+use vash_core::{Command, Key, Set, SetMode, TtlChange};
 
 use super::encode::{MetaStyle, ResponseStyle};
 use super::{ErrorKind, MAX_KEY_LEN, Outcome, Parsed, ProtocolError};
@@ -139,10 +139,12 @@ pub fn parse<'a>(
                 command: Command::Set(Set {
                     key,
                     value: &buf[after_line..data_end],
-                    ttl_secs: flags.ttl.unwrap_or(0),
+                    ttl: TtlChange::Set(flags.ttl.unwrap_or(0)),
                     mc_flags: flags.client_flags.unwrap_or(0),
                     tags: flags.tags,
                     mode,
+                    // memcached has no "report the old value" flag on `ms`.
+                    return_previous: false,
                 }),
                 consumed: data_end + 2,
                 noreply: flags.meta.quiet,
@@ -376,7 +378,7 @@ mod tests {
         };
         assert_eq!(set.key.as_bytes(), b"foo");
         assert_eq!(set.value, b"hello");
-        assert_eq!(set.ttl_secs, 60);
+        assert_eq!(set.ttl, TtlChange::Set(60));
         assert_eq!(set.mc_flags, 42);
         assert_eq!(set.mode, SetMode::Set);
     }

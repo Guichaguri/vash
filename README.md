@@ -42,7 +42,7 @@ Run with `--ephemeral` to start from an empty database and skip syncing, or
 | Tags, `DELETE_BY_TAG`, `FLUSH` | Working — invalidation is constant time, see [benchmark](#tag-invalidation) |
 | Memcached text protocol | Working — `get`/`gets`/`set`/`add`/`replace`/`append`/`prepend`/`cas`/`delete`/`touch`/`gat`/`gats`/`incr`/`decr`/`stats`/`version`/`flush_all`/`quit` |
 | Memcached meta protocol | Working — `mg`/`ms`/`md`/`ma`/`mn`/`me`, core flag set |
-| Redis protocol (RESP2 + RESP3) | Working — string and expiry commands; arithmetic is [atomic](docs/protocol.md#atomicity), four conditional-write commands are not yet |
+| Redis protocol (RESP2 + RESP3) | Working — string and expiry commands, all [atomic](docs/protocol.md#atomicity) except `MSETEX NX/XX` across shards |
 | Sharding | Working — independent environments, one writer each |
 | Capacity watermarks and eviction | Working — TTL-ordered, never LRU |
 | Metrics and admin endpoints | Working — `/metrics`, `/health`, `/stats` |
@@ -409,13 +409,15 @@ discovers a feature is missing.
 
 Two things to know before pointing a real workload at it. Expiry is rounded to
 whole seconds, because that is what the store's deadline field holds — so
-`PX 100` buys up to a full second rather than 100 ms. And while the arithmetic
-family and `APPEND` are **atomic** — one primitive each, evaluated inside the
-shard writer's transaction, so concurrent increments cannot lose an update —
-four commands that read a deadline and then write against it are not yet:
-`SET … KEEPTTL`, `SET … GET`, conditional `EXPIRE`, and `MSETEX NX/XX`. Both are
-covered in [docs/protocol.md](docs/protocol.md#deliberate-divergences-from-redis),
-with the full divergence list.
+`PX 100` buys up to a full second rather than 100 ms. And every command that
+reads then writes — the arithmetic family, `APPEND`, `SET … GET`,
+`SET … KEEPTTL`, conditional `EXPIRE`, `PERSIST` — is **atomic**: one storage
+primitive each, evaluated inside the shard writer's transaction, so concurrent
+clients cannot lose an update. The single exception is `MSETEX NX/XX` when its
+keys span shards, where the guard can be stale — multi-key atomicity across
+shards is a standing non-goal. All of it is in
+[docs/protocol.md](docs/protocol.md#deliberate-divergences-from-redis), with the
+full divergence list.
 
 ## Layout
 

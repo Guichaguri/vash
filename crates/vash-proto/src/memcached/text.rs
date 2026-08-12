@@ -10,7 +10,7 @@
 //! flush_all [delay] [noreply]\r\n
 //! ```
 
-use vash_core::{Command, Key, Set, SetMode};
+use vash_core::{Command, Key, Set, SetMode, TtlChange};
 
 use super::encode::ResponseStyle;
 use super::{ErrorKind, MAX_KEY_LEN, Outcome, Parsed, ProtocolError};
@@ -257,10 +257,11 @@ fn parse_storage<'a>(
         command: Command::Set(Set {
             key,
             value: data,
-            ttl_secs,
+            ttl: TtlChange::Set(ttl_secs),
             mc_flags,
             tags: Vec::new(),
             mode,
+            return_previous: false,
         }),
         consumed,
         noreply,
@@ -380,7 +381,7 @@ mod tests {
         assert_eq!(set.key.as_bytes(), b"foo");
         assert_eq!(set.value, b"hello");
         assert_eq!(set.mc_flags, 42);
-        assert_eq!(set.ttl_secs, 300);
+        assert_eq!(set.ttl, TtlChange::Set(300));
         assert_eq!(set.mode, SetMode::Set);
     }
 
@@ -540,7 +541,7 @@ mod tests {
         let Command::Set(set) = command(b"set k 0 -1 1\r\nx\r\n").command else {
             panic!()
         };
-        assert_eq!(set.ttl_secs, IMMEDIATELY_EXPIRED);
+        assert_eq!(set.ttl, TtlChange::Set(IMMEDIATELY_EXPIRED));
     }
 
     #[test]

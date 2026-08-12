@@ -118,8 +118,16 @@ pub enum Command<'a> {
 pub struct Set<'a> {
     pub key: Key<'a>,
     pub value: &'a [u8],
-    /// Relative TTL in seconds; 0 means no expiry.
-    pub ttl_secs: u32,
+    /// What happens to the key's lifetime.
+    ///
+    /// A [`TtlChange`] rather than a bare `ttl_secs` so that Redis's `KEEPTTL`
+    /// can be expressed as *not touching the deadline* rather than as reading it
+    /// and writing the same number back. The read-then-write form has a race in
+    /// it — a deadline changed in between is overwritten with the older one —
+    /// and it costs a lookup the writer was going to do anyway.
+    ///
+    /// [`TtlChange`]: crate::arith::TtlChange
+    pub ttl: crate::arith::TtlChange,
     /// Memcached client flags, stored verbatim so a value written over VCP and
     /// read over the memcached protocol round-trips.
     pub mc_flags: u32,
@@ -127,20 +135,69 @@ pub struct Set<'a> {
     pub tags: Vec<&'a [u8]>,
     /// The condition under which the write applies.
     pub mode: SetMode,
+    /// Report the value the key held beforehand (Redis `SET … GET`).
+    ///
+    /// Part of the request rather than a separate command because only the store
+    /// can capture it: reading it here, before the write, is the race this field
+    /// exists to avoid. Costs a value copy, so it stays off unless asked for.
+    pub return_previous: bool,
 }
 
 impl<'a> Set<'a> {
     /// An unconditional write with no tags — the common case.
     pub fn plain(key: Key<'a>, value: &'a [u8], ttl_secs: u32) -> Self {
+        Self::with_ttl(key, value, crate::arith::TtlChange::Set(ttl_secs))
+    }
+
+    /// As [`Set::plain`], for a caller that already has a [`TtlChange`].
+    pub fn with_ttl(key: Key<'a>, value: &'a [u8], ttl: crate::arith::TtlChange) -> Self {
         Self {
             key,
             value,
-            ttl_secs,
+            ttl,
             mc_flags: 0,
             tags: Vec::new(),
             mode: SetMode::Set,
+            return_previous: false,
         }
     }
+}
+
+/// The guard on a conditional expiry change (`EXPIRE`'s `NX`/`XX`/`GT`/`LT`).
+///
+/// Evaluated inside the writer's transaction against the deadline the record
+/// actually holds, so the guard cannot be decided against a value that has since
+/// moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpireGuard {
+    #[default]
+    Always,
+    /// Only when the key currently has no deadline.
+    IfPersistent,
+    /// Only when it already has one.
+    IfVolatile,
+    /// Only when the new deadline is later than the current one. A key with no
+    /// deadline is infinitely far off, so this never applies to one.
+    IfLater,
+    /// The mirror image, where a key with no deadline always loses.
+    IfEarlier,
+}
+
+/// The guard on a conditional batch write (`MSETEX`'s `NX`/`XX`).
+///
+/// **Atomic within a shard, and only within a shard.** The keys of one batch are
+/// spread across shards by key hash, and a batch spanning shards is several
+/// transactions — plan §16's standing non-goal. A guard that has to see every
+/// key at once therefore holds exactly when the batch lands in one shard, which
+/// includes every single-shard deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatchGuard {
+    #[default]
+    Always,
+    /// Only when *none* of the keys exist.
+    IfAllAbsent,
+    /// Only when *all* of them do.
+    IfAllPresent,
 }
 
 /// When a write is allowed to take effect.

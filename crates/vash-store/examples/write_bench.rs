@@ -47,7 +47,8 @@ fn set(store: &LmdbStore, key: &str) {
         .set(&Set {
             key: Key::new(key.as_bytes()).unwrap(),
             value: VALUE,
-            ttl_secs: 0,
+            ttl: vash_core::TtlChange::Set(0),
+            return_previous: false,
             mc_flags: 0,
             tags: Vec::new(),
             mode: vash_core::SetMode::Set,

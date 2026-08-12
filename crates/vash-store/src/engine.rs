@@ -13,8 +13,9 @@ use heed::types::Bytes as HeedBytes;
 use heed::{AnyTls, Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls};
 use tracing::{info, warn};
 use vash_core::{
-    Applied, Arithmetic, Clock, Key, RecordMeta, RecordRef, Set, SetMode, Stored, TagRef,
-    TtlChange, Value, arith, encode_record, patch_cas, record::NEVER, validate_value,
+    Applied, Arithmetic, Clock, ExpireGuard, Key, RecordMeta, RecordRef, Set, SetMode, Stored,
+    TagRef, TtlChange, Value, arith, encode_record, patch_cas, patch_expiry, record::NEVER,
+    validate_value,
 };
 
 use crate::config::{Durability, StoreConfig};
@@ -135,8 +136,39 @@ pub struct ShardScan {
 pub struct PreparedSet {
     pub key: Box<[u8]>,
     pub record: Vec<u8>,
-    pub expires_at_ms: u64,
+    /// The resolved deadline, or `None` when [`Self::ttl`] could only be settled
+    /// against the record being replaced — which is the writer's job.
+    pub expires_at_ms: Option<u64>,
+    pub ttl: TtlChange,
     pub tags: Vec<TagRef>,
+    /// Capture what the key held before replacing it (Redis `SET … GET`).
+    pub return_previous: bool,
+}
+
+/// What a guarded write did, and what it displaced.
+#[derive(Debug, Clone)]
+pub struct Written {
+    pub outcome: Stored,
+    /// The value the key held beforehand, when the write asked for it. Always
+    /// `None` otherwise, which is why the caller has to know what it requested.
+    pub previous: Option<Value>,
+}
+
+/// What the record an overwrite replaced was holding.
+#[derive(Debug, Default)]
+struct Displaced {
+    /// Its deadline, or `None` if there was no live record to take one from.
+    deadline: Option<u64>,
+    /// Its value, captured only when the caller asked for it.
+    previous: Option<Value>,
+}
+
+/// The result of storing a prepared record.
+#[derive(Debug)]
+pub struct SetApplied {
+    pub cas: u64,
+    /// What the write displaced, when it asked to be told.
+    pub previous: Option<Value>,
 }
 
 pub struct LmdbEngine {
@@ -534,11 +566,20 @@ impl LmdbEngine {
         }
         validate_value(set.value, self.max_value_len)?;
 
-        let expires_at_ms = self.expiry_from_ttl(set.ttl_secs);
+        // Resolved here when it can be, and left to the writer when it cannot.
+        // `Keep` needs the record's current deadline, which only the writer's
+        // transaction can read consistently — and which it reads anyway, so
+        // deferring costs nothing. See [`Self::apply_set`].
+        let expires_at_ms = match set.ttl {
+            TtlChange::Set(ttl_secs) => Some(self.expiry_from_ttl(ttl_secs)),
+            TtlChange::Keep | TtlChange::SetIfPersistent(_) => None,
+        };
         let meta = RecordMeta {
             epoch: self.epoch(),
             mc_flags: set.mc_flags,
-            expires_at_ms,
+            // Patched by the writer along with the CAS token when the deadline
+            // was not resolvable here.
+            expires_at_ms: expires_at_ms.unwrap_or(NEVER),
             // Stamped by the writer in commit order; see `patch_cas`.
             cas: 0,
         };
@@ -550,7 +591,9 @@ impl LmdbEngine {
             key: set.key.as_bytes().into(),
             record,
             expires_at_ms,
+            ttl: set.ttl,
             tags,
+            return_previous: set.return_previous,
         })
     }
 
@@ -577,21 +620,48 @@ impl LmdbEngine {
         Ok(counter * self.shard_count as u64 + self.shard_index as u64)
     }
 
-    /// Removes the index entries belonging to whatever is currently stored
-    /// under `key`.
+    /// Clears the index entries of whatever is stored under `key`, and reports
+    /// what it held.
     ///
-    /// Without this, overwriting a key would leave its old expiry and tag index
-    /// entries behind, and a hot key rewritten every second would accumulate
-    /// dead entries until its buckets came due.
-    fn drop_index_entries(&self, wtxn: &mut RwTxn, key: &[u8]) -> Result<()> {
+    /// Without the clearing, overwriting a key would leave its old expiry and
+    /// tag index entries behind, and a hot key rewritten every second would
+    /// accumulate dead entries until its buckets came due.
+    ///
+    /// The reporting rides along because **every overwrite has to read the
+    /// record it replaces anyway**. One lookup then serves three jobs: dropping
+    /// the stale index rows, resolving [`TtlChange::Keep`], and capturing the
+    /// previous value for `SET … GET`. Doing the latter two in the caller
+    /// instead would be two more descents of the same B-tree, and — the reason
+    /// this exists — they would be *outside* the write transaction, which is
+    /// exactly where those two commands used to lose a race.
+    fn displace(&self, wtxn: &mut RwTxn, key: &[u8], want_value: bool) -> Result<Displaced> {
         let Some(blob) = self.main.get(wtxn, key).map_err(StoreError::from_heed)? else {
-            return Ok(());
+            return Ok(Displaced::default());
         };
         let record = RecordRef::parse(blob)?;
 
         let expires_at_ms = record.expires_at_ms();
         let cas = record.cas();
         let tag_ids: Vec<u32> = record.tags.iter().map(|t| t.tag_id.get()).collect();
+
+        // Everything the caller learns is gathered before the deletes below,
+        // because those need the transaction mutably and would end this borrow
+        // of the memory map.
+        let displaced = {
+            let lookup = self.tags.lookup();
+            let live = record.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id));
+            Displaced {
+                // A record that is not live is already invisible to clients, so
+                // it has no deadline worth keeping and no value worth reporting.
+                deadline: live.then_some(expires_at_ms),
+                previous: (live && want_value).then(|| Value {
+                    data: Bytes::copy_from_slice(record.value),
+                    mc_flags: record.mc_flags(),
+                    cas,
+                    expires_at_ms: Some(expires_at_ms),
+                }),
+            }
+        };
 
         // Every record is indexed, including those that never expire, so the
         // delete is unconditional too.
@@ -606,7 +676,7 @@ impl LmdbEngine {
                 .map_err(StoreError::from_heed)?;
         }
 
-        Ok(())
+        Ok(displaced)
     }
 
     /// Reads the record currently under `key`, if it is live.
@@ -636,21 +706,39 @@ impl LmdbEngine {
         wtxn: &mut RwTxn,
         prepared: &mut PreparedSet,
         mode: SetMode,
-    ) -> Result<Stored> {
+    ) -> Result<Written> {
         let existing = self
             .live_record(wtxn, &prepared.key)?
             .map(|r| (r.cas(), r.mc_flags(), r.expires_at_ms(), r.value.to_vec()));
 
+        // A guard that refuses the write still has to answer `SET … GET`, which
+        // reports what the key holds whether or not the write applied — that is
+        // Redis's contract for `SET k v NX GET` on a key that already exists.
+        let refused = |outcome: Stored| -> Result<Written> {
+            Ok(Written {
+                outcome,
+                previous: match (&existing, prepared.return_previous) {
+                    (Some((cas, mc_flags, expires_at_ms, value)), true) => Some(Value {
+                        data: Bytes::copy_from_slice(value),
+                        mc_flags: *mc_flags,
+                        cas: *cas,
+                        expires_at_ms: Some(*expires_at_ms),
+                    }),
+                    _ => None,
+                },
+            })
+        };
+
         match (mode, &existing) {
             (SetMode::Set, _) => {}
-            (SetMode::Add, Some(_)) => return Ok(Stored::NotStored),
+            (SetMode::Add, Some(_)) => return refused(Stored::NotStored),
             (SetMode::Add, None) => {}
-            (SetMode::Replace, None) => return Ok(Stored::NotStored),
+            (SetMode::Replace, None) => return refused(Stored::NotStored),
             (SetMode::Replace, Some(_)) => {}
-            (SetMode::Append | SetMode::Prepend, None) => return Ok(Stored::NotStored),
-            (SetMode::Cas(_), None) => return Ok(Stored::NotFound),
+            (SetMode::Append | SetMode::Prepend, None) => return refused(Stored::NotStored),
+            (SetMode::Cas(_), None) => return refused(Stored::NotFound),
             (SetMode::Cas(expected), Some((cas, ..))) if *cas != expected => {
-                return Ok(Stored::Exists);
+                return refused(Stored::Exists);
             }
             (SetMode::Cas(_), Some(_)) => {}
             (SetMode::Append | SetMode::Prepend, Some(_)) => {}
@@ -688,10 +776,16 @@ impl LmdbEngine {
                 &combined,
             )?;
             prepared.record = record;
-            prepared.expires_at_ms = expires_at_ms;
+            // Settled from the record being concatenated onto, so `apply_set`
+            // has nothing left to resolve.
+            prepared.expires_at_ms = Some(expires_at_ms);
         }
 
-        Ok(Stored::Stored(self.apply_set(wtxn, prepared)?))
+        let applied = self.apply_set(wtxn, prepared)?;
+        Ok(Written {
+            outcome: Stored::Stored(applied.cas),
+            previous: applied.previous,
+        })
     }
 
     /// Stores a replacement for a record, keeping the tag table it is given.
@@ -719,10 +813,83 @@ impl LmdbEngine {
         let mut prepared = PreparedSet {
             key: key.into(),
             record,
-            expires_at_ms: meta.expires_at_ms,
+            // Already settled by the caller, which had the record in hand.
+            expires_at_ms: Some(meta.expires_at_ms),
+            ttl: TtlChange::Keep,
             tags,
+            return_previous: false,
         };
         self.apply_set(wtxn, &mut prepared)
+            .map(|applied| applied.cas)
+    }
+
+    /// Changes a key's deadline under a guard, atomically.
+    ///
+    /// Redis's `EXPIRE`/`EXPIREAT`/`PERSIST`. The guard is evaluated against the
+    /// deadline the record holds **inside this transaction**, so a `GT`/`LT`
+    /// comparison cannot be decided against a deadline that has since moved —
+    /// the seam this replaces read the deadline from the network tier and wrote
+    /// back against it.
+    ///
+    /// A deadline that has already passed deletes the key outright rather than
+    /// storing it pre-expired. Redis is explicit that the event is a `del`, and
+    /// the record would be invisible either way; doing it here frees the space
+    /// now instead of leaving it for the sweeper.
+    pub fn apply_expire(
+        &self,
+        wtxn: &mut RwTxn,
+        key: &[u8],
+        ttl: TtlChange,
+        guard: ExpireGuard,
+    ) -> Result<bool> {
+        let Some(record) = self.live_record(wtxn, key)? else {
+            return Ok(false);
+        };
+        let current = record.expires_at_ms();
+        let tags = record.tags.to_vec();
+        let mc_flags = record.mc_flags();
+        let epoch = record.header.epoch.get();
+
+        let target = self.deadline_after(ttl, current);
+
+        // A key with no deadline is infinitely far off, which is what makes `GT`
+        // never apply to one and `LT` always apply.
+        let existing = (current != NEVER).then_some(current);
+        let applies = match guard {
+            ExpireGuard::Always => true,
+            ExpireGuard::IfPersistent => existing.is_none(),
+            ExpireGuard::IfVolatile => existing.is_some(),
+            ExpireGuard::IfLater => existing.is_some_and(|at| target != NEVER && target > at),
+            ExpireGuard::IfEarlier => target != NEVER && existing.is_none_or(|at| target < at),
+        };
+        if !applies {
+            return Ok(false);
+        }
+
+        if target != NEVER && target <= self.now_ms() {
+            // `apply_delete` re-reads the key, which is the price of not holding
+            // the borrow of the memory map across a mutable use of the
+            // transaction. One extra lookup on a path that is deleting anyway.
+            return self.apply_delete(wtxn, key);
+        }
+
+        // Re-encoded rather than patched: the value has to be copied out of the
+        // map before the transaction is used mutably, and once it is copied the
+        // ordinary encode path is the simpler one.
+        let value = record.value.to_vec();
+        self.rewrite(
+            wtxn,
+            key,
+            tags,
+            RecordMeta {
+                epoch,
+                mc_flags,
+                expires_at_ms: target,
+                cas: 0,
+            },
+            &value,
+        )?;
+        Ok(true)
     }
 
     /// The deadline a rewrite lands on, given what the record carries now.
@@ -861,11 +1028,27 @@ impl LmdbEngine {
         Ok(combined.len() as u64)
     }
 
-    pub fn apply_set(&self, wtxn: &mut RwTxn, prepared: &mut PreparedSet) -> Result<u64> {
+    pub fn apply_set(&self, wtxn: &mut RwTxn, prepared: &mut PreparedSet) -> Result<SetApplied> {
         let cas = self.next_cas(wtxn)?;
         patch_cas(&mut prepared.record, cas)?;
 
-        self.drop_index_entries(wtxn, &prepared.key)?;
+        let displaced = self.displace(wtxn, &prepared.key, prepared.return_previous)?;
+
+        // A deadline `prepare_set` could not settle off-thread is settled here,
+        // against the record this write is replacing, and patched into the
+        // header that was encoded without it. This is what makes `KEEPTTL` keep
+        // the deadline the key *actually* has at the moment of the write rather
+        // than one read a moment earlier.
+        let expires_at_ms = match prepared.expires_at_ms {
+            Some(resolved) => resolved,
+            None => {
+                let resolved =
+                    self.deadline_after(prepared.ttl, displaced.deadline.unwrap_or(NEVER));
+                patch_expiry(&mut prepared.record, resolved)?;
+                prepared.expires_at_ms = Some(resolved);
+                resolved
+            }
+        };
 
         self.main
             .put(wtxn, &prepared.key, &prepared.record)
@@ -875,8 +1058,7 @@ impl LmdbEngine {
         // as an eviction victim, so a cache of TTL-less keys would have nothing
         // to free under pressure. Never-expiring records sort last (see
         // `expiry::NEVER_BUCKET`), so they go only after everything with a TTL.
-        let index_key =
-            crate::expiry::encode_key(prepared.expires_at_ms, cas, self.bucket_granularity_ms);
+        let index_key = crate::expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms);
         self.exp
             .put(wtxn, &index_key, &prepared.key)
             .map_err(StoreError::from_heed)?;
@@ -891,7 +1073,10 @@ impl LmdbEngine {
                 .map_err(StoreError::from_heed)?;
         }
 
-        Ok(cas)
+        Ok(SetApplied {
+            cas,
+            previous: displaced.previous,
+        })
     }
 
     /// Returns whether the key was live before the delete. A record that has
@@ -908,7 +1093,7 @@ impl LmdbEngine {
             None => false,
         };
 
-        self.drop_index_entries(wtxn, key)?;
+        self.displace(wtxn, key, false)?;
         self.main.delete(wtxn, key).map_err(StoreError::from_heed)?;
 
         Ok(was_live)
@@ -952,8 +1137,10 @@ impl LmdbEngine {
         let mut prepared = PreparedSet {
             key: key.into(),
             record: rewritten,
-            expires_at_ms,
+            expires_at_ms: Some(expires_at_ms),
+            ttl: TtlChange::Set(ttl_secs),
             tags,
+            return_previous: false,
         };
         self.apply_set(wtxn, &mut prepared)?;
 

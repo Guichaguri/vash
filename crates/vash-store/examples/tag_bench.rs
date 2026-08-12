@@ -53,7 +53,8 @@ fn main() {
                 .map(|key| Set {
                     key: Key::new(key.as_bytes()).unwrap(),
                     value: VALUE,
-                    ttl_secs: 0,
+                    ttl: vash_core::TtlChange::Set(0),
+                    return_previous: false,
                     mc_flags: 0,
                     tags: vec![b"everything"],
                     mode: vash_core::SetMode::Set,

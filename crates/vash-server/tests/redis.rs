@@ -120,6 +120,15 @@ impl Conn {
     /// depends on the clock.
     async fn line(&mut self, args: &[&str]) -> String {
         self.send(&request(args)).await;
+        self.read_line().await
+    }
+
+    /// Reads one more line of a reply already in flight.
+    ///
+    /// A bulk string is two lines — a length header and then the payload — so a
+    /// caller that wants the payload reads the header with [`Conn::line`] and the
+    /// rest with this.
+    async fn read_line(&mut self) -> String {
         loop {
             if let Some(end) = self.buf.windows(2).position(|w| w == b"\r\n") {
                 let line = String::from_utf8_lossy(&self.buf[..end + 2]).into_owned();
@@ -564,6 +573,59 @@ async fn concurrent_increments_do_not_lose_an_update() {
             &format!("${}\r\n{total}\r\n", total.len()),
         )
         .await;
+}
+
+/// `SET … GET` must report exactly what it displaced.
+///
+/// The invariant is a conservation law, and it is what makes this worth testing
+/// concurrently: every value written is either handed back to exactly one client
+/// as the value it displaced, or is the one still in the key at the end. If the
+/// read and the write can interleave, two clients see the same predecessor and
+/// one written value vanishes from the accounting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_with_get_reports_exactly_what_it_displaced() {
+    const CONNECTIONS: usize = 8;
+    const EACH: usize = 16;
+
+    let server = TestServer::start().await;
+
+    let mut clients = Vec::new();
+    for client in 0..CONNECTIONS {
+        let mut conn = server.connect().await;
+        clients.push(tokio::spawn(async move {
+            let mut displaced = Vec::new();
+            for round in 0..EACH {
+                let value = format!("{client}-{round}");
+                // `$-1\r\n` for the very first write, which displaced nothing;
+                // otherwise a bulk header followed by the previous value.
+                let header = conn.line(&["SET", "k", &value, "GET"]).await;
+                if header != "$-1\r\n" {
+                    displaced.push(conn.read_line().await.trim_end().to_string());
+                }
+            }
+            displaced
+        }));
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    for client in clients {
+        seen.extend(client.await.expect("set task"));
+    }
+
+    let survivor = {
+        let mut conn = server.connect().await;
+        conn.line(&["GET", "k"]).await;
+        conn.read_line().await.trim_end().to_string()
+    };
+    seen.push(survivor);
+    seen.sort();
+    seen.dedup();
+
+    assert_eq!(
+        seen.len(),
+        CONNECTIONS * EACH,
+        "every value written must be displaced exactly once, or be the survivor"
+    );
 }
 
 /// Concurrent `APPEND` to one key must not lose a fragment.

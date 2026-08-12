@@ -461,14 +461,34 @@ fn execute_auth(
 fn offsets_to_store_ttls(command: &mut Command<'_>) {
     let clock = vash_core::Clock::new();
     match command {
-        Command::Set(set) => set.ttl_secs = clock.ttl_from_offset(set.ttl_secs),
+        Command::Set(set) => set.ttl = offset_to_store_ttl(&clock, set.ttl),
         Command::SetMany(sets) => {
             for set in sets {
-                set.ttl_secs = clock.ttl_from_offset(set.ttl_secs);
+                set.ttl = offset_to_store_ttl(&clock, set.ttl);
             }
         }
         Command::Touch { ttl_secs, .. } => *ttl_secs = clock.ttl_from_offset(*ttl_secs),
         _ => {}
+    }
+}
+
+/// The same translation for a [`TtlChange`], which only the `Set` forms carry.
+///
+/// The variants that name no offset pass through: there is nothing to reinterpret
+/// in "keep whatever is there".
+///
+/// [`TtlChange`]: vash_core::TtlChange
+fn offset_to_store_ttl(
+    clock: &vash_core::Clock,
+    ttl: vash_core::TtlChange,
+) -> vash_core::TtlChange {
+    use vash_core::TtlChange;
+    match ttl {
+        TtlChange::Set(offset) => TtlChange::Set(clock.ttl_from_offset(offset)),
+        TtlChange::SetIfPersistent(offset) => {
+            TtlChange::SetIfPersistent(clock.ttl_from_offset(offset))
+        }
+        TtlChange::Keep => TtlChange::Keep,
     }
 }
 
@@ -541,7 +561,12 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
             state.store.get_many(keys).map_err(to_status)?,
         )),
 
-        Command::Set(set) => Ok(Reply::Stored(state.store.store(set).map_err(to_status)?)),
+        // The previous value is dropped here, and that is not a loss: only
+        // Redis's `SET … GET` asks for one, and it asks through
+        // `Set::return_previous`, which no VCP or memcached request ever sets.
+        Command::Set(set) => Ok(Reply::Stored(
+            state.store.store(set).map_err(to_status)?.outcome,
+        )),
 
         Command::GetAndTouch { keys, ttl_secs } => Ok(Reply::Values(
             state

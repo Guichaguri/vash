@@ -28,10 +28,10 @@ mod shard;
 pub mod tags;
 mod writer;
 
-use vash_core::{Key, Listing, Set, Stored, Value};
+use vash_core::{BatchGuard, ExpireGuard, Key, Listing, Set, Value};
 
 pub use config::{Durability, EvictionConfig, StoreConfig, WriteConfig};
-pub use engine::Pressure;
+pub use engine::{Pressure, Written};
 pub use error::{Result, StoreError};
 pub use lmdb::LmdbStore;
 
@@ -164,7 +164,33 @@ pub trait Store: Send + Sync + 'static {
     fn set(&self, set: &Set<'_>) -> Result<u64>;
 
     /// Applies a write under its [`SetMode`] guard.
-    fn store(&self, set: &Set<'_>) -> Result<Stored>;
+    ///
+    /// Returns the verdict and, when `set.return_previous` asked for it, the
+    /// value the key held beforehand — captured inside the write transaction, so
+    /// `SET … GET` reports what this write actually displaced rather than what a
+    /// read a moment earlier happened to see.
+    fn store(&self, set: &Set<'_>) -> Result<Written>;
+
+    /// Changes a key's deadline under a guard, atomically.
+    ///
+    /// Redis's `EXPIRE`/`EXPIREAT`/`PERSIST`. The guard is evaluated against the
+    /// deadline the record holds inside the transaction that then writes it, so
+    /// a `GT`/`LT` comparison cannot be decided against a deadline that has
+    /// since moved. Returns whether it applied. A deadline already in the past
+    /// deletes the key, which is the event Redis specifies.
+    fn expire(&self, key: Key<'_>, ttl: vash_core::TtlChange, guard: ExpireGuard) -> Result<bool>;
+
+    /// Stores many values under a batch-wide guard.
+    ///
+    /// Redis's `MSETEX` with `NX`/`XX`. Returns whether the batch applied.
+    ///
+    /// **Atomic within a shard, and only within a shard.** The guard has to see
+    /// every key at once, and a batch spanning shards is several transactions —
+    /// plan §16's standing non-goal, not an oversight here. It therefore holds
+    /// exactly when the keys land in one shard, which includes every
+    /// single-shard deployment; across shards the test can be stale by the time
+    /// the later shards commit. Documented in `docs/protocol.md`.
+    fn set_many_if(&self, sets: &[Set<'_>], guard: BatchGuard) -> Result<bool>;
 
     /// Applies an atomic read-modify-write to a counter held as decimal text.
     ///

@@ -908,7 +908,8 @@ after it is still read correctly.
 | Keys over 511 bytes | allowed | `-ERR invalid key` | LMDB's compile-time `MDB_MAXKEYSIZE`; see [storage.md](storage.md). |
 | `INCRBYFLOAT` precision | 80-bit `long double` | 64-bit `f64` | Rust has no 80-bit float. The last digits of a long chain of increments can differ. |
 | Arithmetic and `APPEND` atomicity | atomic (single-threaded) | atomic (single writer per shard) | See below. |
-| `SET … GET/KEEPTTL`, conditional `EXPIRE`, `MSETEX NX/XX` | atomic | **read-modify-write, not atomic** | See below. |
+| `SET … GET/KEEPTTL`, conditional `EXPIRE`, `PERSIST` | atomic | atomic (single writer per shard) | See below. |
+| `MSETEX NX/XX` spanning shards | atomic | the guard can be stale | Multi-key atomicity across shards is a standing non-goal (plan §16). Atomic within a shard, which is every single-shard deployment. |
 | Eviction under memory pressure | configurable LRU/LFU | TTL-ordered | See [plan.md](plan.md) §6. |
 | Databases (`SELECT`) | 16 | one | A cache does not need a namespace it cannot see into. |
 
@@ -925,22 +926,26 @@ limiter, not a best-effort one.
 Nor do plain `GET`, `SET`, `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`, `TTL` or
 `PERSIST` have a seam — they were always single operations.
 
-**Four commands still do**, and the exposure is different in kind: they write a
-*deadline* derived from one they read a moment earlier, so what a race costs is
-a stale expiry rather than a corrupted value.
+**The conditional writes are atomic as well.** `SET … KEEPTTL`, `SET … GET`,
+`EXPIRE`/`EXPIREAT` with `NX`/`XX`/`GT`/`LT`, and `PERSIST` each used to read a
+deadline or a value from the network tier and then write against what they had
+read. Each is now a single storage primitive, with the guard evaluated and the
+displaced value captured inside the transaction that writes:
 
-| Command | What can be lost |
+| Command | What the guarantee now is |
 |---|---|
-| `SET … KEEPTTL` | A deadline changed between the read and the write is overwritten with the older one. |
-| `SET … GET` | The value reported as "previous" may not be the one this write replaced. |
-| `EXPIRE`/`EXPIREAT` with `NX`/`XX`/`GT`/`LT` | The guard is evaluated against a deadline that may have moved before the write lands. |
-| `MSETEX` with `NX`/`XX` | The all-present/all-absent test may be stale by the time the batch applies. |
+| `SET … KEEPTTL` | Keeps the deadline the key holds **at the moment of the write**. No deadline is read at all — it travels as "keep" and is settled against the record being replaced. |
+| `SET … GET` | Reports exactly the value this write displaced, never one a read a moment earlier happened to see. |
+| `EXPIRE`/`EXPIREAT` with a condition | `GT`/`LT` compare against the deadline the record actually holds when the write lands. |
+| `PERSIST` | Cannot clear a deadline set concurrently after it decided there was none. |
 
-Closing these needs a conditional-write primitive in the shard writer — the same
-move that made the arithmetic commands atomic in M10, applied to a predicate
-rather than to a sum. Planned as [m10.md](m10.md) phase 2.
+**The one exception is `MSETEX` with `NX`/`XX` across shards.** Its guard has to
+see every key at once, and a batch spanning shards is several transactions —
+plan §16's standing non-goal, not an oversight. It is atomic when the keys land
+in one shard, which includes every single-shard deployment; across shards the
+all-present/all-absent test can be stale by the time the later shards commit.
 
-**Note the asymmetry this removed.** Until M10, `INCR` was atomic over memcached
+**Note the asymmetry M10 removed.** Before it, `INCR` was atomic over memcached
 and not over Redis, on the same key, on the same server — because the memcached
 adapter had always executed it in the writer and the Redis adapter composed it
 from two calls. Both now use the same primitive.

@@ -633,6 +633,6 @@ mod tests {
         };
         assert_eq!(set.key.as_bytes(), b"key");
         assert_eq!(set.value, b"val");
-        assert_eq!(set.ttl_secs, 60);
+        assert_eq!(set.ttl, vash_core::TtlChange::Set(60));
     }
 }

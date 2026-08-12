@@ -20,11 +20,13 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use tracing::{debug, error, info, warn};
-use vash_core::{Applied, Arithmetic, Delta, Key, Missing, OnBound, SetMode, Stored, TtlChange};
+use vash_core::{
+    Applied, Arithmetic, Delta, ExpireGuard, Key, Missing, OnBound, SetMode, TtlChange,
+};
 
 use crate::SweepStats;
 use crate::config::WriteConfig;
-use crate::engine::{LmdbEngine, PreparedSet, Pressure, TagMerge};
+use crate::engine::{LmdbEngine, PreparedSet, Pressure, TagMerge, Written};
 use crate::error::{Result, StoreError};
 
 pub(crate) enum WriteOp {
@@ -51,6 +53,12 @@ pub(crate) enum WriteOp {
     Append {
         key: Box<[u8]>,
         suffix: Box<[u8]>,
+    },
+    /// Change a key's deadline under a guard. Redis's `EXPIRE` family.
+    Expire {
+        key: Box<[u8]>,
+        ttl: TtlChange,
+        guard: ExpireGuard,
     },
     /// Register tag names, each with the generation the rest of the node
     /// already holds for it.
@@ -80,6 +88,7 @@ impl WriteOp {
             Self::ConditionalSet(..)
             | Self::Arithmetic(_)
             | Self::Append { .. }
+            | Self::Expire { .. }
             | Self::DeleteByTag(_)
             | Self::MergeTag { .. }
             | Self::Flush => 1,
@@ -140,7 +149,10 @@ impl OwnedArithmetic {
 
 pub(crate) enum WriteOutcome {
     Cas(Vec<u64>),
-    Conditional(Stored),
+    /// A guarded write's verdict, and whatever it displaced.
+    Written(Written),
+    /// A guarded change that either applied or did not.
+    Applied(bool),
     Deleted(Vec<bool>),
     Touched(Vec<bool>),
     /// Where a counter ended up, and how far it moved. `None` when the key was
@@ -265,9 +277,22 @@ impl Writer {
         }
     }
 
-    pub fn conditional_set(&self, prepared: PreparedSet, mode: SetMode) -> Result<Stored> {
+    pub fn conditional_set(&self, prepared: PreparedSet, mode: SetMode) -> Result<Written> {
         match self.submit(WriteOp::ConditionalSet(prepared, mode))? {
-            WriteOutcome::Conditional(outcome) => Ok(outcome),
+            WriteOutcome::Written(written) => Ok(written),
+            _ => Err(mismatched_reply()),
+        }
+    }
+
+    /// Changes a key's deadline under a guard, in one atomic step.
+    pub fn expire(&self, key: Key<'_>, ttl: TtlChange, guard: ExpireGuard) -> Result<bool> {
+        let op = WriteOp::Expire {
+            key: key.as_bytes().into(),
+            ttl,
+            guard,
+        };
+        match self.submit(op)? {
+            WriteOutcome::Applied(applied) => Ok(applied),
             _ => Err(mismatched_reply()),
         }
     }
@@ -755,10 +780,13 @@ fn apply(
         WriteOp::Set(prepared) => {
             let mut cas = Vec::with_capacity(prepared.len());
             for item in prepared.iter_mut() {
-                cas.push(engine.apply_set(wtxn, item)?);
+                cas.push(engine.apply_set(wtxn, item)?.cas);
             }
             Ok(WriteOutcome::Cas(cas))
         }
+        WriteOp::Expire { key, ttl, guard } => Ok(WriteOutcome::Applied(
+            engine.apply_expire(wtxn, key, *ttl, *guard)?,
+        )),
         WriteOp::Delete(keys) => {
             let mut hits = Vec::with_capacity(keys.len());
             for key in keys.iter() {
@@ -766,7 +794,7 @@ fn apply(
             }
             Ok(WriteOutcome::Deleted(hits))
         }
-        WriteOp::ConditionalSet(prepared, mode) => Ok(WriteOutcome::Conditional(
+        WriteOp::ConditionalSet(prepared, mode) => Ok(WriteOutcome::Written(
             engine.apply_conditional_set(wtxn, prepared, *mode)?,
         )),
         WriteOp::Touch { keys, ttl_secs } => Ok(WriteOutcome::Touched(

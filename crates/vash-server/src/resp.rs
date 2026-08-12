@@ -16,11 +16,19 @@
 //! write issued from here, and were not atomic; `vash_core::arith` is where the
 //! arithmetic moved to.
 //!
-//! **Four seams are still open**, and they are a different class: they can write
-//! a stale deadline rather than corrupt a counter. `SET … KEEPTTL`, `SET … GET`,
-//! `EXPIRE` with a condition and `MSETEX` with `NX`/`XX` each read something and
-//! then write against what they read. Closing them needs a conditional-write
-//! primitive rather than an arithmetic one — see `docs/m10.md` phase 2.
+//! **The conditional writes are atomic too (M10 phase 2).** `SET … KEEPTTL`,
+//! `SET … GET`, `EXPIRE`/`EXPIREAT` with `NX`/`XX`/`GT`/`LT` and `PERSIST` each
+//! used to read something here and then write against what they had read.
+//! They are now single storage primitives: the guard is evaluated, and the
+//! displaced value captured, inside the transaction that does the writing.
+//! `KEEPTTL` in particular no longer reads a deadline at all — it travels as
+//! `TtlChange::Keep` and is settled against the record being replaced, off the
+//! lookup an overwrite performs anyway.
+//!
+//! **`MSETEX` with `NX`/`XX` is atomic within a shard and no further**, because
+//! its guard has to see every key at once and a batch spanning shards is several
+//! transactions. That is plan §16's standing non-goal rather than an open seam
+//! here; `docs/protocol.md` states it.
 
 use tracing::{error, warn};
 use vash_core::{CoreError, Key, SetMode, Stored};
@@ -476,18 +484,17 @@ fn run(
         } => execute_expire(state, key, *expiry, *condition, out),
 
         Command::Persist { key } => {
-            let key = key_of(key)?;
-            let Some(current) = state.store.deadline(key)? else {
-                state.metrics.read(0, 1);
-                return answer_bool(out, false);
-            };
-            if current == vash_core::NEVER {
-                state.metrics.read(1, 0);
-                return answer_bool(out, false);
-            }
-            let touched = state.store.touch(key, 0)?;
+            // `IfVolatile` is what makes this answer 0 for a key that has no
+            // deadline to clear, which is Redis's contract — and evaluating it
+            // in the writer is what stops a deadline set concurrently from being
+            // cleared by a `PERSIST` that had already decided there was none.
+            let cleared = state.store.expire(
+                key_of(key)?,
+                vash_core::TtlChange::Set(0),
+                vash_core::ExpireGuard::IfVolatile,
+            )?;
             state.metrics.write();
-            answer_bool(out, touched)
+            answer_bool(out, cleared)
         }
 
         Command::Ttl { key } => {
@@ -530,32 +537,16 @@ fn execute_set(
     version: Version,
     out: &mut Vec<u8>,
 ) -> Answered {
-    let key = key_of(set.key)?;
-
-    // `GET` needs the old value, which is a read Redis does not pay for.
-    let previous = if set.return_previous {
-        state.store.get(key)?
-    } else {
-        None
-    };
-
-    let deadline = if set.return_previous {
-        // Already read; a miss means there is no deadline to keep either.
-        previous.as_ref().and_then(|value| value.expires_at_ms)
-    } else if set.expiry == Expiry::Keep {
-        // `KEEPTTL` wants the old deadline and not the old value, so it reads
-        // the header alone rather than copying the value out to discard it.
-        state.store.deadline(key)?
-    } else {
-        None
-    };
-
-    let ttl_secs = ttl_for(set.expiry, now_ms() as i64, deadline, INVALID_EXPIRE_SET)?;
-
-    let outcome = state.store.store(&vash_core::Set {
-        key,
+    // One store call, whatever options were given. `KEEPTTL` and `GET` both used
+    // to read first and then write against what they read, which is a race in
+    // two directions: another client changing the deadline in between had it
+    // overwritten with the older one, and `GET` could report a value this write
+    // did not actually displace. Both are now settled inside the writer's
+    // transaction, off the same lookup an overwrite performs anyway.
+    let written = state.store.store(&vash_core::Set {
+        key: key_of(set.key)?,
         value: set.value,
-        ttl_secs,
+        ttl: ttl_change_for(set.expiry, INVALID_EXPIRE_SET)?,
         mc_flags: 0,
         tags: Vec::new(),
         mode: match set.condition {
@@ -563,22 +554,52 @@ fn execute_set(
             Condition::IfAbsent => SetMode::Add,
             Condition::IfPresent => SetMode::Replace,
         },
+        return_previous: set.return_previous,
     })?;
     state.metrics.write();
 
     if set.return_previous {
         // With `GET` the client is told what was there, and never whether the
         // write applied — that is Redis's contract, not an omission.
-        match previous {
+        match written.previous {
             Some(value) => encode::bulk(out, &value.data),
             None => encode::null(out, version),
         }
-    } else if matches!(outcome, Stored::Stored(_)) {
+    } else if matches!(written.outcome, Stored::Stored(_)) {
         encode::ok(out);
     } else {
         encode::null(out, version);
     }
     Ok(())
+}
+
+/// Translates a Redis expiry option into the store's lifetime vocabulary.
+///
+/// `KEEPTTL` becomes [`TtlChange::Keep`] rather than a deadline read out and
+/// written back, which is what removes the read and the race with it. The
+/// absolute forms still resolve here, because only this side knows Redis
+/// measures them in milliseconds.
+///
+/// [`TtlChange`]: vash_core::TtlChange
+fn ttl_change_for(
+    expiry: Expiry,
+    invalid_expire: &'static str,
+) -> Result<vash_core::TtlChange, Failure> {
+    use vash_core::TtlChange;
+    Ok(match expiry {
+        // Redis discards any existing TTL on a plain `SET`.
+        Expiry::Unset | Expiry::Persist => TtlChange::Set(0),
+        Expiry::Keep => TtlChange::Keep,
+        // Checked, not saturating: `PX 9223372036854775807` overflows this, and
+        // Redis refuses a deadline it cannot represent rather than silently
+        // storing a different one.
+        Expiry::After(millis) => TtlChange::Set(ttl_from_deadline(
+            (now_ms() as i64)
+                .checked_add(millis)
+                .ok_or_else(|| Failure::client(invalid_expire))?,
+        )),
+        Expiry::At(millis) => TtlChange::Set(ttl_from_deadline(millis)),
+    })
 }
 
 fn execute_msetex(
@@ -590,42 +611,31 @@ fn execute_msetex(
 ) -> Answered {
     let keys = keys_of(pairs.iter().map(|(key, _)| *key))?;
 
-    // The guard and `KEEPTTL` both need to know what is already there — but
-    // neither needs the values, only whether they exist and when they go away.
-    // Under concurrency this read and the write below are not one step — see
-    // the module note.
-    let current = if condition != Condition::Always || expiry == Expiry::Keep {
-        state.store.deadlines(&keys)?
-    } else {
-        Vec::new()
-    };
-
-    let applies = match condition {
-        Condition::Always => true,
-        Condition::IfAbsent => current.iter().all(Option::is_none),
-        Condition::IfPresent => current.iter().all(Option::is_some),
-    };
-    if !applies {
-        state.metrics.other();
-        encode::integer(out, 0);
-        return Ok(());
-    }
-
-    let now = now_ms() as i64;
+    // Resolved once for the whole batch, so every key in it is stamped against
+    // one instant. `KEEPTTL` needs no read at all now — it is carried into the
+    // writer as `TtlChange::Keep` and settled per record there.
+    let ttl = ttl_change_for(expiry, INVALID_EXPIRE_MSETEX)?;
     let sets: Vec<vash_core::Set<'_>> = keys
         .iter()
         .zip(pairs)
-        .enumerate()
-        .map(|(index, (key, (_, value)))| {
-            let deadline = current.get(index).copied().flatten();
-            let ttl_secs = ttl_for(expiry, now, deadline, INVALID_EXPIRE_MSETEX)?;
-            Ok(vash_core::Set::plain(*key, value, ttl_secs))
-        })
-        .collect::<Result<_, Failure>>()?;
+        .map(|(key, (_, value))| vash_core::Set::with_ttl(*key, value, ttl))
+        .collect();
 
-    state.store.set_many(&sets)?;
-    state.metrics.write();
-    encode::integer(out, 1);
+    let applied = state.store.set_many_if(
+        &sets,
+        match condition {
+            Condition::Always => vash_core::BatchGuard::Always,
+            Condition::IfAbsent => vash_core::BatchGuard::IfAllAbsent,
+            Condition::IfPresent => vash_core::BatchGuard::IfAllPresent,
+        },
+    )?;
+
+    if applied {
+        state.metrics.write();
+    } else {
+        state.metrics.other();
+    }
+    encode::integer(out, i64::from(applied));
     Ok(())
 }
 
@@ -636,12 +646,10 @@ fn execute_expire(
     condition: ExpireCondition,
     out: &mut Vec<u8>,
 ) -> Answered {
-    let key = key_of(key)?;
-    let Some(current) = state.store.deadline(key)? else {
-        state.metrics.read(0, 1);
-        return answer_bool(out, false);
-    };
-
+    // The guard travels to the writer rather than being decided here: a
+    // `GT`/`LT` comparison judged against a deadline read a moment earlier can
+    // be judged against one that has since moved. Deleting an already-past
+    // deadline is the store's job too, for the same reason.
     let now = now_ms() as i64;
     let deadline = match expiry {
         Expiry::After(millis) => now.saturating_add(millis),
@@ -650,31 +658,17 @@ fn execute_expire(
         Expiry::Unset | Expiry::Keep | Expiry::Persist => now,
     };
 
-    // A key with no expiry is infinitely far off, which is what makes `GT`
-    // never apply to one and `LT` always apply.
-    let existing = match current {
-        vash_core::NEVER => None,
-        at => Some(at as i64),
-    };
-    let applies = match condition {
-        ExpireCondition::Always => true,
-        ExpireCondition::IfPersistent => existing.is_none(),
-        ExpireCondition::IfVolatile => existing.is_some(),
-        ExpireCondition::IfLater => existing.is_some_and(|at| deadline > at),
-        ExpireCondition::IfEarlier => existing.is_none_or(|at| deadline < at),
-    };
-    if !applies {
-        state.metrics.read(1, 0);
-        return answer_bool(out, false);
-    }
-
-    // A deadline that has already passed deletes the key outright rather than
-    // storing it pre-expired. Redis is explicit that the event is a `del`.
-    let applied = if deadline <= now {
-        state.store.delete(key)?
-    } else {
-        state.store.touch(key, ttl_from_deadline(deadline))?
-    };
+    let applied = state.store.expire(
+        key_of(key)?,
+        vash_core::TtlChange::Set(ttl_from_deadline(deadline)),
+        match condition {
+            ExpireCondition::Always => vash_core::ExpireGuard::Always,
+            ExpireCondition::IfPersistent => vash_core::ExpireGuard::IfPersistent,
+            ExpireCondition::IfVolatile => vash_core::ExpireGuard::IfVolatile,
+            ExpireCondition::IfLater => vash_core::ExpireGuard::IfLater,
+            ExpireCondition::IfEarlier => vash_core::ExpireGuard::IfEarlier,
+        },
+    )?;
     state.metrics.write();
     answer_bool(out, applied)
 }

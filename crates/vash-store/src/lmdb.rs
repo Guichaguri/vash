@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use vash_core::{Key, Listing, Set, Stored, Value};
+use vash_core::{Key, Listing, Set, Value};
 
 use crate::config::StoreConfig;
 use crate::engine::{LmdbEngine, Pressure};
@@ -222,7 +222,7 @@ impl Store for LmdbStore {
         Ok(results)
     }
 
-    fn store(&self, set: &Set<'_>) -> Result<Stored> {
+    fn store(&self, set: &Set<'_>) -> Result<crate::Written> {
         self.ensure_tags_registered(std::slice::from_ref(set))?;
         let shard = self.shards.for_key(set.key.as_bytes());
         let tags = shard.engine.tags().resolve(&set.tags).map_err(|name| {
@@ -232,6 +232,43 @@ impl Store for LmdbStore {
         })?;
         let prepared = shard.engine.prepare_set(set, tags)?;
         shard.writer.conditional_set(prepared, set.mode)
+    }
+
+    fn expire(
+        &self,
+        key: Key<'_>,
+        ttl: vash_core::TtlChange,
+        guard: vash_core::ExpireGuard,
+    ) -> Result<bool> {
+        self.shards
+            .for_key(key.as_bytes())
+            .writer
+            .expire(key, ttl, guard)
+    }
+
+    fn set_many_if(&self, sets: &[Set<'_>], guard: vash_core::BatchGuard) -> Result<bool> {
+        if guard == vash_core::BatchGuard::Always {
+            self.set_many(sets)?;
+            return Ok(true);
+        }
+
+        // The guard is judged from a single consistent snapshot across every
+        // shard the batch touches. Within one shard that snapshot and the write
+        // that follows are the same transaction; across shards they are not, and
+        // cannot be — see the trait's note.
+        let keys: Vec<Key<'_>> = sets.iter().map(|set| set.key).collect();
+        let present = self.deadlines(&keys)?;
+        let applies = match guard {
+            vash_core::BatchGuard::Always => true,
+            vash_core::BatchGuard::IfAllAbsent => present.iter().all(Option::is_none),
+            vash_core::BatchGuard::IfAllPresent => present.iter().all(Option::is_some),
+        };
+        if !applies {
+            return Ok(false);
+        }
+
+        self.set_many(sets)?;
+        Ok(true)
     }
 
     fn arithmetic(&self, op: &vash_core::Arithmetic<'_>) -> Result<Option<vash_core::Applied>> {

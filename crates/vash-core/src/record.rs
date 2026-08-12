@@ -216,15 +216,32 @@ impl<'a> RecordRef<'a> {
 /// which is why this offset is public and guarded by a test.
 pub const RECORD_CAS_OFFSET: usize = 20;
 
+/// Byte offset of the `expires_at_ms` field within the header.
+///
+/// Patched for the same reason as [`RECORD_CAS_OFFSET`], one step later in the
+/// pipeline: a write that keeps the key's existing deadline cannot know it until
+/// the writer has read the record being replaced, which happens after the record
+/// has already been encoded off-thread.
+pub const RECORD_EXPIRES_AT_OFFSET: usize = 12;
+
 /// Overwrites the `cas` field of an already-encoded record.
 pub fn patch_cas(record: &mut [u8], cas: u64) -> Result<()> {
-    let end = RECORD_CAS_OFFSET + 8;
+    patch_u64(record, RECORD_CAS_OFFSET, cas)
+}
+
+/// Overwrites the `expires_at_ms` field of an already-encoded record.
+pub fn patch_expiry(record: &mut [u8], expires_at_ms: u64) -> Result<()> {
+    patch_u64(record, RECORD_EXPIRES_AT_OFFSET, expires_at_ms)
+}
+
+fn patch_u64(record: &mut [u8], offset: usize, value: u64) -> Result<()> {
+    let end = offset + 8;
     if record.len() < end {
         return Err(CoreError::MalformedRecord(
             "record is shorter than its header",
         ));
     }
-    record[RECORD_CAS_OFFSET..end].copy_from_slice(&cas.to_le_bytes());
+    record[offset..end].copy_from_slice(&value.to_le_bytes());
     Ok(())
 }
 
@@ -421,8 +438,40 @@ mod tests {
 
     #[test]
     fn patching_a_truncated_record_is_an_error_not_a_panic() {
+        // Each field is guarded against its own end, not against the header's:
+        // a buffer long enough for the expiry can still be too short for the
+        // CAS token, which sits eight bytes later.
         let mut buf = vec![0u8; RECORD_CAS_OFFSET + 7];
         assert!(patch_cas(&mut buf, 1).is_err());
+        assert!(patch_expiry(&mut buf, 1).is_ok());
+
+        let mut buf = vec![0u8; RECORD_EXPIRES_AT_OFFSET + 7];
+        assert!(patch_expiry(&mut buf, 1).is_err());
+    }
+
+    #[test]
+    fn patching_the_expiry_hits_the_field_the_struct_defines() {
+        let mut buf = roundtrip(
+            RecordMeta {
+                cas: 9,
+                expires_at_ms: 1,
+                mc_flags: 5,
+                epoch: 3,
+            },
+            &[TagRef::new(2, 8)],
+            b"payload",
+        );
+
+        patch_expiry(&mut buf, 1_700_000_000_000).unwrap();
+        let rec = RecordRef::parse(&buf).unwrap();
+
+        assert_eq!(rec.expires_at_ms(), 1_700_000_000_000);
+        // Nothing either side of it may shift.
+        assert_eq!(rec.cas(), 9);
+        assert_eq!(rec.mc_flags(), 5);
+        assert_eq!(rec.header.epoch.get(), 3);
+        assert_eq!(rec.tags[0].generation.get(), 8);
+        assert_eq!(rec.value, b"payload");
     }
 
     #[test]

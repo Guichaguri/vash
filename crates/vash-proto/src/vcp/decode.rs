@@ -578,12 +578,13 @@ fn decode_set<'a>(c: &mut Cursor<'a>) -> Result<Set<'a>, (Status, &'static str)>
     Ok(Set {
         key,
         value,
-        ttl_secs: header.ttl_secs.get(),
+        ttl: vash_core::TtlChange::Set(header.ttl_secs.get()),
         mc_flags: 0,
         tags,
         // VCP has no conditional writes yet; the guarded modes reach the store
         // only through the memcached adapter.
         mode: vash_core::SetMode::Set,
+        return_previous: false,
     })
 }
 
@@ -629,7 +630,7 @@ mod tests {
         };
         assert_eq!(set.key.as_bytes(), b"k");
         assert_eq!(set.value, b"value");
-        assert_eq!(set.ttl_secs, 300);
+        assert_eq!(set.ttl, vash_core::TtlChange::Set(300));
         assert_eq!(set.tags, vec![b"a".as_slice(), b"bb"]);
     }
 

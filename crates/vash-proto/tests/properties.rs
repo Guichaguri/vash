@@ -157,7 +157,7 @@ proptest! {
         };
         prop_assert_eq!(set.key.as_bytes(), key.as_slice());
         prop_assert_eq!(set.value, value.as_slice());
-        prop_assert_eq!(set.ttl_secs, ttl_secs);
+        prop_assert_eq!(set.ttl, vash_core::TtlChange::Set(ttl_secs));
         prop_assert_eq!(set.tags, tag_refs);
     }
 
