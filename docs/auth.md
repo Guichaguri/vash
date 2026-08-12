@@ -218,9 +218,10 @@ file = "/etc/vash/credentials"
 ```
 
 ```
-# /etc/vash/credentials  —  name:sha256hex
-default:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
-billing-api:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
+# /etc/vash/credentials
+default      sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+billing-api  sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
+peer         hmac-sha256-key:4f8a2c91e0b7d3465a8e1f02c7d94b3e6a05f81c2d7e94b306a1f8c25d7e0b43
 ```
 
 Reasons, in order:
@@ -237,14 +238,74 @@ Reasons, in order:
 4. **It matches the peer list.** Static config, distributed by the operator's
    existing tooling. One operational model, not two.
 
+### The line format
+
+**Whitespace-separated fields, one credential per line, with the algorithm named
+explicitly in the value.** The shape is `~/.ssh/authorized_keys`, deliberately:
+a flat list of credentials, one per line, each carrying an algorithm tag, `#`
+comments, revoked by deleting a line and added by appending one. That is this
+file's job exactly, and an operator already knows how to read, diff, review and
+template it.
+
+```
+<name>  <algorithm>:<value>  [key=value …]
+```
+
+| Field | Rule |
+|---|---|
+| `name` | 1–64 bytes of `[A-Za-z0-9_.-]`. No colon and no whitespace, so both splits are unambiguous. Duplicates are a startup error, not last-one-wins. |
+| `algorithm:value` | One of the two below. The algorithm is **always** present; there is no default and a bare value is refused. |
+| trailing `key=value` | Reserved. None are defined; an unknown one is a startup error, so the field cannot be silently ignored the day `role=` exists (§9). |
+
+Blank lines and lines whose **first non-whitespace character** is `#` are
+skipped. `#` is a comment marker and nothing else — it never appears inside a
+field, which is why it is not also a delimiter.
+
+| Algorithm | Value | Mechanism | Meaning |
+|---|---|---|---|
+| `sha256:` | 64 lowercase hex characters | 0 `PLAIN` only | `SHA-256(secret)`. The file holds no usable credential. |
+| `hmac-sha256-key:` | 64 lowercase hex characters — a 32-byte key | 1 `HMAC_SHA256` only | **The secret itself.** The server needs the key to recompute a MAC (§6.3). |
+
+The two are **not interchangeable**, and a row is bound to its mechanism: a
+`PLAIN` attempt against an `hmac-sha256-key:` row is refused even if the bytes
+would match, and vice versa. Without that rule the raw key in an
+`hmac-sha256-key:` row is a password that logs in over `PLAIN`, which would
+defeat the entire point of storing a digest for everyone else.
+
+Hex for both, rather than base64 for the key, because one encoding is one
+parser and no new dependency — and because it makes the two forms visibly the
+same width, so a row that is the wrong kind is obvious from the algorithm tag
+rather than from the length.
+
+**A value beginning with `$` is refused at startup**, with a message saying so.
+That reserves modular crypt format — `$5$`, `$2y$`, `$argon2id$` — for the day a
+real KDF row is wanted, at which point the identifier will mean what it means
+everywhere else and be verifiable by existing tools. Taking the label without
+implementing the algorithm is the one thing this format must not do; refusing it
+loudly is cheaper than a silent mismatch against a hash someone pasted from
+`mkpasswd`. An unrecognised algorithm is likewise a startup error rather than a
+skipped line: a credential file that half-loads is how a server ends up
+accepting fewer identities than its operator believes.
+
+Nothing here is a standard, and no format for this is. What it does instead is
+avoid resembling one it does not implement — the same reason `$5$`, CSV and
+properties syntax were all rejected. A whitespace-separated line list has no
+spec to violate.
+
+### Generating credentials
+
 `VASH_AUTH_SECRET` in the environment configures a single `default` credential
 without a file, for containers where a one-row table does not justify a mount.
 Startup refuses both at once rather than silently preferring one.
 
-Startup also refuses a credential shorter than 16 bytes when generating, and
-warns on a verifier that matches a small built-in list of the usual suspects.
-`vash-server auth-hash` prints a verifier line for a generated secret so nobody
-has to reach for `sha256sum` and leave the plaintext in their shell history.
+`vash-server auth-gen [name]` generates a 32-byte secret from the system CSPRNG,
+prints the secret once on stderr and the finished file line on stdout, and never
+writes either anywhere. Generating rather than accepting a secret is what keeps
+§3.2's assumption true in practice: a fast unsalted hash is the right storage
+for a high-entropy token and the wrong one for `1234`, and the tool is where
+that gets decided. Startup still refuses a secret shorter than 16 bytes and
+warns on a verifier matching a small built-in list of the usual suspects, for
+credentials that arrive some other way.
 
 ---
 
@@ -370,8 +431,11 @@ Reserved so that building it later is not a wire change. `mechanism = 1`:
 4. Server recomputes and compares in constant time.
 
 The verifier for a `HMAC_SHA256` identity is the secret itself, not a digest of
-it — the server needs the key to recompute the MAC. **That is a real cost and
-must be stated where an operator will see it**: enabling this mechanism trades
+it — the server needs the key to recompute the MAC. That is what the
+`hmac-sha256-key:` row in §4 holds, why it is a separate algorithm tag rather
+than a flag, and why such a row can never satisfy a `PLAIN` attempt. **It is
+also a real cost and must be stated where an operator will see it**: enabling
+this mechanism trades
 "the config file holds no usable credential" (§3.2) for "the wire carries no
 usable credential" (§3.3). They are not both available at once without SCRAM,
 and SCRAM is more machinery than §3.3's verdict supports.
@@ -596,7 +660,8 @@ result.
 
 | Layer | What |
 |---|---|
-| Unit | Verifier parsing, constant-time compare, the credential file reader (bad lines, duplicates, comments, CRLF, permission refusal). |
+| Unit | Constant-time compare, and the credential file reader against every way a line can be wrong: unknown algorithm, missing algorithm, `$…$` refusal, bad hex, wrong length, duplicate name, illegal name character, unknown trailing `key=value`, `#` as the first non-whitespace character versus `#` inside a field, blank lines, CRLF, permission refusal. **Each must be a startup error naming the line number**, not a skipped row — the property that matters is that a file never half-loads. |
+| Unit | Mechanism binding: a `PLAIN` attempt against an `hmac-sha256-key:` row is refused even when the presented bytes equal the stored key, and an `HMAC_SHA256` attempt against a `sha256:` row is refused. Both are the tests that stop §4's two forms collapsing into one. |
 | Property | **The invariant that matters: for every command in every dialect, an unauthenticated connection produces a refusal and no storage effect.** Driven off the existing generators, so a command added later without a gate fails this test rather than shipping. |
 | Property | Consumption is unchanged by authentication state — a refused command consumes exactly the bytes it would have consumed if executed. This is what stops a refusal desynchronising a pipeline. |
 | Fuzz | The `AUTH` body decoder gets a target, joining the five that exist. It is pre-auth input by definition, so it is the highest-value surface in the system. |
