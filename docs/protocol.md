@@ -107,8 +107,10 @@ inbound frames.
 1. Connect (TCP; `TCP_NODELAY` recommended, the server sets it on its side).
 2. Send `HELLO`. This must be the first frame.
 3. Check `protocol_version` in the reply and the capability bits.
-4. Issue commands.
-5. Close the socket. There is no `QUIT` opcode in VCP.
+4. If `AUTH_REQUIRED` is set, send [`AUTH`](#auth-0x03). Everything else is
+   refused with `UNAUTHORIZED` (5) until it succeeds.
+5. Issue commands.
+6. Close the socket. There is no `QUIT` opcode in VCP.
 
 A `HELLO` carrying a version other than `1` is answered with
 `UNSUPPORTED` (8) and the connection stays open, so a client can report a clear
@@ -136,7 +138,7 @@ requests, which produce none.
 |---|---|---|
 | `0x01` | `HELLO` | yes |
 | `0x02` | `PING` | yes |
-| `0x03` | `AUTH` | reserved — returns `UNSUPPORTED` |
+| `0x03` | `AUTH` | yes, if authentication is configured |
 | `0x04` | `STATS` | reserved — returns `UNSUPPORTED` |
 | `0x05` | `CLUSTER` | yes |
 | `0x10` | `GET` | yes |
@@ -166,7 +168,7 @@ planned opcodes, so a client can probe for them safely.
 | 2 | `EXISTS` | Reserved for CAS mismatch. Not emitted over VCP today. |
 | 3 | `BAD_REQUEST` | Malformed body, empty key, oversized batch. |
 | 4 | `TOO_LARGE` | Key, value or tag over its limit. |
-| 5 | `UNAUTHORIZED` | Command disabled by configuration (`FLUSH`). |
+| 5 | `UNAUTHORIZED` | Refused by policy: the connection has not authenticated, or the command is disabled by configuration (`FLUSH`). |
 | 6 | `OVERLOADED` | Write queue full, or the server is shutting down. Retryable. |
 | 7 | `CAPACITY_FULL` | The store is out of space, or the tag registry is full. |
 | 8 | `UNSUPPORTED` | Unknown or unimplemented opcode, or an unsupported protocol version. |
@@ -222,12 +224,14 @@ atomic per shard only.
 | `0x02` | `MEMCACHED` | The memcached protocol is served on this port. |
 | `0x04` | `CLUSTER` | An invalidation sent here reaches the rest of the cluster. |
 | `0x08` | `LISTING` | Planned. `LIST_KEYS` and `LIST_TAGS` are enabled here. |
+| `0x10` | `AUTH_REQUIRED` | This connection must send `AUTH` before anything else. |
 
 `CLUSTER` is set only when this node has peers configured **and** is set to
 forward — not merely because the build supports it. A client seeing it clear
 must invalidate on every node itself. `LISTING` follows the same rule: it
 reports that the commands are enabled on this node, not that the build knows
-them.
+them. So does `AUTH_REQUIRED`: it reports that this server is enforcing
+authentication, not that it understands `AUTH`.
 
 Unlisted bits are reserved; ignore them.
 
@@ -235,6 +239,56 @@ Unlisted bits are reserved; ignore them.
 
 Empty request body. Response is `OK` with an empty body. Does not touch storage,
 so it is a liveness check, not a health check.
+
+`PING` is **not** in the pre-authentication set. Everything it could tell an
+unauthenticated party `HELLO` already told them, and `/health` on the admin port
+is the liveness check for an operator.
+
+### `AUTH` (0x03)
+
+**Request body:**
+
+| Offset | Field |
+|---|---|
+| 0 | `mechanism` u8 — 0 `PLAIN`, 1 `HMAC_SHA256` |
+| 1 | `name_len` u8 — 0 to 64; **0 means the `default` identity** |
+| 2 | `secret_len` u16 — 0 to 512 |
+| 4 | `name` bytes[`name_len`] |
+| 4 + `name_len` | `secret` bytes[`secret_len`] |
+
+**Response:** `OK` with an empty body, or `UNAUTHORIZED` (5) with an empty body.
+A bad name and a bad secret are the same answer, so the reply does not confirm
+which names exist. Trailing bytes, an over-long name or an over-long secret are
+`BAD_REQUEST` (3), and count as a failed attempt.
+
+`mechanism` **0 `PLAIN`** is the only one implemented: the secret crosses the
+wire and the server holds `SHA-256(secret)`. `1 HMAC_SHA256` is specified in
+[auth.md](auth.md#63-the-challengeresponse-mechanism-specified-not-built) and
+answered `UNSUPPORTED` (8) — as is any other value, so a client can probe for a
+mechanism without needing a capability bit for it.
+
+**`NO_REPLY` is ignored on `AUTH`; the response is always sent.** It is the only
+opcode that overrides the flag. A client that cannot learn whether it
+authenticated would pipeline a whole batch into a connection that refuses all of
+it.
+
+Re-authenticating on a live connection is allowed and replaces the identity, so
+a pooled connection can follow a credential rotation without reconnecting. A
+failed re-authentication leaves the existing identity intact — it is an attempt
+that did not land, not a logout.
+
+**Only `HELLO` and `AUTH` are accepted before authenticating.** `HELLO` has to
+be, because [first-byte detection](#first-byte-detection) requires a VCP
+connection to open with it; it therefore discloses the server's limits and
+capability bits to an unauthenticated party, which is the deliberate minimum
+that lets a client discover it must authenticate. Every other opcode — including
+ones this build does not implement, and bytes that are not opcodes at all — is
+`UNAUTHORIZED` (5), so an unauthenticated party cannot enumerate what the server
+supports.
+
+A connection that does not authenticate within `auth.timeout_ms` is dropped, and
+one that fails `auth.max_attempts` times is closed after its last refusal is
+sent.
 
 ### `GET` (0x10)
 
@@ -544,6 +598,37 @@ framing is **length-delimited, not line-delimited**: a value may contain `\r\n`.
 
 `incr` wraps at 64 bits; `decr` clamps at zero.
 
+### Authentication
+
+When the server requires it, a connection authenticates with upstream's ASCII
+mechanism (memcached's `-Y authfile`): a `set` whose key is the username and
+whose data block is `<user> <pass>`.
+
+```text
+set billing-api 0 0 44\r\n
+billing-api 0f1e2d3c4b5a69788796a5b4c3d2e1f0\r\n
+→ STORED
+```
+
+It is an ugly shape — credentials tunnelled through a storage command — but it
+is the only one memcached clients implement, and compatibility is why this
+dialect exists here. A wrong credential answers `CLIENT_ERROR authentication
+failure`; nothing is stored either way.
+
+Before authenticating, the only other command accepted is `quit`. Everything
+else, meta commands included, answers `CLIENT_ERROR unauthenticated`. The meta
+protocol has no authentication command of its own upstream, so a meta-only
+client must send the classic `set` first.
+
+A refused storage command still consumes its declared data block, exactly as
+[stream resynchronisation](#stream-resynchronisation) requires — so a client
+pipelining through the gate gets one error line per command, not one per line of
+a value.
+
+**The binary protocol and its SASL commands are not implemented and will not
+be.** SASL lives only in the binary protocol upstream, so supporting it would
+mean adding the third parser this project decided not to have.
+
 ### `stats`
 
 A subset of memcached's counters — only what is actually measured — plus
@@ -761,7 +846,8 @@ together rather than last-one-wins.
 | `INCRBY` / `DECRBY` | `INCRBY key increment` |
 | `INCRBYFLOAT` | `INCRBYFLOAT key increment` |
 | `INCREX` | `INCREX key [BYFLOAT inc \| BYINT inc] [LBOUND lb] [UBOUND ub] [SATURATE] [EX s \| PX ms \| EXAT ts \| PXAT ms \| PERSIST] [ENX]` |
-| `HELLO` | `HELLO [protover]` |
+| `HELLO` | `HELLO [protover [AUTH username password]]` |
+| `AUTH` | `AUTH password` (the `default` identity) or `AUTH username password` |
 | `PING` | `PING [message]` |
 | `QUIT` | `QUIT` |
 
@@ -787,6 +873,10 @@ stored counters, so a value `INCR` accepts is exactly a value it can write back.
 | `-ERR invalid key` | Empty, or past this server's 511-byte key limit. |
 | `-OOM command not allowed when used memory > 'maxmemory'` | The map is full. Clients treat `OOM` as "back off", which is right. |
 | `-NOPROTO unsupported protocol version` | `HELLO` with anything but 2 or 3. |
+| `-NOAUTH Authentication required.` | Any command before authenticating. |
+| `-NOAUTH HELLO must be called with the client already authenticated, …` | A bare `HELLO` while unauthenticated. Redis's own wording, which explains the combined form. |
+| `-WRONGPASS invalid username-password pair or user is disabled.` | A bad name or a bad secret. One message for both, as Redis does, so it does not confirm which names exist. |
+| `-ERR Client sent AUTH, but no password is set. …` | `AUTH` when the server has no credentials configured at all. |
 | `-ERR Protocol error: …` | Framing that cannot be resynchronised. Sent, **then** the connection closes. |
 
 A rejected command consumes exactly its own bytes, so one bad command in a
@@ -800,7 +890,9 @@ after it is still read correctly.
 | Inline commands | accepted | connection is read as memcached | The first byte picks the dialect; see above. |
 | Expiry precision | milliseconds | rounded to the nearest second, never to the past | The store's deadline field is whole seconds. `PX 100` therefore buys up to a full second — too long rather than too short, since a key that vanishes as it is written is the worse failure. |
 | `SET … IFEQ/IFNE/IFDEQ/IFDNE` | supported | `-ERR … are not supported` | Value-conditional writes need a compare inside the write transaction, and the digest forms need a `DIGEST` command that does not exist here. Named explicitly rather than reported as a syntax error. |
-| `HELLO … AUTH/SETNAME` | supported | `-ERR … are not supported` | There is no auth and no client registry. Accepting `AUTH` would tell a client it had authenticated. |
+| `HELLO … SETNAME` | supported | `-ERR … is not supported` | There is no client registry, and accepting it would report back a name nothing had stored. `HELLO … AUTH` **is** supported. |
+| `RESET` | supported | `-ERR unknown command` | It exists partly to drop authentication state; a client that wants that can close the connection. |
+| `ACL` command family | supported | `-ERR unknown command` | The credential table is config, loaded from a file and reloaded on `SIGHUP`. A runtime mutation command is a road that ends at `ACL SETUSER`; see [auth.md](auth.md#36-a-database-of-users). |
 | Empty key (`SET "" v`) | allowed | `-ERR invalid key` | LMDB has no empty key. |
 | Keys over 511 bytes | allowed | `-ERR invalid key` | LMDB's compile-time `MDB_MAXKEYSIZE`; see [storage.md](storage.md). |
 | `INCRBYFLOAT` precision | 80-bit `long double` | 64-bit `f64` | Rust has no 80-bit float. The last digits of a long chain of increments can differ. |

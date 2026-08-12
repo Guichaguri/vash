@@ -29,7 +29,7 @@ for a different command, and a retired one stays reserved.
 |---|---|---|---|---|
 | `0x01` | [`HELLO`](#hello-0x01) | implemented | none | any thread |
 | `0x02` | [`PING`](#ping-0x02) | implemented | none | any thread |
-| `0x03` | [`AUTH`](#auth-0x03) | reserved | — | rejected in the decoder |
+| `0x03` | [`AUTH`](#auth-0x03) | implemented | none | any thread |
 | `0x04` | [`STATS`](#stats-0x04) | reserved | — | rejected in the decoder |
 | `0x05` | [`CLUSTER`](#cluster-0x05) | implemented | none | any thread |
 | `0x10` | [`GET`](#get-0x10) | implemented | read | reader |
@@ -199,10 +199,43 @@ store can be read.
 
 ### `AUTH` (0x03)
 
-**Reserved.** The decoder returns a `Body` error with `UNSUPPORTED` before
-anything is executed. There is no authentication in v1 (plan §11 sketches
-`protocol.auth_secret`; nothing reads it). The value is reserved so that adding
-auth later cannot collide with a client that probed it.
+**Body** — `mechanism u8 | name_len u8 | secret_len u16 | name | secret`, with
+the ceilings and semantics in [protocol.md](protocol.md#auth-0x03). Both lengths
+are checked before either is used to slice, and trailing bytes are refused.
+
+**Decode** — its own `Decoded::Auth` variant rather than a `vash_core::Command`.
+Authentication is a property of a *connection*, not an operation on a cache: the
+domain crate has no variant for it, the storage tier never sees one, and
+`execute` is never reached.
+
+**Storage** — none. One `HashMap` lookup and one constant-time comparison of
+32-byte digests, against a table held in RAM.
+
+**Gating** — this is the gate. The pre-authentication set is `HELLO` and `AUTH`
+and nothing else; see the [refusal path](#the-refusal-path) below.
+
+**Statuses** — `OK`; `UNAUTHORIZED` (5) for a bad name or a bad secret, which
+are deliberately indistinguishable; `UNSUPPORTED` (8) for a mechanism this build
+does not implement, which today means everything except `PLAIN`; `BAD_REQUEST`
+(3) for a malformed body, counted as a failed attempt because a malformed body
+is as good a brute-force vehicle as a well-formed one.
+
+**`NO_REPLY` is ignored**, uniquely. See protocol.md for why.
+
+#### The refusal path
+
+An unauthenticated frame is refused **from the twelve-byte header, before the
+body is parsed at all**. That ordering is the point rather than an
+implementation detail: it keeps the pre-authentication attack surface down to
+the frame header plus `decode_auth`, instead of every body decoder in the
+protocol. They are all fuzzed, so this is defence in depth rather than a hole
+being closed — but a gate that runs after the parsing it protects is not much of
+a gate.
+
+It has a second effect worth stating: because the refusal happens before opcode
+recognition, an unknown or unimplemented opcode answers `UNAUTHORIZED` like
+everything else rather than `UNSUPPORTED`. An unauthenticated party therefore
+cannot enumerate which opcodes this build has.
 
 ### `STATS` (0x04)
 
@@ -584,10 +617,13 @@ Both commands are refused with `UNAUTHORIZED` (5) unless
 `protocol.listing_enabled` is set. Default **false**, mirroring `FLUSH`, for two
 reasons that are separately sufficient:
 
-- **Disclosure.** There is no authentication in v1. Cache keys routinely embed
-  user and session identifiers, and enumeration turns a port a client can reach
-  into a dump of who and what is in the cache. `FLUSH` is gated because it
-  destroys; this is gated because it reveals.
+- **Disclosure.** Cache keys routinely embed user and session identifiers, and
+  enumeration turns a port a client can reach into a dump of who and what is in
+  the cache. `FLUSH` is gated because it destroys; this is gated because it
+  reveals. Authentication (see [auth.md](auth.md)) does not retire this
+  argument: it decides *who may connect*, where the gate decides what any
+  connected client may do, and every authenticated client here is equally
+  trusted.
 - **Cost.** These are the only reads in the protocol whose cost is not bounded
   by the request. Every other read touches as many records as the client named.
 

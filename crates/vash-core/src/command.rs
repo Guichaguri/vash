@@ -17,6 +17,16 @@ pub mod capability {
     pub const MEMCACHED: u32 = 1 << 1;
     /// Server participates in cluster-wide tag invalidation.
     pub const CLUSTER: u32 = 1 << 2;
+    /// `LIST_KEYS`/`LIST_TAGS` are enabled here. Reserved; not built.
+    pub const LISTING: u32 = 1 << 3;
+    /// This connection must send `AUTH` before any other command.
+    ///
+    /// Set only when authentication is being enforced, not merely because the
+    /// build supports it — the same contract as [`CLUSTER`]. `HELLO` stays
+    /// legal before `AUTH` because first-byte detection requires a VCP
+    /// connection to open with it, so this bit is how a client discovers it
+    /// must authenticate rather than guessing from a refusal.
+    pub const AUTH_REQUIRED: u32 = 1 << 4;
 }
 
 /// The VCP protocol version this build implements.

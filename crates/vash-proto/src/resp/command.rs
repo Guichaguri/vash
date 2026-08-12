@@ -18,15 +18,24 @@ const MAX_VERB_LEN: usize = 16;
 #[derive(Debug)]
 pub enum Command<'a> {
     // ---- connection ------------------------------------------------------
-    /// `HELLO [protover]`. `None` asks for the server description without
-    /// changing the negotiated version.
+    /// `HELLO [protover [AUTH user pass]]`. `version: None` asks for the server
+    /// description without changing the negotiated version.
     Hello {
         version: Option<i64>,
+        /// Authenticate and negotiate in one round trip, which is what a client
+        /// library does on checkout when it has a credential.
+        auth: Option<Credential<'a>>,
     },
     Ping {
         message: Option<&'a [u8]>,
     },
     Quit,
+    /// `AUTH password` or `AUTH username password`.
+    ///
+    /// The one-argument form is Redis's pre-6 shape and still the most common;
+    /// it means the `default` identity, which is why the name is optional here
+    /// rather than being two commands.
+    Auth(Credential<'a>),
 
     // ---- strings ---------------------------------------------------------
     Get {
@@ -89,6 +98,17 @@ pub enum Command<'a> {
         delta: Number,
     },
     IncrEx(IncrEx<'a>),
+}
+
+/// A name and a secret, as presented on the wire.
+///
+/// `name` is `None` for Redis's one-argument `AUTH`, which addresses the
+/// `default` identity. Resolving that default is the server's business, not the
+/// parser's.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Credential<'a> {
+    pub name: Option<&'a [u8]>,
+    pub secret: &'a [u8],
 }
 
 #[derive(Debug)]
@@ -208,22 +228,46 @@ pub fn parse_command<'a>(
 
     let command = match verb {
         b"HELLO" => {
-            // `HELLO` also takes AUTH and SETNAME. Neither has anything to act
-            // on here — there is no auth and no client registry — and quietly
-            // accepting AUTH would tell a client it had authenticated.
-            if args.len() > 2 {
-                return Err(fail(ErrorReply::Err(
-                    "HELLO options (AUTH, SETNAME) are not supported",
-                )));
-            }
             let version = match args.get(1) {
                 None => None,
                 Some(token) => Some(parse_int(token).ok_or_else(|| {
                     fail(ErrorReply::Coded("NOPROTO", "unsupported protocol version"))
                 })?),
             };
-            Command::Hello { version }
+
+            // `HELLO 3 AUTH user pass` authenticates and negotiates in one
+            // round trip. `SETNAME` stays refused: there is still no client
+            // registry, and quietly accepting it would report a name back that
+            // nothing had stored.
+            let auth = match args.len() {
+                ..=2 => None,
+                5 if args[2].eq_ignore_ascii_case(b"AUTH") => Some(Credential {
+                    name: Some(args[3]),
+                    secret: args[4],
+                }),
+                _ => {
+                    return Err(fail(ErrorReply::Err(
+                        "HELLO option SETNAME is not supported, and AUTH takes a username \
+                         and a password",
+                    )));
+                }
+            };
+            Command::Hello { version, auth }
         }
+
+        // Redis 6 added the two-argument form for ACL users and kept the
+        // one-argument one, which every pre-6 client still sends.
+        b"AUTH" => match args.len() {
+            2 => Command::Auth(Credential {
+                name: None,
+                secret: args[1],
+            }),
+            3 => Command::Auth(Credential {
+                name: Some(args[1]),
+                secret: args[2],
+            }),
+            _ => return Err(fail(ErrorReply::WrongArity("auth"))),
+        },
 
         b"PING" => match args.len() {
             1 => Command::Ping { message: None },
@@ -1055,15 +1099,76 @@ mod tests {
     fn hello_carries_the_requested_version() {
         assert!(matches!(
             command(&[b"HELLO"]),
-            Command::Hello { version: None }
+            Command::Hello {
+                version: None,
+                auth: None
+            }
         ));
         assert!(matches!(
             command(&[b"HELLO", b"3"]),
-            Command::Hello { version: Some(3) }
+            Command::Hello {
+                version: Some(3),
+                auth: None
+            }
         ));
+    }
+
+    /// The combined form is what a client library sends on checkout when it has
+    /// a credential, and it is the reason `HELLO` is in the pre-auth set.
+    #[test]
+    fn hello_can_authenticate_and_negotiate_at_once() {
+        let Command::Hello { version, auth } = command(&[b"HELLO", b"3", b"AUTH", b"u", b"p"])
+        else {
+            panic!("expected HELLO");
+        };
+        assert_eq!(version, Some(3));
         assert_eq!(
-            rejected(&[b"HELLO", b"3", b"AUTH", b"u", b"p"]),
-            ErrorReply::Err("HELLO options (AUTH, SETNAME) are not supported")
+            auth,
+            Some(Credential {
+                name: Some(b"u"),
+                secret: b"p"
+            })
+        );
+
+        // Lower case, because option tokens are case-insensitive.
+        assert!(matches!(
+            command(&[b"HELLO", b"2", b"auth", b"u", b"p"]),
+            Command::Hello { auth: Some(_), .. }
+        ));
+    }
+
+    #[test]
+    fn setname_is_still_refused() {
+        assert_eq!(
+            rejected(&[b"HELLO", b"3", b"SETNAME", b"app"]),
+            ErrorReply::Err(
+                "HELLO option SETNAME is not supported, and AUTH takes a username and a password"
+            )
+        );
+    }
+
+    /// Redis's pre-6 one-argument form addresses the `default` identity; the
+    /// two-argument form names one.
+    #[test]
+    fn auth_takes_one_or_two_arguments() {
+        assert!(matches!(
+            command(&[b"AUTH", b"secret"]),
+            Command::Auth(Credential {
+                name: None,
+                secret: b"secret"
+            })
+        ));
+        assert!(matches!(
+            command(&[b"AUTH", b"billing", b"secret"]),
+            Command::Auth(Credential {
+                name: Some(b"billing"),
+                secret: b"secret"
+            })
+        ));
+        assert_eq!(rejected(&[b"AUTH"]), ErrorReply::WrongArity("auth"));
+        assert_eq!(
+            rejected(&[b"AUTH", b"a", b"b", b"c"]),
+            ErrorReply::WrongArity("auth")
         );
     }
 

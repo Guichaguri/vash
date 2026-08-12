@@ -24,7 +24,41 @@ pub enum Decoded<'a> {
         request: Request<'a>,
         consumed: usize,
     },
+    /// `AUTH` (0x03).
+    ///
+    /// Its own variant rather than a [`Command`] because authentication is a
+    /// property of a *connection*, not an operation on a cache: the domain
+    /// crate has no variant for it and the storage tier never sees one.
+    ///
+    /// There is no `no_reply` field, and that is deliberate. `NO_REPLY` is
+    /// ignored on `AUTH` — a client that cannot learn whether it authenticated
+    /// will pipeline a whole batch into a connection that refuses all of it.
+    Auth {
+        request_id: u32,
+        auth: AuthRequest<'a>,
+        consumed: usize,
+    },
 }
+
+/// A decoded `AUTH` body, borrowing from the read buffer.
+///
+/// `mechanism` is the raw byte: which ones exist is policy, and the decoder's
+/// job is framing. The executor answers `UNSUPPORTED` for one it does not know,
+/// so a client can probe for a mechanism without a capability bit.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuthRequest<'a> {
+    pub mechanism: u8,
+    /// Empty means the `default` identity.
+    pub name: &'a [u8],
+    /// The secret for `PLAIN`; a MAC for `HMAC_SHA256`. Empty is legal — it is
+    /// how a challenge is requested — and never treated as a match.
+    pub secret: &'a [u8],
+}
+
+/// `mechanism u8 | name_len u8 | secret_len u16` ahead of an `AUTH` body.
+pub const AUTH_BODY_HEADER_LEN: usize = 4;
+pub const MAX_AUTH_NAME_LEN: usize = 64;
+pub const MAX_AUTH_SECRET_LEN: usize = 512;
 
 /// A decode failure.
 ///
@@ -261,6 +295,17 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
         detail,
     };
 
+    // Answered before the `Command` dispatch below, because there is no
+    // `Command` for it: see [`Decoded::Auth`].
+    if opcode == Opcode::Auth {
+        let auth = decode_auth(body).map_err(|(s, d)| fail(s, d))?;
+        return Ok(Decoded::Auth {
+            request_id,
+            auth,
+            consumed,
+        });
+    }
+
     let command = match opcode {
         Opcode::Ping => Command::Ping,
 
@@ -338,7 +383,11 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
 
         Opcode::Cluster => Command::Cluster,
 
-        Opcode::Auth | Opcode::Stats => {
+        // Handled above; listed so this match stays exhaustive over the opcode
+        // set rather than needing a catch-all that would swallow a new one.
+        Opcode::Auth => unreachable!("AUTH returns before the command dispatch"),
+
+        Opcode::Stats => {
             return Err(fail(Status::Unsupported, "opcode not implemented yet"));
         }
     };
@@ -351,6 +400,56 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
             command,
         },
         consumed,
+    })
+}
+
+/// Parses an `AUTH` body.
+///
+/// ```text
+/// mechanism u8 | name_len u8 | secret_len u16 | name | secret
+/// ```
+///
+/// Public and standalone because it is the only parser in this crate that runs
+/// on **pre-authentication** input by definition, which makes it the highest
+/// value fuzz target in the system: everything else can be put behind the gate,
+/// and this is the gate.
+///
+/// Both lengths are checked against their ceilings *before* either is used to
+/// slice, and trailing bytes are refused rather than ignored — a body the
+/// server would accept two readings of is one a client and a server can
+/// disagree about.
+pub fn decode_auth(body: &[u8]) -> Result<AuthRequest<'_>, (Status, &'static str)> {
+    let mut c = Cursor::new(body);
+    let header = c
+        .take(AUTH_BODY_HEADER_LEN)
+        .ok_or((Status::BadRequest, "auth body is shorter than its header"))?;
+
+    let mechanism = header[0];
+    let name_len = header[1] as usize;
+    let secret_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+
+    if name_len > MAX_AUTH_NAME_LEN {
+        return Err((Status::BadRequest, "auth name exceeds the maximum length"));
+    }
+    if secret_len > MAX_AUTH_SECRET_LEN {
+        return Err((Status::BadRequest, "auth secret exceeds the maximum length"));
+    }
+
+    let name = c
+        .take(name_len)
+        .ok_or((Status::BadRequest, "auth body is shorter than its name"))?;
+    let secret = c
+        .take(secret_len)
+        .ok_or((Status::BadRequest, "auth body is shorter than its secret"))?;
+
+    if !c.rest().is_empty() {
+        return Err((Status::BadRequest, "auth body has trailing bytes"));
+    }
+
+    Ok(AuthRequest {
+        mechanism,
+        name,
+        secret,
     })
 }
 

@@ -38,6 +38,15 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam-channel = "0.5"
 memchr = "2"
 proptest = "1"
+# Authentication only, and off the request path: one hash and one compare per
+# connection. `subtle` is what keeps the compare from leaking a timing oracle
+# over the shared prefix, which is the one attack a naive `==` hands over free.
+sha2 = "0.10"
+subtle = "2"
+# `std` so its error implements `std::error::Error` and can join an anyhow
+# chain. Without it a test build works — something else in the graph turns the
+# feature on — and `cargo build` does not.
+getrandom = { version = "0.3", features = ["std"] }
 
 [profile.release]
 opt-level = 3

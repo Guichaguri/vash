@@ -27,6 +27,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "vcp_auth"
+path = "fuzz_targets/vcp_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "memcached_text"
 path = "fuzz_targets/memcached_text.rs"
 test = false

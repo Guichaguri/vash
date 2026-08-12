@@ -3,9 +3,13 @@
 
 use tracing::{error, warn};
 use vash_core::{Command, Reply, ServerInfo};
-use vash_proto::vcp::{DecodeError, Decoded, Status, decode, encode_error, encode_reply};
+use vash_proto::vcp::{
+    AuthRequest, DecodeError, Decoded, Opcode, Status, decode, encode_error, encode_reply,
+    encode_response,
+};
 use vash_store::{Store, StoreError};
 
+use crate::auth::{ConnAuth, DEFAULT_NAME, Mechanism};
 use crate::metrics::ErrorClass;
 use crate::state::ServerState;
 
@@ -15,7 +19,12 @@ use crate::state::ServerState;
 /// so parsing here cannot run short; re-parsing rather than passing the parsed
 /// form across is what keeps the borrowed key and value slices from crossing a
 /// task boundary.
-pub fn execute_memcached_block(state: &ServerState, block: &[u8], out: &mut Vec<u8>) -> Closing {
+pub fn execute_memcached_block(
+    state: &ServerState,
+    conn: &mut ConnAuth,
+    block: &[u8],
+    out: &mut Vec<u8>,
+) -> Closing {
     use vash_proto::memcached::{Outcome, ProtocolError, parse};
 
     let mut rest = block;
@@ -23,7 +32,7 @@ pub fn execute_memcached_block(state: &ServerState, block: &[u8], out: &mut Vec<
         match parse(rest) {
             Ok(Outcome::Command(parsed)) => {
                 let consumed = parsed.consumed;
-                if execute_memcached(state, &parsed, out) == Closing::Yes {
+                if execute_memcached(state, conn, &parsed, out) == Closing::Yes {
                     // `quit`: nothing after it on this connection matters.
                     return Closing::Yes;
                 }
@@ -50,10 +59,15 @@ pub fn execute_memcached_block(state: &ServerState, block: &[u8], out: &mut Vec<
 /// wire format a request arrived on.
 pub fn execute_memcached(
     state: &ServerState,
+    conn: &mut ConnAuth,
     parsed: &vash_proto::memcached::Parsed<'_>,
     out: &mut Vec<u8>,
 ) -> Closing {
     use vash_proto::memcached::encode as mc;
+
+    if !conn.is_authenticated() && state.auth.current().required() {
+        return execute_memcached_unauthenticated(state, conn, parsed, out);
+    }
 
     let result = execute(state, &parsed.command);
     let closing = matches!(result, Ok(Reply::Closing));
@@ -73,6 +87,104 @@ pub fn execute_memcached(
     }
 
     if closing { Closing::Yes } else { Closing::No }
+}
+
+/// Handles a memcached command on a connection that has not authenticated.
+///
+/// The only thing accepted is upstream's ASCII authentication, which tunnels
+/// credentials through a `set` whose key is the username and whose data block
+/// is `<user> <pass>`:
+///
+/// ```text
+/// set billing-api 0 0 34\r\n
+/// billing-api s3cr3t-token-goes-here-here\r\n
+/// → STORED
+/// ```
+///
+/// It is an ugly mechanism — the text protocol had no room for a verb old
+/// clients would tolerate — but it is the only one memcached clients implement,
+/// and compatibility is the entire reason this dialect exists here. Inventing
+/// our own verb would be a command nobody sends.
+///
+/// **The parser is not involved**, and that is the point: it sees an ordinary
+/// storage command and consumes the length-delimited block exactly as it always
+/// does. Deciding here rather than there is what keeps a refused command from
+/// leaving its data block in the stream to be read as commands, and it means
+/// the fuzz targets do not grow a mode.
+fn execute_memcached_unauthenticated(
+    state: &ServerState,
+    conn: &mut ConnAuth,
+    parsed: &vash_proto::memcached::Parsed<'_>,
+    out: &mut Vec<u8>,
+) -> Closing {
+    use vash_core::{Command, SetMode, Stored};
+    use vash_proto::memcached::{ErrorKind, encode as mc};
+
+    // `quit` stays legal: hanging up is not a use of the cache, and refusing it
+    // would leave a client with no way to close politely.
+    if matches!(parsed.command, Command::Quit) {
+        return Closing::Yes;
+    }
+
+    if let Command::Set(set) = &parsed.command
+        && set.mode == SetMode::Set
+        && let Some((name, secret)) = split_credential(set.value)
+        // The key names the identity, and upstream repeats it in the block. A
+        // mismatch is a malformed attempt rather than a different identity.
+        && set.key.as_bytes() == name
+    {
+        return match state.auth.current().verify(name, secret) {
+            Some(identity) => {
+                conn.succeed(identity);
+                state.metrics.auth_ok();
+                // `STORED`, which is what upstream answers a successful
+                // authentication. The CAS token is meaningless — nothing was
+                // stored — and no client reads it from this reply.
+                if !parsed.noreply {
+                    mc::encode(
+                        out,
+                        &parsed.style,
+                        &parsed.command,
+                        &Reply::Stored(Stored::Stored(0)),
+                    );
+                }
+                Closing::No
+            }
+            None => {
+                conn.fail();
+                warn!(
+                    name = %String::from_utf8_lossy(name),
+                    failures = conn.failures(),
+                    "authentication failed"
+                );
+                state.metrics.auth_failed();
+                if !parsed.noreply {
+                    mc::encode_error(out, ErrorKind::Client("authentication failure"));
+                }
+                Closing::No
+            }
+        };
+    }
+
+    state.metrics.auth_refused();
+    if !parsed.noreply {
+        mc::encode_error(out, ErrorKind::Client("unauthenticated"));
+    }
+    Closing::No
+}
+
+/// Splits an ASCII-auth data block into `(user, password)`.
+///
+/// Exactly one space separates them; a password may not contain one, which is
+/// upstream's limitation and not worth diverging over.
+fn split_credential(block: &[u8]) -> Option<(&[u8], &[u8])> {
+    let space = block.iter().position(|b| *b == b' ')?;
+    let (name, rest) = block.split_at(space);
+    let secret = &rest[1..];
+    if name.is_empty() || secret.is_empty() || secret.contains(&b' ') {
+        return None;
+    }
+    Some((name, secret))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,8 +220,42 @@ fn memcached_error(status: Status) -> vash_proto::memcached::ErrorKind {
 ///
 /// Takes the output buffer rather than returning one so a pipelined batch
 /// builds a single response buffer instead of one allocation per frame.
-pub fn execute_frame_into(state: &ServerState, frame: &[u8], out: &mut Vec<u8>) {
+pub fn execute_frame_into(
+    state: &ServerState,
+    conn: &mut ConnAuth,
+    frame: &[u8],
+    out: &mut Vec<u8>,
+) {
+    // Refused from the **header alone**, before the body is parsed at all.
+    //
+    // Doing it here rather than after decoding is what shrinks the pre-auth
+    // attack surface to the frame header plus one body parser: without it, an
+    // unauthenticated stranger drives `decode_set`, `decode_tag_sync` and every
+    // other body decoder just by naming the opcode. They are fuzzed, so this is
+    // defence in depth rather than a hole being closed — but a gate that runs
+    // after the parsing it is meant to protect is not much of a gate.
+    //
+    // It also stops an unauthenticated party enumerating which opcodes this
+    // build implements: an unknown or unimplemented one is `UNAUTHORIZED` like
+    // everything else, rather than `UNSUPPORTED`.
+    if let Some(refused) = header_refusal(state, conn, frame) {
+        state.metrics.auth_refused();
+        if !refused.no_reply {
+            encode_error(
+                out,
+                refused.opcode,
+                refused.request_id,
+                Status::Unauthorized,
+            );
+        }
+        return;
+    }
+
     match decode(frame) {
+        Ok(Decoded::Auth {
+            request_id, auth, ..
+        }) => execute_auth(state, conn, request_id, &auth, out),
+
         Ok(Decoded::Request { mut request, .. }) => {
             offsets_to_store_ttls(&mut request.command);
             let result = execute(state, &request.command);
@@ -146,6 +292,112 @@ pub fn execute_frame_into(state: &ServerState, frame: &[u8], out: &mut Vec<u8>) 
             encode_error(out, 0, 0, Status::Internal);
         }
     }
+}
+
+/// Enough of a refused frame's header to answer it.
+struct Refused {
+    /// The raw byte, echoed so a client can correlate even when the server does
+    /// not recognise it.
+    opcode: u8,
+    request_id: u32,
+    no_reply: bool,
+}
+
+/// Whether a frame must be refused because the connection has not
+/// authenticated, decided from the twelve-byte header without touching the
+/// body.
+///
+/// **`HELLO` is in the pre-auth set and has to be**: first-byte detection
+/// requires a VCP connection to open with opcode `0x01`, so there is no way to
+/// authenticate before announcing the dialect. It therefore discloses the
+/// server's limits and capability bits to an unauthenticated party, which is
+/// the deliberate minimum that lets a client discover it must authenticate
+/// rather than guess from a refusal.
+///
+/// **`PING` is not**, though it looks harmless: everything it could tell an
+/// unauthenticated party `HELLO` already told them, and `/health` on the admin
+/// port is the liveness check an operator should be using.
+fn header_refusal(state: &ServerState, conn: &ConnAuth, frame: &[u8]) -> Option<Refused> {
+    if conn.is_authenticated() || !state.auth.current().required() {
+        return None;
+    }
+    // Short of a header there is nothing to refuse *with* — no request id to
+    // echo. The decoder below reports it as the malformed frame it is.
+    if frame.len() < vash_proto::vcp::HEADER_LEN {
+        return None;
+    }
+
+    let opcode = frame[0];
+    if opcode == Opcode::Hello as u8 || opcode == Opcode::Auth as u8 {
+        return None;
+    }
+
+    Some(Refused {
+        opcode,
+        request_id: u32::from_le_bytes(frame[4..8].try_into().expect("four bytes")),
+        no_reply: frame[1] & vash_proto::vcp::flags::NO_REPLY != 0,
+    })
+}
+
+/// Answers an `AUTH` frame.
+///
+/// Always replies, even under `NO_REPLY` — a client that cannot learn whether
+/// it authenticated will pipeline a batch into a connection that refuses all of
+/// it.
+fn execute_auth(
+    state: &ServerState,
+    conn: &mut ConnAuth,
+    request_id: u32,
+    auth: &AuthRequest<'_>,
+    out: &mut Vec<u8>,
+) {
+    state.metrics.other();
+
+    let status = match Mechanism::from_u8(auth.mechanism) {
+        // Specified in docs/auth.md §6.3 and not built. `UNSUPPORTED` rather
+        // than `UNAUTHORIZED` so a client can tell "this mechanism does not
+        // exist here" from "your credential is wrong", and probe for it without
+        // a capability bit.
+        Some(Mechanism::HmacSha256) | None => {
+            warn!(
+                mechanism = auth.mechanism,
+                "rejected auth: unsupported mechanism"
+            );
+            Status::Unsupported
+        }
+
+        Some(Mechanism::Plain) => {
+            let name = if auth.name.is_empty() {
+                DEFAULT_NAME.as_bytes()
+            } else {
+                auth.name
+            };
+
+            match state.auth.current().verify(name, auth.secret) {
+                Some(identity) => {
+                    conn.succeed(identity);
+                    state.metrics.auth_ok();
+                    Status::Ok
+                }
+                None => {
+                    conn.fail();
+                    // The name is logged because an operator needs to know
+                    // which credential is failing; the secret never is, because
+                    // a near-miss credential in a log file is a credential in a
+                    // log file.
+                    warn!(
+                        name = %String::from_utf8_lossy(name),
+                        failures = conn.failures(),
+                        "authentication failed"
+                    );
+                    state.metrics.auth_failed();
+                    Status::Unauthorized
+                }
+            }
+        }
+    };
+
+    encode_response(out, Opcode::Auth, request_id, status, &[]);
 }
 
 /// Rewrites a decoded VCP request's TTLs from plain offsets into the overloaded
@@ -476,10 +728,20 @@ fn collect_stats(state: &ServerState) -> Vec<(String, String)> {
 /// not merely whether the build supports it. Claiming the capability on a node
 /// with no peers configured would make a client trust a cluster-wide
 /// invalidation that stops at one node.
-pub fn server_info(shards: u16, max_value_len: usize, cluster: bool) -> ServerInfo {
+pub fn server_info(
+    shards: u16,
+    max_value_len: usize,
+    cluster: bool,
+    auth_required: bool,
+) -> ServerInfo {
     let mut capabilities = vash_core::capability::TAGS | vash_core::capability::MEMCACHED;
     if cluster {
         capabilities |= vash_core::capability::CLUSTER;
+    }
+    // Set from enforcement, not from the build supporting it: a client reads
+    // this as "you must authenticate on this connection".
+    if auth_required {
+        capabilities |= vash_core::capability::AUTH_REQUIRED;
     }
 
     ServerInfo {

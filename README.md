@@ -434,9 +434,23 @@ docker build -t vash .
 unit. [docs/operations.md](docs/operations.md) covers sizing, tuning, what to
 alert on, and what each failure mode looks like from outside.
 
-**There is no authentication.** Anyone who can reach the cache port can read and
-write any key and invalidate any tag — and cluster peers use that same port.
-Bind it to a private network.
+**Authentication is off by default**, and with it off anyone who can reach the
+cache port can read and write any key and invalidate any tag — cluster peers use
+that same port. Turn it on with a credential file:
+
+```bash
+vash-server auth-gen billing-api >> /etc/vash/credentials
+```
+
+then set `auth.file` and, once every client and peer is rolled,
+`auth.required = true`. It works in all three protocols: `AUTH` over VCP,
+Redis's `AUTH`/`HELLO … AUTH`, and memcached's ASCII mechanism.
+
+**Bind the port to a private network either way.** Without TLS every key and
+value crosses the wire in the clear, so authentication decides who may use the
+cache rather than who may read it in flight. [docs/auth.md](docs/auth.md) has
+the design, the threat model, and why the credential is stored as a plain
+SHA-256 digest rather than run through a password KDF.
 
 ## Development
 

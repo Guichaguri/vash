@@ -25,6 +25,7 @@ use vash_proto::resp::command::{Condition, ExpireCondition, Expiry, IncrEx, Numb
 use vash_proto::resp::{Command, ErrorReply, Outcome, ProtocolError, Version, encode};
 use vash_store::{Store, StoreError};
 
+use crate::auth::ConnAuth;
 use crate::dispatch::Closing;
 use crate::metrics::ErrorClass;
 use crate::state::ServerState;
@@ -41,6 +42,7 @@ use crate::state::ServerState;
 /// is rendered.
 pub fn execute_block(
     state: &ServerState,
+    conn: &mut ConnAuth,
     block: &[u8],
     version: &mut Version,
     out: &mut Vec<u8>,
@@ -50,7 +52,7 @@ pub fn execute_block(
         match vash_proto::resp::parse(rest) {
             Ok(Outcome::Command(parsed)) => {
                 let consumed = parsed.consumed;
-                if execute(state, &parsed.command, version, out) == Closing::Yes {
+                if execute(state, conn, &parsed.command, version, out) == Closing::Yes {
                     return Closing::Yes;
                 }
                 rest = &rest[consumed..];
@@ -86,12 +88,14 @@ pub fn is_read_only(command: &Command<'_>) -> bool {
             | Command::Ttl { .. }
             | Command::Ping { .. }
             | Command::Hello { .. }
+            | Command::Auth(_)
             | Command::Quit
     )
 }
 
 fn execute(
     state: &ServerState,
+    conn: &mut ConnAuth,
     command: &Command<'_>,
     version: &mut Version,
     out: &mut Vec<u8>,
@@ -102,7 +106,18 @@ fn execute(
         return Closing::Yes;
     }
 
-    match run(state, command, version, out) {
+    // Refused before the command is looked at. Redis is *more* restrictive than
+    // VCP here — a bare `HELLO` is refused, where VCP must allow it because
+    // first-byte detection needs the connection to open with one.
+    if let Some(failure) = refusal(state, conn, command) {
+        state.metrics.auth_refused();
+        state.metrics.other();
+        state.metrics.error(failure.class);
+        encode::error(out, failure.code, failure.message);
+        return Closing::No;
+    }
+
+    match run(state, conn, command, version, out) {
         Ok(()) => {}
         Err(failure) => {
             state.metrics.other();
@@ -111,6 +126,86 @@ fn execute(
         }
     }
     Closing::No
+}
+
+/// Whether a Redis command must be refused for want of authentication.
+///
+/// The pre-auth set is `AUTH`, `HELLO … AUTH`, and `QUIT`. A bare `HELLO` gets
+/// Redis's own long message, which exists precisely to tell a client how to
+/// authenticate and negotiate at once.
+fn refusal(state: &ServerState, conn: &ConnAuth, command: &Command<'_>) -> Option<Failure> {
+    if conn.is_authenticated() || !state.auth.current().required() {
+        return None;
+    }
+
+    match command {
+        Command::Auth(_) | Command::Quit => None,
+        Command::Hello { auth: Some(_), .. } => None,
+        Command::Hello { auth: None, .. } => Some(Failure {
+            code: "NOAUTH",
+            message: HELLO_UNAUTHENTICATED,
+            class: ErrorClass::Client,
+        }),
+        _ => Some(Failure {
+            code: "NOAUTH",
+            message: "Authentication required.",
+            class: ErrorClass::Client,
+        }),
+    }
+}
+
+/// Redis's own wording, long as it is: client libraries surface it verbatim and
+/// it is the only place the combined form is explained.
+const HELLO_UNAUTHENTICATED: &str = "HELLO must be called with the client already \
+     authenticated, otherwise the HELLO <proto> AUTH <user> <pass> option can be used to \
+     authenticate the client and select the RESP protocol version at the same time";
+
+/// One message for a bad name and a bad secret alike, as Redis does, so the
+/// error does not confirm which names exist.
+const WRONGPASS: &str = "invalid username-password pair or user is disabled.";
+
+/// Verifies a Redis credential and records the outcome.
+fn authenticate(
+    state: &ServerState,
+    conn: &mut ConnAuth,
+    credential: &vash_proto::resp::command::Credential<'_>,
+) -> Answered {
+    let table = state.auth.current();
+
+    // Redis distinguishes this from a wrong password, and it matters: it is the
+    // difference between "your credential is wrong" and "there is nothing here
+    // to authenticate against". A client must never have the two confused.
+    if !table.configured() {
+        return Err(Failure::client(
+            "Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?",
+        ));
+    }
+
+    let name = credential
+        .name
+        .unwrap_or(crate::auth::DEFAULT_NAME.as_bytes());
+
+    match table.verify(name, credential.secret) {
+        Some(identity) => {
+            conn.succeed(identity);
+            state.metrics.auth_ok();
+            Ok(())
+        }
+        None => {
+            conn.fail();
+            warn!(
+                name = %String::from_utf8_lossy(name),
+                failures = conn.failures(),
+                "authentication failed"
+            );
+            state.metrics.auth_failed();
+            Err(Failure {
+                code: "WRONGPASS",
+                message: WRONGPASS,
+                class: ErrorClass::Client,
+            })
+        }
+    }
 }
 
 /// A command that could not be answered.
@@ -212,6 +307,7 @@ type Answered = Result<(), Failure>;
 
 fn run(
     state: &ServerState,
+    conn: &mut ConnAuth,
     command: &Command<'_>,
     version: &mut Version,
     out: &mut Vec<u8>,
@@ -225,8 +321,26 @@ fn run(
             Ok(())
         }
 
-        Command::Hello { version: requested } => {
+        Command::Auth(credential) => {
             state.metrics.other();
+            authenticate(state, conn, credential)?;
+            encode::ok(out);
+            Ok(())
+        }
+
+        Command::Hello {
+            version: requested,
+            auth,
+        } => {
+            state.metrics.other();
+
+            // Before the version is applied: a `HELLO 3 AUTH` with a bad
+            // credential must leave the connection exactly as it was, rather
+            // than switching it to RESP3 and then refusing.
+            if let Some(credential) = auth {
+                authenticate(state, conn, credential)?;
+            }
+
             match requested {
                 None => {}
                 Some(2) => *version = Version::Resp2,

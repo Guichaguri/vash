@@ -262,6 +262,22 @@ pub fn encode_touch_body(out: &mut Vec<u8>, key: &[u8], ttl_secs: u32) {
     out.extend_from_slice(key);
 }
 
+/// Builds an `AUTH` body: `mechanism u8 | name_len u8 | secret_len u16`, then
+/// the two.
+///
+/// Both lengths are the caller's to keep within
+/// [`MAX_AUTH_NAME_LEN`](super::MAX_AUTH_NAME_LEN) and
+/// [`MAX_AUTH_SECRET_LEN`](super::MAX_AUTH_SECRET_LEN); a server rejects the
+/// frame otherwise, which is the client learning it built something it should
+/// not have.
+pub fn encode_auth_body(out: &mut Vec<u8>, mechanism: u8, name: &[u8], secret: &[u8]) {
+    out.push(mechanism);
+    out.push(name.len() as u8);
+    out.extend_from_slice(&(secret.len() as u16).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(secret);
+}
+
 /// Builds a `GET_MANY` or `DELETE_MANY` body: a count, then length-prefixed keys.
 pub fn encode_key_list_body(out: &mut Vec<u8>, keys: &[&[u8]]) {
     out.extend_from_slice(&(keys.len() as u32).to_le_bytes());

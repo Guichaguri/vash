@@ -1,16 +1,14 @@
 # Authentication — design
 
-Status: **planned, nothing built.** This document is to authentication what
+Status: **built (M9), off by default.** This document is to authentication what
 [plan.md](plan.md) is to the rest of the server: decision first, then the
-reasoning, then the rejected alternatives.
+reasoning, then the rejected alternatives. Sections marked *as implemented*
+record where building it changed the design.
 
-Today there is none. `AUTH` (`0x03`) is a reserved VCP opcode that the decoder
-refuses with `UNSUPPORTED`, `protocol.auth_secret` is sketched in plan.md §11
-and read by nothing, Redis `HELLO … AUTH` is explicitly rejected so that a
-client is never told it authenticated when it did not, and
-[operations.md](operations.md) says plainly that anyone who can reach the cache
-port can read and write any key. Cluster peers speak the ordinary protocol on
-the ordinary port, so they inherit the same absence.
+`AUTH` (`0x03`) is answered over VCP, Redis takes `AUTH` and `HELLO … AUTH`,
+memcached takes upstream's ASCII mechanism, and cluster peers authenticate like
+any other client. Nothing is enforced until `auth.required` is set, and the
+network boundary remains the primary control (§1).
 
 ---
 
@@ -266,6 +264,12 @@ field, which is why it is not also a delimiter.
 | `sha256:` | 64 lowercase hex characters | 0 `PLAIN` only | `SHA-256(secret)`. The file holds no usable credential. |
 | `hmac-sha256-key:` | 64 lowercase hex characters — a 32-byte key | 1 `HMAC_SHA256` only | **The secret itself.** The server needs the key to recompute a MAC (§6.3). |
 
+**As implemented:** the algorithm token `hmac-sha256-key` is recognised and then
+**refused at startup**, naming §6.3, because the mechanism that would consume it
+is not built. A row that parses but can never authenticate is worse than one
+that is rejected — it reads as a working credential. The token is reserved here
+so that building mechanism 1 is not a file-format change.
+
 The two are **not interchangeable**, and a row is bound to its mechanism: a
 `PLAIN` attempt against an `hmac-sha256-key:` row is refused even if the bytes
 would match, and vice versa. Without that rule the raw key in an
@@ -313,11 +317,15 @@ credentials that arrive some other way.
 
 Where each piece goes, in the existing code.
 
-**The table.** A new `vash-server/src/auth.rs`: `Auth { required: bool, table:
-HashMap<Vec<u8>, Verifier> }`, built from config, held as `Arc<ArcSwap<Auth>>`
-in [`ServerState`](../crates/vash-server/src/state.rs) beside `flush_enabled`.
-Verification is `table.get(name)` then a constant-time compare of two 32-byte
-digests. It touches no store and takes no lock on the hot path.
+**The table.** A new [`vash-server/src/auth.rs`](../crates/vash-server/src/auth.rs):
+`Auth { required: bool, table: HashMap<Box<[u8]>, Credential> }`, built from
+config and held in [`ServerState`](../crates/vash-server/src/state.rs) beside
+`flush_enabled`. Verification is `table.get(name)` then a constant-time compare
+of two 32-byte digests. It touches no store.
+
+**As implemented:** `RwLock<Arc<Auth>>` rather than the `ArcSwap` this section
+first proposed. The table is read once per *connection*, never per request, so
+the lock is not on any path worth optimising and a dependency is saved.
 
 **The connection's state.** A local in
 [`conn.rs::handle`](../crates/vash-server/src/conn.rs), exactly like
@@ -331,25 +339,50 @@ never shared, and dropped when the socket closes. Two consequences to get right:
   therefore has to take effect *within* a block, not between reads, which is
   again what `version` already requires.
 
-**The gate goes in the executor, not the parser.** `execute` in
+**The gate goes in the executor, not the parser.**
 [`dispatch.rs`](../crates/vash-server/src/dispatch.rs) and
-[`resp.rs`](../crates/vash-server/src/resp.rs) grow one check ahead of the match:
-if `required` and the identity is absent and the command is not in the pre-auth
-set, emit the refusal and return. It must be there and not in the decoder for
-the reason the resynchronisation rules already state: `set k 0 0 5\r\nhello\r\n`
-must consume its data block even when refused, or the next command on that
-connection is read out of the middle of a value. The parsers stay pure functions
-of bytes and learn nothing about identity.
+[`resp.rs`](../crates/vash-server/src/resp.rs) grow one check ahead of the
+match: if `required` and the identity is absent and the command is not in the
+pre-auth set, emit the refusal and return. It must be there and not in the
+decoder for the reason the resynchronisation rules already state: `set k 0 0
+5\r\nhello\r\n` must consume its data block even when refused, or the next
+command on that connection is read out of the middle of a value. The parsers
+stay pure functions of bytes and learn nothing about identity.
+
+**As implemented, VCP refuses one step earlier than that — from the frame
+header, before the body is decoded at all.** The two are not in tension: the
+text dialects are length-delimited by their *parsers*, so the gate cannot
+precede parsing there, while a VCP frame's boundary comes from a fixed twelve
+byte header that is already validated before the frame is split off. Taking the
+refusal there costs nothing and shrinks the pre-authentication attack surface
+from every body decoder in the protocol down to the header plus `decode_auth`.
+Those decoders are all fuzzed, so this is defence in depth rather than a hole
+being closed — but a gate that runs after the parsing it protects is not much of
+a gate.
+
+This was found by the exhaustive test in §14 rather than by design: `STATS` is
+refused by the decoder as unimplemented, so it answered `UNSUPPORTED` where
+every other opcode answered `UNAUTHORIZED`. The narrow fix was a special case;
+the real one was that the gate was in the wrong place. It has a second benefit
+the original design did not have — an unknown or unimplemented opcode is now
+`UNAUTHORIZED` like everything else, so an unauthenticated party cannot
+enumerate which opcodes the build implements.
 
 **No new domain concept.** `vash-core::Command` gains nothing. Authentication is
 a property of a connection, not an operation on a cache, and the storage tier
 never learns that it exists. VCP's `AUTH` is answered in `dispatch.rs` before
 `execute` is reached, the way `HELLO` already is.
 
-**Metrics** (`metrics.rs`): `vash_auth_ok_total`, `vash_auth_failed_total{reason}`
-— `reason` being `unknown_name`, `bad_secret`, `malformed` — and
-`vash_auth_refused_commands_total`. A failure rate that is not zero is the alert
-worth having; a *sudden* zero on a required-auth server is worth one too.
+**Metrics** (`metrics.rs`): `auth_ok`, `auth_failed`, `auth_refused`,
+`auth_timeouts` and `auth_capacity_rejected`. A failure rate that is not zero is
+the alert worth having; a *sudden* zero on a required-auth server is worth one
+too.
+
+**As implemented:** failures are one counter rather than split by reason.
+Distinguishing `unknown_name` from `bad_secret` in a metric would publish the
+distinction §8 deliberately refuses to put in the error reply — an unauthorised
+observer with access to a dashboard could confirm which names exist by watching
+which counter moves.
 
 ---
 
@@ -626,7 +659,7 @@ can create, so it gets a budget rather than the ordinary limits.
 | Authentication deadline | 5 s | A connection that authenticates nothing occupies a slot for free. Enforced in the `select!` that already handles shutdown, so it costs no new task. |
 | Failed attempts per connection | 3, then close | Bounds guessing per connection without a lockout an attacker could use to lock out a legitimate client. |
 | Concurrent unauthenticated connections | `max_connections / 10` | Otherwise the pre-auth budget is the whole connection budget, and a stranger can fill it. |
-| Read buffer before authentication | one read, no growth | A pre-auth connection must not be able to make the server buffer. |
+| Buffered bytes before authentication | 4 KiB, then close | A pre-auth connection must not be able to make the server hold, or *reserve*, arbitrary memory. Both halves are needed: a VCP header claiming a 64 MiB body reserves against a length that has not arrived, so checking what is buffered would not catch it. |
 | Constant-time comparison | always | The timing oracle in §3.1 is the one attack a naive implementation hands over for free. |
 | No delay on failure | — | Redis does not sleep on a bad `AUTH` and neither should this: a sleeping connection is a held resource, which converts a guessing attempt into a cheaper denial of service. The attempt cap is the control. |
 
@@ -662,11 +695,11 @@ result.
 |---|---|
 | Unit | Constant-time compare, and the credential file reader against every way a line can be wrong: unknown algorithm, missing algorithm, `$…$` refusal, bad hex, wrong length, duplicate name, illegal name character, unknown trailing `key=value`, `#` as the first non-whitespace character versus `#` inside a field, blank lines, CRLF, permission refusal. **Each must be a startup error naming the line number**, not a skipped row — the property that matters is that a file never half-loads. |
 | Unit | Mechanism binding: a `PLAIN` attempt against an `hmac-sha256-key:` row is refused even when the presented bytes equal the stored key, and an `HMAC_SHA256` attempt against a `sha256:` row is refused. Both are the tests that stop §4's two forms collapsing into one. |
-| Property | **The invariant that matters: for every command in every dialect, an unauthenticated connection produces a refusal and no storage effect.** Driven off the existing generators, so a command added later without a gate fails this test rather than shipping. |
-| Property | Consumption is unchanged by authentication state — a refused command consumes exactly the bytes it would have consumed if executed. This is what stops a refusal desynchronising a pipeline. |
-| Fuzz | The `AUTH` body decoder gets a target, joining the five that exist. It is pre-auth input by definition, so it is the highest-value surface in the system. |
+| Exhaustive | **The invariant that matters: `no_vcp_opcode_executes_unauthenticated` walks all 256 opcode bytes** — not a list someone maintained by hand — and requires `UNAUTHORIZED` with an empty body from every one outside the pre-auth set. An opcode added later without a gate fails here rather than shipping. This is the test that found the ordering bug in §5. |
+| Integration | Consumption is unchanged by authentication state: `a_refused_storage_command_still_consumes_its_block` pipelines a refused memcached `set` whose data block would parse as a command, and asserts exactly two replies. One more would mean the block had been read as commands. |
+| Fuzz | `vcp_auth` runs `decode_auth` against a seeded corpus, joining the five existing targets in CI. It is pre-auth input by definition, so it is the highest-value surface in the system. |
 | Integration | Per dialect: authenticate and succeed, wrong secret, unknown name, command before auth, re-auth on a live connection, `SIGHUP` reload, the attempt cap and the deadline. |
-| Differential | The memcached error line and pre-auth command set against real memcached under `-Y` (§7); the Redis error strings and `HELLO … AUTH` against real Redis. Both are byte comparisons in the existing suite. |
+| Differential | The memcached error line and pre-auth command set against real memcached under `-Y` (§7); the Redis error strings and `HELLO … AUTH` against real Redis. Both are byte comparisons in the existing suite. **Still outstanding** — the strings shipped are the ones §7 and §8 name, pinned by this repo's own tests rather than against a real server. |
 | Client compat | `pymemcache` with a username and password, and `redis-py` with `AUTH` and with `HELLO 3 AUTH`. The point is whether real clients drive it unchanged, which is the same bar M3 and M7 were held to. |
 | Cluster | A three-node cluster with auth required, converging; and the negative case — a node started without a peer credential must fail startup, not run degraded (§9). |
 
@@ -710,6 +743,15 @@ worth making.
 | # | Scope | Exit criteria |
 |---|---|---|
 | **M9** | Credential table and file loader; `AUTH` in VCP, memcached ASCII auth, Redis `AUTH`/`HELLO … AUTH`; the pre-auth gate in all three executors; peer credentials; `SIGHUP` reload; the pre-auth abuse budget | Real memcached and Redis clients authenticate unchanged and are refused when they do not; the property test proves no command in any dialect executes unauthenticated; a three-node cluster converges with auth required, and a node with a missing peer credential refuses to start; the `AUTH` decoder is fuzzed in CI |
+
+**Delivered**, with two exceptions carried forward:
+
+- **`SIGHUP` reload is Unix only.** Windows has no `SIGHUP`; rotation there
+  means a restart, which the two-step rollout already tolerates.
+- **The differential suite has not been extended** to compare authentication
+  against a real memcached and a real Redis (§14). The wire strings here are the
+  ones §7 and §8 specify, pinned by this repo's tests; §7 names the two
+  memcached behaviours that upstream, not this document, should settle.
 
 Sequencing within it: the credential table and VCP first (it is the dialect we
 own end to end, and `vash-client` is the test driver everything else uses), then

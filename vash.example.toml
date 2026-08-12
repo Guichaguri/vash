@@ -125,6 +125,49 @@ batch = 512
 # byte, so there is nothing to turn on.
 flush_enabled = false
 
+[auth]
+# Who may use the cache port. Off by default.
+#
+# The network boundary stays the primary control — a firewall rule stops a party
+# who never sends a byte, where a credential only stops them after they have
+# reached a parser. This adds a layer, it does not replace one. And it does not
+# make the connection private: without TLS every key and value crosses the
+# network in the clear, so an eavesdropper already has the data. See
+# docs/auth.md §1.
+#
+# Rolling it out is two steps, because enforcement is separate from the table:
+#   1. set `file` and leave `required = false`. AUTH is answered, nothing is
+#      refused. Roll every client — and every peer — to send its credential.
+#   2. set `required = true` and restart.
+# There is deliberately no third "optional" mode: one where unauthenticated
+# clients still work is not authentication.
+required = false
+
+# Path to the credential file — `<name>  sha256:<64 hex>` per line, `#`
+# comments, the shape of ~/.ssh/authorized_keys. Generate a row with:
+#
+#   vash-server auth-gen billing-api >> /etc/vash/credentials
+#
+# A separate file rather than a key here, because this config is not secret and
+# gets committed. On Unix it must not be group- or world-readable; startup
+# refuses it otherwise, the way ssh refuses a loose private key. Reloaded on
+# SIGHUP, which is the whole of the rotation story: add the new credential, roll
+# the clients, remove the old one.
+#
+# VASH_AUTH_SECRET in the environment configures a single `default` credential
+# instead, for containers where a one-row table does not justify a mount.
+# Setting both is refused.
+file = ""
+
+# An unauthenticated connection is the one thing here a stranger can create, so
+# it gets its own budget rather than the ordinary limits.
+timeout_ms = 5000    # dropped if it has not authenticated by then
+max_attempts = 3     # failed attempts before the connection is closed
+# Concurrent unauthenticated connections; 0 picks a tenth of
+# server.max_connections. Without it the pre-auth budget is the whole
+# connection budget.
+max_unauthenticated_connections = 0
+
 [cluster]
 # Other nodes' cache ports. Nodes are otherwise shared-nothing — clients shard
 # the keyspace, nothing is replicated — and tag invalidation is the only thing
@@ -162,6 +205,15 @@ fanout_timeout_ms = 2000
 # anti-entropy delivers whatever fan-out lost. An unbounded queue against a dead
 # peer would not be.
 queue_depth = 1024
+
+# What this node presents to its peers. A peer is an ordinary VCP client on the
+# ordinary port, so with auth.required set it has to authenticate like any
+# other — and a cluster whose peers cannot is one where writes keep working,
+# invalidation silently stops converging, and every node goes on reporting
+# itself healthy. Startup refuses that configuration rather than running into
+# it. Empty auth_name means `default`.
+auth_name = ""
+auth_secret = ""
 
 [observability]
 log_format = "pretty"   # or "json"

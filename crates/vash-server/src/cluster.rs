@@ -72,6 +72,11 @@ struct Peer {
     /// Whether the last exchange succeeded. `false` before the first attempt —
     /// it reports what is known, never an optimistic guess.
     reachable: AtomicBool,
+    /// What this node presents to the peer. A peer is an ordinary VCP client on
+    /// the ordinary port, so with authentication enforced it has to
+    /// authenticate like any other. Startup refuses a clustered node that has
+    /// auth required and no credential here.
+    credential: Option<vash_client::Credential>,
     tx: mpsc::Sender<PeerMessage>,
 }
 
@@ -118,11 +123,16 @@ impl Cluster {
         let mut peers = Vec::with_capacity(config.peers.len());
         let mut tasks = Vec::new();
 
+        let credential = config
+            .credential()
+            .map(|(name, secret)| vash_client::Credential::new(name, secret));
+
         for addr in &config.peers {
             let (tx, rx) = mpsc::channel(config.queue_depth);
             let peer = Arc::new(Peer {
                 addr: addr.clone(),
                 reachable: AtomicBool::new(false),
+                credential: credential.clone(),
                 tx,
             });
             tasks.push(tokio::spawn(peer_loop(
@@ -350,13 +360,40 @@ async fn exchange(
     entries: &[(&[u8], u64)],
 ) -> Result<Vec<TagGeneration>, PeerError> {
     let result = try_exchange(client, peer, timeout, full, entries).await;
-    peer.reachable.store(result.is_ok(), Ordering::Relaxed);
-    if result.is_err() {
+    let was_reachable = peer.reachable.swap(result.is_ok(), Ordering::Relaxed);
+    if let Err(error) = &result {
+        // A rejected credential is a configuration error, not unreachability,
+        // and it will not fix itself — so it is logged at `warn` and only on
+        // the transition, rather than once per gossip interval forever.
+        if was_reachable || peer.credential.is_some() && is_unauthorized(error) {
+            log_refusal(peer, error, was_reachable);
+        }
         // Whatever went wrong, this connection is not worth keeping; the next
         // attempt starts from a fresh one.
         *client = None;
     }
     result
+}
+
+fn is_unauthorized(error: &PeerError) -> bool {
+    matches!(
+        error,
+        PeerError::Client(vash_client::ClientError::Status(
+            vash_proto::vcp::Status::Unauthorized
+        ))
+    )
+}
+
+fn log_refusal(peer: &Peer, error: &PeerError, was_reachable: bool) {
+    if is_unauthorized(error) {
+        warn!(
+            peer = %peer.addr,
+            "peer refused this node's credential; tag invalidation will not converge with it. \
+             cluster.auth_name and cluster.auth_secret must name a credential the peer also has"
+        );
+    } else if was_reachable {
+        debug!(peer = %peer.addr, error = %error, "peer became unreachable");
+    }
 }
 
 async fn try_exchange(
@@ -368,8 +405,16 @@ async fn try_exchange(
 ) -> Result<Vec<TagGeneration>, PeerError> {
     for attempt in 0..2 {
         if client.is_none() {
+            let connecting = async {
+                match &peer.credential {
+                    Some(credential) => {
+                        vash_client::Client::connect_with(&peer.addr, credential).await
+                    }
+                    None => vash_client::Client::connect(&peer.addr).await,
+                }
+            };
             *client = Some(
-                tokio::time::timeout(timeout, vash_client::Client::connect(&peer.addr))
+                tokio::time::timeout(timeout, connecting)
                     .await
                     .map_err(|_| PeerError::ConnectTimeout)??,
             );

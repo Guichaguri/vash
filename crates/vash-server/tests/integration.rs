@@ -222,6 +222,13 @@ impl TestCluster {
         self.node(index).client().await
     }
 
+    /// A client that authenticates, for the clustered-with-auth test.
+    async fn client_with(&self, index: usize, credential: &vash_client::Credential) -> Client {
+        Client::connect_with(self.node(index).addr, credential)
+            .await
+            .expect("connecting")
+    }
+
     /// Stops one node, keeping its database so it can come back.
     async fn stop(&mut self, index: usize) -> TempDir {
         self.nodes[index]
@@ -432,6 +439,118 @@ async fn a_restarted_node_catches_up_on_invalidations_it_missed() {
         .await;
 
     cluster.shutdown().await;
+}
+
+/// The other half of the M9 exit criterion: a cluster that authenticates still
+/// converges.
+///
+/// Peers reach each other over the cache port as ordinary VCP clients, so this
+/// is the test that would catch fan-out and gossip being silently refused —
+/// the failure mode where writes keep working, invalidations stop propagating,
+/// and every node goes on reporting itself healthy.
+#[tokio::test]
+async fn invalidation_converges_across_a_cluster_that_authenticates() {
+    let shared = tempfile::tempdir().unwrap();
+    let (secret, line) = vash_server::auth::generate("peer").unwrap();
+    let credentials = shared.path().join("credentials");
+    std::fs::write(&credentials, format!("{line}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let credentials = &credentials;
+    let secret = &secret;
+    let cluster = TestCluster::start_with(3, |config| {
+        config.auth.required = true;
+        config.auth.file = credentials.clone();
+        config.cluster.auth_name = "peer".into();
+        config.cluster.auth_secret = secret.clone();
+        // One environment per node rather than one per shard: this test is
+        // about the peer credential, and the suite runs in parallel against a
+        // finite pool of LMDB thread-local slots.
+        config.store.shards = 1;
+    })
+    .await;
+
+    let credential = vash_client::Credential::new("peer", secret.clone());
+
+    for index in 0..3 {
+        cluster
+            .client_with(index, &credential)
+            .await
+            .set_tagged(cluster_key(index).as_bytes(), b"v", 0, &[b"news"])
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        cluster
+            .client_with(0, &credential)
+            .await
+            .delete_by_tag(b"news")
+            .await
+            .unwrap()
+    );
+
+    cluster
+        .wait_for(
+            "every authenticating node to stop serving the invalidated tag",
+            async |node| {
+                let mut client = Client::connect_with(node.addr, &credential).await.unwrap();
+                let mut gone = true;
+                for index in 0..3 {
+                    gone &= client
+                        .get(cluster_key(index).as_bytes())
+                        .await
+                        .unwrap()
+                        .is_none();
+                }
+                gone
+            },
+        )
+        .await;
+
+    cluster.shutdown().await;
+}
+
+/// A plain `connect` against a server that requires authentication fails at the
+/// handshake rather than on the first command, so a misconfiguration reads as
+/// one clear error instead of every request coming back `UNAUTHORIZED`.
+#[tokio::test]
+async fn an_unauthenticated_client_is_told_at_connect_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (secret, line) = vash_server::auth::generate("app").unwrap();
+    let credentials = dir.path().join("credentials");
+    std::fs::write(&credentials, format!("{line}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let server = TestServer::start_with(dir, |config| {
+        config.auth.required = true;
+        config.auth.file = credentials.clone();
+        config.store.shards = 1;
+    })
+    .await;
+
+    let Err(error) = Client::connect(server.addr).await else {
+        panic!("connecting without a credential must fail at the handshake");
+    };
+    assert!(
+        matches!(error, ClientError::Protocol(detail) if detail.contains("requires authentication")),
+        "unexpected error: {error}"
+    );
+
+    // And the same address works with a credential.
+    let credential = vash_client::Credential::new("app", secret);
+    let mut client = Client::connect_with(server.addr, &credential)
+        .await
+        .unwrap();
+    client.set(b"k", b"v", 0).await.unwrap();
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use vash_core::ServerInfo;
 use vash_store::LmdbStore;
 
+use crate::auth::AuthState;
 use crate::cluster::Cluster;
 
 /// Everything a connection needs, shared by `Arc` across all of them.
@@ -12,6 +13,10 @@ pub struct ServerState {
     /// `FLUSH` is a remote cache-wipe primitive, so it is off unless
     /// deliberately enabled.
     pub flush_enabled: bool,
+    /// The credential table and the pre-auth budget. Present even when
+    /// authentication is off, so the gate has no special case and `AUTH` can be
+    /// answered truthfully during a rollout.
+    pub auth: AuthState,
     pub metrics: crate::metrics::ServerMetrics,
     /// Present even with no peers configured, so `CLUSTER` and `/stats` have
     /// something truthful to report and dispatch has no special case.
@@ -26,6 +31,7 @@ impl ServerState {
         store: Arc<LmdbStore>,
         info: ServerInfo,
         flush_enabled: bool,
+        auth: AuthState,
         cluster: Arc<Cluster>,
         inline_reads: bool,
     ) -> Arc<Self> {
@@ -33,6 +39,7 @@ impl ServerState {
             store,
             info,
             flush_enabled,
+            auth,
             metrics: crate::metrics::ServerMetrics::default(),
             cluster,
             inline_reads,

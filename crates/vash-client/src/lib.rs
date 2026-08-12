@@ -42,9 +42,46 @@ pub struct Client {
     info: ServerInfo,
 }
 
+/// What a client presents to a server that requires authentication.
+///
+/// Only `PLAIN` exists: the secret crosses the wire and the server holds a
+/// digest. The challenge–response mechanism is specified in `docs/auth.md`
+/// §6.3 and not built, which is why this is a pair of strings rather than a
+/// trait.
+#[derive(Debug, Clone)]
+pub struct Credential {
+    pub name: String,
+    pub secret: String,
+}
+
+impl Credential {
+    pub fn new(name: impl Into<String>, secret: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            secret: secret.into(),
+        }
+    }
+}
+
 impl Client {
     /// Connects and completes the handshake.
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self> {
+        Self::connect_inner(addr, None).await
+    }
+
+    /// Connects, completes the handshake, and authenticates before returning.
+    ///
+    /// A refusal comes back as `Status(Unauthorized)`, distinguishable from a
+    /// dead server — which is what lets the cluster log a bad peer credential
+    /// as the configuration error it is rather than as unreachability.
+    pub async fn connect_with(addr: impl ToSocketAddrs, credential: &Credential) -> Result<Self> {
+        Self::connect_inner(addr, Some(credential)).await
+    }
+
+    async fn connect_inner(
+        addr: impl ToSocketAddrs,
+        credential: Option<&Credential>,
+    ) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
 
@@ -79,7 +116,39 @@ impl Client {
             });
         }
         client.info = info;
+
+        // After `HELLO`, because that is the order the protocol requires: the
+        // dialect has to be announced before anything else, and the reply's
+        // `AUTH_REQUIRED` bit is how a client without a credential learns it
+        // needs one.
+        if let Some(credential) = credential {
+            client.authenticate(credential).await?;
+        } else if info.capabilities & vash_core::capability::AUTH_REQUIRED != 0 {
+            // Failing here rather than on the first command turns "every
+            // request is Unauthorized" into one clear error at the point the
+            // configuration is wrong.
+            return Err(ClientError::Protocol(
+                "server requires authentication; use Client::connect_with",
+            ));
+        }
+
         Ok(client)
+    }
+
+    /// Sends `AUTH`. Replaces any identity the connection already had.
+    pub async fn authenticate(&mut self, credential: &Credential) -> Result<()> {
+        let mut body = Vec::with_capacity(4 + credential.name.len() + credential.secret.len());
+        vash_proto::vcp::encode_auth_body(
+            &mut body,
+            0, // PLAIN
+            credential.name.as_bytes(),
+            credential.secret.as_bytes(),
+        );
+
+        match self.round_trip(Opcode::Auth, &body).await? {
+            (Status::Ok, _) => Ok(()),
+            (status, _) => Err(ClientError::Status(status)),
+        }
     }
 
     pub fn server_info(&self) -> &ServerInfo {

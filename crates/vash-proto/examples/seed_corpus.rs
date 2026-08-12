@@ -85,6 +85,52 @@ fn vcp_seeds(root: &Path) {
     write(&dir, "pipelined", &pipelined);
 }
 
+/// Seeds for the `AUTH` body parser.
+///
+/// Its own corpus rather than more frames in `vcp_decode`, because the target
+/// takes a bare body: it is the one parser reachable before any credential has
+/// been presented, so it is fuzzed on its own rather than behind a frame header
+/// the fuzzer has to keep valid.
+fn auth_seeds(root: &Path) {
+    let dir = root.join("vcp_auth");
+
+    let body = |mechanism: u8, name: &[u8], secret: &[u8]| {
+        let mut out = Vec::new();
+        vash_proto::vcp::encode_auth_body(&mut out, mechanism, name, secret);
+        out
+    };
+
+    let secret = b"0123456789abcdef0123456789abcdef";
+    write(&dir, "plain", &body(0, b"billing-api", secret));
+    // An empty name is the `default` identity, not a malformed body.
+    write(&dir, "default_identity", &body(0, b"", secret));
+    // Mechanism 1 is specified and unbuilt; an empty secret is how a challenge
+    // would be asked for. Both must *parse*, and be refused above the parser.
+    write(&dir, "hmac_challenge", &body(1, b"peer", b""));
+    write(&dir, "hmac_response", &body(1, b"peer", &[7u8; 32]));
+    // An unknown mechanism still has to frame correctly, so that the executor
+    // is what answers `UNSUPPORTED`.
+    write(&dir, "unknown_mechanism", &body(0xff, b"x", b"y"));
+    // Exactly at both ceilings, which is where the length arithmetic is most
+    // likely to be off by one.
+    write(
+        &dir,
+        "max_lengths",
+        &body(
+            0,
+            &[b'n'; vash_proto::vcp::MAX_AUTH_NAME_LEN],
+            &[b's'; vash_proto::vcp::MAX_AUTH_SECRET_LEN],
+        ),
+    );
+    write(&dir, "header_only", &body(0, b"", b""));
+    // Neither field is text to this parser.
+    write(
+        &dir,
+        "binary",
+        &body(0, &[0xff, 0x00, 0xfe], &[0x00, 0x80, 0xff]),
+    );
+}
+
 fn memcached_seeds(root: &Path) {
     let dir = root.join("memcached_text");
     for (name, line) in [
@@ -256,6 +302,7 @@ fn main() {
     let root = Path::new(&root);
 
     vcp_seeds(root);
+    auth_seeds(root);
     memcached_seeds(root);
     resp_seeds(root);
     record_seeds(root);

@@ -15,6 +15,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub store: StoreConfig,
     pub protocol: ProtocolConfig,
+    pub auth: AuthConfig,
     pub cluster: ClusterConfig,
     pub observability: ObservabilityConfig,
 }
@@ -200,6 +201,49 @@ impl From<Durability> for vash_store::Durability {
     }
 }
 
+/// Who may use the cache port.
+///
+/// Off by default. The network boundary stays the primary control — a firewall
+/// rule stops a party who never sends a byte, where a credential only stops
+/// them after they have reached a parser — and this adds a layer rather than
+/// replacing one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    /// Whether unauthenticated connections are refused.
+    ///
+    /// Separate from the credential table so a rollout can configure
+    /// credentials, roll every client and peer, and only then start enforcing.
+    /// There is deliberately no third "optional" mode: one where
+    /// unauthenticated clients still work is not authentication.
+    pub required: bool,
+    /// Path to the credential file. Empty uses `VASH_AUTH_SECRET`, or nothing.
+    ///
+    /// A separate file rather than a key here, because the main config is not
+    /// secret and gets committed. See `docs/auth.md` §4 for the format.
+    pub file: PathBuf,
+    /// How long a connection may stay unauthenticated before it is dropped.
+    pub timeout_ms: u64,
+    /// Failed attempts on one connection before it is closed.
+    pub max_attempts: u32,
+    /// Concurrent unauthenticated connections. `0` picks a tenth of
+    /// `server.max_connections`, so the pre-auth budget is never the whole
+    /// connection budget.
+    pub max_unauthenticated_connections: usize,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            required: false,
+            file: PathBuf::new(),
+            timeout_ms: 5_000,
+            max_attempts: 3,
+            max_unauthenticated_connections: 0,
+        }
+    }
+}
+
 /// Peers, and how tag invalidation reaches them.
 ///
 /// Nodes are otherwise shared-nothing: no replication, no consensus, no
@@ -227,6 +271,13 @@ pub struct ClusterConfig {
     /// anti-entropy delivers whatever fan-out lost. An unbounded queue against
     /// a peer that is down would not be.
     pub queue_depth: usize,
+    /// Credential the peer connections present. A peer is an ordinary VCP
+    /// client on the ordinary port, so with `auth.required` set it has to
+    /// authenticate like any other — and a cluster whose peers cannot is one
+    /// where invalidation silently stops converging while every node reports
+    /// itself healthy. Startup refuses that configuration.
+    pub auth_name: String,
+    pub auth_secret: String,
 }
 
 impl Default for ClusterConfig {
@@ -237,7 +288,24 @@ impl Default for ClusterConfig {
             gossip_interval_ms: 5_000,
             fanout_timeout_ms: 2_000,
             queue_depth: 1_024,
+            auth_name: String::new(),
+            auth_secret: String::new(),
         }
+    }
+}
+
+impl ClusterConfig {
+    /// What peer connections should present, if anything.
+    pub fn credential(&self) -> Option<(&str, &str)> {
+        if self.auth_secret.is_empty() {
+            return None;
+        }
+        let name = if self.auth_name.is_empty() {
+            crate::auth::DEFAULT_NAME
+        } else {
+            &self.auth_name
+        };
+        Some((name, &self.auth_secret))
     }
 }
 
@@ -379,6 +447,32 @@ impl Config {
              or reads will fail with MDB_READERS_FULL under load",
             self.store.max_readers,
             self.server.max_blocking_threads
+        );
+
+        // Peers are ordinary VCP clients on the ordinary port, so enabling auth
+        // without giving them a credential breaks tag fan-out and gossip across
+        // the whole cluster — and it breaks in the worst available shape:
+        // writes keep working, TAG_SYNC starts being refused, and invalidations
+        // quietly stop converging while every node reports itself healthy.
+        // Refusing to start is the only failure mode an operator cannot miss.
+        anyhow::ensure!(
+            !self.auth.required
+                || self.cluster.peers.is_empty()
+                || self.cluster.credential().is_some(),
+            "auth.required is set and {} peers are configured, but cluster.auth_secret is \
+             empty. Peer traffic uses the cache port like any other client, so the peers \
+             would be refused and tag invalidation would stop converging across the cluster \
+             while every node still reported itself healthy",
+            self.cluster.peers.len()
+        );
+        anyhow::ensure!(
+            self.auth.max_attempts > 0,
+            "auth.max_attempts must be > 0, or no credential could ever be presented"
+        );
+        anyhow::ensure!(
+            self.auth.timeout_ms > 0,
+            "auth.timeout_ms must be > 0, or a connection would be dropped before it could \
+             authenticate"
         );
 
         anyhow::ensure!(

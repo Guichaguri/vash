@@ -33,10 +33,20 @@ Flags override the config file: `--listen`, `--data`, `--peer` (repeatable),
 | Cache | 11311 | Clients **and cluster peers**. All three protocols share it. |
 | Admin | 9090 | Your monitoring only. |
 
-**There is no authentication.** Anyone who can reach the cache port can read and
-write any key, invalidate any tag, and — because peer traffic uses the same port
-— raise any tag's generation. Bind it to a private network. Set
-`observability.admin_listen = ""` to switch the admin port off entirely.
+**Authentication is off by default.** With `auth.required = false` — the
+default — anyone who can reach the cache port can read and write any key,
+invalidate any tag, and, because peer traffic uses the same port, raise any
+tag's generation.
+
+**Bind it to a private network regardless.** A network boundary stops a party
+who never sends a byte, where a credential only stops them after they have
+reached a parser, and without TLS every key and value crosses the wire in the
+clear either way — so authentication decides who may *use* the cache, not who
+may read it in flight. Turning it on adds a layer; it does not replace the
+firewall rule. See [auth.md](auth.md) for the design and the rollout.
+
+Set `observability.admin_listen = ""` to switch the admin port off entirely; it
+has no authentication of its own and defaults to loopback.
 
 `flush_all` and the VCP `FLUSH` are off unless enabled: they empty the whole
 cache for anyone who can reach the port.

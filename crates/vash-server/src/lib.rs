@@ -5,6 +5,7 @@
 //! than testing a stubbed-out approximation of it.
 
 pub mod admin;
+pub mod auth;
 pub mod cluster;
 pub mod config;
 pub mod conn;
@@ -31,6 +32,10 @@ pub struct Server {
     state: Arc<ServerState>,
     config: Config,
     connections: Arc<Semaphore>,
+    /// A separate, smaller budget for connections that have not authenticated
+    /// yet. Without it the pre-auth budget *is* the connection budget, and a
+    /// stranger can fill it without presenting anything.
+    pre_auth: Arc<Semaphore>,
 }
 
 impl Server {
@@ -52,15 +57,43 @@ impl Server {
             Arc::new(metrics::ClusterMetrics::default()),
         );
 
+        // Loaded before the listener binds: a credential file that will not
+        // parse must stop startup, not surface as a refusal on the first
+        // client.
+        let credentials = auth::Auth::load(&config.auth)?;
+        if credentials.required() {
+            info!("authentication is required on the cache port");
+        } else if credentials.configured() {
+            // The rollout's middle step, and worth saying out loud: an operator
+            // who thinks they turned it on should be told they have not.
+            warn!("credentials are configured but auth.required is false; nothing is refused");
+        }
+
+        let auth_state = auth::AuthState::new(
+            credentials,
+            auth::Limits {
+                timeout: std::time::Duration::from_millis(config.auth.timeout_ms),
+                max_attempts: config.auth.max_attempts,
+                max_connections: match config.auth.max_unauthenticated_connections {
+                    // A tenth of the budget, so pre-auth connections cannot
+                    // crowd out the authenticated ones.
+                    0 => (config.server.max_connections / 10).max(1),
+                    explicit => explicit,
+                },
+            },
+        );
+
         let info = dispatch::server_info(
             store.shard_count() as u16,
             config.store.max_value_bytes,
             cluster.active(),
+            config.auth.required,
         );
         let state = ServerState::new(
             Arc::clone(&store),
             info,
             config.protocol.flush_enabled,
+            auth_state,
             cluster,
             config.store.inline_reads,
         );
@@ -89,6 +122,7 @@ impl Server {
         Ok(Self {
             listener,
             admin,
+            pre_auth: Arc::new(Semaphore::new(state.auth.limits.max_connections)),
             state,
             connections: Arc::new(Semaphore::new(config.server.max_connections)),
             config,
@@ -119,7 +153,9 @@ impl Server {
             state,
             config,
             connections,
+            pre_auth,
         } = self;
+        let enforcing = state.auth.current().required();
 
         // Signalled once the listener is gone, so connections sitting idle
         // between requests let go instead of holding the drain open until it
@@ -138,6 +174,15 @@ impl Server {
                 .await
             })
         });
+
+        // Joined before the store is closed below: a detached task holding an
+        // `Arc<ServerState>` would keep the LMDB environment open past
+        // shutdown.
+        let reload_task = spawn_credential_reload(
+            Arc::clone(&state),
+            config.auth.clone(),
+            conn_stopped.clone(),
+        );
 
         tokio::pin!(shutdown);
 
@@ -165,12 +210,30 @@ impl Server {
                         continue;
                     };
 
+                    // Held until the connection authenticates, and released the
+                    // moment it does — so the cap counts connections that have
+                    // presented nothing, not connections in total.
+                    let pre_auth_permit = if enforcing {
+                        match Arc::clone(&pre_auth).try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                debug!(%peer, "refusing connection: too many unauthenticated connections");
+                                state.metrics.auth_capacity_rejected();
+                                state.metrics.connection_rejected();
+                                drop(stream);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     let conn_state = Arc::clone(&state);
                     let read_buffer = config.server.read_buffer;
                     let stopping = conn_stopped.clone();
                     conn_state.metrics.connection_opened();
                     tokio::spawn(async move {
-                        if let Err(e) = conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping).await {
+                        if let Err(e) = conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping, pre_auth_permit).await {
                             debug!(%peer, error = %e, "connection ended with an error");
                         }
                         conn_state.metrics.connection_closed();
@@ -192,6 +255,9 @@ impl Server {
         let _ = conn_stop.send(true);
         let _ = admin_stop.send(());
         if let Some(task) = admin_task {
+            let _ = task.await;
+        }
+        if let Some(task) = reload_task {
             let _ = task.await;
         }
         let outstanding = config.server.max_connections as u32;
@@ -225,6 +291,61 @@ impl Server {
 
         Ok(())
     }
+}
+
+/// Reloads the credential table on `SIGHUP`.
+///
+/// This is the whole of the rotation story — add the new credential, roll the
+/// clients, remove the old one — and it is why there is no runtime mutation
+/// command and no credential storage inside LMDB. Connections that already
+/// authenticated keep the identity they authenticated with; only new attempts
+/// see the new table.
+///
+/// A reload that fails leaves the running table in place and logs. Refusing to
+/// start on a bad file is right, because nothing is serving yet; swapping in an
+/// empty table because someone truncated the file mid-edit is not.
+#[cfg(unix)]
+fn spawn_credential_reload(
+    state: Arc<ServerState>,
+    config: config::AuthConfig,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut hangup = match signal(SignalKind::hangup()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            // Not fatal: the server works, it just cannot be told to reload.
+            error!(error = %e, "could not listen for SIGHUP; credential reload is disabled");
+            return None;
+        }
+    };
+
+    Some(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = hangup.recv() => match auth::Auth::load(&config) {
+                    Ok(reloaded) => {
+                        state.auth.replace(reloaded);
+                        info!("reloaded the credential table");
+                    }
+                    Err(e) => error!(error = %format!("{e:#}"), "credential reload failed; keeping the table in use"),
+                },
+                _ = stopping.changed() => return,
+            }
+        }
+    }))
+}
+
+/// Windows has no `SIGHUP`. Rotation there means a restart, which is what the
+/// two-step rollout already tolerates.
+#[cfg(not(unix))]
+fn spawn_credential_reload(
+    _state: Arc<ServerState>,
+    _config: config::AuthConfig,
+    _stopping: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
 }
 
 /// How long shutdown waits for in-flight connections before giving up on them.

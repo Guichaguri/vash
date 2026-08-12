@@ -85,17 +85,20 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  # These two parsers are the only code that reads bytes from unauthenticated
-  # strangers, so they get coverage-guided fuzzing on every PR rather than only
-  # the property tests. A short run per target catches regressions; the nightly
-  # job below is what actually explores.
+  # These parsers read bytes from strangers, so they get coverage-guided fuzzing
+  # on every PR rather than only the property tests. A short run per target
+  # catches regressions; the nightly job below is what actually explores.
+  #
+  # `vcp_auth` is the one that runs on input from a connection that has
+  # presented no credential at all — with authentication enabled, everything
+  # else sits behind the gate it opens.
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [vcp_decode, memcached_text, memcached_meta, resp_decode, record_header]
+        target: [vcp_decode, vcp_auth, memcached_text, memcached_meta, resp_decode, record_header]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

@@ -8,8 +8,18 @@ use vash_proto::memcached::{self, Outcome, ProtocolError};
 use vash_proto::vcp::{FrameLen, peek_frame_len};
 use vash_proto::{Protocol, detect};
 
+use crate::auth::ConnAuth;
 use crate::dispatch::{Closing, execute_frame_into, execute_memcached_block};
 use crate::state::ServerState;
+
+/// Most bytes an unauthenticated connection may have buffered, or ask the
+/// server to reserve.
+///
+/// Generous against everything legal before authenticating — a VCP `AUTH` at
+/// both ceilings is under 600 bytes, and the two text dialects' credentials are
+/// one short line each — and small enough that filling the pre-auth connection
+/// budget costs an attacker nothing worth having.
+const PRE_AUTH_MAX_BUFFERED: usize = 4096;
 
 /// Serves one connection until the peer disconnects or sends something
 /// unintelligible.
@@ -21,6 +31,10 @@ pub async fn handle(
     state: Arc<ServerState>,
     read_buffer: usize,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    // Released the moment this connection authenticates, so the pre-auth cap
+    // counts connections that have presented nothing rather than connections in
+    // total. `None` when authentication is not being enforced.
+    mut pre_auth: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> std::io::Result<()> {
     // Cache traffic is small and latency-sensitive; Nagle would batch a reply
     // against the next one and add up to 40ms for nothing.
@@ -33,6 +47,17 @@ pub async fn handle(
     // asks. Per-connection state, because that is exactly what `HELLO`
     // negotiates.
     let mut resp_version = vash_proto::resp::Version::default();
+    // Likewise per connection: authentication is a property of this socket, and
+    // it dies with it.
+    let mut conn_auth = ConnAuth::default();
+
+    let limits = state.auth.limits;
+    let enforcing = state.auth.current().required();
+    // An unauthenticated connection is the one thing here a stranger can
+    // create, so it gets a deadline rather than the ordinary idle treatment. It
+    // is folded into the `select!` that already handles shutdown, so it costs
+    // no timer task of its own.
+    let deadline = tokio::time::Instant::now() + limits.timeout;
 
     loop {
         // Shutdown is only ever noticed *here*, between requests, where nothing
@@ -44,15 +69,35 @@ pub async fn handle(
         // timed out, and the store could not be closed. That is not a corner
         // case in a cluster: peers keep their connections open indefinitely, so
         // every node would have one per peer.
+        let unauthenticated = enforcing && !conn_auth.is_authenticated();
         let n = tokio::select! {
             read = stream.read_buf(&mut read_buf) => read?,
             _ = shutdown.changed() => {
                 debug!("closing an idle connection to drain");
                 return Ok(());
             }
+            _ = tokio::time::sleep_until(deadline), if unauthenticated => {
+                debug!(timeout = ?limits.timeout, "closing a connection that never authenticated");
+                state.metrics.auth_timeout();
+                return Ok(());
+            }
         };
         if n == 0 {
             return Ok(()); // clean disconnect
+        }
+
+        // A connection that has presented nothing must not be able to make the
+        // server hold arbitrary bytes. Everything legal before authenticating
+        // is small — a VCP `HELLO` is 16 bytes and an `AUTH` at both ceilings
+        // is under 600, and the two text dialects' credentials are one short
+        // line each — so this is far above any honest pre-auth traffic and far
+        // below anything worth holding.
+        if unauthenticated && read_buf.len() > PRE_AUTH_MAX_BUFFERED {
+            debug!(
+                buffered = read_buf.len(),
+                "closing an unauthenticated connection that buffered too much"
+            );
+            return Ok(());
         }
 
         if protocol.is_none() {
@@ -73,18 +118,46 @@ pub async fn handle(
         }
 
         let keep_going = match protocol.expect("set above") {
-            Protocol::Vcp => drain_vcp(&state, &mut read_buf, &mut write_buf).await?,
-            Protocol::Memcached => drain_memcached(&state, &mut read_buf, &mut write_buf).await?,
+            Protocol::Vcp => {
+                drain_vcp(&state, &mut conn_auth, &mut read_buf, &mut write_buf).await?
+            }
+            Protocol::Memcached => {
+                drain_memcached(&state, &mut conn_auth, &mut read_buf, &mut write_buf).await?
+            }
             Protocol::Resp => {
-                drain_resp(&state, &mut read_buf, &mut resp_version, &mut write_buf).await?
+                drain_resp(
+                    &state,
+                    &mut conn_auth,
+                    &mut read_buf,
+                    &mut resp_version,
+                    &mut write_buf,
+                )
+                .await?
             }
         };
+
+        if pre_auth.is_some() && conn_auth.is_authenticated() {
+            pre_auth = None;
+        }
 
         if !write_buf.is_empty() {
             stream.write_all(&write_buf).await?;
             write_buf.clear();
         }
         if !keep_going {
+            return Ok(());
+        }
+
+        // Bounds guessing on one connection. Deliberately not a lockout across
+        // connections: an attacker who could trigger one would have a denial of
+        // service against the legitimate holder instead of a break-in, which is
+        // not a trade worth making. The reply above has already been written,
+        // so the client learns why before the socket goes.
+        if conn_auth.failures() >= limits.max_attempts {
+            debug!(
+                failures = conn_auth.failures(),
+                "closing a connection after too many failed authentications"
+            );
             return Ok(());
         }
     }
@@ -103,15 +176,30 @@ pub async fn handle(
 /// frame in the buffer is still one hop.
 async fn drain_vcp(
     state: &Arc<ServerState>,
+    conn_auth: &mut ConnAuth,
     read_buf: &mut BytesMut,
     write_buf: &mut Vec<u8>,
 ) -> std::io::Result<bool> {
     let mut frames: Vec<Bytes> = Vec::new();
     let mut closing = false;
 
+    // Ordered so an authenticated connection never touches the lock.
+    let gated = !conn_auth.is_authenticated() && state.auth.current().required();
+
     loop {
         match peek_frame_len(read_buf) {
             FrameLen::Incomplete { needed } => {
+                // `needed` comes from the frame header, which an
+                // unauthenticated stranger controls: without this, one 12-byte
+                // header claiming a 64 MiB body reserves 64 MiB before anything
+                // has been presented. The buffered-bytes check in `handle`
+                // cannot cover it, because this reserves against a length that
+                // has not arrived.
+                if gated && needed > PRE_AUTH_MAX_BUFFERED {
+                    debug!(needed, "closing: unauthenticated frame is too large");
+                    closing = true;
+                    break;
+                }
                 read_buf.reserve(needed.saturating_sub(read_buf.len()));
                 break;
             }
@@ -135,24 +223,30 @@ async fn drain_vcp(
     // other connection it serves — behind it.
     if state.inline_reads && frames.iter().all(|frame| is_read_only(frame)) {
         for frame in &frames {
-            execute_frame_into(state, frame, write_buf);
+            execute_frame_into(state, conn_auth, frame, write_buf);
         }
         return Ok(!closing);
     }
 
     let state = Arc::clone(state);
+    // Carried into the blocking task and copied back, exactly as `drain_resp`
+    // does with the negotiated version — and for the same reason: an `AUTH` and
+    // the commands it authorises can arrive in one pipelined read, so it has to
+    // take effect within a block rather than between reads.
+    let mut authenticating = conn_auth.clone();
     // Store operations can page-fault or wait on the writer queue, neither of
     // which may happen on a runtime worker.
-    let response = tokio::task::spawn_blocking(move || {
+    let (response, authenticated) = tokio::task::spawn_blocking(move || {
         let mut out = Vec::with_capacity(frames.len() * 64);
         for frame in &frames {
-            execute_frame_into(&state, frame, &mut out);
+            execute_frame_into(&state, &mut authenticating, frame, &mut out);
         }
-        out
+        (out, authenticating)
     })
     .await
     .map_err(std::io::Error::other)?;
 
+    *conn_auth = authenticated;
     write_buf.extend_from_slice(&response);
     Ok(!closing)
 }
@@ -190,6 +284,7 @@ fn is_read_only_command(command: &vash_core::Command<'_>) -> bool {
 /// may contain CRLF.
 async fn drain_memcached(
     state: &Arc<ServerState>,
+    conn_auth: &mut ConnAuth,
     read_buf: &mut BytesMut,
     write_buf: &mut Vec<u8>,
 ) -> std::io::Result<bool> {
@@ -225,23 +320,25 @@ async fn drain_memcached(
 
     if state.inline_reads && all_reads {
         let block: Bytes = read_buf.split_to(complete).freeze();
-        let closing = execute_memcached_block(state, &block, write_buf);
+        let closing = execute_memcached_block(state, conn_auth, &block, write_buf);
         return Ok(closing == Closing::No && !fatal);
     }
 
     let block: Bytes = read_buf.split_to(complete).freeze();
     let state = Arc::clone(state);
+    let mut authenticating = conn_auth.clone();
 
     // Re-parsed on the blocking thread so the borrowed key and value slices
     // never cross a task boundary, exactly as the VCP path does.
-    let (response, closing) = tokio::task::spawn_blocking(move || {
+    let (response, closing, authenticated) = tokio::task::spawn_blocking(move || {
         let mut out = Vec::with_capacity(64);
-        let closing = execute_memcached_block(&state, &block, &mut out);
-        (out, closing)
+        let closing = execute_memcached_block(&state, &mut authenticating, &block, &mut out);
+        (out, closing, authenticating)
     })
     .await
     .map_err(std::io::Error::other)?;
 
+    *conn_auth = authenticated;
     write_buf.extend_from_slice(&response);
     Ok(closing == Closing::No && !fatal)
 }
@@ -258,6 +355,7 @@ async fn drain_memcached(
 /// including ones in the same pipelined block.
 async fn drain_resp(
     state: &Arc<ServerState>,
+    conn_auth: &mut ConnAuth,
     read_buf: &mut BytesMut,
     version: &mut vash_proto::resp::Version,
     write_buf: &mut Vec<u8>,
@@ -292,19 +390,28 @@ async fn drain_resp(
         let block: Bytes = read_buf.split_to(complete).freeze();
 
         if state.inline_reads && all_reads {
-            closing = crate::resp::execute_block(state, &block, version, write_buf);
+            closing = crate::resp::execute_block(state, conn_auth, &block, version, write_buf);
         } else {
             let state = Arc::clone(state);
             let mut negotiating = *version;
-            let (response, done, negotiated) = tokio::task::spawn_blocking(move || {
-                let mut out = Vec::with_capacity(64);
-                let done = crate::resp::execute_block(&state, &block, &mut negotiating, &mut out);
-                (out, done, negotiating)
-            })
-            .await
-            .map_err(std::io::Error::other)?;
+            let mut authenticating = conn_auth.clone();
+            let (response, done, negotiated, authenticated) =
+                tokio::task::spawn_blocking(move || {
+                    let mut out = Vec::with_capacity(64);
+                    let done = crate::resp::execute_block(
+                        &state,
+                        &mut authenticating,
+                        &block,
+                        &mut negotiating,
+                        &mut out,
+                    );
+                    (out, done, negotiating, authenticating)
+                })
+                .await
+                .map_err(std::io::Error::other)?;
 
             *version = negotiated;
+            *conn_auth = authenticated;
             write_buf.extend_from_slice(&response);
             closing = done;
         }

@@ -15,35 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "vash-core"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror",
- "zerocopy",
-]
-
-[[package]]
-name = "vash-fuzz"
-version = "0.0.0"
-dependencies = [
- "vash-core",
- "vash-proto",
- "libfuzzer-sys",
-]
-
-[[package]]
-name = "vash-proto"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "vash-core",
- "memchr",
- "thiserror",
- "zerocopy",
-]
-
-[[package]]
 name = "cc"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -187,6 +158,35 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "vash-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
+name = "vash-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "vash-core",
+ "vash-proto",
+]
+
+[[package]]
+name = "vash-proto"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "memchr",
+ "thiserror",
+ "vash-core",
+ "zerocopy",
+]
 
 [[package]]
 name = "zerocopy"

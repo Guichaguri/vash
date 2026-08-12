@@ -20,6 +20,20 @@ pub struct ServerMetrics {
     pub connections_active: AtomicU64,
     pub connections_rejected: AtomicU64,
 
+    /// Successful authentications, failed ones, and commands refused for want
+    /// of one.
+    ///
+    /// A failure rate that is not zero is the alert worth having. So, on a
+    /// server with authentication required, is a sudden *drop* to zero: it
+    /// means nothing is reaching the gate any more.
+    pub auth_ok: AtomicU64,
+    pub auth_failed: AtomicU64,
+    pub auth_refused: AtomicU64,
+    /// Connections dropped for not authenticating inside `auth.timeout_ms`, and
+    /// refused because the unauthenticated-connection budget was full.
+    pub auth_timeouts: AtomicU64,
+    pub auth_capacity_rejected: AtomicU64,
+
     pub commands_total: AtomicU64,
     pub reads: AtomicU64,
     pub writes: AtomicU64,
@@ -46,6 +60,26 @@ impl ServerMetrics {
 
     pub fn connection_rejected(&self) {
         self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn auth_ok(&self) {
+        self.auth_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn auth_failed(&self) {
+        self.auth_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn auth_refused(&self) {
+        self.auth_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn auth_timeout(&self) {
+        self.auth_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn auth_capacity_rejected(&self) {
+        self.auth_capacity_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]

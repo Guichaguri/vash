@@ -43,10 +43,35 @@ struct Cli {
     /// it, so the flag always describes the whole cluster.
     #[arg(long = "peer", value_name = "HOST:PORT")]
     peers: Vec<String>,
+
+    /// Require authentication on the cache port. Overrides the config file.
+    #[arg(long)]
+    require_auth: bool,
+
+    #[command(subcommand)]
+    command: Option<Subcommand>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Subcommand {
+    /// Generate a credential and print the line to add to the credential file.
+    ///
+    /// The secret is generated rather than accepted, which is what keeps the
+    /// server's fast unsalted hash the right storage for it: that argument
+    /// holds for a high-entropy token and fails for a guessable string.
+    AuthGen {
+        /// Identity the credential is for.
+        #[arg(default_value = vash_server::auth::DEFAULT_NAME)]
+        name: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Subcommand::AuthGen { name }) = &cli.command {
+        return auth_gen(name);
+    }
 
     let mut config = match &cli.config {
         Some(path) => Config::load(path)?,
@@ -65,6 +90,9 @@ fn main() -> anyhow::Result<()> {
     }
     if cli.enable_flush {
         config.protocol.flush_enabled = true;
+    }
+    if cli.require_auth {
+        config.auth.required = true;
     }
     if !cli.peers.is_empty() {
         config.cluster.peers = cli.peers;
@@ -89,6 +117,21 @@ fn main() -> anyhow::Result<()> {
         let server = Server::bind(config).await?;
         server.serve(shutdown_signal()).await
     })
+}
+
+/// Prints a generated credential: the secret on stderr, the file line on
+/// stdout.
+///
+/// Split across the two streams so `vash-server auth-gen api >> credentials`
+/// appends the row and still shows a human the secret, which is the only time
+/// it is ever displayed. Nothing is written to disk here — where the secret
+/// goes is the operator's business, and a tool that helpfully saved it would be
+/// putting a plaintext credential somewhere nobody asked for.
+fn auth_gen(name: &str) -> anyhow::Result<()> {
+    let (secret, line) = vash_server::auth::generate(name)?;
+    eprintln!("secret for {name} (shown once, store it in your secret manager):\n{secret}\n");
+    println!("{line}");
+    Ok(())
 }
 
 fn init_tracing(config: &Config) -> anyhow::Result<()> {
