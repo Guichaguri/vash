@@ -125,9 +125,6 @@ pub struct ShardScan {
     pub stopped_at: Option<Box<[u8]>>,
     /// It stopped on the scan budget rather than on `limit`.
     pub budget_exhausted: bool,
-    /// Records that would not parse. Logged, skipped, and counted so the caller
-    /// can surface that the database has a problem.
-    pub corrupt: u64,
 }
 
 /// A record encoded and ready to store, still missing its CAS token.
@@ -489,10 +486,7 @@ impl LmdbEngine {
                 // Failing the page would make the keyspace past a corrupt
                 // record unlistable — the tool would break exactly when the
                 // database did, which is when it is wanted most.
-                Err(error) => {
-                    warn!(?key, %error, "skipping an unreadable record while listing");
-                    scan.corrupt += 1;
-                }
+                Err(error) => warn!(?key, %error, "skipping an unreadable record while listing"),
             }
 
             if scan.entries.len() >= limit {

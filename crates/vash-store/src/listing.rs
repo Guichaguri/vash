@@ -17,6 +17,12 @@ use crate::error::{Result, StoreError};
 /// `shard_index u16` ahead of the key.
 const SHARD_PREFIX_LEN: usize = 2;
 
+/// The wire refuses a cursor longer than this before it reaches us, so an
+/// encoding that could exceed it would produce cursors the next request
+/// rejects — a pager that stops dead one page in. Checked at compile time
+/// rather than discovered at that point.
+const _: () = assert!(SHARD_PREFIX_LEN + MAX_KEY_LEN <= vash_core::MAX_LIST_CURSOR_LEN);
+
 /// Builds the cursor for "resume strictly after `key` in `shard`".
 pub(crate) fn encode(shard: usize, key: &[u8]) -> Box<[u8]> {
     let mut out = Vec::with_capacity(SHARD_PREFIX_LEN + key.len());

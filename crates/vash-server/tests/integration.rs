@@ -1394,7 +1394,13 @@ async fn garbage_input_closes_the_connection_without_killing_the_server() {
 
 // ---- listing ---------------------------------------------------------------
 
-/// Pages a listing to exhaustion over the wire, exactly as a client must.
+/// Pages a listing to exhaustion over the wire at a **caller-chosen page size**.
+///
+/// Deliberately not `Client::list_all_keys`, which always asks for the largest
+/// page the server allows: at that size these keyspaces come back in one reply
+/// and the cursor is never exercised. Small limits are the whole point here.
+/// The iteration bound turns "the cursor stopped advancing" into a failing test
+/// rather than a hung one.
 async fn page_all(
     client: &mut Client,
     keys: bool,

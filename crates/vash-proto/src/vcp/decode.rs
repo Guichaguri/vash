@@ -99,12 +99,6 @@ pub const TAG_SYNC_HEADER_LEN: usize = 8;
 /// `limit u32 | cursor_len u16 | pattern_len u16 | reserved u32` ahead of a
 /// listing request's cursor and pattern.
 pub const LIST_BODY_HEADER_LEN: usize = 12;
-/// Longest cursor a client may send back.
-///
-/// The longest this server *produces* is `shard_index u16` plus a maximum-length
-/// key. Bounded here so a fabricated one is refused before it is copied
-/// anywhere, and so the limit is one number rather than an inference.
-pub const MAX_LIST_CURSOR_LEN: usize = 2 + vash_core::MAX_KEY_LEN;
 
 /// A bounds-checked forward reader over a frame body.
 ///
@@ -435,20 +429,23 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
 /// codec has no business knowing; the store decodes it and reports a malformed
 /// one as `BAD_REQUEST` all the same.
 pub fn decode_list_request(body: &[u8]) -> Result<ListRequest<'_>, (Status, &'static str)> {
+    // Read field by field rather than by offset into a taken header: the layout
+    // is a clean `u32, u16, u16` prefix, so the cursor's own accessors state it
+    // once instead of restating it as three slice ranges.
     let mut c = Cursor::new(body);
-    let header = c.take(LIST_BODY_HEADER_LEN).ok_or((
+    let short = (
         Status::BadRequest,
         "listing body is shorter than its header",
-    ))?;
-
-    let limit = u32::from_le_bytes(header[0..4].try_into().expect("8-byte header"));
-    let cursor_len = u16::from_le_bytes(header[4..6].try_into().expect("8-byte header")) as usize;
-    let pattern_len = u16::from_le_bytes(header[6..8].try_into().expect("8-byte header")) as usize;
+    );
+    let limit = c.u32().ok_or(short)?;
+    let cursor_len = c.u16().ok_or(short)? as usize;
+    let pattern_len = c.u16().ok_or(short)? as usize;
+    c.take(4).ok_or(short)?; // reserved
 
     // Bounded before either is used to slice, so a hostile length cannot read
     // past the frame — `take` would refuse anyway, but refusing with the reason
     // is what a client can act on.
-    if cursor_len > MAX_LIST_CURSOR_LEN {
+    if cursor_len > vash_core::MAX_LIST_CURSOR_LEN {
         return Err((Status::BadRequest, "listing cursor is too long"));
     }
     if pattern_len > vash_core::MAX_KEY_LEN {
@@ -462,7 +459,7 @@ pub fn decode_list_request(body: &[u8]) -> Result<ListRequest<'_>, (Status, &'st
         .take(pattern_len)
         .ok_or((Status::BadRequest, "truncated listing pattern"))?;
 
-    if c.pos != body.len() {
+    if !c.rest().is_empty() {
         return Err((Status::BadRequest, "trailing bytes after the listing body"));
     }
 

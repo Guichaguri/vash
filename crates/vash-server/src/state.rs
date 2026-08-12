@@ -10,14 +10,13 @@ use crate::cluster::Cluster;
 pub struct ServerState {
     pub store: Arc<LmdbStore>,
     pub info: ServerInfo,
-    /// `FLUSH` is a remote cache-wipe primitive, so it is off unless
-    /// deliberately enabled.
-    pub flush_enabled: bool,
-    /// `LIST_KEYS`/`LIST_TAGS` enumerate the cache, so they are off unless
-    /// deliberately enabled. See [`crate::config::ProtocolConfig`].
-    pub listing_enabled: bool,
-    /// Records one `LIST_KEYS` call may examine before stopping early.
-    pub listing_max_scan: usize,
+    /// Which commands are available and on what budget.
+    ///
+    /// Held whole rather than unpacked into a field per setting: it is `Copy`,
+    /// every field is read by dispatch and by nothing else, and a new toggle
+    /// should not have to be declared and threaded twice to reach the one place
+    /// that acts on it.
+    pub protocol: crate::config::ProtocolConfig,
     /// The credential table and the pre-auth budget. Present even when
     /// authentication is off, so the gate has no special case and `AUTH` can be
     /// answered truthfully during a rollout.
@@ -43,9 +42,7 @@ impl ServerState {
         Arc::new(Self {
             store,
             info,
-            flush_enabled: protocol.flush_enabled,
-            listing_enabled: protocol.listing_enabled,
-            listing_max_scan: protocol.listing_max_scan,
+            protocol,
             auth,
             metrics: crate::metrics::ServerMetrics::default(),
             cluster,

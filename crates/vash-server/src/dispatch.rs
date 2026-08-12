@@ -609,7 +609,7 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
         Command::Cluster => Ok(Reply::Cluster(state.cluster.view())),
 
         Command::Flush => {
-            if !state.flush_enabled {
+            if !state.protocol.flush_enabled {
                 // A remote cache-wipe primitive stays off unless deliberately
                 // enabled.
                 warn!("rejected flush: disabled by configuration");
@@ -623,7 +623,7 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
             Ok(Reply::Listing(
                 state
                     .store
-                    .list_keys(request, state.listing_max_scan)
+                    .list_keys(request, state.protocol.listing_max_scan)
                     .map_err(to_status)?,
             ))
         }
@@ -643,7 +643,7 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
 /// decides *who may connect*, this one decides what any connected client may
 /// do, and every authenticated client on this server is equally trusted.
 fn listing_gate(state: &ServerState) -> Result<(), Status> {
-    if !state.listing_enabled {
+    if !state.protocol.listing_enabled {
         warn!("rejected listing: disabled by configuration");
         return Err(Status::Unauthorized);
     }

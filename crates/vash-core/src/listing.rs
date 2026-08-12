@@ -18,6 +18,16 @@ use crate::glob;
 /// asked for 10000 and silently got 1024 would page incorrectly.
 pub const MAX_LIST_LIMIT: u32 = 1024;
 
+/// Longest cursor a listing may carry.
+///
+/// A cursor is a position, and the longest position is a maximum-length key
+/// plus whatever framing the storage layer puts in front of it. The allowance
+/// is deliberately loose: this bound exists so a fabricated cursor is refused
+/// before it is copied anywhere, not to pin down an encoding that the wire
+/// format does not know and must not care about. It lives here because the
+/// codec and the store both need it and neither can see the other.
+pub const MAX_LIST_CURSOR_LEN: usize = crate::MAX_KEY_LEN + 8;
+
 /// A decoded listing request, borrowing from the connection's read buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListRequest<'a> {
@@ -33,16 +43,7 @@ pub struct ListRequest<'a> {
     pub pattern: &'a [u8],
 }
 
-impl<'a> ListRequest<'a> {
-    /// A request for the first page of everything.
-    pub fn new(limit: u32) -> Self {
-        Self {
-            limit,
-            cursor: &[],
-            pattern: &[],
-        }
-    }
-
+impl ListRequest<'_> {
     /// Checks the bounds a decoder must enforce before this reaches the store.
     ///
     /// The pattern is validated here rather than at match time so a bad one
@@ -110,57 +111,34 @@ pub struct Listing {
     pub truncated: bool,
 }
 
-impl Listing {
-    /// A complete, empty listing.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Whether a client must ask for another page.
-    #[inline]
-    pub fn has_more(&self) -> bool {
-        self.cursor.is_some()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn request(limit: u32, pattern: &[u8]) -> ListRequest<'_> {
+        ListRequest {
+            limit,
+            cursor: &[],
+            pattern,
+        }
+    }
+
     #[test]
     fn limit_bounds_are_enforced() {
-        assert!(ListRequest::new(1).validate().is_ok());
-        assert!(ListRequest::new(MAX_LIST_LIMIT).validate().is_ok());
-        assert!(ListRequest::new(0).validate().is_err());
-        assert!(ListRequest::new(MAX_LIST_LIMIT + 1).validate().is_err());
+        assert!(request(1, b"").validate().is_ok());
+        assert!(request(MAX_LIST_LIMIT, b"").validate().is_ok());
+        assert!(request(0, b"").validate().is_err());
+        assert!(request(MAX_LIST_LIMIT + 1, b"").validate().is_err());
     }
 
     #[test]
     fn a_bad_pattern_is_refused_by_validation() {
-        let request = ListRequest {
-            limit: 10,
-            cursor: &[],
-            pattern: br"trailing\",
-        };
-        assert!(request.validate().is_err());
+        assert!(request(10, br"trailing\").validate().is_err());
     }
 
     #[test]
     fn an_empty_pattern_matches_every_name() {
-        let request = ListRequest::new(10);
-        assert!(request.matches(b"anything"));
-        assert!(request.matches(b""));
-    }
-
-    #[test]
-    fn a_complete_listing_carries_no_cursor() {
-        let done = Listing::empty();
-        assert!(!done.has_more());
-
-        let more = Listing {
-            cursor: Some(b"somewhere".to_vec().into_boxed_slice()),
-            ..Listing::empty()
-        };
-        assert!(more.has_more());
+        assert!(request(10, b"").matches(b"anything"));
+        assert!(request(10, b"").matches(b""));
     }
 }

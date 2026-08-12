@@ -8,42 +8,7 @@
 //! Add `--enable-listing` to the server to exercise `LIST_KEYS`/`LIST_TAGS`;
 //! without it they are refused, and this prints that rather than failing.
 
-use vash_client::{Client, ListEntry};
-
-/// Pages a listing to exhaustion, which is the loop every caller has to write.
-///
-/// The whole protocol is here: start with an empty cursor, echo back the one
-/// each page carries, and stop when a page carries none. The cursor is opaque —
-/// never parse one, never build one.
-async fn page_all(
-    client: &mut Client,
-    keys: bool,
-    limit: u32,
-    pattern: &[u8],
-) -> Result<Vec<ListEntry>, Box<dyn std::error::Error>> {
-    let mut all = Vec::new();
-    let mut cursor: Vec<u8> = Vec::new();
-
-    loop {
-        let page = if keys {
-            client.list_keys(limit, &cursor, pattern).await?
-        } else {
-            client.list_tags(limit, &cursor, pattern).await?
-        };
-        if page.truncated {
-            // The page stopped on the server's scan budget rather than on the
-            // limit. Paging is unaffected — the cursor still advanced — but it
-            // is the sign of a pattern that is not selective.
-            println!("           (page truncated after {} scanned)", page.scanned);
-        }
-        all.extend(page.entries);
-
-        match page.cursor {
-            Some(next) => cursor = next.to_vec(),
-            None => return Ok(all),
-        }
-    }
-}
+use vash_client::Client;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -132,9 +97,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if capabilities & vash_core::capability::LISTING == 0 {
         println!("listing -> disabled on this server (start it with --enable-listing)");
     } else {
-        // A page size of one so the paging loop actually runs more than once
-        // against a handful of smoke keys. Real callers should ask for more.
-        let keys = page_all(&mut client, true, 1, b"smoke:*").await?;
+        // `list_all_keys` pages to exhaustion; `list_keys` hands back one page
+        // and a cursor for callers that want to stream rather than collect.
+        let keys = client.list_all_keys(b"smoke:*").await?;
         println!(
             "list    -> {} live key(s) matching smoke:* \
              (t1 and t2 are gone: a listing applies the same liveness check as GET)",
@@ -150,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        let tags = page_all(&mut client, false, 1, b"").await?;
+        let tags = client.list_all_tags(b"").await?;
         println!("tags    -> {} registered", tags.len());
         for entry in &tags {
             // Generation 0 means registered but never invalidated. `demo` was

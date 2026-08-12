@@ -322,6 +322,43 @@ impl Client {
         self.list(Opcode::ListTags, limit, cursor, pattern).await
     }
 
+    /// Every live key matching `pattern`, paged to exhaustion.
+    ///
+    /// The paging loop is the one thing a caller can get wrong — echo the
+    /// cursor, stop when a page carries none — so it is written once here
+    /// rather than in each caller.
+    ///
+    /// **Collects the whole listing into memory.** That is right for the
+    /// administrative uses these commands exist for, and wrong for a keyspace
+    /// larger than the process can hold; page with [`Client::list_keys`]
+    /// directly if that is a risk.
+    pub async fn list_all_keys(&mut self, pattern: &[u8]) -> Result<Vec<ListEntry>> {
+        self.list_all(Opcode::ListKeys, pattern).await
+    }
+
+    /// Every tag matching `pattern`, paged to exhaustion. See
+    /// [`Client::list_all_keys`].
+    pub async fn list_all_tags(&mut self, pattern: &[u8]) -> Result<Vec<ListEntry>> {
+        self.list_all(Opcode::ListTags, pattern).await
+    }
+
+    async fn list_all(&mut self, opcode: Opcode, pattern: &[u8]) -> Result<Vec<ListEntry>> {
+        let mut all = Vec::new();
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            // The largest page the server will serve: fewer round trips, and
+            // the limit is a transport detail that cannot change the result.
+            let page = self
+                .list(opcode, vash_core::MAX_LIST_LIMIT, &cursor, pattern)
+                .await?;
+            all.extend(page.entries);
+            match page.cursor {
+                Some(next) => cursor = next.into_vec(),
+                None => return Ok(all),
+            }
+        }
+    }
+
     /// Both listings share a body, a reply and therefore this.
     async fn list(
         &mut self,

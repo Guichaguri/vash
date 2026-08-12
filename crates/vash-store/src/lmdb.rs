@@ -1,6 +1,5 @@
 use std::sync::atomic::Ordering;
 
-use tracing::warn;
 use vash_core::{Key, Listing, Set, Stored, Value};
 
 use crate::config::StoreConfig;
@@ -409,13 +408,6 @@ impl Store for LmdbStore {
 
             listing.scanned += scan.scanned;
             listing.entries.extend(scan.entries);
-            if scan.corrupt > 0 {
-                warn!(
-                    shard = index,
-                    count = scan.corrupt,
-                    "skipped unreadable records while listing"
-                );
-            }
 
             if let Some(stopped) = scan.stopped_at {
                 listing.cursor = Some(crate::listing::encode(index, &stopped));
@@ -454,17 +446,20 @@ impl Store for LmdbStore {
 
         let limit = request.limit as usize;
         let mut listing = Listing::default();
-        for entry in &known[start..] {
+        // Consumed rather than borrowed so each name moves into its entry
+        // instead of being copied out of a snapshot that is about to be dropped.
+        for entry in known.into_iter().skip(start) {
             listing.scanned += 1;
             if !request.matches(&entry.name) {
                 continue;
             }
-            listing.entries.push(vash_core::ListEntry::new(
-                entry.name.clone(),
-                entry.generation,
-            ));
+            listing
+                .entries
+                .push(vash_core::ListEntry::new(entry.name, entry.generation));
             if listing.entries.len() >= limit {
-                listing.cursor = Some(entry.name.clone());
+                // Taken from the entry just pushed: the cursor is the last name
+                // returned, so this is the one copy the page genuinely needs.
+                listing.cursor = listing.entries.last().map(|last| last.name.clone());
                 break;
             }
         }

@@ -153,7 +153,7 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             let payload: usize = listing
                 .entries
                 .iter()
-                .map(|entry| 10 + entry.name.len())
+                .map(|entry| NAMED_ENTRY_PREFIX_LEN + entry.name.len())
                 .sum();
 
             let mut body = Vec::with_capacity(LIST_RESPONSE_HEADER_LEN + cursor.len() + payload);
@@ -169,9 +169,7 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             body.extend_from_slice(&0u16.to_le_bytes()); // reserved
             body.extend_from_slice(cursor);
             for entry in &listing.entries {
-                body.extend_from_slice(&entry.version.to_le_bytes());
-                body.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
-                body.extend_from_slice(&entry.name);
+                push_named_entry(&mut body, &entry.name, entry.version);
             }
             encode_response(out, opcode, request_id, Status::Ok, &body);
         }
@@ -220,6 +218,25 @@ pub const CLUSTER_HEADER_LEN: usize = 4;
 /// reserved u16` ahead of a listing's cursor and entries.
 pub const LIST_RESPONSE_HEADER_LEN: usize = 20;
 
+/// `version u64 | name_len u16` ahead of a named entry's bytes.
+///
+/// One layout, three users: `TAG_SYNC` in both directions and both listings.
+/// Named because it is also the *minimum* entry length, which is what bounds a
+/// count coming off the wire before it sizes an allocation.
+pub const NAMED_ENTRY_PREFIX_LEN: usize = 10;
+
+/// Appends `version u64 | name_len u16 | name`, the entry shape shared by
+/// `TAG_SYNC` and the listings.
+///
+/// A tag's generation and a record's CAS are the same thing on the wire — an
+/// opaque monotonic version for a name — so they get one encoder rather than
+/// two that can drift apart without either side's round-trip test noticing.
+fn push_named_entry(out: &mut Vec<u8>, name: &[u8], version: u64) {
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    out.extend_from_slice(name);
+}
+
 /// Flags in a listing response.
 pub mod list_flags {
     /// The page ended on the server's scan budget rather than on `limit`.
@@ -247,10 +264,10 @@ pub fn decode_listing(body: &[u8]) -> Option<vash_core::Listing> {
     let cursor = body.get(pos..pos + cursor_len)?;
     pos += cursor_len;
 
-    // Bounded by what the body can actually hold: the smallest entry is ten
-    // bytes, so a count larger than that cannot be honest and must not size an
-    // allocation.
-    if count > body.len().saturating_sub(pos) / 10 {
+    // Bounded by what the body can actually hold: an entry cannot be shorter
+    // than its prefix, so a count larger than that cannot be honest and must not
+    // size an allocation.
+    if count > body.len().saturating_sub(pos) / NAMED_ENTRY_PREFIX_LEN {
         return None;
     }
 
@@ -302,9 +319,7 @@ pub fn encode_tag_sync_body<'a>(
     out.extend_from_slice(&[0, 0, 0]); // reserved
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (name, generation) in entries {
-        out.extend_from_slice(&generation.to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        out.extend_from_slice(name);
+        push_named_entry(out, name, generation);
     }
 }
 
@@ -551,7 +566,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes(body[16..18].try_into().unwrap()), 0);
         let decoded = decode_listing(body).expect("valid listing");
         assert_eq!(decoded, listing);
-        assert!(!decoded.has_more());
+        assert!(decoded.cursor.is_none(), "an absent cursor means complete");
     }
 
     #[test]
@@ -561,10 +576,10 @@ mod tests {
             &mut out,
             Opcode::ListKeys,
             1,
-            &Reply::Listing(vash_core::Listing::empty()),
+            &Reply::Listing(vash_core::Listing::default()),
         );
         let body = &out[super::super::frame::HEADER_LEN..];
-        assert_eq!(decode_listing(body), Some(vash_core::Listing::empty()));
+        assert_eq!(decode_listing(body), Some(vash_core::Listing::default()));
     }
 
     #[test]
