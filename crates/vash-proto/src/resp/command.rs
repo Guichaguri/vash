@@ -257,6 +257,10 @@ pub fn parse_command<'a>(
 
         // Redis 6 added the two-argument form for ACL users and kept the
         // one-argument one, which every pre-6 client still sends.
+        //
+        // The two failure modes are different errors, which is Redis's own
+        // asymmetry and not ours: no arguments is an arity error, too many is a
+        // syntax error. Verified against Redis 7.4.10.
         b"AUTH" => match args.len() {
             2 => Command::Auth(Credential {
                 name: None,
@@ -266,7 +270,8 @@ pub fn parse_command<'a>(
                 name: Some(args[1]),
                 secret: args[2],
             }),
-            _ => return Err(fail(ErrorReply::WrongArity("auth"))),
+            1 => return Err(fail(ErrorReply::WrongArity("auth"))),
+            _ => return Err(fail(ErrorReply::SYNTAX)),
         },
 
         b"PING" => match args.len() {
@@ -1165,11 +1170,10 @@ mod tests {
                 secret: b"secret"
             })
         ));
+        // Redis's own asymmetry, verified against 7.4.10 by the differential
+        // suite: no arguments is an arity error, too many is a syntax error.
         assert_eq!(rejected(&[b"AUTH"]), ErrorReply::WrongArity("auth"));
-        assert_eq!(
-            rejected(&[b"AUTH", b"a", b"b", b"c"]),
-            ErrorReply::WrongArity("auth")
-        );
+        assert_eq!(rejected(&[b"AUTH", b"a", b"b", b"c"]), ErrorReply::SYNTAX);
     }
 
     #[test]

@@ -522,14 +522,36 @@ commands included, is refused with `CLIENT_ERROR unauthenticated`. The meta
 protocol has no authentication command of its own upstream, so a meta-only
 client must send the classic `set` first.
 
-**Two things to pin against real memcached rather than assert here**, in the
-differential suite that already compares raw bytes (`tests/compat/`):
+**Pinned against memcached 1.6.45** by `tests/compat/docker_differential.py`,
+which is where these answers came from rather than from this document:
 
-1. The exact refusal line for an unauthenticated command. `CLIENT_ERROR
-   unauthenticated` is what upstream is understood to emit; the suite decides.
-2. Whether `version`, `stats` and `quit` are permitted before authentication.
-   The design above allows only `quit`; if upstream differs, upstream wins —
-   that is the standing rule for this dialect.
+| | Upstream | vash |
+|---|---|---|
+| Unauthenticated command | `CLIENT_ERROR unauthenticated` | same |
+| Unknown verb, bad command line, garbage | `CLIENT_ERROR unauthenticated` — **not** the parse error | same |
+| `version`, `stats` before auth | refused | same |
+| `quit` before auth | closes | same |
+| Successful credential | `STORED` | same |
+| Wrong secret, unknown name, block naming another user | `CLIENT_ERROR authentication failure` | same |
+| Block that is not `<user> <pass>` | `CLIENT_ERROR bad authentication token format` | same |
+| `mg`, `md`, `ma`, `me` before auth | `CLIENT_ERROR unauthenticated` | same |
+| `mn`, `ms` before auth | **closes, silently** | `CLIENT_ERROR unauthenticated` |
+| Anything after the first refusal | **discarded** | answered in the position it occupied |
+
+The last two are deliberate divergences, recorded in the suite with their
+evidence. A silent disconnect gives a client nothing to report, and the split
+across the six meta commands — four answer, two hang up — reads as an oversight
+rather than a decision. Dropping the rest of a client's pipeline is worse: it
+discards commands that were sent, and what upstream answers depends on whether
+they arrived in one read, which makes it not even self-consistent. `-Y` is
+marked EXPERIMENTAL upstream, and this is what that looks like.
+
+Three of the rows above were wrong in the first implementation and were found by
+running the suite: the unknown-verb case answered `ERROR`, a malformed block
+answered `unauthenticated`, and a block naming another user did too. The
+unknown-verb one is the memcached form of the same mistake §5 records for
+VCP — refusing *after* the parser has already told a stranger what the server
+understands.
 
 The **binary protocol and its SASL commands stay unimplemented** (plan.md §7).
 SASL lives only in the binary protocol upstream, so supporting it means adding
@@ -563,13 +585,38 @@ clients branch on 7's behaviour:
 | `+OK` | Authentication succeeded. |
 | `-WRONGPASS invalid username-password pair or user is disabled.` | Bad name or bad secret. **One message for both**, as Redis does, so the error does not confirm which names exist. |
 | `-NOAUTH Authentication required.` | Any other command before authenticating. |
-| `-ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?` | `AUTH` when no credential is configured at all. |
+| `-ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?` | `AUTH` when no credential is configured at all. |
 | `-NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and select the RESP protocol version at the same time` | Bare `HELLO` while unauthenticated. Redis's own wording, long as it is. |
 
 **Pre-auth set: `AUTH`, `HELLO … AUTH`, `QUIT`.** Bare `HELLO` is refused with
 the message above — which, note, is Redis choosing to be *more* restrictive than
 VCP is (§6.2), where `HELLO` must be allowed because the dialect is not yet
 known. Two protocols, two correct answers, for a reason worth writing down.
+
+An unknown command is **not** refused: Redis answers `unknown command` to an
+unauthenticated client, so it tells a stranger which commands it knows, and this
+matches. memcached goes the other way — everything unparseable is
+`unauthenticated` there (§7) — and that matches too. Each dialect keeps its own
+answer rather than being made consistent with the other.
+
+**Pinned against Redis 7.4.10** by the same suite as §7, which moved two more
+answers and one ordering:
+
+- `AUTH a b c` is `-ERR syntax error`, not an arity error; `AUTH` with no
+  arguments *is* an arity error. Redis's own asymmetry.
+- The no-credential message above is Redis 7's, replacing the Redis 6 wording
+  this document originally specified.
+- **`HELLO` validates the protocol version before it looks at the credential.**
+  `HELLO 9 AUTH <good credential>` answers `NOPROTO` and leaves the connection
+  unauthenticated. The version is then applied only after the credential is
+  accepted, so a `HELLO 3 AUTH <bad credential>` does not switch the connection
+  to RESP3 on its way to refusing. Three steps, in that order, and both ends of
+  it are observable.
+
+One deliberate divergence: with no credential configured, real Redis answers
+`AUTH <user> <anything>` with `+OK`, because its `default` user is then `nopass`
+and any secret satisfies it. vash refuses. Telling a client it authenticated
+when nothing was verified is the one thing §15's rollout is built to avoid.
 
 **`RESET` is not implemented and stays that way.** It exists in Redis partly to
 drop authentication state; a client that wants that can close the connection,
@@ -699,7 +746,7 @@ result.
 | Integration | Consumption is unchanged by authentication state: `a_refused_storage_command_still_consumes_its_block` pipelines a refused memcached `set` whose data block would parse as a command, and asserts exactly two replies. One more would mean the block had been read as commands. |
 | Fuzz | `vcp_auth` runs `decode_auth` against a seeded corpus, joining the five existing targets in CI. It is pre-auth input by definition, so it is the highest-value surface in the system. |
 | Integration | Per dialect: authenticate and succeed, wrong secret, unknown name, command before auth, re-auth on a live connection, `SIGHUP` reload, the attempt cap and the deadline. |
-| Differential | The memcached error line and pre-auth command set against real memcached under `-Y` (§7); the Redis error strings and `HELLO … AUTH` against real Redis. Both are byte comparisons in the existing suite. **Still outstanding** — the strings shipped are the ones §7 and §8 name, pinned by this repo's own tests rather than against a real server. |
+| Differential | `tests/compat/docker_differential.py` runs identical command sequences against pinned reference images — `memcached:1.6-alpine` and `redis:7.4-alpine` — and compares raw response bytes. Four combinations, because authentication is a startup flag: each dialect plain and authenticated. Every divergence is either listed with its reasoning or fails the run. |
 | Client compat | `pymemcache` with a username and password, and `redis-py` with `AUTH` and with `HELLO 3 AUTH`. The point is whether real clients drive it unchanged, which is the same bar M3 and M7 were held to. |
 | Cluster | A three-node cluster with auth required, converging; and the negative case — a node started without a peer credential must fail startup, not run degraded (§9). |
 
@@ -744,14 +791,16 @@ worth making.
 |---|---|---|
 | **M9** | Credential table and file loader; `AUTH` in VCP, memcached ASCII auth, Redis `AUTH`/`HELLO … AUTH`; the pre-auth gate in all three executors; peer credentials; `SIGHUP` reload; the pre-auth abuse budget | Real memcached and Redis clients authenticate unchanged and are refused when they do not; the property test proves no command in any dialect executes unauthenticated; a three-node cluster converges with auth required, and a node with a missing peer credential refuses to start; the `AUTH` decoder is fuzzed in CI |
 
-**Delivered**, with two exceptions carried forward:
+**Delivered.** One limitation carried forward: **`SIGHUP` reload is Unix only.**
+Windows has no `SIGHUP`; rotation there means a restart, which the two-step
+rollout already tolerates.
 
-- **`SIGHUP` reload is Unix only.** Windows has no `SIGHUP`; rotation there
-  means a restart, which the two-step rollout already tolerates.
-- **The differential suite has not been extended** to compare authentication
-  against a real memcached and a real Redis (§14). The wire strings here are the
-  ones §7 and §8 specify, pinned by this repo's tests; §7 names the two
-  memcached behaviours that upstream, not this document, should settle.
+The differential suite settled the wire behaviour afterwards, and moved five
+answers (§7, §8). What that exercise is worth recording for: every one of the
+five was a case where this document had *specified* a string and the
+implementation had faithfully produced it — the specification was simply wrong
+about what the real server does. No amount of reading upstream's source would
+have been as quick as running it.
 
 Sequencing within it: the credential table and VCP first (it is the dialect we
 own end to end, and `vash-client` is the test driver everything else uses), then

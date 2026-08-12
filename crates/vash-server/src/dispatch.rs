@@ -39,7 +39,26 @@ pub fn execute_memcached_block(
                 rest = &rest[consumed..];
             }
             Err(ProtocolError::Recoverable { response, consumed }) => {
-                vash_proto::memcached::encode::encode_error(out, response);
+                // An unparseable command from an unauthenticated connection is
+                // still an unauthenticated command, and upstream answers it as
+                // one — an unknown verb, a bad command line and outright
+                // garbage all get `CLIENT_ERROR unauthenticated` rather than
+                // the parse error, so a stranger cannot probe which commands
+                // the server understands. Verified against memcached 1.6.45.
+                //
+                // The same reasoning put the VCP gate ahead of opcode
+                // recognition; this is that rule for the text dialect. The byte
+                // count is the parser's either way, so a refused storage
+                // command still steps over its data block.
+                if !conn.is_authenticated() && state.auth.current().required() {
+                    state.metrics.auth_refused();
+                    vash_proto::memcached::encode::encode_error(
+                        out,
+                        vash_proto::memcached::ErrorKind::Client("unauthenticated"),
+                    );
+                } else {
+                    vash_proto::memcached::encode::encode_error(out, response);
+                }
                 rest = &rest[consumed..];
             }
             // Unreachable: the caller only includes whole commands. Stopping
@@ -118,7 +137,7 @@ fn execute_memcached_unauthenticated(
     out: &mut Vec<u8>,
 ) -> Closing {
     use vash_core::{Command, SetMode, Stored};
-    use vash_proto::memcached::{ErrorKind, encode as mc};
+    use vash_proto::memcached::encode as mc;
 
     // `quit` stays legal: hanging up is not a use of the cache, and refusing it
     // would leave a client with no way to close politely.
@@ -126,49 +145,70 @@ fn execute_memcached_unauthenticated(
         return Closing::Yes;
     }
 
-    if let Command::Set(set) = &parsed.command
-        && set.mode == SetMode::Set
-        && let Some((name, secret)) = split_credential(set.value)
-        // The key names the identity, and upstream repeats it in the block. A
-        // mismatch is a malformed attempt rather than a different identity.
-        && set.key.as_bytes() == name
-    {
-        return match state.auth.current().verify(name, secret) {
-            Some(identity) => {
-                conn.succeed(identity);
-                state.metrics.auth_ok();
-                // `STORED`, which is what upstream answers a successful
-                // authentication. The CAS token is meaningless — nothing was
-                // stored — and no client reads it from this reply.
-                if !parsed.noreply {
-                    mc::encode(
-                        out,
-                        &parsed.style,
-                        &parsed.command,
-                        &Reply::Stored(Stored::Stored(0)),
-                    );
-                }
-                Closing::No
-            }
-            None => {
-                conn.fail();
-                warn!(
-                    name = %String::from_utf8_lossy(name),
-                    failures = conn.failures(),
-                    "authentication failed"
-                );
-                state.metrics.auth_failed();
-                if !parsed.noreply {
-                    mc::encode_error(out, ErrorKind::Client("authentication failure"));
-                }
-                Closing::No
-            }
-        };
+    // Anything that is not a plain `set` is simply not the auth command. All
+    // three of these strings are upstream's, verified against memcached 1.6.45
+    // by `tests/compat/differential.py --dialect memcached --auth`.
+    let Command::Set(set) = &parsed.command else {
+        return refuse_memcached(state, parsed, out, "unauthenticated");
+    };
+    if set.mode != SetMode::Set {
+        return refuse_memcached(state, parsed, out, "unauthenticated");
     }
 
-    state.metrics.auth_refused();
+    // A `set` that reaches here is an authentication attempt, so a block that
+    // is not `<user> <pass>` is a malformed attempt rather than an
+    // unauthenticated command — upstream distinguishes the two and so does
+    // this.
+    let Some((name, secret)) = split_credential(set.value) else {
+        conn.fail();
+        state.metrics.auth_failed();
+        return refuse_memcached(state, parsed, out, "bad authentication token format");
+    };
+
+    match state.auth.current().verify(name, secret) {
+        Some(identity) => {
+            conn.succeed(identity);
+            state.metrics.auth_ok();
+            // `STORED`, which is what upstream answers a successful
+            // authentication. The CAS token is meaningless — nothing was
+            // stored — and no client reads it from this reply.
+            if !parsed.noreply {
+                mc::encode(
+                    out,
+                    &parsed.style,
+                    &parsed.command,
+                    &Reply::Stored(Stored::Stored(0)),
+                );
+            }
+            Closing::No
+        }
+        None => {
+            conn.fail();
+            warn!(
+                name = %String::from_utf8_lossy(name),
+                failures = conn.failures(),
+                "authentication failed"
+            );
+            state.metrics.auth_failed();
+            refuse_memcached(state, parsed, out, "authentication failure")
+        }
+    }
+}
+
+fn refuse_memcached(
+    state: &ServerState,
+    parsed: &vash_proto::memcached::Parsed<'_>,
+    out: &mut Vec<u8>,
+    reason: &'static str,
+) -> Closing {
+    if reason == "unauthenticated" {
+        state.metrics.auth_refused();
+    }
     if !parsed.noreply {
-        mc::encode_error(out, ErrorKind::Client("unauthenticated"));
+        vash_proto::memcached::encode::encode_error(
+            out,
+            vash_proto::memcached::ErrorKind::Client(reason),
+        );
     }
     Closing::No
 }
@@ -177,6 +217,12 @@ fn execute_memcached_unauthenticated(
 ///
 /// Exactly one space separates them; a password may not contain one, which is
 /// upstream's limitation and not worth diverging over.
+///
+/// The command's key also names the identity, and upstream repeats it in the
+/// block — but only the block is read here. Both orderings are observably the
+/// same: a block naming a different user either fails to verify, or verifies as
+/// the user it actually named, and upstream answers `authentication failure`
+/// for a mismatch either way.
 fn split_credential(block: &[u8]) -> Option<(&[u8], &[u8])> {
     let space = block.iter().position(|b| *b == b' ')?;
     let (name, rest) = block.split_at(space);

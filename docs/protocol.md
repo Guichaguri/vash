@@ -552,7 +552,9 @@ deprecated it in favour of the meta commands.
 Compatibility is checked in CI two ways: a real client library
 (`pymemcache`) driven against both vash and real memcached, and a byte-for-byte
 differential that sends identical command sequences to both and compares raw
-responses. See `tests/compat/`.
+responses. The differential's reference is a pinned Docker image rather than
+whatever the runner has installed, and it covers Redis too. See
+`tests/compat/docker_differential.py`.
 
 ## Limits
 
@@ -612,13 +614,23 @@ billing-api 0f1e2d3c4b5a69788796a5b4c3d2e1f0\r\n
 
 It is an ugly shape — credentials tunnelled through a storage command — but it
 is the only one memcached clients implement, and compatibility is why this
-dialect exists here. A wrong credential answers `CLIENT_ERROR authentication
-failure`; nothing is stored either way.
+dialect exists here. Nothing is stored either way.
+
+| Reply | When |
+|---|---|
+| `STORED` | The credential was accepted. |
+| `CLIENT_ERROR authentication failure` | Wrong secret, unknown name, or a block naming a different identity. |
+| `CLIENT_ERROR bad authentication token format` | The block is not `<user> <pass>`. |
+| `CLIENT_ERROR unauthenticated` | Any other command — **including an unknown verb, a malformed command line, or outright garbage**, so a stranger cannot probe which commands the server understands. |
 
 Before authenticating, the only other command accepted is `quit`. Everything
 else, meta commands included, answers `CLIENT_ERROR unauthenticated`. The meta
 protocol has no authentication command of its own upstream, so a meta-only
 client must send the classic `set` first.
+
+These replies are checked byte for byte against `memcached:1.6-alpine` in
+`tests/compat/docker_differential.py`. Two upstream behaviours are deliberately
+not copied — see [auth.md §7](auth.md#7-memcached).
 
 A refused storage command still consumes its declared data block, exactly as
 [stream resynchronisation](#stream-resynchronisation) requires — so a client
@@ -876,7 +888,7 @@ stored counters, so a value `INCR` accepts is exactly a value it can write back.
 | `-NOAUTH Authentication required.` | Any command before authenticating. |
 | `-NOAUTH HELLO must be called with the client already authenticated, …` | A bare `HELLO` while unauthenticated. Redis's own wording, which explains the combined form. |
 | `-WRONGPASS invalid username-password pair or user is disabled.` | A bad name or a bad secret. One message for both, as Redis does, so it does not confirm which names exist. |
-| `-ERR Client sent AUTH, but no password is set. …` | `AUTH` when the server has no credentials configured at all. |
+| `-ERR AUTH <password> called without any password configured for the default user. …` | `AUTH` when the server has no credentials configured at all. |
 | `-ERR Protocol error: …` | Framing that cannot be resynchronised. Sent, **then** the connection closes. |
 
 A rejected command consumes exactly its own bytes, so one bad command in a

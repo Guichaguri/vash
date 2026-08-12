@@ -27,10 +27,10 @@ jobs:
       - run: cargo build --all-targets
       - run: cargo test --all-features
 
-  # The memcached compatibility claim is only worth anything if it is checked
-  # against real clients, and against real memcached. Running the identical
-  # suite on both is what turns "we implemented the protocol" into "a client
-  # cannot tell the difference".
+  # The compatibility claim is only worth anything if it is checked against real
+  # clients, and against the real servers. Running the identical suite on both
+  # is what turns "we implemented the protocol" into "a client cannot tell the
+  # difference".
   compat:
     name: memcached client compatibility
     runs-on: ubuntu-latest
@@ -68,11 +68,26 @@ jobs:
           done
           python3 tests/compat/memcached_compat.py 127.0.0.1:11311 --flush --tags
 
-      # Stricter than the client-library suite: identical command sequences to
-      # both servers, comparing the raw response bytes. A library smooths over
-      # exact error strings and edge-case verdicts; this does not.
-      - name: Byte-for-byte differential
-        run: python3 tests/compat/differential.py --reference 127.0.0.1:11211 --subject 127.0.0.1:11311
+  # Stricter than the client-library suite: identical command sequences to both
+  # servers, comparing the raw response bytes. A library smooths over exact
+  # error strings and edge-case verdicts; this does not.
+  #
+  # The reference servers come from pinned Docker images rather than from
+  # whatever the runner's package index happens to hold. For a suite whose whole
+  # job is byte-for-byte equality, a reference that changes with the distro is
+  # not a reference — and Redis was not being compared against at all.
+  differential:
+    name: byte-for-byte differential
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin vash-server
+      # Four combinations: each dialect with authentication off and on. Auth is
+      # a startup flag on all three servers, so it cannot be one run.
+      - name: memcached and Redis, plain and authenticated
+        run: python3 tests/compat/docker_differential.py
 
   lint:
     runs-on: ubuntu-latest

@@ -350,7 +350,7 @@ classic dialect) to invalidate one. Clients that never send them are unaffected.
 
 ### How compatibility is checked
 
-Two suites, both run in CI against **real memcached** as well as against vash,
+Two suites, both run in CI against the **real servers** as well as against vash,
 so a divergence fails the build rather than someone's cache.
 
 **Client library** — drives `pymemcache` through the behaviour clients actually
@@ -364,17 +364,29 @@ python tests/compat/memcached_compat.py 127.0.0.1:11311 --tags
 
 **Byte-for-byte differential** — sends identical command sequences to both
 servers and compares the raw responses. A client library smooths over exact
-error strings, edge-case verdicts and response framing; this does not:
+error strings, edge-case verdicts and response framing; this does not. It covers
+Redis as well, and both dialects with authentication on and off, against pinned
+reference images so the baseline does not drift with a distro's packages:
 
 ```bash
-docker run -d -p 11211:11211 memcached:1.6-alpine
-python tests/compat/differential.py --reference 127.0.0.1:11211 --subject 127.0.0.1:11311
+cargo build --release --bin vash-server
+python tests/compat/docker_differential.py
 ```
 
-Current result: **37 of 38 probes byte-identical**, with one deliberate
-divergence recorded in the script — for an over-long key memcached emits a stray
-empty line after the error, which vash does not reproduce because it would
-leave a pipelining client counting one more response than it sent commands.
+| Suite | Reference | Identical | Deliberate divergences |
+|---|---|---|---|
+| memcached | `memcached:1.6-alpine` | 37 | 1 |
+| memcached, authenticated | `memcached -Y authfile` | 23 | 3 |
+| Redis | `redis:7.4-alpine` | 27 | 1 |
+| Redis, authenticated | `redis --requirepass` | 21 | 1 |
+
+Every divergence is listed in the script with the reasoning; anything not on
+that list fails the run. They are all cases where copying upstream would hurt a
+client — a stray protocol line, a silent disconnect, discarding the rest of a
+pipeline — or where upstream echoes attacker-controlled bytes back in an error.
+
+Running it is also how five wire strings in the authentication work got
+corrected: the specification said one thing, the real servers said another.
 
 ## Redis compatibility
 

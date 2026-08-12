@@ -48,6 +48,10 @@ struct Cli {
     #[arg(long)]
     require_auth: bool,
 
+    /// Credential file to authenticate against. Overrides the config file.
+    #[arg(long, value_name = "PATH")]
+    auth_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Subcommand>,
 }
@@ -90,6 +94,9 @@ fn main() -> anyhow::Result<()> {
     }
     if cli.enable_flush {
         config.protocol.flush_enabled = true;
+    }
+    if let Some(path) = cli.auth_file {
+        config.auth.file = path;
     }
     if cli.require_auth {
         config.auth.required = true;

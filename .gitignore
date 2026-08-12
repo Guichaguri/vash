@@ -20,3 +20,6 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
+
+# Python bytecode from the compatibility suite
+__pycache__/

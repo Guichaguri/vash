@@ -175,9 +175,11 @@ fn authenticate(
     // Redis distinguishes this from a wrong password, and it matters: it is the
     // difference between "your credential is wrong" and "there is nothing here
     // to authenticate against". A client must never have the two confused.
+    // Redis 7's wording, verified against 7.4.10.
     if !table.configured() {
         return Err(Failure::client(
-            "Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?",
+            "AUTH <password> called without any password configured for the default user. \
+             Are you sure your configuration is correct?",
         ));
     }
 
@@ -334,23 +336,32 @@ fn run(
         } => {
             state.metrics.other();
 
-            // Before the version is applied: a `HELLO 3 AUTH` with a bad
-            // credential must leave the connection exactly as it was, rather
-            // than switching it to RESP3 and then refusing.
-            if let Some(credential) = auth {
-                authenticate(state, conn, credential)?;
-            }
-
-            match requested {
-                None => {}
-                Some(2) => *version = Version::Resp2,
-                Some(3) => *version = Version::Resp3,
+            // Three steps, in this order, because Redis does it in this order
+            // and the order is observable twice over (verified against 7.4.10):
+            //
+            //   1. Validate the version. `HELLO 9 AUTH <good credential>`
+            //      answers `NOPROTO` and leaves the connection *unauthenticated*
+            //      — the credential is never looked at.
+            //   2. Authenticate. A bad credential answers `WRONGPASS` and must
+            //      leave the connection exactly as it was, rather than
+            //      switching it to RESP3 and then refusing.
+            //   3. Only now apply the version.
+            let negotiated = match requested {
+                None => *version,
+                Some(2) => Version::Resp2,
+                Some(3) => Version::Resp3,
                 Some(_) => {
                     return Err(
                         (&ErrorReply::Coded("NOPROTO", "unsupported protocol version")).into(),
                     );
                 }
+            };
+
+            if let Some(credential) = auth {
+                authenticate(state, conn, credential)?;
             }
+
+            *version = negotiated;
             encode::hello(out, *version);
             Ok(())
         }

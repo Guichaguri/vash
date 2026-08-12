@@ -622,8 +622,8 @@ async fn redis_says_so_when_no_credential_is_configured() {
     conn.send(&resp(&["AUTH", "anything"])).await;
     assert_eq!(
         conn.read_until("\r\n").await,
-        "-ERR Client sent AUTH, but no password is set. \
-         Did you mean AUTH <username> <password>?\r\n"
+        "-ERR AUTH <password> called without any password configured for the default user. \
+         Are you sure your configuration is correct?\r\n"
     );
 
     drop(tx);
@@ -687,10 +687,68 @@ async fn a_refused_storage_command_still_consumes_its_block() {
 
     // Exactly two replies: the refusal, then the successful authentication. A
     // third would mean `get k\r\n` had been read as a command.
+    //
+    // The refusal is `authentication failure` rather than `unauthenticated`
+    // because the block does split into a name and a secret — `get` and `k` —
+    // which is an attempt naming an identity that does not exist. Upstream
+    // answers the same for an unknown user.
     let replies = conn.read_until("STORED\r\n").await;
     assert_eq!(
-        replies, "CLIENT_ERROR unauthenticated\r\nSTORED\r\n",
+        replies, "CLIENT_ERROR authentication failure\r\nSTORED\r\n",
         "the five-byte block was parsed as a command"
+    );
+}
+
+/// Covered here rather than in the differential suite: upstream's answer to
+/// this depends on whether the two commands land in one read, so it is not
+/// something two servers can be compared on.
+#[tokio::test]
+async fn a_failed_memcached_attempt_does_not_authenticate() {
+    let (server, _) = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    let block = format!("{NAME} not-the-secret");
+    let command = format!("set {NAME} 0 0 {}\r\n{block}\r\n", block.len());
+    assert_eq!(
+        conn.text(&command).await,
+        "CLIENT_ERROR authentication failure\r\n"
+    );
+    assert_eq!(
+        conn.text("get k\r\n").await,
+        "CLIENT_ERROR unauthenticated\r\n"
+    );
+}
+
+/// A block that is not `<user> <pass>` is a malformed attempt, not an
+/// unauthenticated command, and upstream distinguishes the two.
+#[tokio::test]
+async fn a_malformed_memcached_credential_says_so() {
+    let (server, secret) = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    let command = format!("set {NAME} 0 0 {}\r\n{secret}\r\n", secret.len());
+    assert_eq!(
+        conn.text(&command).await,
+        "CLIENT_ERROR bad authentication token format\r\n"
+    );
+}
+
+/// An unparseable command from an unauthenticated connection is answered as an
+/// unauthenticated one, so a stranger cannot probe which verbs exist.
+#[tokio::test]
+async fn an_unknown_memcached_command_is_refused_as_unauthenticated() {
+    let (server, _) = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    assert_eq!(
+        conn.text("frobnicate\r\n").await,
+        "CLIENT_ERROR unauthenticated\r\n"
+    );
+    // A malformed *storage* command, whose data block still has to be sent and
+    // consumed — the byte count is readable even though the flags are not.
+    assert_eq!(
+        conn.text("set broken notanumber 0 1\r\nx\r\n").await,
+        "CLIENT_ERROR unauthenticated\r\n"
     );
 }
 
