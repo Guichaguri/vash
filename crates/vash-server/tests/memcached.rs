@@ -276,6 +276,41 @@ async fn incr_on_a_non_numeric_value_is_a_client_error() {
     assert_eq!(c.line("incr absent 1\r\n").await, "NOT_FOUND\r\n");
 }
 
+/// This dialect's counter has always been atomic — it has always been evaluated
+/// inside the writer's transaction — and both dialects now share the primitive
+/// that makes it so. The guard is here because "shared" is exactly the condition
+/// under which one dialect's change can quietly cost the other its guarantee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_increments_do_not_lose_an_update() {
+    const CONNECTIONS: usize = 8;
+    const EACH: usize = 64;
+
+    let server = TestServer::start().await;
+    server.connect().await.line("set n 0 0 1\r\n0\r\n").await;
+
+    let mut clients = Vec::new();
+    for _ in 0..CONNECTIONS {
+        let mut conn = server.connect().await;
+        clients.push(tokio::spawn(async move {
+            for _ in 0..EACH {
+                conn.line("incr n 1\r\n").await;
+            }
+        }));
+    }
+    for client in clients {
+        client.await.expect("increment task");
+    }
+
+    let total = CONNECTIONS * EACH;
+    assert_eq!(
+        server.connect().await.get("get n\r\n").await,
+        format!(
+            "VALUE n 0 {}\r\n{total}\r\nEND\r\n",
+            total.to_string().len()
+        )
+    );
+}
+
 #[tokio::test]
 async fn touch_and_gat_extend_a_lifetime() {
     let server = TestServer::start().await;

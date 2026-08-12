@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use tracing::{debug, error, info, warn};
-use vash_core::{Key, SetMode, Stored};
+use vash_core::{Applied, Arithmetic, Delta, Key, Missing, OnBound, SetMode, Stored, TtlChange};
 
 use crate::SweepStats;
 use crate::config::WriteConfig;
@@ -41,10 +41,16 @@ pub(crate) enum WriteOp {
         keys: Vec<Box<[u8]>>,
         ttl_secs: u32,
     },
-    Incr {
+    /// An atomic read-modify-write on a counter.
+    ///
+    /// The key is owned because the operation outlives the caller's buffer, and
+    /// the rest of [`OwnedArithmetic`] is `Copy` — a counter operation carries no
+    /// payload beyond its numbers.
+    Arithmetic(OwnedArithmetic),
+    /// Concatenate onto a value, creating it if absent. Redis's `APPEND`.
+    Append {
         key: Box<[u8]>,
-        delta: u64,
-        decrement: bool,
+        suffix: Box<[u8]>,
     },
     /// Register tag names, each with the generation the rest of the node
     /// already holds for it.
@@ -72,7 +78,8 @@ impl WriteOp {
             Self::Delete(keys) => keys.len(),
             Self::Touch { keys, .. } => keys.len(),
             Self::ConditionalSet(..)
-            | Self::Incr { .. }
+            | Self::Arithmetic(_)
+            | Self::Append { .. }
             | Self::DeleteByTag(_)
             | Self::MergeTag { .. }
             | Self::Flush => 1,
@@ -82,13 +89,65 @@ impl WriteOp {
     }
 }
 
+/// The writer answered a job with an outcome its operation cannot produce.
+///
+/// A bug in this module rather than anything a caller can cause: the queue is
+/// typed by `WriteOp` and answered by `WriteOutcome`, and only a mismatched pair
+/// here reaches it.
+fn mismatched_reply() -> StoreError {
+    StoreError::Corrupt("writer returned the wrong reply".into())
+}
+
+/// An [`Arithmetic`] that owns its key, so the operation can cross the queue.
+///
+/// `Arithmetic` borrows its key from the connection's read buffer, which is gone
+/// by the time the writer thread runs. Everything else a counter operation
+/// carries is a handful of numbers, so the key is the only field to copy.
+pub(crate) struct OwnedArithmetic {
+    key: Box<[u8]>,
+    delta: Delta,
+    on_bound: OnBound,
+    missing: Missing,
+    ttl: TtlChange,
+}
+
+impl OwnedArithmetic {
+    fn new(op: &Arithmetic<'_>) -> Self {
+        Self {
+            key: op.key.as_bytes().into(),
+            delta: op.delta,
+            on_bound: op.on_bound,
+            missing: op.missing,
+            ttl: op.ttl,
+        }
+    }
+
+    /// Borrows it back into the form the engine takes.
+    ///
+    /// `from_stored` rather than `Key::new`: these bytes were validated when the
+    /// caller built the operation, and re-checking them would put work on the
+    /// single writer thread that every other write keeps off it.
+    fn borrow(&self) -> Arithmetic<'_> {
+        Arithmetic {
+            key: Key::from_stored(&self.key),
+            delta: self.delta,
+            on_bound: self.on_bound,
+            missing: self.missing,
+            ttl: self.ttl,
+        }
+    }
+}
+
 pub(crate) enum WriteOutcome {
     Cas(Vec<u64>),
     Conditional(Stored),
     Deleted(Vec<bool>),
     Touched(Vec<bool>),
-    /// `None` when the key was absent.
-    Counter(Option<u64>),
+    /// Where a counter ended up, and how far it moved. `None` when the key was
+    /// absent and the operation does not create one.
+    Arithmetic(Option<Applied>),
+    /// The length a value reached after being concatenated onto.
+    Length(u64),
     /// `None` when the tag was never registered, so nothing referenced it.
     Invalidated(Option<u64>),
     /// The generation the tag holds after a max-merge.
@@ -195,41 +254,45 @@ impl Writer {
     pub fn set_many(&self, prepared: Vec<PreparedSet>) -> Result<Vec<u64>> {
         match self.submit(WriteOp::Set(prepared))? {
             WriteOutcome::Cas(cas) => Ok(cas),
-            _ => Err(StoreError::Corrupt(
-                "writer returned the wrong reply".into(),
-            )),
+            _ => Err(mismatched_reply()),
         }
     }
 
     pub fn delete_many(&self, keys: Vec<Box<[u8]>>) -> Result<Vec<bool>> {
         match self.submit(WriteOp::Delete(keys))? {
             WriteOutcome::Deleted(hits) => Ok(hits),
-            _ => Err(StoreError::Corrupt(
-                "writer returned the wrong reply".into(),
-            )),
+            _ => Err(mismatched_reply()),
         }
     }
 
     pub fn conditional_set(&self, prepared: PreparedSet, mode: SetMode) -> Result<Stored> {
         match self.submit(WriteOp::ConditionalSet(prepared, mode))? {
             WriteOutcome::Conditional(outcome) => Ok(outcome),
-            _ => Err(StoreError::Corrupt(
-                "writer returned the wrong reply".into(),
-            )),
+            _ => Err(mismatched_reply()),
         }
     }
 
-    pub fn incr(&self, key: Key<'_>, delta: u64, decrement: bool) -> Result<Option<u64>> {
-        let op = WriteOp::Incr {
+    /// Applies an atomic read-modify-write to a counter.
+    ///
+    /// One queue hop, where the Redis adapter used to take two — a read and then
+    /// a write — and could lose an update between them.
+    pub fn arithmetic(&self, op: &Arithmetic<'_>) -> Result<Option<Applied>> {
+        match self.submit(WriteOp::Arithmetic(OwnedArithmetic::new(op)))? {
+            WriteOutcome::Arithmetic(applied) => Ok(applied),
+            _ => Err(mismatched_reply()),
+        }
+    }
+
+    /// Concatenates onto a value, creating it if absent, and returns its new
+    /// length.
+    pub fn append(&self, key: Key<'_>, suffix: &[u8]) -> Result<u64> {
+        let op = WriteOp::Append {
             key: key.as_bytes().into(),
-            delta,
-            decrement,
+            suffix: suffix.into(),
         };
         match self.submit(op)? {
-            WriteOutcome::Counter(value) => Ok(value),
-            _ => Err(StoreError::Corrupt(
-                "writer returned the wrong reply".into(),
-            )),
+            WriteOutcome::Length(len) => Ok(len),
+            _ => Err(mismatched_reply()),
         }
     }
 
@@ -242,9 +305,7 @@ impl Writer {
     pub fn touch_many(&self, keys: Vec<Box<[u8]>>, ttl_secs: u32) -> Result<Vec<bool>> {
         match self.submit(WriteOp::Touch { keys, ttl_secs })? {
             WriteOutcome::Touched(hits) => Ok(hits),
-            _ => Err(StoreError::Corrupt(
-                "writer returned the wrong reply".into(),
-            )),
+            _ => Err(mismatched_reply()),
         }
     }
 
@@ -264,9 +325,7 @@ impl Writer {
         };
         match self.submit(op)? {
             WriteOutcome::Merged(generation) => Ok(generation),
-            _ => Err(StoreError::Corrupt(
-                "writer returned the wrong reply".into(),
-            )),
+            _ => Err(mismatched_reply()),
         }
     }
 
@@ -275,18 +334,14 @@ impl Writer {
     pub fn delete_by_tag(&self, name: &[u8]) -> Result<Option<u64>> {
         match self.submit(WriteOp::DeleteByTag(name.into()))? {
             WriteOutcome::Invalidated(generation) => Ok(generation),
-            _ => Err(StoreError::Corrupt(
-                "writer returned the wrong reply".into(),
-            )),
+            _ => Err(mismatched_reply()),
         }
     }
 
     pub fn flush(&self) -> Result<u32> {
         match self.submit(WriteOp::Flush)? {
             WriteOutcome::Flushed(epoch) => Ok(epoch),
-            _ => Err(StoreError::Corrupt(
-                "writer returned the wrong reply".into(),
-            )),
+            _ => Err(mismatched_reply()),
         }
     }
 
@@ -719,12 +774,11 @@ fn apply(
                 .map(|key| engine.apply_touch(wtxn, key, *ttl_secs))
                 .collect::<Result<Vec<bool>>>()?,
         )),
-        WriteOp::Incr {
-            key,
-            delta,
-            decrement,
-        } => Ok(WriteOutcome::Counter(
-            engine.apply_incr(wtxn, key, *delta, *decrement)?,
+        WriteOp::Arithmetic(op) => Ok(WriteOutcome::Arithmetic(
+            engine.apply_arithmetic(wtxn, &op.borrow())?,
+        )),
+        WriteOp::Append { key, suffix } => Ok(WriteOutcome::Length(
+            engine.apply_append(wtxn, key, suffix)?,
         )),
         WriteOp::CreateTags(names) => {
             for (name, start_generation) in names.iter() {

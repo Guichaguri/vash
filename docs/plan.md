@@ -966,6 +966,7 @@ checked as well as the code — and any result that survives only one run is not
 | **M7** | Redis protocol: RESP2/RESP3 framing, the string and expiry command subset, `HELLO` negotiation | Real Redis clients drive the supported commands unchanged; the read-modify-write seam is documented rather than hidden |
 | **M8** | Listing: `LIST_KEYS`/`LIST_TAGS`, glob matching, cursor pagination, the `listing_enabled` gate and `LISTING` capability bit | Paging a sharded keyspace is linear, not quadratic, and returns every key present throughout the walk exactly once; no request holds a read txn past its scan budget; disabled by default, and the cursor and pattern are fuzzed |
 | **M9** | Authentication: credential table, `AUTH` in all three dialects, the pre-auth gate and abuse budget, peer credentials — designed in [auth.md](auth.md) | Real memcached and Redis clients authenticate unchanged; no command in any dialect executes unauthenticated; a cluster converges with auth required, and a node missing a peer credential refuses to start |
+| **M10** | Architecture remediation: atomic read-modify-write, one command boundary for all three dialects, a real `Store` seam, module cohesion, the promised observability — planned in [m10.md](m10.md) | `INCR` is atomic in every dialect; RESP is counted and mapped by the same code as the other two; a `Store` fake runs a server test; queue-wait and execution latency are separately visible |
 
 ---
 

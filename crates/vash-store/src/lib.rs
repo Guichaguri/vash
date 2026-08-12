@@ -166,9 +166,27 @@ pub trait Store: Send + Sync + 'static {
     /// Applies a write under its [`SetMode`] guard.
     fn store(&self, set: &Set<'_>) -> Result<Stored>;
 
-    /// Adds to or subtracts from a counter held as decimal text. `None` when
-    /// the key is absent.
-    fn incr(&self, key: Key<'_>, delta: u64, decrement: bool) -> Result<Option<u64>>;
+    /// Applies an atomic read-modify-write to a counter held as decimal text.
+    ///
+    /// **The read and the write are one step**, taken on the shard's single
+    /// writer thread inside one transaction, so concurrent callers cannot lose
+    /// an update. Composing this out of [`Store::get`] and [`Store::set`] in the
+    /// caller would look equivalent and would not be — which is what the Redis
+    /// adapter used to do.
+    ///
+    /// `None` when the key is absent and the operation does not create one;
+    /// otherwise where the counter ended up and how far it moved. Every dialect's
+    /// arithmetic is expressed through [`vash_core::Arithmetic`] rather than
+    /// through a method each, because they differ in the numbers and in nothing
+    /// else.
+    fn arithmetic(&self, op: &vash_core::Arithmetic<'_>) -> Result<Option<vash_core::Applied>>;
+
+    /// Concatenates onto a value atomically, creating it if absent, and returns
+    /// its new length.
+    ///
+    /// Redis's `APPEND`. memcached's is a conditional write instead — it refuses
+    /// an absent key — and goes through [`Store::store`] with `SetMode::Append`.
+    fn append(&self, key: Key<'_>, suffix: &[u8]) -> Result<u64>;
 
     /// Fetches keys and re-stamps their TTL in one pass (memcached `gat`).
     fn get_and_touch(&self, keys: &[Key<'_>], ttl_secs: u32) -> Result<Vec<Option<Value>>>;

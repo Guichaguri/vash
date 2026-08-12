@@ -2,22 +2,25 @@
 //!
 //! Kept apart from [`crate::dispatch`] because it works differently on purpose.
 //! The VCP and memcached adapters decode into `vash_core::Command`, one command
-//! to one storage operation. Redis's string commands do not fit that shape:
-//! `APPEND` reads then writes, `INCR` creates a key it did not find, `TTL`
-//! reports a lifetime nothing else asks for, and `INCREX` does arithmetic,
-//! bounds and an expiry in one step. Rather than push all of that into the
-//! storage engine, this module composes the operations the `Store` trait
-//! already has.
+//! to one storage operation. Some of Redis's string commands do not fit that
+//! shape: `TTL` reports a lifetime nothing else asks for, and `HELLO` negotiates
+//! a dialect only this protocol has. Those are composed here from the operations
+//! the `Store` trait already offers.
 //!
-//! **The consequence is that the read-modify-write commands are not atomic.**
-//! `APPEND`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `INCRBYFLOAT` and `INCREX` are
-//! a read followed by a write with no lock between them, so two clients
-//! incrementing the same counter at the same moment can lose an update — where
-//! Redis, single-threaded, cannot. `SET … KEEPTTL`, `SET … GET`, `EXPIRE` with
-//! a condition and `MSETEX` with `NX`/`XX` have the same seam. Making them
-//! atomic means new primitives inside the shard writer, where the single
-//! writer thread already serialises everything; that is a storage-engine
-//! change, and this milestone is deliberately the protocol only.
+//! **The arithmetic commands are atomic (M10).** `INCR`, `INCRBY`, `DECR`,
+//! `DECRBY`, `INCRBYFLOAT`, `INCREX` and `APPEND` are single storage primitives
+//! evaluated inside the shard writer's transaction, so two clients incrementing
+//! one counter cannot lose an update — the guarantee Redis gets from being
+//! single-threaded, obtained here from the single writer thread that already
+//! serialises every write to a shard. They used to be a read followed by a
+//! write issued from here, and were not atomic; `vash_core::arith` is where the
+//! arithmetic moved to.
+//!
+//! **Four seams are still open**, and they are a different class: they can write
+//! a stale deadline rather than corrupt a counter. `SET … KEEPTTL`, `SET … GET`,
+//! `EXPIRE` with a condition and `MSETEX` with `NX`/`XX` each read something and
+//! then write against what they read. Closing them needs a conditional-write
+//! primitive rather than an arithmetic one — see `docs/m10.md` phase 2.
 
 use tracing::{error, warn};
 use vash_core::{CoreError, Key, SetMode, Stored};
@@ -269,7 +272,13 @@ impl From<StoreError> for Failure {
             StoreError::Core(CoreError::EmptyKey | CoreError::KeyTooLong { .. }) => {
                 Failure::client(INVALID_KEY)
             }
-            StoreError::NotNumeric => Failure::client(NOT_AN_INTEGER),
+            // The arithmetic failures, now that the store performs the
+            // arithmetic. Each keeps Redis's own wording, which client libraries
+            // match on.
+            StoreError::Core(CoreError::NotAnInteger) => Failure::client(NOT_AN_INTEGER),
+            StoreError::Core(CoreError::NotAFloat) => Failure::client(NOT_A_FLOAT),
+            StoreError::Core(CoreError::Overflow) => Failure::client(OVERFLOW),
+            StoreError::Core(CoreError::NotFinite) => Failure::client(NOT_FINITE),
             StoreError::Unsupported(what) => {
                 warn!(what, "client used a feature this build does not implement");
                 Failure::client("unsupported operation")
@@ -451,26 +460,12 @@ fn run(
         } => execute_msetex(state, pairs, *condition, *expiry, out),
 
         Command::Append { key, value } => {
-            let key = key_of(key)?;
-            let current = state.store.get(key)?;
-
-            // Redis creates the key when it is absent, and keeps the existing
-            // expiry when it is not.
-            let (combined, ttl_secs) = match &current {
-                Some(existing) => {
-                    let mut combined = Vec::with_capacity(existing.data.len() + value.len());
-                    combined.extend_from_slice(&existing.data);
-                    combined.extend_from_slice(value);
-                    (combined, keep_ttl(existing.expires_at_ms))
-                }
-                None => (value.to_vec(), 0),
-            };
-
-            state
-                .store
-                .set(&vash_core::Set::plain(key, &combined, ttl_secs))?;
+            // One atomic step in the shard writer, which also means the existing
+            // value is concatenated from a slice of the memory map rather than
+            // being copied out here and shipped back.
+            let length = state.store.append(key_of(key)?, value)?;
             state.metrics.write();
-            encode::integer(out, combined.len() as i64);
+            encode::integer(out, length as i64);
             Ok(())
         }
 
@@ -688,128 +683,145 @@ fn execute_expire(
 ///
 /// No `Version` argument, unlike `INCREX`: `INCRBYFLOAT` answers with a bulk
 /// string in RESP3 as well as RESP2, so nothing here depends on the dialect.
+///
+/// One store call, and it is a write. There is no read first — the deadline is
+/// kept by [`TtlChange::Keep`] rather than by being read out and written back,
+/// and the current value never leaves the writer's transaction. `INCR` keeps the
+/// key's lifetime because it alters the value in place rather than replacing it,
+/// which is the distinction `EXPIRE` documents.
 fn execute_incr(state: &ServerState, key: &[u8], delta: Number, out: &mut Vec<u8>) -> Answered {
-    let key = key_of(key)?;
-    let current = state.store.get(key)?;
-    let ttl_secs = keep_ttl(current.as_ref().and_then(|value| value.expires_at_ms));
-
-    let updated = match delta {
-        Number::Int(delta) => {
-            let value = read_int(current.as_ref())?;
-            Number::Int(
-                value
-                    .checked_add(delta)
-                    .ok_or_else(|| Failure::client(OVERFLOW))?,
-            )
-        }
-        Number::Float(delta) => {
-            let value = read_float(current.as_ref())?;
-            let updated = value + delta;
-            if !updated.is_finite() {
-                return Err(Failure::client(NOT_FINITE));
-            }
-            Number::Float(updated)
-        }
-    };
-
-    // `INCR` keeps the key's lifetime: it alters the value in place rather
-    // than replacing it, which is the distinction `EXPIRE` documents.
-    write_number(state, key, updated, ttl_secs)?;
+    let op = vash_core::Arithmetic::redis(key_of(key)?, delta_of(delta));
+    let applied = created(state.store.arithmetic(&op)?)?;
     state.metrics.write();
 
-    match updated {
+    match number_of(applied.value)? {
         Number::Int(value) => encode::integer(out, value),
         Number::Float(value) => encode::bulk(out, encode::format_float(value).as_bytes()),
     }
     Ok(())
 }
 
+/// `INCREX`: arithmetic, bounds and an expiry in one atomic step.
+///
+/// Everything about *how the number moves* — the bounds, the saturation, which
+/// bound an overflow clamps to — now lives in `vash_core::arith`, shared with
+/// every other arithmetic command and evaluated inside the writer's transaction.
+/// What is left here is the translation from Redis's option set into that
+/// vocabulary.
 fn execute_increx(
     state: &ServerState,
     op: &IncrEx<'_>,
     version: Version,
     out: &mut Vec<u8>,
 ) -> Answered {
-    let key = key_of(op.key)?;
-    let current = state.store.get(key)?;
-
-    let (value, applied) = match op.delta {
-        Number::Int(delta) => {
-            let current = read_int(current.as_ref())?;
-            let lower = bound_int(op.lower, i64::MIN)?;
-            let upper = bound_int(op.upper, i64::MAX)?;
-
-            // Overflowing the type is a bound violation like any other, which
-            // is what lets `SATURATE` clamp it instead of failing. Which bound
-            // was breached comes from the result where there is one, and from
-            // the sign of the increment where the addition overflowed and
-            // there is not — reading it off the sign in both cases would clamp
-            // `INCREX k BYINT 0 UBOUND 5` on a key holding 10 to the *floor*.
-            let candidate = current.checked_add(delta);
-
-            if let Some(updated) = candidate.filter(|v| (lower..=upper).contains(v)) {
-                (Number::Int(updated), Number::Int(delta))
-            } else if !op.saturate {
-                // Skipped: the key and its lifetime are left exactly as they
-                // were, and the zero delta is how the client is told.
-                state.metrics.other();
-                return answer_increx(out, Number::Int(current), Number::Int(0), version);
-            } else {
-                let clamped = match candidate {
-                    Some(updated) if updated > upper => upper,
-                    Some(_) => lower,
-                    None if delta > 0 => upper,
-                    None => lower,
-                };
-                let applied = clamped
-                    .checked_sub(current)
-                    .ok_or_else(|| Failure::client(OVERFLOW))?;
-                (Number::Int(clamped), Number::Int(applied))
-            }
-        }
-        Number::Float(delta) => {
-            let current = read_float(current.as_ref())?;
-            let lower = bound_float(op.lower, -f64::MAX);
-            let upper = bound_float(op.upper, f64::MAX);
-
-            let updated = current + delta;
-            if updated.is_finite() && (lower..=upper).contains(&updated) {
-                (Number::Float(updated), Number::Float(delta))
-            } else if !op.saturate {
-                state.metrics.other();
-                return answer_increx(out, Number::Float(current), Number::Float(0.0), version);
-            } else {
-                let clamped = if updated > upper || (!updated.is_finite() && delta > 0.0) {
-                    upper
-                } else {
-                    lower
-                };
-                let applied = clamped - current;
-                if !applied.is_finite() {
-                    return Err(Failure::client(NOT_FINITE));
-                }
-                (Number::Float(clamped), Number::Float(applied))
-            }
-        }
+    let delta = match op.delta {
+        Number::Int(delta) => vash_core::Delta::Int {
+            delta,
+            lower: bound_int(op.lower, i64::MIN)?,
+            upper: bound_int(op.upper, i64::MAX)?,
+        },
+        Number::Float(delta) => vash_core::Delta::Float {
+            delta,
+            lower: bound_float(op.lower, -f64::MAX),
+            upper: bound_float(op.upper, f64::MAX),
+        },
     };
 
-    let deadline = current.as_ref().and_then(|value| value.expires_at_ms);
-    let existing_ttl = keep_ttl(deadline);
-    let ttl_secs = match op.expiry {
+    // No deadline is read to decide this, which is what removes the read that
+    // used to precede the write: `Keep` preserves the record's lifetime by not
+    // touching it, and `SetIfPersistent` is `ENX` decided at the record.
+    let ttl = match op.expiry {
         // No expiry option: the lifetime is left alone.
-        None => existing_ttl,
-        Some(Expiry::Persist) => 0,
-        // `ENX`: a key that already has a deadline keeps it.
-        Some(_) if op.only_if_persistent && existing_ttl != 0 => existing_ttl,
+        None => vash_core::TtlChange::Keep,
+        // Ahead of the `ENX` arm below, because `PERSIST` applies either way.
+        Some(Expiry::Persist) => vash_core::TtlChange::Set(0),
         // Neither is an `INCREX` option, so the parser cannot produce them;
         // both would mean "leave the lifetime alone" if one ever arrived.
-        Some(Expiry::Unset | Expiry::Keep) => existing_ttl,
-        Some(expiry) => ttl_for(expiry, now_ms() as i64, deadline, INVALID_EXPIRE_INCREX)?,
+        Some(Expiry::Unset | Expiry::Keep) => vash_core::TtlChange::Keep,
+        Some(expiry) => {
+            // `Expiry::Keep` is handled above, so no current deadline is needed
+            // to resolve what remains.
+            let ttl_secs = ttl_for(expiry, now_ms() as i64, None, INVALID_EXPIRE_INCREX)?;
+            if op.only_if_persistent {
+                vash_core::TtlChange::SetIfPersistent(ttl_secs)
+            } else {
+                vash_core::TtlChange::Set(ttl_secs)
+            }
+        }
     };
 
-    write_number(state, key, value, ttl_secs)?;
-    state.metrics.write();
-    answer_increx(out, value, applied, version)
+    let applied = created(state.store.arithmetic(&vash_core::Arithmetic {
+        key: key_of(op.key)?,
+        delta,
+        // Out of bounds without `SATURATE` skips the write and reports a zero
+        // increment, rather than failing as the unbounded commands do.
+        on_bound: if op.saturate {
+            vash_core::OnBound::Clamp
+        } else {
+            vash_core::OnBound::Skip
+        },
+        missing: vash_core::Missing::CreateAtZero,
+        ttl,
+    })?)?;
+
+    // A skipped `INCREX` left the key and its lifetime exactly as they were, so
+    // it is not counted as a write.
+    if applied.wrote {
+        state.metrics.write();
+    } else {
+        state.metrics.other();
+    }
+    answer_increx(
+        out,
+        number_of(applied.value)?,
+        number_of(applied.applied)?,
+        version,
+    )
+}
+
+/// Converts a parsed Redis delta into the domain's arithmetic.
+///
+/// The unbounded commands pass the limits of their own type, which is what turns
+/// "overflowed" and "out of bounds" into one condition with one handler.
+fn delta_of(delta: Number) -> vash_core::Delta {
+    match delta {
+        Number::Int(value) => vash_core::Delta::int(value),
+        Number::Float(value) => vash_core::Delta::float(value),
+    }
+}
+
+/// Reads a result back into the domain the reply is rendered from.
+fn number_of(value: vash_core::Number) -> Result<Number, Failure> {
+    match value {
+        vash_core::Number::Int(value) => Ok(Number::Int(value)),
+        vash_core::Number::Float(value) => Ok(Number::Float(value)),
+        // Only memcached's counter operation produces this, and no Redis command
+        // builds one.
+        vash_core::Number::Counter(value) => {
+            error!(value, "a Redis command produced a memcached counter");
+            Err(Failure {
+                code: "ERR",
+                message: "internal error",
+                class: ErrorClass::Internal,
+            })
+        }
+    }
+}
+
+/// Unwraps the outcome of a Redis arithmetic command.
+///
+/// Every one of them creates the key it did not find, so the miss a memcached
+/// counter reports cannot arise here. Answering rather than unwrapping keeps a
+/// logic slip off the request path.
+fn created(applied: Option<vash_core::Applied>) -> Result<vash_core::Applied, Failure> {
+    applied.ok_or_else(|| {
+        error!("a Redis arithmetic command reported a miss it cannot produce");
+        Failure {
+            code: "ERR",
+            message: "internal error",
+            class: ErrorClass::Internal,
+        }
+    })
 }
 
 /// `INCREX` answers with the new value and the increment actually applied, so
@@ -826,46 +838,10 @@ fn answer_increx(out: &mut Vec<u8>, value: Number, applied: Number, version: Ver
     Ok(())
 }
 
-fn write_number(
-    state: &ServerState,
-    key: Key<'_>,
-    value: Number,
-    ttl_secs: u32,
-) -> Result<(), Failure> {
-    // Counters are stored as their decimal text, which is what makes a `GET`
-    // of one return something a client can read — and what the memcached
-    // adapter's `incr` already assumes.
-    let text = match value {
-        Number::Int(value) => value.to_string(),
-        Number::Float(value) => encode::format_float(value),
-    };
-    state
-        .store
-        .set(&vash_core::Set::plain(key, text.as_bytes(), ttl_secs))?;
-    Ok(())
-}
-
-/// Reads a stored counter as an integer. A key that is not there counts as
-/// zero, which is how `INCR` creates one.
-fn read_int(current: Option<&vash_core::Value>) -> Result<i64, Failure> {
-    match current {
-        None => Ok(0),
-        Some(value) => vash_proto::resp::command::parse_int(&value.data)
-            .ok_or_else(|| Failure::client(NOT_AN_INTEGER)),
-    }
-}
-
-/// The float equivalent. Accepts a stored integer too, because an integer
-/// promotes to a float without loss — which is exactly what `INCRBYFLOAT` and
-/// `BYFLOAT` are specified to allow.
-fn read_float(current: Option<&vash_core::Value>) -> Result<f64, Failure> {
-    match current {
-        None => Ok(0.0),
-        Some(value) => vash_proto::resp::command::parse_float(&value.data)
-            .filter(|value| value.is_finite())
-            .ok_or_else(|| Failure::client(NOT_A_FLOAT)),
-    }
-}
+// `write_number`, `read_int` and `read_float` lived here and are gone. Reading a
+// stored counter and rendering the result back to text are now
+// `vash_core::arith`'s, because they have to happen where the arithmetic does —
+// inside the writer's transaction — for the update not to be lost.
 
 fn bound_int(bound: Option<Number>, default: i64) -> Result<i64, Failure> {
     match bound {

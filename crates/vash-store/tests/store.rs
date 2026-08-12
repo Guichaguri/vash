@@ -101,6 +101,11 @@ impl Harness {
         self.store().stats().unwrap().pending_reclaims
     }
 
+    /// One atomic counter step, for the arithmetic tests below.
+    fn arithmetic(&self, op: &vash_core::Arithmetic<'_>) -> Option<vash_core::Applied> {
+        self.store().arithmetic(op).unwrap()
+    }
+
     /// Waits for a condition the background sweeper is expected to bring about.
     fn wait_for(&self, what: &str, mut done: impl FnMut(&Self) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1661,4 +1666,114 @@ fn a_tag_registered_mid_walk_does_not_shift_the_page_after_it() {
         vec![b"ddd".to_vec()],
         "the tag present throughout the walk is still returned exactly once"
     );
+}
+
+// ---- atomic arithmetic ---------------------------------------------------
+
+/// A counter carrying tags must keep them across an increment.
+///
+/// An increment alters the value in place, so the record's tag table has to
+/// survive the rewrite. One that silently shed its tags would go on being served
+/// after the invalidation it was tagged for — a stale hit, which is the failure
+/// direction a cache must never take.
+#[test]
+fn arithmetic_keeps_the_tag_table() {
+    let h = Harness::new();
+    h.set_tagged(b"n", b"1", 0, &[b"news"]);
+
+    let applied = h
+        .arithmetic(&vash_core::Arithmetic::counter(
+            Key::new(b"n").unwrap(),
+            4,
+            false,
+        ))
+        .expect("the key is live");
+    assert_eq!(applied.value, vash_core::Number::Counter(5));
+    assert_eq!(h.get(b"n").as_deref(), Some(b"5".as_slice()));
+
+    h.store().delete_by_tag(b"news").unwrap();
+    assert_eq!(
+        h.get(b"n"),
+        None,
+        "the incremented record must still answer to its tag"
+    );
+}
+
+/// `TtlChange::Keep` must preserve the deadline exactly, not re-derive it.
+///
+/// Re-deriving would round the remaining lifetime to whole seconds on every
+/// increment, so a counter incremented once a second would drift its own expiry
+/// forward indefinitely.
+#[test]
+fn arithmetic_leaves_the_deadline_untouched() {
+    let h = Harness::new();
+    h.set(b"n", b"1", 3600);
+    let before = h.store().deadline(Key::new(b"n").unwrap()).unwrap();
+
+    for _ in 0..5 {
+        h.arithmetic(&vash_core::Arithmetic::counter(
+            Key::new(b"n").unwrap(),
+            1,
+            false,
+        ));
+    }
+
+    assert_eq!(
+        h.store().deadline(Key::new(b"n").unwrap()).unwrap(),
+        before,
+        "the deadline is preserved by not being touched"
+    );
+    assert_eq!(h.get(b"n").as_deref(), Some(b"6".as_slice()));
+}
+
+/// A Redis-style increment creates the key it did not find; a memcached-style
+/// one reports a miss and writes nothing.
+#[test]
+fn creation_on_a_missing_key_is_the_dialects_choice() {
+    let h = Harness::new();
+
+    assert!(
+        h.arithmetic(&vash_core::Arithmetic::counter(
+            Key::new(b"absent").unwrap(),
+            1,
+            false
+        ))
+        .is_none()
+    );
+    assert_eq!(h.entries(), 0, "a miss must not leave a record behind");
+
+    let applied = h
+        .arithmetic(&vash_core::Arithmetic::redis(
+            Key::new(b"fresh").unwrap(),
+            vash_core::Delta::int(7),
+        ))
+        .expect("creates at zero");
+    assert_eq!(applied.value, vash_core::Number::Int(7));
+    assert_eq!(h.get(b"fresh").as_deref(), Some(b"7".as_slice()));
+}
+
+/// Appending must keep the record's deadline and its client flags.
+#[test]
+fn append_preserves_the_deadline_and_the_flags() {
+    let h = Harness::new();
+    h.store()
+        .set(&Set {
+            key: Key::new(b"k").unwrap(),
+            value: b"a",
+            ttl_secs: 3600,
+            mc_flags: 0xbeef,
+            tags: Vec::new(),
+            mode: vash_core::SetMode::Set,
+        })
+        .unwrap();
+    let before = h.store().deadline(Key::new(b"k").unwrap()).unwrap();
+
+    assert_eq!(h.store().append(Key::new(b"k").unwrap(), b"bc").unwrap(), 3);
+    assert_eq!(h.get(b"k").as_deref(), Some(b"abc".as_slice()));
+    assert_eq!(h.store().deadline(Key::new(b"k").unwrap()).unwrap(), before);
+
+    // The flags belong to whichever memcached client wrote the value; a Redis
+    // append has no opinion about them and must not clear them.
+    let value = h.store().get(Key::new(b"k").unwrap()).unwrap().unwrap();
+    assert_eq!(value.mc_flags, 0xbeef);
 }

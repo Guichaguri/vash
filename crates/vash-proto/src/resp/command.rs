@@ -782,45 +782,15 @@ fn as_float(number: Number) -> f64 {
     }
 }
 
-/// Redis's `string2ll`, reproduced: an optional `-`, then digits, with no
-/// leading zeros, no `+`, no whitespace and nothing trailing.
+/// Redis's `string2ll` and its float counterpart, re-exported from the domain
+/// crate where they now live.
 ///
-/// Being more permissive would be worse than useless. The same function judges
-/// command arguments *and* the stored counter that `INCR` reads back, so a
-/// laxer parser here would accept values the increment then refuses.
-pub fn parse_int(token: &[u8]) -> Option<i64> {
-    if token == b"0" {
-        return Some(0);
-    }
-
-    let (negative, digits) = match token.split_first() {
-        Some((b'-', rest)) => (true, rest),
-        _ => (false, token),
-    };
-    if digits.is_empty() || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-
-    let magnitude: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
-    if negative {
-        // `i64::MIN` has no positive counterpart, so it is admitted by
-        // magnitude and negated by wrapping — which lands exactly on it.
-        (magnitude <= i64::MAX as u64 + 1).then(|| (magnitude as i64).wrapping_neg())
-    } else {
-        i64::try_from(magnitude).ok()
-    }
-}
-
-/// The float equivalent. NaN is rejected on the way in, as Redis does, so the
-/// only NaN an arithmetic command can meet is one it computed itself.
-pub fn parse_float(token: &[u8]) -> Option<f64> {
-    let text = std::str::from_utf8(token).ok()?;
-    if text.is_empty() || text.trim() != text {
-        return None;
-    }
-    let value: f64 = text.parse().ok()?;
-    (!value.is_nan()).then_some(value)
-}
+/// They moved because the same rules judge a command's *argument*, here, and the
+/// *stored counter* that the increment reads back, in `vash_core::arith` — and
+/// two copies of a rule this exacting is how a value gets written that the
+/// server then refuses to read. The re-export keeps every call site in this
+/// module spelling them the way it always did.
+pub use vash_core::{parse_float, parse_int};
 
 #[cfg(test)]
 mod tests {

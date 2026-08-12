@@ -35,11 +35,6 @@ pub enum StoreError {
     #[error("tag registry is full ({0} tags)")]
     TagLimit(usize),
 
-    /// `incr`/`decr` on a value that is not decimal text. memcached reports
-    /// this as a client error rather than a miss.
-    #[error("value is not a decimal number")]
-    NotNumeric,
-
     #[error("database is corrupt or was written by an incompatible build: {0}")]
     Corrupt(String),
 }
@@ -75,7 +70,6 @@ impl StoreError {
             Self::CapacityFull => Self::CapacityFull,
             Self::Overloaded => Self::Overloaded,
             Self::ShuttingDown => Self::ShuttingDown,
-            Self::NotNumeric => Self::NotNumeric,
             Self::TagLimit(n) => Self::TagLimit(*n),
             Self::Unsupported(what) => Self::Unsupported(what),
             Self::Core(e) => Self::Core(e.clone()),

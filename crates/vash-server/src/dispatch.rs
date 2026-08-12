@@ -554,14 +554,24 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
             key,
             delta,
             decrement,
-        } => match state
-            .store
-            .incr(*key, *delta, *decrement)
-            .map_err(to_status)?
-        {
-            Some(value) => Ok(Reply::Counter(value)),
-            None => Ok(Reply::NotFound),
-        },
+        } => {
+            // memcached's counter domain: unsigned, never creates the key, and
+            // leaves its lifetime alone. `Arithmetic::counter` is where those
+            // three facts live, so this arm carries no semantics of its own.
+            let op = vash_core::Arithmetic::counter(*key, *delta, *decrement);
+            match state.store.arithmetic(&op).map_err(to_status)? {
+                Some(applied) => Ok(Reply::Counter(match applied.value {
+                    vash_core::Number::Counter(value) => value,
+                    // Unreachable: a counter delta yields a counter. Answering
+                    // rather than panicking keeps a logic slip off the wire.
+                    other => {
+                        error!(?other, "counter arithmetic produced the wrong domain");
+                        return Err(Status::Internal);
+                    }
+                })),
+                None => Ok(Reply::NotFound),
+            }
+        }
 
         Command::Stats => Ok(Reply::Stats(collect_stats(state))),
         Command::Version => Ok(Reply::Version(vash_proto::memcached::encode::VERSION)),
@@ -725,9 +735,17 @@ fn to_status(err: StoreError) -> Status {
             warn!(limit, "tag registry is full");
             Status::CapacityFull
         }
-        // memcached reports this as a client error, not a miss, and with its
-        // own wording — see `memcached_error`.
-        StoreError::NotNumeric => Status::NotNumeric,
+        // memcached reports a non-numeric value as a client error, not a miss,
+        // and with its own wording — see `memcached_error`. The three arithmetic
+        // failures it has no vocabulary for are folded into it, because
+        // upstream's counter cannot produce them: it wraps instead of
+        // overflowing and has no float mode.
+        StoreError::Core(
+            CoreError::NotAnInteger
+            | CoreError::NotAFloat
+            | CoreError::Overflow
+            | CoreError::NotFinite,
+        ) => Status::NotNumeric,
         StoreError::Core(_) => Status::BadRequest,
         other => {
             error!(error = %other, "storage failure");

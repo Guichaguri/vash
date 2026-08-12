@@ -39,6 +39,26 @@ pub enum CoreError {
     #[error("listing cursor is malformed: {0}")]
     BadCursor(&'static str),
 
+    /// Arithmetic against a value that is not an integer in decimal text.
+    ///
+    /// Every dialect reports this differently — memcached calls it a client
+    /// error, Redis folds it together with a range failure — so the wording
+    /// lives in the adapters and this carries only the fact.
+    #[error("value is not an integer")]
+    NotAnInteger,
+
+    /// Arithmetic against a value that is not a float in decimal text.
+    #[error("value is not a valid float")]
+    NotAFloat,
+
+    /// The result will not fit the operation's own type.
+    #[error("increment or decrement would overflow")]
+    Overflow,
+
+    /// The result would be NaN or infinite.
+    #[error("increment would produce NaN or Infinity")]
+    NotFinite,
+
     /// A stored record could not be interpreted. This means on-disk corruption
     /// or a format written by an incompatible build.
     #[error("malformed record: {0}")]

@@ -13,8 +13,8 @@ use heed::types::Bytes as HeedBytes;
 use heed::{AnyTls, Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls};
 use tracing::{info, warn};
 use vash_core::{
-    Clock, Key, RecordMeta, RecordRef, Set, SetMode, Stored, TagRef, Value, encode_record,
-    patch_cas, record::NEVER, validate_value,
+    Applied, Arithmetic, Clock, Key, RecordMeta, RecordRef, Set, SetMode, Stored, TagRef,
+    TtlChange, Value, arith, encode_record, patch_cas, record::NEVER, validate_value,
 };
 
 use crate::config::{Durability, StoreConfig};
@@ -694,61 +694,171 @@ impl LmdbEngine {
         Ok(Stored::Stored(self.apply_set(wtxn, prepared)?))
     }
 
-    /// Adds to or subtracts from a value held as decimal text.
+    /// Stores a replacement for a record, keeping the tag table it is given.
     ///
-    /// The memcached protocol defines counters this way, so the value stays a
-    /// plain string that a `get` returns unchanged.
-    pub fn apply_incr(
+    /// The tail every in-place rewrite shares. An LMDB value is an immutable
+    /// blob, so "changing" a record means encoding a whole new one — there is no
+    /// patching a stored value in place.
+    ///
+    /// `value` must not borrow from `wtxn`: this takes the transaction mutably,
+    /// so anything still pointing into the memory map would keep a shared borrow
+    /// alive across the write. That is why [`Self::apply_touch`] does not use it
+    /// — its value is a map slice, and copying it out to satisfy this helper
+    /// would be a real cost for a cosmetic gain.
+    fn rewrite(
         &self,
         wtxn: &mut RwTxn,
         key: &[u8],
-        delta: u64,
-        decrement: bool,
-    ) -> Result<Option<u64>> {
-        let Some(record) = self.live_record(wtxn, key)? else {
-            return Ok(None);
+        tags: Vec<TagRef>,
+        meta: RecordMeta,
+        value: &[u8],
+    ) -> Result<u64> {
+        let mut record = Vec::with_capacity(vash_core::record_len(tags.len(), value.len()));
+        encode_record(&mut record, meta, &tags, value)?;
+
+        let mut prepared = PreparedSet {
+            key: key.into(),
+            record,
+            expires_at_ms: meta.expires_at_ms,
+            tags,
+        };
+        self.apply_set(wtxn, &mut prepared)
+    }
+
+    /// The deadline a rewrite lands on, given what the record carries now.
+    fn deadline_after(&self, change: TtlChange, current: u64) -> u64 {
+        match change {
+            // Preserved by not being touched, rather than by being read out and
+            // written back — which is what lets `INCR` keep a key's lifetime
+            // without anyone reading the deadline first.
+            TtlChange::Keep => current,
+            TtlChange::Set(ttl_secs) => self.expiry_from_ttl(ttl_secs),
+            // `ENX`: a record that already has a deadline keeps it.
+            TtlChange::SetIfPersistent(ttl_secs) => {
+                if current == NEVER {
+                    self.expiry_from_ttl(ttl_secs)
+                } else {
+                    current
+                }
+            }
+        }
+    }
+
+    /// Applies an atomic read-modify-write to a counter.
+    ///
+    /// Evaluated **inside the caller's transaction**, which is the whole point:
+    /// reading the current value and writing the new one are one step on the
+    /// shard's single writer thread, so two clients incrementing the same key
+    /// cannot lose an update. The Redis adapter used to do this as a `get`
+    /// followed by a `set` from the network tier, where they could interleave.
+    ///
+    /// The arithmetic itself belongs to [`vash_core::arith`], which keeps every
+    /// dialect's numeric rules in one place and leaves this function the storage
+    /// around them.
+    pub fn apply_arithmetic(
+        &self,
+        wtxn: &mut RwTxn,
+        op: &Arithmetic<'_>,
+    ) -> Result<Option<Applied>> {
+        let key = op.key.as_bytes();
+        let existing = self.live_record(wtxn, key)?;
+
+        // Both readings of `existing` happen here so its borrow of the
+        // transaction ends before the write below needs it mutably. The value is
+        // handed to the evaluator as a **map slice**: the outcome owns whatever
+        // it produces, so nothing is copied out of a record about to be replaced.
+        let (outcome, carried) = match &existing {
+            Some(record) => (
+                op.evaluate(Some(record.value))?,
+                (
+                    record.tags.to_vec(),
+                    record.mc_flags(),
+                    record.expires_at_ms(),
+                ),
+            ),
+            // Created here, if the operation creates at all: no tags, no client
+            // flags, and no expiry unless one is asked for.
+            None => (op.evaluate(None)?, (Vec::new(), 0, NEVER)),
         };
 
-        let current = std::str::from_utf8(record.value)
-            .ok()
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .ok_or(StoreError::NotNumeric)?;
-
-        // memcached clamps a decrement at zero rather than wrapping, and lets
-        // an increment wrap at 64 bits.
-        let updated = if decrement {
-            current.saturating_sub(delta)
-        } else {
-            current.wrapping_add(delta)
+        let (text, applied) = match outcome {
+            arith::Outcome::Missing => return Ok(None),
+            // A bound held the value where it was, so **nothing is written** —
+            // not the value, and not the deadline either.
+            arith::Outcome::Unchanged(applied) => return Ok(Some(applied)),
+            arith::Outcome::Store { text, applied } => (text, applied),
         };
 
-        let mc_flags = record.mc_flags();
-        let expires_at_ms = record.expires_at_ms();
-        let tags = record.tags.to_vec();
-        let text = updated.to_string();
+        // A counter is short, but the configured ceiling applies to every path
+        // that can grow a value, not only to the ones a client sends bytes on.
+        validate_value(text.as_bytes(), self.max_value_len)?;
 
-        let mut encoded = Vec::with_capacity(vash_core::record_len(tags.len(), text.len()));
-        encode_record(
-            &mut encoded,
+        let (tags, mc_flags, current_deadline) = carried;
+        self.rewrite(
+            wtxn,
+            key,
+            tags,
+            RecordMeta {
+                epoch: self.epoch(),
+                mc_flags,
+                expires_at_ms: self.deadline_after(op.ttl, current_deadline),
+                cas: 0,
+            },
+            text.as_bytes(),
+        )?;
+
+        Ok(Some(applied))
+    }
+
+    /// Concatenates onto a value atomically, returning the new length.
+    ///
+    /// This is Redis's `APPEND`, which differs from memcached's in exactly one
+    /// respect: it creates the key when absent, where memcached answers
+    /// `NOT_STORED`. That case is [`Self::apply_conditional_set`]'s, through
+    /// `SetMode::Append`, and the two stay separate rather than growing a flag
+    /// because the memcached path also has to report a `Stored` verdict this one
+    /// has no use for.
+    ///
+    /// The existing value is concatenated from a slice borrowed straight out of
+    /// the memory map. The Redis adapter used to copy it out to the network tier,
+    /// concatenate there and ship the result back, so appending one byte to a
+    /// megabyte moved two megabytes between the tiers.
+    pub fn apply_append(&self, wtxn: &mut RwTxn, key: &[u8], suffix: &[u8]) -> Result<u64> {
+        let existing = self.live_record(wtxn, key)?;
+
+        let (combined, tags, mc_flags, expires_at_ms) = match &existing {
+            Some(record) => {
+                let mut combined = Vec::with_capacity(record.value.len() + suffix.len());
+                combined.extend_from_slice(record.value);
+                combined.extend_from_slice(suffix);
+                (
+                    combined,
+                    record.tags.to_vec(),
+                    record.mc_flags(),
+                    // Redis keeps the existing expiry: `APPEND` alters a value
+                    // in place rather than replacing it.
+                    record.expires_at_ms(),
+                )
+            }
+            None => (suffix.to_vec(), Vec::new(), 0, NEVER),
+        };
+
+        validate_value(&combined, self.max_value_len)?;
+
+        self.rewrite(
+            wtxn,
+            key,
+            tags,
             RecordMeta {
                 epoch: self.epoch(),
                 mc_flags,
                 expires_at_ms,
                 cas: 0,
             },
-            &tags,
-            text.as_bytes(),
+            &combined,
         )?;
 
-        let mut prepared = PreparedSet {
-            key: key.into(),
-            record: encoded,
-            expires_at_ms,
-            tags,
-        };
-        self.apply_set(wtxn, &mut prepared)?;
-
-        Ok(Some(updated))
+        Ok(combined.len() as u64)
     }
 
     pub fn apply_set(&self, wtxn: &mut RwTxn, prepared: &mut PreparedSet) -> Result<u64> {

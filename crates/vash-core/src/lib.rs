@@ -8,6 +8,7 @@
 //! [`Command`]: command::Command
 //! [`Reply`]: command::Reply
 
+pub mod arith;
 pub mod clock;
 pub mod cluster;
 pub mod command;
@@ -18,6 +19,13 @@ pub mod listing;
 pub mod record;
 pub mod value;
 
+// `arith::Outcome` is deliberately not re-exported here: both protocol modules
+// already have a type of that name, and a third at the domain root would make
+// every import site ambiguous for no gain. The store spells it out.
+pub use arith::{
+    Applied, Arithmetic, Delta, Missing, Number, OnBound, TtlChange, format_float, parse_float,
+    parse_int,
+};
 pub use clock::{Clock, MAX_TTL_SECS};
 pub use cluster::{ClusterInfo, ClusterMode, MAX_TAG_SYNC_ENTRIES, PeerInfo, TagGeneration};
 pub use command::{

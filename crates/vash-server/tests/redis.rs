@@ -522,6 +522,82 @@ async fn counters_overflow_rather_than_wrap() {
         .await;
 }
 
+// ---- atomicity -----------------------------------------------------------
+//
+// The property the storage engine's arithmetic primitive exists for. `INCR` was
+// once a `get` and then a `set` issued from the network tier, so two connections
+// could read the same value and both write back one more than it. These fail
+// against that shape and pass only when the read and the write are one step
+// inside the shard writer's transaction.
+//
+// Multi-threaded on purpose: the whole point is real overlap.
+
+/// Concurrent `INCR` on one key must sum exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_increments_do_not_lose_an_update() {
+    const CONNECTIONS: usize = 8;
+    const EACH: usize = 64;
+
+    let server = TestServer::start().await;
+
+    let mut clients = Vec::new();
+    for _ in 0..CONNECTIONS {
+        let mut conn = server.connect().await;
+        clients.push(tokio::spawn(async move {
+            for _ in 0..EACH {
+                // Every connection sees a different number, so only the total
+                // is worth asserting on.
+                conn.line(&["INCR", "counter"]).await;
+            }
+        }));
+    }
+    for client in clients {
+        client.await.expect("increment task");
+    }
+
+    let total = (CONNECTIONS * EACH).to_string();
+    server
+        .connect()
+        .await
+        .call(
+            &["GET", "counter"],
+            &format!("${}\r\n{total}\r\n", total.len()),
+        )
+        .await;
+}
+
+/// Concurrent `APPEND` to one key must not lose a fragment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_appends_do_not_lose_a_fragment() {
+    const CONNECTIONS: usize = 8;
+    const EACH: usize = 32;
+
+    let server = TestServer::start().await;
+
+    let mut clients = Vec::new();
+    for _ in 0..CONNECTIONS {
+        let mut conn = server.connect().await;
+        clients.push(tokio::spawn(async move {
+            for _ in 0..EACH {
+                conn.line(&["APPEND", "log", "x"]).await;
+            }
+        }));
+    }
+    for client in clients {
+        client.await.expect("append task");
+    }
+
+    // The bulk header is the assertion: every fragment is the same byte, so a
+    // lost concatenation can only show up as a short value.
+    let expected = CONNECTIONS * EACH;
+    let header = server.connect().await.line(&["GET", "log"]).await;
+    assert_eq!(
+        header,
+        format!("${expected}\r\n"),
+        "every append must have contributed a byte"
+    );
+}
+
 #[tokio::test]
 async fn incrbyfloat_answers_with_a_bulk_string() {
     let server = TestServer::start().await;

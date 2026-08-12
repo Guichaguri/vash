@@ -907,27 +907,43 @@ after it is still read correctly.
 | Empty key (`SET "" v`) | allowed | `-ERR invalid key` | LMDB has no empty key. |
 | Keys over 511 bytes | allowed | `-ERR invalid key` | LMDB's compile-time `MDB_MAXKEYSIZE`; see [storage.md](storage.md). |
 | `INCRBYFLOAT` precision | 80-bit `long double` | 64-bit `f64` | Rust has no 80-bit float. The last digits of a long chain of increments can differ. |
-| Arithmetic and `APPEND` atomicity | atomic (single-threaded) | **read-modify-write, not atomic** | See below. |
+| Arithmetic and `APPEND` atomicity | atomic (single-threaded) | atomic (single writer per shard) | See below. |
+| `SET … GET/KEEPTTL`, conditional `EXPIRE`, `MSETEX NX/XX` | atomic | **read-modify-write, not atomic** | See below. |
 | Eviction under memory pressure | configurable LRU/LFU | TTL-ordered | See [plan.md](plan.md) §6. |
 | Databases (`SELECT`) | 16 | one | A cache does not need a namespace it cannot see into. |
 
 ### Atomicity
 
-The Redis adapter is a **protocol layer only**: it composes the storage
-operations the engine already has rather than adding new ones. Commands that
-need a read and a write therefore have a seam between them, and two clients
-touching the same key at the same moment can lose an update where Redis, being
-single-threaded, cannot.
+**The arithmetic commands are atomic.** `APPEND`, `INCR`, `INCRBY`, `DECR`,
+`DECRBY`, `INCRBYFLOAT` and `INCREX` are each one storage primitive, evaluated
+inside the transaction of the shard's single writer thread. Reading the current
+value and writing the new one is one step, so concurrent clients cannot lose an
+update: Redis gets that guarantee from being single-threaded, and this server
+gets it from having exactly one writer per shard. `INCREX` is an exact rate
+limiter, not a best-effort one.
 
-This affects `APPEND`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `INCRBYFLOAT`,
-`INCREX`, `SET … GET`, `SET … KEEPTTL`, `EXPIRE`/`EXPIREAT` with a condition,
-and `MSETEX` with `NX`/`XX`. It does **not** affect plain `GET`, `SET`, `MGET`,
-`MSET`, `DEL`, `UNLINK`, `EXISTS`, `TTL` or `PERSIST`.
+Nor do plain `GET`, `SET`, `MGET`, `MSET`, `DEL`, `UNLINK`, `EXISTS`, `TTL` or
+`PERSIST` have a seam — they were always single operations.
 
-Closing the seam means new primitives inside the shard writer, which already
-serialises everything on one thread — so the fix is cheap in principle and is a
-storage-engine change, not a protocol one. Until then, treat `INCREX` as a
-best-effort rate limiter rather than an exact one.
+**Four commands still do**, and the exposure is different in kind: they write a
+*deadline* derived from one they read a moment earlier, so what a race costs is
+a stale expiry rather than a corrupted value.
+
+| Command | What can be lost |
+|---|---|
+| `SET … KEEPTTL` | A deadline changed between the read and the write is overwritten with the older one. |
+| `SET … GET` | The value reported as "previous" may not be the one this write replaced. |
+| `EXPIRE`/`EXPIREAT` with `NX`/`XX`/`GT`/`LT` | The guard is evaluated against a deadline that may have moved before the write lands. |
+| `MSETEX` with `NX`/`XX` | The all-present/all-absent test may be stale by the time the batch applies. |
+
+Closing these needs a conditional-write primitive in the shard writer — the same
+move that made the arithmetic commands atomic in M10, applied to a predicate
+rather than to a sum. Planned as [m10.md](m10.md) phase 2.
+
+**Note the asymmetry this removed.** Until M10, `INCR` was atomic over memcached
+and not over Redis, on the same key, on the same server — because the memcached
+adapter had always executed it in the writer and the Redis adapter composed it
+from two calls. Both now use the same primitive.
 
 ---
 

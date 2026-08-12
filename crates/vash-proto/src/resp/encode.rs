@@ -160,22 +160,13 @@ pub fn hello(out: &mut Vec<u8>, version: Version) {
     array(out, 0);
 }
 
-/// Renders a float the way Redis does: plain decimal notation, no exponent, and
-/// no trailing zeros — `3.0` comes back as `3`.
+/// Renders a float the way Redis does, re-exported from the domain crate.
 ///
-/// Redis computes in `long double` and this server in `f64`, so the last digits
-/// of a long chain of `INCRBYFLOAT` calls can differ. Rust has no 80-bit float,
-/// and the alternative — carrying a decimal library for one command — is not
-/// worth it for a cache.
-pub fn format_float(value: f64) -> String {
-    // Rust's `Display` for `f64` already prints the shortest text that reads
-    // back as the same value, and never uses exponent notation.
-    let text = format!("{value}");
-    if let Some(trimmed) = text.strip_suffix(".0") {
-        return trimmed.to_string();
-    }
-    text
-}
+/// It moved for the same reason the numeric parsers did: this renders the reply,
+/// and `vash_core::arith` renders the *stored* value that a later `GET` returns.
+/// A client that increments a float and then reads it must see one number, not
+/// two spellings of it.
+pub use vash_core::format_float;
 
 /// Escapes a command name for the `unknown command` line, which is echoed back
 /// to the client and must not be able to inject a CRLF into the reply stream.

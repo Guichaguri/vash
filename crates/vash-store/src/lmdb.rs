@@ -234,11 +234,15 @@ impl Store for LmdbStore {
         shard.writer.conditional_set(prepared, set.mode)
     }
 
-    fn incr(&self, key: Key<'_>, delta: u64, decrement: bool) -> Result<Option<u64>> {
+    fn arithmetic(&self, op: &vash_core::Arithmetic<'_>) -> Result<Option<vash_core::Applied>> {
+        self.shards.for_key(op.key.as_bytes()).writer.arithmetic(op)
+    }
+
+    fn append(&self, key: Key<'_>, suffix: &[u8]) -> Result<u64> {
         self.shards
             .for_key(key.as_bytes())
             .writer
-            .incr(key, delta, decrement)
+            .append(key, suffix)
     }
 
     fn get_and_touch(&self, keys: &[Key<'_>], ttl_secs: u32) -> Result<Vec<Option<Value>>> {

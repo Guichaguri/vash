@@ -42,7 +42,7 @@ Run with `--ephemeral` to start from an empty database and skip syncing, or
 | Tags, `DELETE_BY_TAG`, `FLUSH` | Working — invalidation is constant time, see [benchmark](#tag-invalidation) |
 | Memcached text protocol | Working — `get`/`gets`/`set`/`add`/`replace`/`append`/`prepend`/`cas`/`delete`/`touch`/`gat`/`gats`/`incr`/`decr`/`stats`/`version`/`flush_all`/`quit` |
 | Memcached meta protocol | Working — `mg`/`ms`/`md`/`ma`/`mn`/`me`, core flag set |
-| Redis protocol (RESP2 + RESP3) | Working — string and expiry commands; the read-modify-write ones are [not atomic](docs/protocol.md#atomicity) |
+| Redis protocol (RESP2 + RESP3) | Working — string and expiry commands; arithmetic is [atomic](docs/protocol.md#atomicity), four conditional-write commands are not yet |
 | Sharding | Working — independent environments, one writer each |
 | Capacity watermarks and eviction | Working — TTL-ordered, never LRU |
 | Metrics and admin endpoints | Working — `/metrics`, `/health`, `/stats` |
@@ -409,12 +409,13 @@ discovers a feature is missing.
 
 Two things to know before pointing a real workload at it. Expiry is rounded to
 whole seconds, because that is what the store's deadline field holds — so
-`PX 100` buys up to a full second rather than 100 ms. And the commands that read
-then write — the arithmetic family, `APPEND`, `SET … GET`, conditional `EXPIRE`
-— are **not atomic**, because this is a protocol adapter over the existing
-storage engine rather than a new set of engine primitives. Both are covered in
-[docs/protocol.md](docs/protocol.md#deliberate-divergences-from-redis), with the
-full divergence list.
+`PX 100` buys up to a full second rather than 100 ms. And while the arithmetic
+family and `APPEND` are **atomic** — one primitive each, evaluated inside the
+shard writer's transaction, so concurrent increments cannot lose an update —
+four commands that read a deadline and then write against it are not yet:
+`SET … KEEPTTL`, `SET … GET`, conditional `EXPIRE`, and `MSETEX NX/XX`. Both are
+covered in [docs/protocol.md](docs/protocol.md#deliberate-divergences-from-redis),
+with the full divergence list.
 
 ## Layout
 
@@ -429,9 +430,10 @@ crates/vash-client   VCP client, and the integration-test driver
 `vash-core` defines the domain; `vash-store` and `vash-proto` are adapters on
 either side of it. VCP and memcached decode into the same `Command` type, so the
 storage engine never learns which wire format a request arrived on. The Redis
-adapter is the exception: its string commands do not map one-to-one onto storage
-operations, so it composes them in `vash-server::resp` instead — see
-[docs/protocol.md](docs/protocol.md#atomicity) for what that costs.
+adapter is partly the exception: the commands that map one-to-one onto a storage
+operation go the same way, and the rest are composed in `vash-server::resp` —
+see [docs/protocol.md](docs/protocol.md#atomicity). Bringing that remainder back
+onto the shared boundary is [docs/m10.md](docs/m10.md) phase 2.
 
 ## Deploying
 
