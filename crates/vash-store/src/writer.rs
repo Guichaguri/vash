@@ -32,6 +32,13 @@ use crate::queue::{OwnedArithmetic, PostCommit, WriteOp, WriteOutcome, apply, mi
 struct WriteJob {
     op: WriteOp,
     reply: Sender<Result<WriteOutcome>>,
+    /// When the caller handed this to the queue.
+    ///
+    /// The difference between this and the moment its transaction opens is the
+    /// shard writer's queue wait — plan §12's "queue-wait vs execution" split,
+    /// and the number that says whether the writer is the bottleneck or merely
+    /// downstream of one.
+    queued: Instant,
 }
 
 /// Counters describing how well group commit is working.
@@ -48,6 +55,15 @@ pub(crate) struct WriterMetrics {
     pub sweep_lag_ms: AtomicU64,
     /// Records freed by tag reclamation, as opposed to expiry sweeping.
     pub tag_reclaimed: AtomicU64,
+    /// Microseconds jobs spent waiting in this queue, and microseconds spent
+    /// applying and committing them.
+    ///
+    /// Reported as totals rather than a histogram: divided by `committed_ops`
+    /// and `commits` they give the mean of each stage, which is what answers
+    /// "is the writer the bottleneck" — and a per-shard histogram would be a lot
+    /// of series to answer a question a ratio already answers.
+    pub queue_wait_us: AtomicU64,
+    pub commit_us: AtomicU64,
     /// Live records dropped to reclaim space under capacity pressure.
     pub evicted: AtomicU64,
 }
@@ -89,6 +105,7 @@ impl Writer {
         let job = WriteJob {
             op,
             reply: reply_tx,
+            queued: Instant::now(),
         };
 
         let tx = self.tx.as_ref().ok_or(StoreError::ShuttingDown)?;
@@ -357,6 +374,12 @@ fn commit_batch(
 ) -> Result<()> {
     let batch_size = batch.len();
     let committed_items: usize = batch.iter().map(|job| job.op.item_count()).sum();
+    // Measured before the transaction opens, so it is the wait and nothing else.
+    let waited: u64 = batch
+        .iter()
+        .map(|job| job.queued.elapsed().as_micros().min(u64::MAX as u128) as u64)
+        .sum();
+    let started = Instant::now();
     let mut wtxn = match engine.write_txn() {
         Ok(txn) => txn,
         Err(e) => {
@@ -455,6 +478,11 @@ fn commit_batch(
                 metrics
                     .committed_ops
                     .fetch_add(committed_items as u64, Ordering::Relaxed);
+                metrics.queue_wait_us.fetch_add(waited, Ordering::Relaxed);
+                metrics.commit_us.fetch_add(
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
             }
             for (job, outcome) in batch.drain(..).zip(outcomes) {
                 let _ = job.reply.send(outcome);

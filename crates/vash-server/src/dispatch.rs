@@ -10,7 +10,7 @@ use vash_proto::vcp::{
 use vash_store::StoreError;
 
 use crate::auth::{ConnAuth, DEFAULT_NAME, Mechanism};
-use crate::metrics::ErrorClass;
+use crate::metrics::{CommandKind, Dialect, ErrorClass};
 use crate::state::ServerState;
 
 /// Executes every complete memcached command in `block`, appending the replies.
@@ -88,7 +88,7 @@ pub fn execute_memcached(
         return execute_memcached_unauthenticated(state, conn, parsed, out);
     }
 
-    let result = execute(state, &parsed.command);
+    let result = execute(state, &parsed.command, Dialect::Memcached);
     let closing = matches!(result, Ok(Reply::Closing));
 
     match result {
@@ -335,7 +335,7 @@ pub fn execute_frame_into(
 
         Ok(Decoded::Request { mut request, .. }) => {
             offsets_to_store_ttls(&mut request.command);
-            let result = execute(state, &request.command);
+            let result = execute(state, &request.command, Dialect::Vcp);
 
             if request.no_reply {
                 if let Err(failed) = result {
@@ -525,8 +525,21 @@ fn offset_to_store_ttl(
     }
 }
 
-pub fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Failed> {
+pub fn execute(
+    state: &ServerState,
+    command: &Command<'_>,
+    dialect: Dialect,
+) -> Result<Reply, Failed> {
+    // Timed around `execute_inner` only, so this is the storage work and not the
+    // wait to reach a thread that could do it. The wait is the shard writer's
+    // and is measured there — subtracting the two is what answers plan §12's
+    // question of whether the writer is the bottleneck.
+    let started = std::time::Instant::now();
     let outcome = execute_inner(state, command);
+    state
+        .metrics
+        .commands
+        .observe(CommandKind::of(command), dialect, started.elapsed());
 
     // Counted here, at the single point every command passes through, so the
     // numbers cannot drift apart from what was actually served.

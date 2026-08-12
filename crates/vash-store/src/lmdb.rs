@@ -564,12 +564,19 @@ impl Store for LmdbStore {
             total.reclaimed += writer.reclaimed.load(Ordering::Relaxed);
             total.tag_reclaimed += writer.tag_reclaimed.load(Ordering::Relaxed);
             total.evicted += writer.evicted.load(Ordering::Relaxed);
+            total.queue_wait_us += writer.queue_wait_us.load(Ordering::Relaxed);
+            total.commit_us += writer.commit_us.load(Ordering::Relaxed);
             // The worst shard, not the average: one lagging shard is the
             // problem, and a mean would hide it.
             total.sweep_lag_ms = total
                 .sweep_lag_ms
                 .max(writer.sweep_lag_ms.load(Ordering::Relaxed));
             total.utilisation = total.utilisation.max(engine.utilisation);
+            // The oldest across shards, for the same reason as the sweep lag:
+            // one shard pinning a snapshot is the problem, and a mean would
+            // bury it.
+            total.oldest_reader_age_ms =
+                total.oldest_reader_age_ms.max(engine.oldest_reader_age_ms);
         }
 
         Ok(total)

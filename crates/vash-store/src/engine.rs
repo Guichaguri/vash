@@ -81,6 +81,8 @@ pub struct LmdbEngine {
     pub(crate) pressure: AtomicU8,
     pub(crate) shard_index: usize,
     pub(crate) shard_count: usize,
+    /// See [`crate::readers`].
+    pub(crate) reader_ages: crate::readers::ReaderAges,
 }
 
 impl LmdbEngine {
@@ -185,6 +187,7 @@ impl LmdbEngine {
             readers_in_use: info.number_of_readers,
             max_readers: info.maximum_number_of_readers,
             epoch: self.epoch(),
+            oldest_reader_age_ms: self.reader_ages.oldest_age_ms(self.now_ms()),
             // Owned by the writer thread, merged in by `LmdbStore::stats`.
             ..StoreStats::default()
         })

@@ -1276,15 +1276,23 @@ async fn metrics_report_what_actually_happened() {
     let (code, body) = server.admin("/metrics").await;
     assert_eq!(code, 200);
 
-    // Prometheus rejects a sample whose family has no TYPE line.
+    // Prometheus rejects a sample whose family has no TYPE line. A histogram
+    // declares its type once, on the family — `_bucket`, `_sum` and `_count`
+    // belong to it and carry none of their own — so the suffix is stripped
+    // rather than the series exempted, which would lose the check for them.
     for line in body
         .lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
     {
-        let family = line.split(['{', ' ']).next().unwrap();
+        let series = line.split(['{', ' ']).next().unwrap();
+        let family = ["_bucket", "_sum", "_count"]
+            .iter()
+            .find_map(|suffix| series.strip_suffix(suffix))
+            .filter(|family| body.contains(&format!("# TYPE {family} histogram")))
+            .unwrap_or(series);
         assert!(
             body.contains(&format!("# TYPE {family} ")),
-            "{family} has no TYPE line"
+            "{series} has no TYPE line"
         );
     }
 

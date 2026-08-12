@@ -39,6 +39,7 @@ pub mod lmdb;
 pub mod memory;
 mod queue;
 mod read;
+mod readers;
 pub mod reclaim;
 pub mod schema;
 mod shard;
@@ -81,6 +82,13 @@ pub struct StoreStats {
     pub utilisation: f64,
     pub readers_in_use: u32,
     pub max_readers: u32,
+    /// How long the oldest currently-open read transaction has been open.
+    ///
+    /// Plan §15's mitigation for the one High-impact storage risk: a read
+    /// transaction that stays open pins a snapshot, which stops LMDB reusing
+    /// freed pages and grows the file without bound. Sustained growth here is
+    /// the alarm; zero means nothing is open.
+    pub oldest_reader_age_ms: u64,
     pub epoch: u32,
 
     /// Write transactions committed.
@@ -97,6 +105,17 @@ pub struct StoreStats {
     pub sweep_lag_ms: u64,
     /// Records freed by tag reclamation, as opposed to expiry sweeping.
     pub tag_reclaimed: u64,
+
+    /// Total time write jobs spent waiting in a shard queue, and total time
+    /// spent applying and committing them, in microseconds.
+    ///
+    /// Plan §12's queue-wait/execution split. Against `committed_ops` and
+    /// `commits` these give the mean of each stage: when the wait dominates, the
+    /// shard writer is the bottleneck and more shards would help; when the
+    /// commit dominates, the device is, and more shards would make it worse
+    /// (plan §9).
+    pub queue_wait_us: u64,
+    pub commit_us: u64,
 }
 
 impl Default for StoreStats {
@@ -115,6 +134,7 @@ impl Default for StoreStats {
             utilisation: 0.0,
             readers_in_use: 0,
             max_readers: 0,
+            oldest_reader_age_ms: 0,
             epoch: 0,
             commits: 0,
             committed_ops: 0,
@@ -122,6 +142,8 @@ impl Default for StoreStats {
             reclaimed: 0,
             sweep_lag_ms: 0,
             tag_reclaimed: 0,
+            queue_wait_us: 0,
+            commit_us: 0,
         }
     }
 }

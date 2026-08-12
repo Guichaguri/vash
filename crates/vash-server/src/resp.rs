@@ -403,7 +403,8 @@ fn run(
         // failures get classified — and rendered back into this dialect.
         storage => {
             let translated = translate(storage)?;
-            let reply = crate::dispatch::execute(state, &translated).map_err(resp_error)?;
+            let reply = crate::dispatch::execute(state, &translated, crate::metrics::Dialect::Resp)
+                .map_err(resp_error)?;
             render(storage, &reply, *version, out)
         }
     }
