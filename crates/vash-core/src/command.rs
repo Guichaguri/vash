@@ -55,11 +55,40 @@ pub enum Command<'a> {
     },
     GetMany(Vec<Key<'a>>),
     Set(Set<'a>),
-    SetMany(Vec<Set<'a>>),
+    SetMany {
+        sets: Vec<Set<'a>>,
+        /// Applies to the batch as a whole (Redis `MSETEX NX`/`XX`). The other
+        /// dialects send [`BatchGuard::Always`], which is why this is one
+        /// command rather than two.
+        guard: BatchGuard,
+    },
     Delete {
         key: Key<'a>,
     },
     DeleteMany(Vec<Key<'a>>),
+    /// A live key's deadline, without copying its value.
+    ///
+    /// What every command that asks *about* a key rather than for it is made of
+    /// — Redis's `TTL`, `TYPE` and `EXISTS` all reduce to this, differing only
+    /// in how they render the answer.
+    Deadline {
+        key: Key<'a>,
+    },
+    Deadlines(Vec<Key<'a>>),
+    /// Change a key's deadline under a guard (Redis `EXPIRE`/`PERSIST`).
+    Expire {
+        key: Key<'a>,
+        ttl: crate::arith::TtlChange,
+        guard: ExpireGuard,
+    },
+    /// Concatenate onto a value, creating it if absent (Redis `APPEND`).
+    ///
+    /// memcached's `append` is a *conditional* write instead — it refuses an
+    /// absent key — and travels as [`Command::Set`] with [`SetMode::Append`].
+    Append {
+        key: Key<'a>,
+        suffix: &'a [u8],
+    },
     /// Extends (or clears, with `ttl_secs` of 0) a key's lifetime without
     /// resending its value.
     Touch {
@@ -79,15 +108,12 @@ pub enum Command<'a> {
         keys: Vec<Key<'a>>,
         ttl_secs: u32,
     },
-    /// Atomic numeric add or subtract (memcached `incr`/`decr`).
+    /// Atomic read-modify-write on a counter.
     ///
-    /// Operates on the decimal text of the value, because that is what the
-    /// memcached protocol defines and what clients round-trip.
-    Incr {
-        key: Key<'a>,
-        delta: u64,
-        decrement: bool,
-    },
+    /// One variant for every dialect's arithmetic: memcached's `incr`/`decr` and
+    /// Redis's `INCR` family alike, which differ in their numeric domain and in
+    /// nothing else. See [`crate::arith`].
+    Arithmetic(crate::arith::Arithmetic<'a>),
 
     /// Cluster: merge tag generations a peer reported.
     ///
@@ -251,7 +277,26 @@ pub enum Reply {
     /// One slot per requested key; `None` is a miss.
     Values(Vec<Option<Value>>),
     Stored(Stored),
+    /// A write that reported what it displaced (Redis `SET … GET`).
+    ///
+    /// Separate from [`Reply::Stored`] because the client is told what was
+    /// there and never whether the write applied — that is Redis's contract,
+    /// and folding the two would make every other dialect carry an
+    /// `Option<Value>` it never populates.
+    Swapped {
+        outcome: Stored,
+        previous: Option<Value>,
+    },
     StoredMany(Vec<u64>),
+    /// A guarded change either applied or it did not (Redis `EXPIRE`,
+    /// `PERSIST`).
+    Applied(bool),
+    /// The length a value reached after being concatenated onto.
+    Length(u64),
+    /// A key's deadline: `None` if it is not live, `Some(NEVER)` if it never
+    /// expires.
+    Deadline(Option<u64>),
+    Deadlines(Vec<Option<u64>>),
     Deleted,
     /// `true` where the key was live before the delete.
     DeletedMany(Vec<bool>),
@@ -261,8 +306,8 @@ pub enum Reply {
     Invalidated(bool),
     /// The cache was emptied, carrying the new flush epoch.
     Flushed(u32),
-    /// New value of a counter after `incr`/`decr`.
-    Counter(u64),
+    /// Where a counter ended up, and how far it moved.
+    Arithmetic(crate::arith::Applied),
     /// Answer to a peer's `TAG_SYNC`: the generations this node holds that the
     /// sender is behind on. Empty when the sender was already up to date.
     TagSync(Vec<crate::cluster::TagGeneration>),

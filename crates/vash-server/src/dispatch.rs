@@ -98,9 +98,9 @@ pub fn execute_memcached(
                 mc::encode(out, &parsed.style, &parsed.command, &reply);
             }
         }
-        Err(status) => {
+        Err(failed) => {
             if !parsed.noreply {
-                mc::encode_error(out, memcached_error(status));
+                mc::encode_error(out, memcached_error(failed.status));
             }
         }
     }
@@ -307,15 +307,17 @@ pub fn execute_frame_into(
             let result = execute(state, &request.command);
 
             if request.no_reply {
-                if let Err(status) = result {
-                    warn!(?status, opcode = ?request.opcode, "no-reply request failed");
+                if let Err(failed) = result {
+                    warn!(status = ?failed.status, opcode = ?request.opcode, "no-reply request failed");
                 }
                 return;
             }
 
             match result {
                 Ok(reply) => encode_reply(out, request.opcode, request.request_id, &reply),
-                Err(status) => encode_error(out, request.opcode as u8, request.request_id, status),
+                Err(failed) => {
+                    encode_error(out, request.opcode as u8, request.request_id, failed.status)
+                }
             }
         }
 
@@ -462,7 +464,7 @@ fn offsets_to_store_ttls(command: &mut Command<'_>) {
     let clock = vash_core::Clock::new();
     match command {
         Command::Set(set) => set.ttl = offset_to_store_ttl(&clock, set.ttl),
-        Command::SetMany(sets) => {
+        Command::SetMany { sets, .. } => {
             for set in sets {
                 set.ttl = offset_to_store_ttl(&clock, set.ttl);
             }
@@ -492,7 +494,7 @@ fn offset_to_store_ttl(
     }
 }
 
-fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> {
+pub fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Failed> {
     let outcome = execute_inner(state, command);
 
     // Counted here, at the single point every command passes through, so the
@@ -504,20 +506,38 @@ fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> 
                 let hits = values.iter().filter(|v| v.is_some()).count() as u64;
                 state.metrics.read(hits, values.len() as u64 - hits);
             }
+            // A deadline query is a read that never copies a value: `TTL`,
+            // `TYPE` and `EXISTS` all reduce to one, and all count their hits
+            // the same way a `GET` does.
+            Reply::Deadline(deadline) => state
+                .metrics
+                .read(u64::from(deadline.is_some()), u64::from(deadline.is_none())),
+            Reply::Deadlines(deadlines) => {
+                let live = deadlines.iter().filter(|d| d.is_some()).count() as u64;
+                state.metrics.read(live, deadlines.len() as u64 - live);
+            }
             Reply::NotFound if is_read(command) => state.metrics.read(0, 1),
+            // A skipped conditional change wrote nothing, so it is not counted
+            // as a write — the same rule the arithmetic path applies through
+            // `Applied::wrote`.
+            Reply::Applied(false) => state.metrics.other(),
+            Reply::Arithmetic(applied) if !applied.wrote => state.metrics.other(),
             Reply::Stored(_)
+            | Reply::Swapped { .. }
             | Reply::StoredMany(_)
+            | Reply::Applied(true)
+            | Reply::Length(_)
             | Reply::Deleted
             | Reply::DeletedMany(_)
             | Reply::Touched
-            | Reply::Counter(_)
+            | Reply::Arithmetic(_)
             | Reply::Invalidated(_)
             | Reply::Flushed(_) => state.metrics.write(),
             _ => state.metrics.other(),
         },
-        Err(status) => {
+        Err(failed) => {
             state.metrics.other();
-            state.metrics.error(match status {
+            state.metrics.error(match failed.status {
                 Status::CapacityFull => ErrorClass::Capacity,
                 Status::Overloaded => ErrorClass::Overloaded,
                 Status::Internal => ErrorClass::Internal,
@@ -532,11 +552,15 @@ fn execute(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> 
 fn is_read(command: &Command<'_>) -> bool {
     matches!(
         command,
-        Command::Get { .. } | Command::GetMany(_) | Command::GetAndTouch { .. }
+        Command::Get { .. }
+            | Command::GetMany(_)
+            | Command::GetAndTouch { .. }
+            | Command::Deadline { .. }
+            | Command::Deadlines(_)
     )
 }
 
-fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, Status> {
+fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, Failed> {
     match command {
         Command::Ping => Ok(Reply::Pong),
 
@@ -547,67 +571,89 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
                     server = vash_core::PROTOCOL_VERSION,
                     "client requested an unsupported protocol version"
                 );
-                return Err(Status::Unsupported);
+                return Err(Failed::status(Status::Unsupported));
             }
             Ok(Reply::Hello(state.info))
         }
 
-        Command::Get { key } => match state.store.get(*key).map_err(to_status)? {
+        Command::Get { key } => match state.store.get(*key).map_err(to_failed)? {
             Some(value) => Ok(Reply::Value(value)),
             None => Ok(Reply::NotFound),
         },
 
         Command::GetMany(keys) => Ok(Reply::Values(
-            state.store.get_many(keys).map_err(to_status)?,
+            state.store.get_many(keys).map_err(to_failed)?,
         )),
 
-        // The previous value is dropped here, and that is not a loss: only
-        // Redis's `SET … GET` asks for one, and it asks through
-        // `Set::return_previous`, which no VCP or memcached request ever sets.
-        Command::Set(set) => Ok(Reply::Stored(
-            state.store.store(set).map_err(to_status)?.outcome,
-        )),
+        Command::Set(set) => {
+            let written = state.store.store(set).map_err(to_failed)?;
+            // The reply shape follows the request: only `SET … GET` asks to be
+            // told what it displaced, and no VCP or memcached request does.
+            if set.return_previous {
+                Ok(Reply::Swapped {
+                    outcome: written.outcome,
+                    previous: written.previous,
+                })
+            } else {
+                Ok(Reply::Stored(written.outcome))
+            }
+        }
 
         Command::GetAndTouch { keys, ttl_secs } => Ok(Reply::Values(
             state
                 .store
                 .get_and_touch(keys, *ttl_secs)
-                .map_err(to_status)?,
+                .map_err(to_failed)?,
         )),
 
-        Command::Incr {
-            key,
-            delta,
-            decrement,
-        } => {
-            // memcached's counter domain: unsigned, never creates the key, and
-            // leaves its lifetime alone. `Arithmetic::counter` is where those
-            // three facts live, so this arm carries no semantics of its own.
-            let op = vash_core::Arithmetic::counter(*key, *delta, *decrement);
-            match state.store.arithmetic(&op).map_err(to_status)? {
-                Some(applied) => Ok(Reply::Counter(match applied.value {
-                    vash_core::Number::Counter(value) => value,
-                    // Unreachable: a counter delta yields a counter. Answering
-                    // rather than panicking keeps a logic slip off the wire.
-                    other => {
-                        error!(?other, "counter arithmetic produced the wrong domain");
-                        return Err(Status::Internal);
-                    }
-                })),
-                None => Ok(Reply::NotFound),
-            }
-        }
+        Command::Deadline { key } => Ok(Reply::Deadline(
+            state.store.deadline(*key).map_err(to_failed)?,
+        )),
+
+        Command::Deadlines(keys) => Ok(Reply::Deadlines(
+            state.store.deadlines(keys).map_err(to_failed)?,
+        )),
+
+        Command::Expire { key, ttl, guard } => Ok(Reply::Applied(
+            state.store.expire(*key, *ttl, *guard).map_err(to_failed)?,
+        )),
+
+        Command::Append { key, suffix } => Ok(Reply::Length(
+            state.store.append(*key, suffix).map_err(to_failed)?,
+        )),
+
+        // Every dialect's arithmetic, in one arm: the operation already carries
+        // its own numeric domain, so there are no semantics left here to get
+        // wrong. A miss is only reachable for memcached's counter, which is the
+        // one that does not create.
+        Command::Arithmetic(op) => match state.store.arithmetic(op).map_err(to_failed)? {
+            Some(applied) => Ok(Reply::Arithmetic(applied)),
+            None => Ok(Reply::NotFound),
+        },
 
         Command::Stats => Ok(Reply::Stats(collect_stats(state))),
         Command::Version => Ok(Reply::Version(vash_proto::memcached::encode::VERSION)),
         Command::Quit => Ok(Reply::Closing),
 
-        Command::SetMany(sets) => Ok(Reply::StoredMany(
-            state.store.set_many(sets).map_err(to_status)?,
-        )),
+        // An unguarded batch takes the plain path, which is what VCP and
+        // memcached always send. A guard that rejects reports `NotStored`,
+        // reusing the vocabulary conditional single writes already have rather
+        // than inventing a batch-shaped one.
+        Command::SetMany { sets, guard } => match guard {
+            vash_core::BatchGuard::Always => Ok(Reply::StoredMany(
+                state.store.set_many(sets).map_err(to_failed)?,
+            )),
+            guard => {
+                if state.store.set_many_if(sets, *guard).map_err(to_failed)? {
+                    Ok(Reply::StoredMany(Vec::new()))
+                } else {
+                    Ok(Reply::Stored(vash_core::Stored::NotStored))
+                }
+            }
+        },
 
         Command::Delete { key } => {
-            if state.store.delete(*key).map_err(to_status)? {
+            if state.store.delete(*key).map_err(to_failed)? {
                 Ok(Reply::Deleted)
             } else {
                 Ok(Reply::NotFound)
@@ -615,11 +661,11 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
         }
 
         Command::DeleteMany(keys) => Ok(Reply::DeletedMany(
-            state.store.delete_many(keys).map_err(to_status)?,
+            state.store.delete_many(keys).map_err(to_failed)?,
         )),
 
         Command::Touch { key, ttl_secs } => {
-            if state.store.touch(*key, *ttl_secs).map_err(to_status)? {
+            if state.store.touch(*key, *ttl_secs).map_err(to_failed)? {
                 Ok(Reply::Touched)
             } else {
                 Ok(Reply::NotFound)
@@ -627,7 +673,7 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
         }
 
         Command::DeleteByTag { tag } => {
-            let generation = state.store.delete_by_tag(tag).map_err(to_status)?;
+            let generation = state.store.delete_by_tag(tag).map_err(to_failed)?;
 
             // Propagated only once the local bump has committed, so a peer can
             // never be told about an invalidation this node did not perform. In
@@ -648,9 +694,9 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
                 // A remote cache-wipe primitive stays off unless deliberately
                 // enabled.
                 warn!("rejected flush: disabled by configuration");
-                return Err(Status::Unauthorized);
+                return Err(Failed::status(Status::Unauthorized));
             }
-            Ok(Reply::Flushed(state.store.flush().map_err(to_status)?))
+            Ok(Reply::Flushed(state.store.flush().map_err(to_failed)?))
         }
 
         Command::ListKeys(request) => {
@@ -659,14 +705,14 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
                 state
                     .store
                     .list_keys(request, state.protocol.listing_max_scan)
-                    .map_err(to_status)?,
+                    .map_err(to_failed)?,
             ))
         }
 
         Command::ListTags(request) => {
             listing_gate(state)?;
             Ok(Reply::Listing(
-                state.store.list_tags(request).map_err(to_status)?,
+                state.store.list_tags(request).map_err(to_failed)?,
             ))
         }
     }
@@ -677,10 +723,10 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
 /// Separate from the authentication gate and not redundant with it: that one
 /// decides *who may connect*, this one decides what any connected client may
 /// do, and every authenticated client on this server is equally trusted.
-fn listing_gate(state: &ServerState) -> Result<(), Status> {
+fn listing_gate(state: &ServerState) -> Result<(), Failed> {
     if !state.protocol.listing_enabled {
         warn!("rejected listing: disabled by configuration");
-        return Err(Status::Unauthorized);
+        return Err(Failed::status(Status::Unauthorized));
     }
     Ok(())
 }
@@ -695,10 +741,10 @@ fn tag_sync(
     state: &ServerState,
     full: bool,
     entries: &[(&[u8], u64)],
-) -> Result<Vec<vash_core::TagGeneration>, Status> {
+) -> Result<Vec<vash_core::TagGeneration>, Failed> {
     use std::collections::{HashMap, HashSet};
 
-    let known = state.store.tag_generations().map_err(to_status)?;
+    let known = state.store.tag_generations().map_err(to_failed)?;
     let ours: HashMap<&[u8], u64> = known
         .iter()
         .map(|entry| (&*entry.name, entry.generation))
@@ -743,38 +789,73 @@ fn tag_sync(
 /// Internal failures are logged here and reported as a bare `INTERNAL`: the
 /// client gets enough to retry or fall back, and nothing about the server's
 /// internals leaks onto the wire.
-fn to_status(err: StoreError) -> Status {
+/// Why a command could not be executed, classified **once** for every dialect.
+///
+/// `status` is the VCP status code, which memcached also renders from.
+/// `cause` is the domain failure underneath it, carried because Redis draws
+/// distinctions memcached has no vocabulary for: four arithmetic failures all
+/// land on `NotNumeric`, and a Redis client library matches on the message text
+/// of each.
+///
+/// Carrying the cause is what lets there be one classification. The alternative
+/// — and what this replaced — was the Redis adapter classifying `StoreError`
+/// again on its own, two independent judgements that had to agree forever about
+/// which storage failures are the client's fault.
+#[derive(Debug, Clone)]
+pub struct Failed {
+    pub status: Status,
+    pub cause: Option<vash_core::CoreError>,
+}
+
+impl Failed {
+    /// A failure with no domain cause worth reporting: capacity, overload, a
+    /// gate, an internal error.
+    pub fn status(status: Status) -> Self {
+        Self {
+            status,
+            cause: None,
+        }
+    }
+}
+
+fn to_failed(err: StoreError) -> Failed {
     use vash_core::CoreError;
 
+    let classified = |status: Status, cause: CoreError| Failed {
+        status,
+        cause: Some(cause),
+    };
+
     match err {
-        StoreError::CapacityFull => Status::CapacityFull,
-        StoreError::Overloaded | StoreError::ShuttingDown => Status::Overloaded,
+        StoreError::CapacityFull => Failed::status(Status::CapacityFull),
+        StoreError::Overloaded | StoreError::ShuttingDown => Failed::status(Status::Overloaded),
         StoreError::Unsupported(what) => {
             warn!(what, "client used a feature this build does not implement");
-            Status::Unsupported
+            Failed::status(Status::Unsupported)
         }
-        StoreError::Core(CoreError::ValueTooLarge { .. } | CoreError::KeyTooLong { .. }) => {
-            Status::TooLarge
-        }
+        StoreError::Core(
+            cause @ (CoreError::ValueTooLarge { .. } | CoreError::KeyTooLong { .. }),
+        ) => classified(Status::TooLarge, cause),
         StoreError::TagLimit(limit) => {
             warn!(limit, "tag registry is full");
-            Status::CapacityFull
+            Failed::status(Status::CapacityFull)
         }
         // memcached reports a non-numeric value as a client error, not a miss,
         // and with its own wording — see `memcached_error`. The three arithmetic
-        // failures it has no vocabulary for are folded into it, because
-        // upstream's counter cannot produce them: it wraps instead of
-        // overflowing and has no float mode.
+        // failures it has no vocabulary for are folded into the same status,
+        // because upstream's counter cannot produce them: it wraps instead of
+        // overflowing and has no float mode. Redis can, and tells them apart
+        // from `cause`.
         StoreError::Core(
-            CoreError::NotAnInteger
+            cause @ (CoreError::NotAnInteger
             | CoreError::NotAFloat
             | CoreError::Overflow
-            | CoreError::NotFinite,
-        ) => Status::NotNumeric,
-        StoreError::Core(_) => Status::BadRequest,
+            | CoreError::NotFinite),
+        ) => classified(Status::NotNumeric, cause),
+        StoreError::Core(cause) => classified(Status::BadRequest, cause),
         other => {
             error!(error = %other, "storage failure");
-            Status::Internal
+            Failed::status(Status::Internal)
         }
     }
 }

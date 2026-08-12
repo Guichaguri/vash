@@ -1,4 +1,4 @@
-﻿//! Memcached response rendering.
+//! Memcached response rendering.
 //!
 //! A reply's shape depends on which command asked for it â€” `get` answers with
 //! `VALUE`/`END`, `mg` with `HD`/`VA`/`EN`, `incr` with a bare number â€” so the
@@ -73,8 +73,11 @@ pub fn encode(out: &mut Vec<u8>, style: &ResponseStyle, command: &Command<'_>, r
         }),
 
         ResponseStyle::Counter => match reply {
-            Reply::Counter(value) => {
-                out.extend_from_slice(value.to_string().as_bytes());
+            // `to_text` rather than a counter-specific render: it is the same
+            // decimal text in every numeric domain, and this dialect only ever
+            // produces the unsigned one.
+            Reply::Arithmetic(applied) => {
+                out.extend_from_slice(applied.value.to_text().as_bytes());
                 out.extend_from_slice(b"\r\n");
             }
             _ => out.extend_from_slice(b"NOT_FOUND\r\n"),
@@ -200,8 +203,8 @@ fn encode_meta(out: &mut Vec<u8>, style: &MetaStyle, command: &Command<'_>, repl
         }
 
         MetaStyle::Arithmetic(flags) => match reply {
-            Reply::Counter(value) => {
-                let text = value.to_string();
+            Reply::Arithmetic(applied) => {
+                let text = applied.value.to_text();
                 if flags.want_value {
                     out.extend_from_slice(b"VA ");
                     out.extend_from_slice(text.len().to_string().as_bytes());
@@ -285,7 +288,7 @@ fn command_key<'a>(command: &'a Command<'a>) -> Option<&'a [u8]> {
         Command::Get { key } | Command::Delete { key } | Command::Touch { key, .. } => {
             Some(key.as_bytes())
         }
-        Command::Incr { key, .. } => Some(key.as_bytes()),
+        Command::Arithmetic(op) => Some(op.key.as_bytes()),
         Command::Set(set) => Some(set.key.as_bytes()),
         Command::GetAndTouch { keys, .. } | Command::GetMany(keys) => {
             keys.first().map(|k| k.as_bytes())
@@ -399,7 +402,15 @@ mod tests {
     #[test]
     fn counters_render_bare() {
         assert_eq!(
-            rendered(ResponseStyle::Counter, Command::Ping, Reply::Counter(41)),
+            rendered(
+                ResponseStyle::Counter,
+                Command::Ping,
+                Reply::Arithmetic(vash_core::Applied {
+                    value: vash_core::Number::Counter(41),
+                    applied: vash_core::Number::Counter(1),
+                    wrote: true
+                })
+            ),
             "41\r\n"
         );
         assert_eq!(

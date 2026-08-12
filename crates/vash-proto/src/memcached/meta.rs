@@ -168,11 +168,11 @@ pub fn parse<'a>(
             let flags = collect(tokens, after_line)?;
             let decrement = matches!(flags.mode, Some(b'D' | b'-'));
             Ok(Outcome::Command(Parsed {
-                command: Command::Incr {
+                command: Command::Arithmetic(vash_core::Arithmetic::counter(
                     key,
-                    delta: flags.delta.unwrap_or(1),
+                    flags.delta.unwrap_or(1),
                     decrement,
-                },
+                )),
                 consumed: after_line,
                 noreply: flags.meta.quiet,
                 style: ResponseStyle::Meta(MetaStyle::Arithmetic(flags.meta)),
@@ -339,6 +339,17 @@ fn parse_u64(arg: &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// The delta and direction of a parsed counter operation.
+    fn counter_delta(command: Command<'_>) -> (u64, bool) {
+        let Command::Arithmetic(op) = command else {
+            panic!("expected arithmetic, got {command:?}")
+        };
+        match op.delta {
+            vash_core::Delta::Counter { delta, decrement } => (delta, decrement),
+            other => panic!("this dialect only counts unsigned, got {other:?}"),
+        }
+    }
+
     use super::super::{Outcome, parse as parse_any};
     use super::*;
 
@@ -426,23 +437,15 @@ mod tests {
 
     #[test]
     fn ma_defaults_to_incrementing_by_one() {
-        let Command::Incr {
-            delta, decrement, ..
-        } = command(b"ma counter\r\n").command
-        else {
-            panic!()
-        };
-        assert_eq!(delta, 1);
-        assert!(!decrement);
-
-        let Command::Incr {
-            delta, decrement, ..
-        } = command(b"ma counter MD D5\r\n").command
-        else {
-            panic!()
-        };
-        assert_eq!(delta, 5);
-        assert!(decrement, "MD must decrement");
+        assert_eq!(
+            counter_delta(command(b"ma counter\r\n").command),
+            (1, false)
+        );
+        assert_eq!(
+            counter_delta(command(b"ma counter MD D5\r\n").command),
+            (5, true),
+            "MD must decrement"
+        );
     }
 
     #[test]

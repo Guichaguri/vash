@@ -134,9 +134,17 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             }
         },
 
-        Reply::Counter(value) => {
-            encode_response(out, opcode, request_id, Status::Ok, &value.to_le_bytes())
-        }
+        // VCP has no arithmetic opcode yet, so nothing here can produce this —
+        // but the unsigned domain has a natural wire shape and keeping it mapped
+        // means adding the opcode (m10.md phase 7) needs no encoder change. The
+        // signed and float domains are Redis's and have no VCP form to render
+        // into, so they are refused rather than silently truncated.
+        Reply::Arithmetic(applied) => match applied.value {
+            vash_core::Number::Counter(value) => {
+                encode_response(out, opcode, request_id, Status::Ok, &value.to_le_bytes())
+            }
+            _ => encode_response(out, opcode, request_id, Status::Unsupported, &[]),
+        },
 
         Reply::TagSync(entries) => {
             let mut body = Vec::new();
@@ -189,11 +197,22 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             encode_response(out, opcode, request_id, Status::Ok, &body);
         }
 
-        // Protocol-level replies with no VCP representation yet. Reported as
-        // unsupported rather than silently rendered as success.
-        Reply::Stats(_) | Reply::Version(_) | Reply::Closing => {
-            encode_response(out, opcode, request_id, Status::Unsupported, &[])
-        }
+        // Replies with no VCP representation yet. Reported as unsupported rather
+        // than silently rendered as success.
+        //
+        // The second group is Redis's: `SET … GET`, the deadline queries,
+        // guarded expiry and `APPEND` have no opcode here, so no VCP client can
+        // provoke one. They are listed rather than caught by a wildcard so that
+        // giving any of them an opcode is a compile error here first — which is
+        // the point of this match being exhaustive.
+        Reply::Stats(_)
+        | Reply::Version(_)
+        | Reply::Closing
+        | Reply::Swapped { .. }
+        | Reply::Applied(_)
+        | Reply::Length(_)
+        | Reply::Deadline(_)
+        | Reply::Deadlines(_) => encode_response(out, opcode, request_id, Status::Unsupported, &[]),
 
         Reply::Value(value) => {
             // Written as one frame without an intermediate buffer: header, then

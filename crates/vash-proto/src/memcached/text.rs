@@ -94,11 +94,14 @@ pub fn parse<'a>(
                 .ok_or_else(|| fail(ErrorKind::Client("invalid numeric delta argument")))?;
             let noreply = has_noreply(tokens);
             Ok(Outcome::Command(Parsed {
-                command: Command::Incr {
+                // memcached's counter domain — unsigned, never creates the
+                // key, never touches its lifetime — lives in
+                // `Arithmetic::counter` rather than being restated here.
+                command: Command::Arithmetic(vash_core::Arithmetic::counter(
                     key,
                     delta,
-                    decrement: verb == b"decr",
-                },
+                    verb == b"decr",
+                )),
                 consumed,
                 noreply,
                 style: ResponseStyle::Counter,
@@ -359,6 +362,17 @@ fn parse_u64(token: Option<&[u8]>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// The delta and direction of a parsed counter operation.
+    fn counter_delta(command: Command<'_>) -> (u64, bool) {
+        let Command::Arithmetic(op) = command else {
+            panic!("expected arithmetic, got {command:?}")
+        };
+        match op.delta {
+            vash_core::Delta::Counter { delta, decrement } => (delta, decrement),
+            other => panic!("this dialect only counts unsigned, got {other:?}"),
+        }
+    }
+
     use super::super::{Outcome, parse};
     use super::*;
 
@@ -511,19 +525,14 @@ mod tests {
 
     #[test]
     fn parses_incr_and_decr() {
-        let Command::Incr {
-            delta, decrement, ..
-        } = command(b"incr counter 5\r\n").command
-        else {
-            panic!()
-        };
-        assert_eq!(delta, 5);
-        assert!(!decrement);
-
-        let Command::Incr { decrement, .. } = command(b"decr counter 1\r\n").command else {
-            panic!()
-        };
-        assert!(decrement);
+        assert_eq!(
+            counter_delta(command(b"incr counter 5\r\n").command),
+            (5, false)
+        );
+        assert_eq!(
+            counter_delta(command(b"decr counter 1\r\n").command),
+            (1, true)
+        );
     }
 
     #[test]

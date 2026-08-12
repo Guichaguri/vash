@@ -1,11 +1,27 @@
 //! Executing Redis commands.
 //!
-//! Kept apart from [`crate::dispatch`] because it works differently on purpose.
-//! The VCP and memcached adapters decode into `vash_core::Command`, one command
-//! to one storage operation. Some of Redis's string commands do not fit that
-//! shape: `TTL` reports a lifetime nothing else asks for, and `HELLO` negotiates
-//! a dialect only this protocol has. Those are composed here from the operations
-//! the `Store` trait already offers.
+//! A **codec, not an executor** (M10 phase 2b). Every command that touches
+//! storage is translated into a `vash_core::Command`, handed to
+//! [`crate::dispatch::execute`] — the same function that runs VCP and memcached
+//! — and rendered back into this dialect. This module opens no transaction and
+//! calls no `Store` method; `state.store` does not appear in it.
+//!
+//! That is what makes the counting and the error classification single-sourced.
+//! Requests are counted where they execute, so a Redis command cannot be missed
+//! by an instrumentation call somebody forgot to add; and `StoreError` is
+//! classified once, in `dispatch::to_failed`, rather than here as well by a
+//! second judgement that had to agree with the first forever.
+//!
+//! Two things stay local, and the line between them is the useful one:
+//! **commands about the conversation** — `HELLO`, `AUTH`, `QUIT`, and the
+//! version they negotiate — never reach the boundary, because they are
+//! properties of this socket rather than operations on the cache. Everything
+//! else does.
+//!
+//! Several Redis commands collapse onto one domain operation on the way through:
+//! `EXISTS`, `TYPE` and `TTL` are all deadline queries that differ only in how
+//! the answer is worded, and `PERSIST` is an `EXPIRE` with a guard. The
+//! translation is in [`translate`] and the wording in [`render`].
 //!
 //! **The arithmetic commands are atomic (M10).** `INCR`, `INCRBY`, `DECR`,
 //! `DECRBY`, `INCRBYFLOAT`, `INCREX` and `APPEND` are single storage primitives
@@ -31,10 +47,9 @@
 //! here; `docs/protocol.md` states it.
 
 use tracing::{error, warn};
-use vash_core::{CoreError, Key, SetMode, Stored};
+use vash_core::{CoreError, Key, Reply, SetMode, Stored};
 use vash_proto::resp::command::{Condition, ExpireCondition, Expiry, IncrEx, Number};
 use vash_proto::resp::{Command, ErrorReply, Outcome, ProtocolError, Version, encode};
-use vash_store::{Store, StoreError};
 
 use crate::auth::ConnAuth;
 use crate::dispatch::Closing;
@@ -131,8 +146,12 @@ fn execute(
     match run(state, conn, command, version, out) {
         Ok(()) => {}
         Err(failure) => {
-            state.metrics.other();
-            state.metrics.error(failure.class);
+            // Only what the shared executor has not already counted; see
+            // [`Failure::counted`].
+            if !failure.counted {
+                state.metrics.other();
+                state.metrics.error(failure.class);
+            }
             encode::error(out, failure.code, failure.message);
         }
     }
@@ -156,11 +175,13 @@ fn refusal(state: &ServerState, conn: &ConnAuth, command: &Command<'_>) -> Optio
             code: "NOAUTH",
             message: HELLO_UNAUTHENTICATED,
             class: ErrorClass::Client,
+            counted: false,
         }),
         _ => Some(Failure {
             code: "NOAUTH",
             message: "Authentication required.",
             class: ErrorClass::Client,
+            counted: false,
         }),
     }
 }
@@ -216,6 +237,7 @@ fn authenticate(
                 code: "WRONGPASS",
                 message: WRONGPASS,
                 class: ErrorClass::Client,
+                counted: false,
             })
         }
     }
@@ -229,14 +251,42 @@ struct Failure {
     code: &'static str,
     message: &'static str,
     class: ErrorClass,
+    /// Already counted by [`crate::dispatch::execute`].
+    ///
+    /// Failures raised *before* a command reaches the shared executor — a key
+    /// this store cannot hold, an expiry it cannot represent — are counted by
+    /// this module, because nothing else has seen them. Everything from the
+    /// executor was counted there, and counting it again would double it.
+    counted: bool,
 }
 
 impl Failure {
+    /// A failure raised here, before the command reached the executor.
     fn client(message: &'static str) -> Self {
         Self {
             code: "ERR",
             message,
             class: ErrorClass::Client,
+            counted: false,
+        }
+    }
+
+    /// A client error the executor already counted.
+    fn executed(message: &'static str) -> Self {
+        Self {
+            counted: true,
+            ..Self::client(message)
+        }
+    }
+
+    /// A logic slip in this module — a command translated into a reply it cannot
+    /// render. Never anything a client can provoke.
+    fn internal() -> Self {
+        Self {
+            code: "ERR",
+            message: "internal error",
+            class: ErrorClass::Internal,
+            counted: false,
         }
     }
 }
@@ -249,6 +299,7 @@ impl From<&ErrorReply<'_>> for Failure {
                 code,
                 message,
                 class: ErrorClass::Client,
+                counted: false,
             },
             // The parser produces the rest; they never reach the executor.
             _ => Failure::client("syntax error"),
@@ -256,56 +307,18 @@ impl From<&ErrorReply<'_>> for Failure {
     }
 }
 
-/// Maps a storage failure onto the error a Redis client expects.
-///
-/// `OOM` is the one clients actually branch on — it is what Redis answers when
-/// `maxmemory` is reached, and libraries treat it as "back off", which is
-/// exactly right for a full map.
-impl From<StoreError> for Failure {
-    fn from(err: StoreError) -> Self {
-        match err {
-            StoreError::CapacityFull | StoreError::TagLimit(_) => Failure {
-                code: "OOM",
-                message: "command not allowed when used memory > 'maxmemory'",
-                class: ErrorClass::Capacity,
-            },
-            StoreError::Overloaded | StoreError::ShuttingDown => Failure {
-                code: "ERR",
-                message: "server is overloaded, try again",
-                class: ErrorClass::Overloaded,
-            },
-            StoreError::Core(CoreError::ValueTooLarge { .. }) => {
-                Failure::client("string exceeds maximum allowed size")
-            }
-            StoreError::Core(CoreError::EmptyKey | CoreError::KeyTooLong { .. }) => {
-                Failure::client(INVALID_KEY)
-            }
-            // The arithmetic failures, now that the store performs the
-            // arithmetic. Each keeps Redis's own wording, which client libraries
-            // match on.
-            StoreError::Core(CoreError::NotAnInteger) => Failure::client(NOT_AN_INTEGER),
-            StoreError::Core(CoreError::NotAFloat) => Failure::client(NOT_A_FLOAT),
-            StoreError::Core(CoreError::Overflow) => Failure::client(OVERFLOW),
-            StoreError::Core(CoreError::NotFinite) => Failure::client(NOT_FINITE),
-            StoreError::Unsupported(what) => {
-                warn!(what, "client used a feature this build does not implement");
-                Failure::client("unsupported operation")
-            }
-            other => {
-                error!(error = %other, "storage failure");
-                Failure {
-                    code: "ERR",
-                    message: "internal error",
-                    class: ErrorClass::Internal,
-                }
-            }
-        }
-    }
-}
-
+/// Validation raised on this side of the boundary, which is only ever about a
+/// key: everything else a client can get wrong is caught by the parser above or
+/// by the store below.
 impl From<CoreError> for Failure {
     fn from(err: CoreError) -> Self {
-        StoreError::Core(err).into()
+        match err {
+            CoreError::EmptyKey | CoreError::KeyTooLong { .. } => Failure::client(INVALID_KEY),
+            other => {
+                error!(error = %other, "unexpected validation failure translating a command");
+                Failure::internal()
+            }
+        }
     }
 }
 
@@ -383,195 +396,299 @@ fn run(
             Ok(())
         }
 
-        Command::Ping { message } => {
-            state.metrics.other();
-            match message {
-                Some(message) => encode::bulk(out, message),
-                None => encode::simple(out, "PONG"),
-            }
-            Ok(())
+        // Everything past this point touches storage, so it goes through the
+        // shared boundary: translated into a `vash_core::Command`, executed by
+        // `dispatch::execute` — which is where it gets counted and where its
+        // failures get classified — and rendered back into this dialect.
+        storage => {
+            let translated = translate(storage)?;
+            let reply = crate::dispatch::execute(state, &translated).map_err(resp_error)?;
+            render(storage, &reply, *version, out)
         }
+    }
+}
 
-        Command::Get { key } => {
-            let value = state.store.get(key_of(key)?)?;
-            state
-                .metrics
-                .read(u64::from(value.is_some()), u64::from(value.is_none()));
-            match value {
-                Some(value) => encode::bulk(out, &value.data),
-                None => encode::null(out, *version),
-            }
-            Ok(())
-        }
+/// Renders a reply in this dialect.
+///
+/// Takes the original command as well, because several of them share a reply
+/// shape and differ only in how Redis words the answer: `TTL`, `TYPE` and
+/// `EXISTS` are all one deadline query, and `MSET` and `MSETEX` are one batch
+/// write.
+fn render(command: &Command<'_>, reply: &Reply, version: Version, out: &mut Vec<u8>) -> Answered {
+    match (command, reply) {
+        (Command::Ping { message }, _) => match message {
+            Some(message) => encode::bulk(out, message),
+            None => encode::simple(out, "PONG"),
+        },
 
-        Command::MGet { keys } => {
-            let keys = keys_of(keys.iter().copied())?;
-            let values = state.store.get_many(&keys)?;
-            let hits = values.iter().filter(|value| value.is_some()).count() as u64;
-            state.metrics.read(hits, values.len() as u64 - hits);
+        (_, Reply::Value(value)) => encode::bulk(out, &value.data),
+        (Command::Get { .. }, Reply::NotFound) => encode::null(out, version),
 
+        (_, Reply::Values(values)) => {
             encode::array(out, values.len());
-            for value in &values {
+            for value in values {
                 match value {
                     Some(value) => encode::bulk(out, &value.data),
-                    None => encode::null(out, *version),
+                    None => encode::null(out, version),
                 }
             }
-            Ok(())
         }
 
-        Command::Exists { keys } => {
-            // Redis counts a key once per time it is named, so duplicates are
-            // not folded together.
-            let keys = keys_of(keys.iter().copied())?;
-            let found = state.store.deadlines(&keys)?;
-            let live = found.iter().filter(|entry| entry.is_some()).count() as u64;
-            state.metrics.read(live, found.len() as u64 - live);
-            encode::integer(out, live as i64);
-            Ok(())
+        (Command::Exists { .. }, Reply::Deadlines(found)) => encode::integer(
+            out,
+            found.iter().filter(|entry| entry.is_some()).count() as i64,
+        ),
+
+        // Redis answers with a simple string in both dialects, and `none` rather
+        // than a null for a key that is not there.
+        (Command::Type { .. }, Reply::Deadline(deadline)) => {
+            encode::simple(out, if deadline.is_some() { "string" } else { "none" })
         }
 
-        Command::Type { key } => {
-            let live = state.store.deadline(key_of(key)?)?.is_some();
-            state.metrics.read(u64::from(live), u64::from(!live));
-            // Redis answers with a simple string in both RESP2 and RESP3, and
-            // `none` rather than a null for a key that is not there.
-            encode::simple(out, if live { "string" } else { "none" });
-            Ok(())
+        (Command::Ttl { .. }, Reply::Deadline(deadline)) => {
+            let answer = match deadline {
+                None => TTL_MISSING,
+                Some(vash_core::NEVER) => TTL_PERSISTENT,
+                Some(at) => {
+                    // Redis rounds the remaining milliseconds to the nearest
+                    // second rather than truncating, so a key set with `EX 10`
+                    // still reports 10 a moment later.
+                    let remaining = at.saturating_sub(now_ms()) as i64;
+                    (remaining + 500) / 1_000
+                }
+            };
+            encode::integer(out, answer);
         }
 
-        Command::Delete { keys } => {
-            let keys = keys_of(keys.iter().copied())?;
-            let hits = state.store.delete_many(&keys)?;
-            state.metrics.write();
-            encode::integer(out, hits.iter().filter(|hit| **hit).count() as i64);
-            Ok(())
+        (Command::Delete { .. }, Reply::DeletedMany(hits)) => {
+            encode::integer(out, hits.iter().filter(|hit| **hit).count() as i64)
         }
 
-        Command::Set(set) => execute_set(state, set, *version, out),
+        // With `GET` the client is told what was there, and never whether the
+        // write applied — that is Redis's contract, not an omission.
+        (Command::Set(_), Reply::Swapped { previous, .. }) => match previous {
+            Some(value) => encode::bulk(out, &value.data),
+            None => encode::null(out, version),
+        },
+        (Command::Set(_), Reply::Stored(outcome)) => {
+            if matches!(outcome, Stored::Stored(_)) {
+                encode::ok(out)
+            } else {
+                encode::null(out, version)
+            }
+        }
 
-        Command::MSet { pairs } => {
-            let sets = pairs
+        (Command::MSet { .. }, Reply::StoredMany(_)) => encode::ok(out),
+        // The guard's verdict, which is all `MSETEX` reports.
+        (Command::MSetEx { .. }, Reply::StoredMany(_)) => encode::integer(out, 1),
+        (Command::MSetEx { .. }, Reply::Stored(Stored::NotStored)) => encode::integer(out, 0),
+
+        (Command::Append { .. }, Reply::Length(length)) => encode::integer(out, *length as i64),
+
+        (Command::Expire { .. } | Command::Persist { .. }, Reply::Applied(applied)) => {
+            encode::integer(out, i64::from(*applied))
+        }
+
+        (Command::Incr { .. }, Reply::Arithmetic(applied)) => match number_of(applied.value)? {
+            Number::Int(value) => encode::integer(out, value),
+            Number::Float(value) => encode::bulk(out, encode::format_float(value).as_bytes()),
+        },
+
+        (Command::IncrEx(_), Reply::Arithmetic(applied)) => {
+            return answer_increx(
+                out,
+                number_of(applied.value)?,
+                number_of(applied.applied)?,
+                version,
+            );
+        }
+
+        // A reply shape no command of this dialect can produce is a bug in the
+        // translation above, not anything a client did.
+        (command, reply) => {
+            error!(
+                ?command,
+                ?reply,
+                "a Redis command produced a reply it cannot render"
+            );
+            return Err(Failure::internal());
+        }
+    }
+    Ok(())
+}
+
+/// Maps a classified failure onto the error a Redis client expects.
+///
+/// The classification itself is `dispatch::to_failed`'s, shared with the other
+/// two dialects. What is left here is the wording, which is Redis's own and
+/// which client libraries match on — `OOM` above all, since libraries treat it
+/// as "back off", exactly right for a full map.
+///
+/// `cause` is consulted first because Redis draws distinctions the status codes
+/// do not: four arithmetic failures share `NotNumeric` and have four different
+/// messages.
+fn resp_error(failed: crate::dispatch::Failed) -> Failure {
+    use vash_proto::vcp::Status;
+
+    let message = match failed.cause {
+        Some(CoreError::NotAnInteger) => Some(NOT_AN_INTEGER),
+        Some(CoreError::NotAFloat) => Some(NOT_A_FLOAT),
+        Some(CoreError::Overflow) => Some(OVERFLOW),
+        Some(CoreError::NotFinite) => Some(NOT_FINITE),
+        Some(CoreError::EmptyKey | CoreError::KeyTooLong { .. }) => Some(INVALID_KEY),
+        Some(CoreError::ValueTooLarge { .. }) => Some("string exceeds maximum allowed size"),
+        _ => None,
+    };
+    if let Some(message) = message {
+        return Failure::executed(message);
+    }
+
+    match failed.status {
+        Status::CapacityFull => Failure {
+            code: "OOM",
+            message: "command not allowed when used memory > 'maxmemory'",
+            class: ErrorClass::Capacity,
+            counted: true,
+        },
+        Status::Overloaded => Failure {
+            code: "ERR",
+            message: "server is overloaded, try again",
+            class: ErrorClass::Overloaded,
+            counted: true,
+        },
+        Status::Unsupported => Failure::executed("unsupported operation"),
+        Status::Unauthorized => Failure::executed("command disabled by configuration"),
+        Status::Internal => Failure {
+            code: "ERR",
+            message: "internal error",
+            class: ErrorClass::Internal,
+            counted: true,
+        },
+        _ => Failure::executed("invalid argument"),
+    }
+}
+
+/// Translates a Redis command into the shared boundary type.
+///
+/// Only the commands that touch storage appear here; the connection ones are
+/// answered before this is reached. Several collapse onto one variant —
+/// `EXISTS`, `TYPE` and `TTL` are all deadline queries differing in how they
+/// render — which is the point of the boundary being about *storage operations*
+/// rather than about command names.
+fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failure> {
+    use vash_core::Command as Domain;
+
+    Ok(match command {
+        Command::Ping { .. } => Domain::Ping,
+        Command::Get { key } => Domain::Get { key: key_of(key)? },
+        Command::MGet { keys } => Domain::GetMany(keys_of(keys.iter().copied())?),
+
+        // Redis counts a key once per time it is named, so duplicates are not
+        // folded together.
+        Command::Exists { keys } => Domain::Deadlines(keys_of(keys.iter().copied())?),
+        Command::Type { key } | Command::Ttl { key } => Domain::Deadline { key: key_of(key)? },
+
+        Command::Delete { keys } => Domain::DeleteMany(keys_of(keys.iter().copied())?),
+
+        Command::Set(set) => Domain::Set(vash_core::Set {
+            key: key_of(set.key)?,
+            value: set.value,
+            ttl: ttl_change_for(set.expiry, INVALID_EXPIRE_SET)?,
+            mc_flags: 0,
+            tags: Vec::new(),
+            mode: match set.condition {
+                Condition::Always => SetMode::Set,
+                Condition::IfAbsent => SetMode::Add,
+                Condition::IfPresent => SetMode::Replace,
+            },
+            return_previous: set.return_previous,
+        }),
+
+        Command::MSet { pairs } => Domain::SetMany {
+            sets: pairs
                 .iter()
                 .map(|(key, value)| Ok(vash_core::Set::plain(key_of(key)?, value, 0)))
-                .collect::<Result<Vec<_>, Failure>>()?;
-            state.store.set_many(&sets)?;
-            state.metrics.write();
-            encode::ok(out);
-            Ok(())
-        }
+                .collect::<Result<_, Failure>>()?,
+            guard: vash_core::BatchGuard::Always,
+        },
 
         Command::MSetEx {
             pairs,
             condition,
             expiry,
-        } => execute_msetex(state, pairs, *condition, *expiry, out),
-
-        Command::Append { key, value } => {
-            // One atomic step in the shard writer, which also means the existing
-            // value is concatenated from a slice of the memory map rather than
-            // being copied out here and shipped back.
-            let length = state.store.append(key_of(key)?, value)?;
-            state.metrics.write();
-            encode::integer(out, length as i64);
-            Ok(())
+        } => {
+            // Resolved once for the whole batch, so every key in it is stamped
+            // against one instant.
+            let ttl = ttl_change_for(*expiry, INVALID_EXPIRE_MSETEX)?;
+            Domain::SetMany {
+                sets: pairs
+                    .iter()
+                    .map(|(key, value)| Ok(vash_core::Set::with_ttl(key_of(key)?, value, ttl)))
+                    .collect::<Result<_, Failure>>()?,
+                guard: match condition {
+                    Condition::Always => vash_core::BatchGuard::Always,
+                    Condition::IfAbsent => vash_core::BatchGuard::IfAllAbsent,
+                    Condition::IfPresent => vash_core::BatchGuard::IfAllPresent,
+                },
+            }
         }
+
+        Command::Append { key, value } => Domain::Append {
+            key: key_of(key)?,
+            suffix: value,
+        },
 
         Command::Expire {
             key,
             expiry,
             condition,
-        } => execute_expire(state, key, *expiry, *condition, out),
-
-        Command::Persist { key } => {
-            // `IfVolatile` is what makes this answer 0 for a key that has no
-            // deadline to clear, which is Redis's contract — and evaluating it
-            // in the writer is what stops a deadline set concurrently from being
-            // cleared by a `PERSIST` that had already decided there was none.
-            let cleared = state.store.expire(
-                key_of(key)?,
-                vash_core::TtlChange::Set(0),
-                vash_core::ExpireGuard::IfVolatile,
-            )?;
-            state.metrics.write();
-            answer_bool(out, cleared)
-        }
-
-        Command::Ttl { key } => {
-            let deadline = state.store.deadline(key_of(key)?)?;
-            state
-                .metrics
-                .read(u64::from(deadline.is_some()), u64::from(deadline.is_none()));
-
-            let answer = match deadline {
-                None => TTL_MISSING,
-                Some(deadline) => match deadline {
-                    vash_core::NEVER => TTL_PERSISTENT,
-                    at => {
-                        // Redis rounds the remaining milliseconds to the
-                        // nearest second rather than truncating, so a key set
-                        // with `EX 10` still reports 10 a moment later.
-                        let remaining = at.saturating_sub(now_ms()) as i64;
-                        (remaining + 500) / 1_000
-                    }
-                },
+        } => {
+            let now = now_ms() as i64;
+            let deadline = match expiry {
+                Expiry::After(millis) => now.saturating_add(*millis),
+                Expiry::At(millis) => *millis,
+                // The parser only produces the two relative forms for `EXPIRE`.
+                Expiry::Unset | Expiry::Keep | Expiry::Persist => now,
             };
-            encode::integer(out, answer);
-            Ok(())
+            Domain::Expire {
+                key: key_of(key)?,
+                ttl: vash_core::TtlChange::Set(ttl_from_deadline(deadline)),
+                guard: match condition {
+                    ExpireCondition::Always => vash_core::ExpireGuard::Always,
+                    ExpireCondition::IfPersistent => vash_core::ExpireGuard::IfPersistent,
+                    ExpireCondition::IfVolatile => vash_core::ExpireGuard::IfVolatile,
+                    ExpireCondition::IfLater => vash_core::ExpireGuard::IfLater,
+                    ExpireCondition::IfEarlier => vash_core::ExpireGuard::IfEarlier,
+                },
+            }
         }
 
-        Command::Incr { key, delta } => execute_incr(state, key, *delta, out),
+        // `IfVolatile` is what makes this answer 0 for a key with no deadline to
+        // clear, which is Redis's contract.
+        Command::Persist { key } => Domain::Expire {
+            key: key_of(key)?,
+            ttl: vash_core::TtlChange::Set(0),
+            guard: vash_core::ExpireGuard::IfVolatile,
+        },
 
-        Command::IncrEx(op) => execute_increx(state, op, *version, out),
-    }
+        Command::Incr { key, delta } => {
+            Domain::Arithmetic(vash_core::Arithmetic::redis(key_of(key)?, delta_of(*delta)))
+        }
+
+        Command::IncrEx(op) => Domain::Arithmetic(translate_increx(op)?),
+
+        // Answered before translation is reached.
+        Command::Quit | Command::Auth(_) | Command::Hello { .. } => {
+            error!("a connection command reached the storage boundary");
+            return Err(Failure::internal());
+        }
+    })
 }
 
 /// `TTL` on a key that is not there.
 const TTL_MISSING: i64 = -2;
 /// `TTL` on a key with no expiry.
 const TTL_PERSISTENT: i64 = -1;
-
-fn execute_set(
-    state: &ServerState,
-    set: &vash_proto::resp::command::Set<'_>,
-    version: Version,
-    out: &mut Vec<u8>,
-) -> Answered {
-    // One store call, whatever options were given. `KEEPTTL` and `GET` both used
-    // to read first and then write against what they read, which is a race in
-    // two directions: another client changing the deadline in between had it
-    // overwritten with the older one, and `GET` could report a value this write
-    // did not actually displace. Both are now settled inside the writer's
-    // transaction, off the same lookup an overwrite performs anyway.
-    let written = state.store.store(&vash_core::Set {
-        key: key_of(set.key)?,
-        value: set.value,
-        ttl: ttl_change_for(set.expiry, INVALID_EXPIRE_SET)?,
-        mc_flags: 0,
-        tags: Vec::new(),
-        mode: match set.condition {
-            Condition::Always => SetMode::Set,
-            Condition::IfAbsent => SetMode::Add,
-            Condition::IfPresent => SetMode::Replace,
-        },
-        return_previous: set.return_previous,
-    })?;
-    state.metrics.write();
-
-    if set.return_previous {
-        // With `GET` the client is told what was there, and never whether the
-        // write applied — that is Redis's contract, not an omission.
-        match written.previous {
-            Some(value) => encode::bulk(out, &value.data),
-            None => encode::null(out, version),
-        }
-    } else if matches!(written.outcome, Stored::Stored(_)) {
-        encode::ok(out);
-    } else {
-        encode::null(out, version);
-    }
-    Ok(())
-}
 
 /// Translates a Redis expiry option into the store's lifetime vocabulary.
 ///
@@ -602,177 +719,6 @@ fn ttl_change_for(
     })
 }
 
-fn execute_msetex(
-    state: &ServerState,
-    pairs: &[(&[u8], &[u8])],
-    condition: Condition,
-    expiry: Expiry,
-    out: &mut Vec<u8>,
-) -> Answered {
-    let keys = keys_of(pairs.iter().map(|(key, _)| *key))?;
-
-    // Resolved once for the whole batch, so every key in it is stamped against
-    // one instant. `KEEPTTL` needs no read at all now — it is carried into the
-    // writer as `TtlChange::Keep` and settled per record there.
-    let ttl = ttl_change_for(expiry, INVALID_EXPIRE_MSETEX)?;
-    let sets: Vec<vash_core::Set<'_>> = keys
-        .iter()
-        .zip(pairs)
-        .map(|(key, (_, value))| vash_core::Set::with_ttl(*key, value, ttl))
-        .collect();
-
-    let applied = state.store.set_many_if(
-        &sets,
-        match condition {
-            Condition::Always => vash_core::BatchGuard::Always,
-            Condition::IfAbsent => vash_core::BatchGuard::IfAllAbsent,
-            Condition::IfPresent => vash_core::BatchGuard::IfAllPresent,
-        },
-    )?;
-
-    if applied {
-        state.metrics.write();
-    } else {
-        state.metrics.other();
-    }
-    encode::integer(out, i64::from(applied));
-    Ok(())
-}
-
-fn execute_expire(
-    state: &ServerState,
-    key: &[u8],
-    expiry: Expiry,
-    condition: ExpireCondition,
-    out: &mut Vec<u8>,
-) -> Answered {
-    // The guard travels to the writer rather than being decided here: a
-    // `GT`/`LT` comparison judged against a deadline read a moment earlier can
-    // be judged against one that has since moved. Deleting an already-past
-    // deadline is the store's job too, for the same reason.
-    let now = now_ms() as i64;
-    let deadline = match expiry {
-        Expiry::After(millis) => now.saturating_add(millis),
-        Expiry::At(millis) => millis,
-        // The parser only produces the two relative forms for `EXPIRE`.
-        Expiry::Unset | Expiry::Keep | Expiry::Persist => now,
-    };
-
-    let applied = state.store.expire(
-        key_of(key)?,
-        vash_core::TtlChange::Set(ttl_from_deadline(deadline)),
-        match condition {
-            ExpireCondition::Always => vash_core::ExpireGuard::Always,
-            ExpireCondition::IfPersistent => vash_core::ExpireGuard::IfPersistent,
-            ExpireCondition::IfVolatile => vash_core::ExpireGuard::IfVolatile,
-            ExpireCondition::IfLater => vash_core::ExpireGuard::IfLater,
-            ExpireCondition::IfEarlier => vash_core::ExpireGuard::IfEarlier,
-        },
-    )?;
-    state.metrics.write();
-    answer_bool(out, applied)
-}
-
-/// `INCR`, `INCRBY`, `DECR`, `DECRBY` and `INCRBYFLOAT`.
-///
-/// No `Version` argument, unlike `INCREX`: `INCRBYFLOAT` answers with a bulk
-/// string in RESP3 as well as RESP2, so nothing here depends on the dialect.
-///
-/// One store call, and it is a write. There is no read first — the deadline is
-/// kept by [`TtlChange::Keep`] rather than by being read out and written back,
-/// and the current value never leaves the writer's transaction. `INCR` keeps the
-/// key's lifetime because it alters the value in place rather than replacing it,
-/// which is the distinction `EXPIRE` documents.
-fn execute_incr(state: &ServerState, key: &[u8], delta: Number, out: &mut Vec<u8>) -> Answered {
-    let op = vash_core::Arithmetic::redis(key_of(key)?, delta_of(delta));
-    let applied = created(state.store.arithmetic(&op)?)?;
-    state.metrics.write();
-
-    match number_of(applied.value)? {
-        Number::Int(value) => encode::integer(out, value),
-        Number::Float(value) => encode::bulk(out, encode::format_float(value).as_bytes()),
-    }
-    Ok(())
-}
-
-/// `INCREX`: arithmetic, bounds and an expiry in one atomic step.
-///
-/// Everything about *how the number moves* — the bounds, the saturation, which
-/// bound an overflow clamps to — now lives in `vash_core::arith`, shared with
-/// every other arithmetic command and evaluated inside the writer's transaction.
-/// What is left here is the translation from Redis's option set into that
-/// vocabulary.
-fn execute_increx(
-    state: &ServerState,
-    op: &IncrEx<'_>,
-    version: Version,
-    out: &mut Vec<u8>,
-) -> Answered {
-    let delta = match op.delta {
-        Number::Int(delta) => vash_core::Delta::Int {
-            delta,
-            lower: bound_int(op.lower, i64::MIN)?,
-            upper: bound_int(op.upper, i64::MAX)?,
-        },
-        Number::Float(delta) => vash_core::Delta::Float {
-            delta,
-            lower: bound_float(op.lower, -f64::MAX),
-            upper: bound_float(op.upper, f64::MAX),
-        },
-    };
-
-    // No deadline is read to decide this, which is what removes the read that
-    // used to precede the write: `Keep` preserves the record's lifetime by not
-    // touching it, and `SetIfPersistent` is `ENX` decided at the record.
-    let ttl = match op.expiry {
-        // No expiry option: the lifetime is left alone.
-        None => vash_core::TtlChange::Keep,
-        // Ahead of the `ENX` arm below, because `PERSIST` applies either way.
-        Some(Expiry::Persist) => vash_core::TtlChange::Set(0),
-        // Neither is an `INCREX` option, so the parser cannot produce them;
-        // both would mean "leave the lifetime alone" if one ever arrived.
-        Some(Expiry::Unset | Expiry::Keep) => vash_core::TtlChange::Keep,
-        Some(expiry) => {
-            // `Expiry::Keep` is handled above, so no current deadline is needed
-            // to resolve what remains.
-            let ttl_secs = ttl_for(expiry, now_ms() as i64, None, INVALID_EXPIRE_INCREX)?;
-            if op.only_if_persistent {
-                vash_core::TtlChange::SetIfPersistent(ttl_secs)
-            } else {
-                vash_core::TtlChange::Set(ttl_secs)
-            }
-        }
-    };
-
-    let applied = created(state.store.arithmetic(&vash_core::Arithmetic {
-        key: key_of(op.key)?,
-        delta,
-        // Out of bounds without `SATURATE` skips the write and reports a zero
-        // increment, rather than failing as the unbounded commands do.
-        on_bound: if op.saturate {
-            vash_core::OnBound::Clamp
-        } else {
-            vash_core::OnBound::Skip
-        },
-        missing: vash_core::Missing::CreateAtZero,
-        ttl,
-    })?)?;
-
-    // A skipped `INCREX` left the key and its lifetime exactly as they were, so
-    // it is not counted as a write.
-    if applied.wrote {
-        state.metrics.write();
-    } else {
-        state.metrics.other();
-    }
-    answer_increx(
-        out,
-        number_of(applied.value)?,
-        number_of(applied.applied)?,
-        version,
-    )
-}
-
 /// Converts a parsed Redis delta into the domain's arithmetic.
 ///
 /// The unbounded commands pass the limits of their own type, which is what turns
@@ -793,29 +739,9 @@ fn number_of(value: vash_core::Number) -> Result<Number, Failure> {
         // builds one.
         vash_core::Number::Counter(value) => {
             error!(value, "a Redis command produced a memcached counter");
-            Err(Failure {
-                code: "ERR",
-                message: "internal error",
-                class: ErrorClass::Internal,
-            })
+            Err(Failure::internal())
         }
     }
-}
-
-/// Unwraps the outcome of a Redis arithmetic command.
-///
-/// Every one of them creates the key it did not find, so the miss a memcached
-/// counter reports cannot arise here. Answering rather than unwrapping keeps a
-/// logic slip off the request path.
-fn created(applied: Option<vash_core::Applied>) -> Result<vash_core::Applied, Failure> {
-    applied.ok_or_else(|| {
-        error!("a Redis arithmetic command reported a miss it cannot produce");
-        Failure {
-            code: "ERR",
-            message: "internal error",
-            class: ErrorClass::Internal,
-        }
-    })
 }
 
 /// `INCREX` answers with the new value and the increment actually applied, so
@@ -837,6 +763,67 @@ fn answer_increx(out: &mut Vec<u8>, value: Number, applied: Number, version: Ver
 // `vash_core::arith`'s, because they have to happen where the arithmetic does —
 // inside the writer's transaction — for the update not to be lost.
 
+/// `INCREX`: arithmetic, bounds and an expiry in one operation.
+///
+/// Everything about *how the number moves* — the bounds, the saturation, which
+/// bound an overflow clamps to — belongs to `vash_core::arith` and is evaluated
+/// inside the writer's transaction. What is left here is the translation from
+/// Redis's option set into that vocabulary.
+fn translate_increx<'a>(op: &IncrEx<'a>) -> Result<vash_core::Arithmetic<'a>, Failure> {
+    let delta = match op.delta {
+        Number::Int(delta) => vash_core::Delta::Int {
+            delta,
+            lower: bound_int(op.lower, i64::MIN)?,
+            upper: bound_int(op.upper, i64::MAX)?,
+        },
+        Number::Float(delta) => vash_core::Delta::Float {
+            delta,
+            lower: bound_float(op.lower, -f64::MAX),
+            upper: bound_float(op.upper, f64::MAX),
+        },
+    };
+
+    // No deadline is read to decide this: `Keep` preserves the record's lifetime
+    // by not touching it, and `SetIfPersistent` is `ENX` decided at the record.
+    let ttl = match op.expiry {
+        // No expiry option: the lifetime is left alone.
+        None => vash_core::TtlChange::Keep,
+        // Ahead of the `ENX` arm below, because `PERSIST` applies either way.
+        Some(Expiry::Persist) => vash_core::TtlChange::Set(0),
+        // Neither is an `INCREX` option, so the parser cannot produce them; both
+        // would mean "leave the lifetime alone" if one ever arrived.
+        Some(Expiry::Unset | Expiry::Keep) => vash_core::TtlChange::Keep,
+        Some(expiry) => {
+            let vash_core::TtlChange::Set(ttl_secs) =
+                ttl_change_for(expiry, INVALID_EXPIRE_INCREX)?
+            else {
+                // `Keep` is handled above, so what remains always resolves to a
+                // deadline.
+                return Err(Failure::internal());
+            };
+            if op.only_if_persistent {
+                vash_core::TtlChange::SetIfPersistent(ttl_secs)
+            } else {
+                vash_core::TtlChange::Set(ttl_secs)
+            }
+        }
+    };
+
+    Ok(vash_core::Arithmetic {
+        key: key_of(op.key)?,
+        delta,
+        // Out of bounds without `SATURATE` skips the write and reports a zero
+        // increment, rather than failing as the unbounded commands do.
+        on_bound: if op.saturate {
+            vash_core::OnBound::Clamp
+        } else {
+            vash_core::OnBound::Skip
+        },
+        missing: vash_core::Missing::CreateAtZero,
+        ttl,
+    })
+}
+
 fn bound_int(bound: Option<Number>, default: i64) -> Result<i64, Failure> {
     match bound {
         None => Ok(default),
@@ -855,10 +842,9 @@ fn bound_float(bound: Option<Number>, default: f64) -> f64 {
     }
 }
 
-fn answer_bool(out: &mut Vec<u8>, applied: bool) -> Answered {
-    encode::integer(out, i64::from(applied));
-    Ok(())
-}
+// `answer_bool`, `keep_ttl` and `ttl_for` lived here and are gone. The first
+// was a one-line encoder the reply renderer now covers; the other two existed to
+// reconstruct a deadline that the store keeps by not touching it.
 
 fn key_of(bytes: &[u8]) -> Result<Key<'_>, Failure> {
     Key::new(bytes).map_err(Failure::from)
@@ -870,48 +856,6 @@ fn keys_of<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Result<Vec<Key<'a>>,
 
 fn now_ms() -> u64 {
     vash_core::Clock::new().now_ms()
-}
-
-/// The `ttl_secs` that reproduces a key's current deadline, for the commands
-/// that must not disturb it.
-///
-/// Takes the deadline rather than the value: `KEEPTTL` never looks at what is
-/// stored, only at when it goes away.
-fn keep_ttl(deadline: Option<u64>) -> u32 {
-    match deadline.unwrap_or(vash_core::NEVER) {
-        vash_core::NEVER => 0,
-        at => ttl_from_deadline(at as i64),
-    }
-}
-
-/// The `ttl_secs` an expiry option asks for, against the key's current
-/// deadline.
-///
-/// One definition for `SET`, `MSETEX` and `INCREX`, which offer the same option
-/// set and each used to spell this out again.
-///
-/// `now` is a parameter rather than read here so that a batch stamps every key
-/// in it against one instant, and `invalid_expire` is the command's own name in
-/// Redis's wording for the single case this refuses.
-fn ttl_for(
-    expiry: Expiry,
-    now: i64,
-    deadline: Option<u64>,
-    invalid_expire: &'static str,
-) -> Result<u32, Failure> {
-    Ok(match expiry {
-        // Redis discards any existing TTL on a plain `SET`.
-        Expiry::Unset | Expiry::Persist => 0,
-        // Checked, not saturating: `PX 9223372036854775807` overflows this, and
-        // Redis refuses a deadline it cannot represent rather than silently
-        // storing a different one.
-        Expiry::After(millis) => ttl_from_deadline(
-            now.checked_add(millis)
-                .ok_or_else(|| Failure::client(invalid_expire))?,
-        ),
-        Expiry::At(millis) => ttl_from_deadline(millis),
-        Expiry::Keep => keep_ttl(deadline),
-    })
 }
 
 /// Converts an absolute deadline in unix milliseconds into the `ttl_secs` the

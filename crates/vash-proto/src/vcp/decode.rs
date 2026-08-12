@@ -363,7 +363,11 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
             for _ in 0..count {
                 sets.push(decode_set(&mut cursor).map_err(|(s, d)| fail(s, d))?);
             }
-            Command::SetMany(sets)
+            // VCP has no batch guard; `MSETEX NX/XX` is Redis's alone.
+            Command::SetMany {
+                sets,
+                guard: vash_core::BatchGuard::Always,
+            }
         }
 
         // The whole body is the tag name.
