@@ -11,7 +11,10 @@
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use vash_core::{ServerInfo, Value};
+// Re-exported rather than merely imported: every one of these appears in this
+// crate's public signatures, so a caller that cannot name them cannot use it
+// without depending on `vash-core` directly.
+pub use vash_core::{ListEntry, Listing, ServerInfo, Value};
 use vash_proto::vcp::{
     FrameLen, HEADER_LEN, Opcode, Status, encode_request, encode_set_body, peek_frame_len,
 };

@@ -38,6 +38,12 @@ struct Cli {
     #[arg(long)]
     enable_flush: bool,
 
+    /// Allow `LIST_KEYS` / `LIST_TAGS`, which page through the keyspace and the
+    /// tag registry for any client that can reach the port. Off unless asked
+    /// for.
+    #[arg(long)]
+    enable_listing: bool,
+
     /// Address of another node's cache port, to forward tag invalidations to.
     /// Repeatable. Replaces the config file's peer list rather than adding to
     /// it, so the flag always describes the whole cluster.
@@ -94,6 +100,9 @@ fn main() -> anyhow::Result<()> {
     }
     if cli.enable_flush {
         config.protocol.flush_enabled = true;
+    }
+    if cli.enable_listing {
+        config.protocol.listing_enabled = true;
     }
     if let Some(path) = cli.auth_file {
         config.auth.file = path;

@@ -4,8 +4,46 @@
 //! cargo run --bin vash-server -- --listen 127.0.0.1:11311 --data ./data --ephemeral
 //! cargo run -p vash-client --example smoke -- 127.0.0.1:11311
 //! ```
+//!
+//! Add `--enable-listing` to the server to exercise `LIST_KEYS`/`LIST_TAGS`;
+//! without it they are refused, and this prints that rather than failing.
 
-use vash_client::Client;
+use vash_client::{Client, ListEntry};
+
+/// Pages a listing to exhaustion, which is the loop every caller has to write.
+///
+/// The whole protocol is here: start with an empty cursor, echo back the one
+/// each page carries, and stop when a page carries none. The cursor is opaque —
+/// never parse one, never build one.
+async fn page_all(
+    client: &mut Client,
+    keys: bool,
+    limit: u32,
+    pattern: &[u8],
+) -> Result<Vec<ListEntry>, Box<dyn std::error::Error>> {
+    let mut all = Vec::new();
+    let mut cursor: Vec<u8> = Vec::new();
+
+    loop {
+        let page = if keys {
+            client.list_keys(limit, &cursor, pattern).await?
+        } else {
+            client.list_tags(limit, &cursor, pattern).await?
+        };
+        if page.truncated {
+            // The page stopped on the server's scan budget rather than on the
+            // limit. Paging is unaffected — the cursor still advanced — but it
+            // is the sign of a pattern that is not selective.
+            println!("           (page truncated after {} scanned)", page.scanned);
+        }
+        all.extend(page.entries);
+
+        match page.cursor {
+            Some(next) => cursor = next.to_vec(),
+            None => return Ok(all),
+        }
+    }
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -85,6 +123,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.get(b"smoke:t2").await?.is_some(),
         client.get(b"smoke:plain").await?.is_some()
     );
+    // Listing is administrative and off unless the server was started with
+    // `--enable-listing`, so the capability bit decides whether to try at all —
+    // which is what the bit is for. Probing and reading back `UNAUTHORIZED`
+    // would work too, but a client cannot tell that from a build too old to
+    // know the opcode.
+    let capabilities = client.server_info().capabilities;
+    if capabilities & vash_core::capability::LISTING == 0 {
+        println!("listing -> disabled on this server (start it with --enable-listing)");
+    } else {
+        // A page size of one so the paging loop actually runs more than once
+        // against a handful of smoke keys. Real callers should ask for more.
+        let keys = page_all(&mut client, true, 1, b"smoke:*").await?;
+        println!(
+            "list    -> {} live key(s) matching smoke:* \
+             (t1 and t2 are gone: a listing applies the same liveness check as GET)",
+            keys.len()
+        );
+        for entry in &keys {
+            // The version is the record's CAS token, so two listings taken
+            // apart can be diffed to see which records were rewritten.
+            println!(
+                "           {} (cas {})",
+                String::from_utf8_lossy(&entry.name),
+                entry.version
+            );
+        }
+
+        let tags = page_all(&mut client, false, 1, b"").await?;
+        println!("tags    -> {} registered", tags.len());
+        for entry in &tags {
+            // Generation 0 means registered but never invalidated. `demo` was
+            // invalidated above, so it is ahead of `other`.
+            println!(
+                "           {} (generation {})",
+                String::from_utf8_lossy(&entry.name),
+                entry.version
+            );
+        }
+    }
     client.delete(b"smoke:plain").await?;
 
     let cas = client.set(b"smoke:ttl", b"expires", 1).await?;
