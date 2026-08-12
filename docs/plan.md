@@ -44,7 +44,7 @@ Kept deliberately small. Every dependency on the request path must earn its plac
 |---|---|---|
 | Storage | `heed` (LMDB) | The maintained Rust LMDB wrapper (Meilisearch's). Safe txn lifetimes, `NoTls` support, typed databases. `lmdb-rkv` is unmaintained. |
 | Async runtime | `tokio` (multi-thread) | Only mature option. Used for **network I/O only** — see §9. |
-| Sockets | `socket2` | Needed for `SO_REUSEPORT`, `TCP_NODELAY`, backlog tuning. |
+| Sockets | ~~`socket2`~~ **not adopted** | Was for `SO_REUSEPORT`, `TCP_NODELAY` and backlog tuning. `TCP_NODELAY` turned out to be on `tokio::net::TcpStream` already, and the other two answer a problem this workload does not have — see §9. |
 | Buffers | `bytes` | `BytesMut` read buffers, `Bytes` for refcounted response slices, vectored writes. |
 | Channels | `crossbeam-channel` (net→store), `oneshot` from tokio (store→net) | Bounded MPMC, ~100 ns/hop, supports `try_recv` draining — which is what group commit is built on. |
 | Byte scanning | `memchr` | SIMD `\r\n` and space scanning in the memcached text parser. |
@@ -128,12 +128,19 @@ Fixed 12-byte header, little-endian, so it decodes as a single `zerocopy` cast:
 - `flags`: bit 0 `RESPONSE`, bit 1 `NOREPLY` (fire-and-forget writes), bit 2 `RESERVED_COMPRESSED`.
 
 **Opcodes:** `HELLO 0x01`, `PING 0x02`, `AUTH 0x03`, `STATS 0x04`, `CLUSTER 0x05`, `GET 0x10`,
-`SET 0x11`, `DELETE 0x12`, `TOUCH 0x13`, `GET_MANY 0x20`, `SET_MANY 0x21`, `DELETE_MANY 0x22`,
+`SET 0x11`, `DELETE 0x12`, `TOUCH 0x13`, `ARITHMETIC 0x14`, `GET_MANY 0x20`, `SET_MANY 0x21`, `DELETE_MANY 0x22`,
 `DELETE_BY_TAG 0x30`, `FLUSH 0x31`, `TAG_SYNC 0x40`, `LIST_KEYS 0x50`, `LIST_TAGS 0x51`.
 
 `TAG_SYNC` was added in M5 for peer-to-peer traffic (§10). Peers speak the ordinary protocol on
 the ordinary port — a peer is just another VCP client — which meant no second listener, no second
 codec and no second thing to fuzz.
+
+`ARITHMETIC 0x14` was added in M10. It joins the single-key group because that
+is what it is, and it exists because the compatibility dialects had atomic
+counters from the start and the native one did not — so a first-party client had
+to speak memcached or Redis to increment a number. The primitive underneath it is
+shared with both (`vash_core::arith`), so the three dialects agree by
+construction.
 
 `LIST_KEYS 0x50` and `LIST_TAGS 0x51` were added in M8. They open a new group
 rather than extending `0x3x`, whose members are whole-keyspace *mutations*. Both are administrative:
@@ -575,6 +582,23 @@ reads fail with `MDB_READERS_FULL` under load. Startup refuses a config where it
    had quietly filled up. The genuine cause was one line of environment setup, and the only reason it
    was found is that `examples/txn_bench` measured the transaction and the lookup separately instead
    of measuring "a read".
+
+**`SO_REUSEPORT` was not adopted, and the decision is recorded rather than
+measured (M10).** The plan proposed several accept loops on one port, each with
+its own listener socket, so the kernel spreads incoming connections across them.
+What that buys is *accept* throughput, and accept is not on this server's hot
+path: a cache client library opens a pooled connection and keeps it, so a busy
+node accepts a handful of connections a minute and serves millions of requests a
+second over them. Sharding the accept loop would divide a number that is already
+near zero.
+
+It stops being the right call for a workload with connection churn — short-lived
+clients, a proxy that does not pool, or a serverless caller that reconnects per
+request. The tell is `vash_connections_total` climbing at a rate comparable to
+`vash_commands_total`; today it is orders of magnitude below it. Recording this
+rather than measuring it is deliberate: measuring would mean building the sharded
+listener first, and the number that would justify building it is one the existing
+connection counter already reports.
 
 Requests are also handed over **in batches rather than one at a time**: whatever complete frames a
 single read produced cross to the storage tier together. Pipelining is what makes that worth having,

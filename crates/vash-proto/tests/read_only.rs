@@ -55,6 +55,7 @@ fn command_for(opcode: Opcode) -> Option<Command<'static>> {
             key: key(),
             ttl_secs: 1,
         },
+        Opcode::Arithmetic => Command::Arithmetic(vash_core::Arithmetic::counter(key(), 1, false)),
         Opcode::DeleteByTag => Command::DeleteByTag { tag: b"t" },
         Opcode::Flush => Command::Flush,
         Opcode::TagSync => Command::TagSync {
@@ -80,6 +81,7 @@ const EVERY_OPCODE: &[Opcode] = &[
     Opcode::Set,
     Opcode::Delete,
     Opcode::Touch,
+    Opcode::Arithmetic,
     Opcode::GetMany,
     Opcode::SetMany,
     Opcode::DeleteMany,

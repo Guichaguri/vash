@@ -94,6 +94,14 @@ pub const SET_BODY_HEADER_LEN: usize = 12;
 pub const HELLO_BODY_LEN: usize = 4;
 /// `ttl_secs u32` ahead of the key in a `TOUCH` body.
 pub const TOUCH_PREFIX_LEN: usize = 4;
+/// Fixed part of an `ARITHMETIC` body, ahead of the key.
+///
+/// `mode u8 | flags u8 | on_bound u8 | ttl_kind u8 | ttl_secs u32 | delta u64 |
+/// lower u64 | upper u64`. The three eight-byte numbers are reinterpreted by
+/// `mode`, which is what lets one fixed layout carry an unsigned counter, a
+/// signed integer and a float without a variable-length encoding on the hot
+/// path.
+pub const ARITHMETIC_PREFIX_LEN: usize = 32;
 /// `kind u8 | reserved u8 * 3 | count u32` ahead of a `TAG_SYNC` entry list.
 pub const TAG_SYNC_HEADER_LEN: usize = 8;
 /// `limit u32 | cursor_len u16 | pattern_len u16 | reserved u32` ahead of a
@@ -119,6 +127,10 @@ impl<'a> Cursor<'a> {
         let slice = self.buf.get(self.pos..end)?;
         self.pos = end;
         Some(slice)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
     }
 
     fn u16(&mut self) -> Option<u16> {
@@ -333,6 +345,11 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
         Opcode::Set => {
             let mut cursor = Cursor::new(body);
             Command::Set(decode_set(&mut cursor).map_err(|(s, d)| fail(s, d))?)
+        }
+
+        Opcode::Arithmetic => {
+            let mut cursor = Cursor::new(body);
+            Command::Arithmetic(decode_arithmetic(&mut cursor).map_err(|(s, d)| fail(s, d))?)
         }
 
         Opcode::Touch => {
@@ -915,4 +932,91 @@ mod tests {
         let buf = frame(Opcode::Set, 1, &body);
         assert!(matches!(decode(&buf), Err(DecodeError::Body { .. })));
     }
+}
+
+/// Reads an `ARITHMETIC` body.
+///
+/// Every field is validated against the enum it names rather than defaulted: a
+/// mode byte nobody recognises might mean the three numbers below it are to be
+/// read as something else entirely, and guessing would apply an operation the
+/// client did not ask for. Refusing is the only safe reading.
+fn decode_arithmetic<'a>(
+    c: &mut Cursor<'a>,
+) -> Result<vash_core::Arithmetic<'a>, (Status, &'static str)> {
+    use vash_core::{Delta, Missing, OnBound, TtlChange};
+
+    let short = (Status::BadRequest, "arithmetic body is too short");
+    let mode = c.u8().ok_or(short)?;
+    let flags = c.u8().ok_or(short)?;
+    let on_bound = c.u8().ok_or(short)?;
+    let ttl_kind = c.u8().ok_or(short)?;
+    let ttl_secs = c.u32().ok_or(short)?;
+    let delta = c.u64().ok_or(short)?;
+    let lower = c.u64().ok_or(short)?;
+    let upper = c.u64().ok_or(short)?;
+
+    let delta = match mode {
+        arithmetic_mode::COUNTER => Delta::Counter {
+            delta,
+            decrement: flags & arithmetic_flags::DECREMENT != 0,
+        },
+        arithmetic_mode::INT => Delta::Int {
+            delta: delta as i64,
+            lower: lower as i64,
+            upper: upper as i64,
+        },
+        arithmetic_mode::FLOAT => Delta::Float {
+            delta: f64::from_bits(delta),
+            lower: f64::from_bits(lower),
+            upper: f64::from_bits(upper),
+        },
+        _ => return Err((Status::BadRequest, "unknown arithmetic mode")),
+    };
+
+    let on_bound = match on_bound {
+        0 => OnBound::Fail,
+        1 => OnBound::Skip,
+        2 => OnBound::Clamp,
+        _ => return Err((Status::BadRequest, "unknown arithmetic bound policy")),
+    };
+
+    let ttl = match ttl_kind {
+        0 => TtlChange::Keep,
+        1 => TtlChange::Set(ttl_secs),
+        2 => TtlChange::SetIfPersistent(ttl_secs),
+        _ => return Err((Status::BadRequest, "unknown arithmetic ttl policy")),
+    };
+
+    Ok(vash_core::Arithmetic {
+        key: decode_key(c.rest())?,
+        delta,
+        on_bound,
+        missing: if flags & arithmetic_flags::CREATE_AT_ZERO != 0 {
+            Missing::CreateAtZero
+        } else {
+            Missing::Fail
+        },
+        ttl,
+    })
+}
+
+/// `mode` values in an `ARITHMETIC` body. The numeric domain, which also decides
+/// how `delta`, `lower` and `upper` are reinterpreted.
+pub mod arithmetic_mode {
+    /// Unsigned, wrapping on increment and flooring at zero on decrement —
+    /// memcached's counter. `lower` and `upper` are ignored.
+    pub const COUNTER: u8 = 0;
+    /// Signed, with `lower` and `upper` as `i64` bounds.
+    pub const INT: u8 = 1;
+    /// `f64` throughout, transmitted as IEEE-754 bits.
+    pub const FLOAT: u8 = 2;
+}
+
+/// `flags` bits in an `ARITHMETIC` body.
+pub mod arithmetic_flags {
+    /// Treat an absent key as holding zero and create it.
+    pub const CREATE_AT_ZERO: u8 = 1 << 0;
+    /// Subtract rather than add. Counter mode only; the signed and float modes
+    /// carry the sign in `delta`.
+    pub const DECREMENT: u8 = 1 << 1;
 }

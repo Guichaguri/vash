@@ -93,6 +93,13 @@ pub enum Opcode {
     Set = 0x11,
     Delete = 0x12,
     Touch = 0x13,
+    /// Atomic read-modify-write on a counter.
+    ///
+    /// In the single-key group because that is what it is. The compatibility
+    /// dialects had this from the start and the native one did not, which meant
+    /// a first-party client had to fall back to memcached or Redis to increment
+    /// a counter — exactly the wrong way round.
+    Arithmetic = 0x14,
 
     GetMany = 0x20,
     SetMany = 0x21,
@@ -151,6 +158,7 @@ impl Opcode {
             0x11 => Self::Set,
             0x12 => Self::Delete,
             0x13 => Self::Touch,
+            0x14 => Self::Arithmetic,
             0x20 => Self::GetMany,
             0x21 => Self::SetMany,
             0x22 => Self::DeleteMany,

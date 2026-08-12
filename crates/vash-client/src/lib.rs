@@ -237,6 +237,51 @@ impl Client {
         }
     }
 
+    /// Applies an atomic read-modify-write to a counter.
+    ///
+    /// One round trip and one storage operation: the read and the write happen
+    /// inside the shard writer's transaction, so concurrent callers cannot lose
+    /// an update. Returns where the counter ended up and how far it moved, or
+    /// `None` when the key was absent and `op.missing` does not create one.
+    ///
+    /// The reply echoes its own numeric mode, so it decodes without the caller
+    /// having to remember what it asked for — which matters because VCP
+    /// responses may arrive out of order.
+    pub async fn arithmetic(
+        &mut self,
+        op: &vash_core::Arithmetic<'_>,
+    ) -> Result<Option<vash_core::Applied>> {
+        let mut body = Vec::with_capacity(32 + op.key.len());
+        vash_proto::vcp::encode_arithmetic_body(&mut body, op);
+
+        let (status, payload) = self.round_trip(Opcode::Arithmetic, &body).await?;
+        match status {
+            Status::NotFound => return Ok(None),
+            Status::Ok => {}
+            other => return Err(ClientError::Status(other)),
+        }
+        if payload.len() < vash_proto::vcp::ARITHMETIC_RESPONSE_LEN {
+            return Err(ClientError::Protocol("arithmetic response is too short"));
+        }
+
+        let raw_value = u64::from_le_bytes(payload[4..12].try_into().expect("eight bytes"));
+        let raw_applied = u64::from_le_bytes(payload[12..20].try_into().expect("eight bytes"));
+        let number = |bits: u64| match payload[0] {
+            vash_proto::vcp::arithmetic_mode::COUNTER => Some(vash_core::Number::Counter(bits)),
+            vash_proto::vcp::arithmetic_mode::INT => Some(vash_core::Number::Int(bits as i64)),
+            vash_proto::vcp::arithmetic_mode::FLOAT => {
+                Some(vash_core::Number::Float(f64::from_bits(bits)))
+            }
+            _ => None,
+        };
+
+        Ok(Some(vash_core::Applied {
+            value: number(raw_value).ok_or(ClientError::Protocol("unknown arithmetic mode"))?,
+            applied: number(raw_applied).ok_or(ClientError::Protocol("unknown arithmetic mode"))?,
+            wrote: payload[1] != 0,
+        }))
+    }
+
     /// Invalidates every record carrying `tag`.
     ///
     /// Constant time on the server regardless of how many keys are affected.

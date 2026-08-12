@@ -595,7 +595,7 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
         Command::Set(set) => Domain::Set(vash_core::Set {
             key: key_of(set.key)?,
             value: set.value,
-            ttl: ttl_change_for(set.expiry, INVALID_EXPIRE_SET)?,
+            ttl: ttl_change_for(set.expiry, now_ms() as i64, INVALID_EXPIRE_SET)?,
             mc_flags: 0,
             tags: Vec::new(),
             mode: match set.condition {
@@ -621,7 +621,7 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
         } => {
             // Resolved once for the whole batch, so every key in it is stamped
             // against one instant.
-            let ttl = ttl_change_for(*expiry, INVALID_EXPIRE_MSETEX)?;
+            let ttl = ttl_change_for(*expiry, now_ms() as i64, INVALID_EXPIRE_MSETEX)?;
             Domain::SetMany {
                 sets: pairs
                     .iter()
@@ -654,7 +654,7 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
             };
             Domain::Expire {
                 key: key_of(key)?,
-                ttl: vash_core::TtlChange::Set(ttl_from_deadline(deadline)),
+                ttl: vash_core::TtlChange::Set(ttl_from_deadline(deadline, now)),
                 guard: match condition {
                     ExpireCondition::Always => vash_core::ExpireGuard::Always,
                     ExpireCondition::IfPersistent => vash_core::ExpireGuard::IfPersistent,
@@ -702,6 +702,7 @@ const TTL_PERSISTENT: i64 = -1;
 /// [`TtlChange`]: vash_core::TtlChange
 fn ttl_change_for(
     expiry: Expiry,
+    now: i64,
     invalid_expire: &'static str,
 ) -> Result<vash_core::TtlChange, Failure> {
     use vash_core::TtlChange;
@@ -713,11 +714,11 @@ fn ttl_change_for(
         // Redis refuses a deadline it cannot represent rather than silently
         // storing a different one.
         Expiry::After(millis) => TtlChange::Set(ttl_from_deadline(
-            (now_ms() as i64)
-                .checked_add(millis)
+            now.checked_add(millis)
                 .ok_or_else(|| Failure::client(invalid_expire))?,
+            now,
         )),
-        Expiry::At(millis) => TtlChange::Set(ttl_from_deadline(millis)),
+        Expiry::At(millis) => TtlChange::Set(ttl_from_deadline(millis, now)),
     })
 }
 
@@ -797,7 +798,7 @@ fn translate_increx<'a>(op: &IncrEx<'a>) -> Result<vash_core::Arithmetic<'a>, Fa
         Some(Expiry::Unset | Expiry::Keep) => vash_core::TtlChange::Keep,
         Some(expiry) => {
             let vash_core::TtlChange::Set(ttl_secs) =
-                ttl_change_for(expiry, INVALID_EXPIRE_INCREX)?
+                ttl_change_for(expiry, now_ms() as i64, INVALID_EXPIRE_INCREX)?
             else {
                 // `Keep` is handled above, so what remains always resolves to a
                 // deadline.
@@ -875,8 +876,14 @@ fn now_ms() -> u64 {
 /// then pushed forward if rounding landed at or before now, because a key that
 /// vanishes the instant it is written is a worse failure than one that lingers
 /// for under a second. `PX 100` therefore buys up to a full second.
-fn ttl_from_deadline(deadline_ms: i64) -> u32 {
-    let now = now_ms() as i64;
+///
+/// `now` is a parameter rather than read here, and that is load-bearing rather
+/// than tidiness: this used to read the clock itself while its callers had
+/// already read one to compute the deadline they passed in. Two reads that
+/// straddle a millisecond make the deadline and the "is it in the past" test
+/// disagree by one, which turns a `PX 1` into an already-expired key about once
+/// in a thousand. One instant per command, threaded.
+fn ttl_from_deadline(deadline_ms: i64, now: i64) -> u32 {
     if deadline_ms <= now {
         return vash_core::clock::TTL_ALREADY_EXPIRED;
     }

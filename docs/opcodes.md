@@ -388,6 +388,68 @@ live → `NOT_FOUND`, and nothing is written.
 
 ---
 
+### `ARITHMETIC` (0x14)
+
+**Body** — a fixed 32-byte prefix, then the key to the end of the body:
+
+```
+mode u8 | flags u8 | on_bound u8 | ttl_kind u8
+ttl_secs u32
+delta u64 | lower u64 | upper u64      // reinterpreted by `mode`
+key bytes
+```
+
+`mode` is the numeric domain, and it decides how the three eight-byte numbers
+are read. One fixed layout carries all three rather than a variable-length
+encoding, because this is a single-key operation on the hot path and the
+sixteen wasted bytes cost less than a length prefix would.
+
+| `mode` | domain | numbers |
+|---|---|---|
+| 0 `COUNTER` | unsigned, wrapping on increment and flooring at zero on decrement — memcached's | `delta` as `u64`; bounds ignored |
+| 1 `INT` | signed | all three as `i64` |
+| 2 `FLOAT` | `f64` | all three as IEEE-754 bits |
+
+`flags`: bit 0 `CREATE_AT_ZERO` treats an absent key as holding zero and creates
+it; bit 1 `DECREMENT` subtracts, and is **counter mode only** — the other two
+carry the sign in `delta`.
+
+`on_bound` decides what happens when the result will not fit `lower..=upper`:
+`0` fail, `1` leave the value where it is and report a zero increment, `2` clamp
+to the bound that was breached. The unbounded forms pass the limits of their own
+type, which turns "overflowed" and "out of bounds" into one condition.
+
+`ttl_kind`: `0` leave the deadline alone, `1` set it to `ttl_secs`, `2` set it
+only if the key currently has none.
+
+An unrecognised `mode`, `on_bound` or `ttl_kind` is `BAD_REQUEST`. None is
+defaulted: a byte this build does not know might mean the numbers below it are to
+be read as something else, and guessing would apply an operation the client did
+not ask for.
+
+**Execute** — writer queue. The read of the current value and the write of the
+new one happen **inside one transaction**, so concurrent callers cannot lose an
+update. The arithmetic itself is `vash_core::arith`, shared with the memcached
+and Redis adapters, so all three dialects agree by construction rather than by
+three implementations agreeing.
+
+**Response** — `mode u8 | wrote u8 | reserved u16 | value u64 | applied u64`.
+
+`value` is where the counter ended up and `applied` is how far it moved, which
+is zero when a bound held it. `wrote` is `0` when nothing was stored — a skipped
+step leaves the key and its lifetime exactly as they were. The mode is **echoed**
+rather than assumed from the request, because responses may arrive out of order
+and a client should not have to remember what it asked for to decode one.
+
+Absent key with `CREATE_AT_ZERO` clear → `NOT_FOUND`, and nothing is written.
+A value that is not a number in the requested domain → `NOT_NUMERIC`.
+
+**Added in M10 phase 7.** Before it the native protocol had no arithmetic at all,
+so a first-party client had to fall back to memcached or Redis to move a counter —
+the wrong way round for the protocol plan §3 calls primary.
+
+---
+
 ## Batch opcodes
 
 All three carry `count u32` first, which is **bounded against

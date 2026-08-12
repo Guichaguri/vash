@@ -1616,3 +1616,73 @@ async fn a_scan_budget_still_lets_a_listing_finish() {
     assert!(page.truncated, "and says that it was truncated");
     assert!(page.scanned <= 3);
 }
+
+/// The native protocol can increment a counter without falling back to a
+/// compatibility dialect.
+///
+/// Until M10 phase 7 it could not: VCP had no arithmetic opcode at all, so a
+/// first-party client had to speak memcached or Redis to move a number — the
+/// wrong way round for the protocol the plan calls primary.
+#[tokio::test]
+async fn vcp_arithmetic_round_trips() {
+    use vash_core::{Arithmetic, Delta, Missing, Number, OnBound, TtlChange};
+
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    // memcached's domain: never creates, so an absent key is a miss.
+    let key = vash_core::Key::new(b"n").unwrap();
+    assert!(
+        client
+            .arithmetic(&Arithmetic::counter(key, 1, false))
+            .await
+            .unwrap()
+            .is_none(),
+        "a counter must not create the key it did not find"
+    );
+
+    client.set(b"n", b"10", 0).await.unwrap();
+    let applied = client
+        .arithmetic(&Arithmetic::counter(key, 5, false))
+        .await
+        .unwrap()
+        .expect("the key is live");
+    assert_eq!(applied.value, Number::Counter(15));
+    assert!(applied.wrote);
+
+    // Redis's domain, over the native protocol: signed, and it creates.
+    let fresh = vash_core::Key::new(b"signed").unwrap();
+    let applied = client
+        .arithmetic(&Arithmetic::redis(fresh, Delta::int(-7)))
+        .await
+        .unwrap()
+        .expect("creates at zero");
+    assert_eq!(applied.value, Number::Int(-7));
+
+    // Floats survive the round trip as bits, not as text.
+    let f = vash_core::Key::new(b"float").unwrap();
+    let applied = client
+        .arithmetic(&Arithmetic::redis(f, Delta::float(0.5)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.value, Number::Float(0.5));
+
+    // Bounds and the skip policy, which only the native protocol and INCREX can
+    // express.
+    let bounded = Arithmetic {
+        key: vash_core::Key::new(b"bounded").unwrap(),
+        delta: Delta::Int {
+            delta: 100,
+            lower: 0,
+            upper: 10,
+        },
+        on_bound: OnBound::Skip,
+        missing: Missing::CreateAtZero,
+        ttl: TtlChange::Keep,
+    };
+    let applied = client.arithmetic(&bounded).await.unwrap().unwrap();
+    assert_eq!(applied.value, Number::Int(0), "the bound held it at zero");
+    assert_eq!(applied.applied, Number::Int(0));
+    assert!(!applied.wrote, "a skipped step writes nothing");
+}

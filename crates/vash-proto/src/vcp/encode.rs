@@ -134,17 +134,40 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             }
         },
 
-        // VCP has no arithmetic opcode yet, so nothing here can produce this —
-        // but the unsigned domain has a natural wire shape and keeping it mapped
-        // means adding the opcode (m10.md phase 7) needs no encoder change. The
-        // signed and float domains are Redis's and have no VCP form to render
-        // into, so they are refused rather than silently truncated.
-        Reply::Arithmetic(applied) => match applied.value {
-            vash_core::Number::Counter(value) => {
-                encode_response(out, opcode, request_id, Status::Ok, &value.to_le_bytes())
-            }
-            _ => encode_response(out, opcode, request_id, Status::Unsupported, &[]),
-        },
+        // `mode u8 | wrote u8 | reserved u16 | value u64 | applied u64`.
+        //
+        // The mode is echoed rather than assumed from the request, so a client
+        // decodes the reply without having to remember what it asked for — which
+        // matters here because responses may arrive out of order.
+        Reply::Arithmetic(applied) => {
+            let mut body = [0u8; ARITHMETIC_RESPONSE_LEN];
+            let (mode, value, moved) = match (applied.value, applied.applied) {
+                (vash_core::Number::Counter(value), vash_core::Number::Counter(moved)) => {
+                    (super::decode::arithmetic_mode::COUNTER, value, moved)
+                }
+                (vash_core::Number::Int(value), vash_core::Number::Int(moved)) => (
+                    super::decode::arithmetic_mode::INT,
+                    value as u64,
+                    moved as u64,
+                ),
+                (vash_core::Number::Float(value), vash_core::Number::Float(moved)) => (
+                    super::decode::arithmetic_mode::FLOAT,
+                    value.to_bits(),
+                    moved.to_bits(),
+                ),
+                // The evaluator answers in the domain it was asked in, so the
+                // two always match. Refusing beats inventing a mode byte.
+                _ => {
+                    encode_response(out, opcode, request_id, Status::Internal, &[]);
+                    return;
+                }
+            };
+            body[0] = mode;
+            body[1] = u8::from(applied.wrote);
+            body[4..12].copy_from_slice(&value.to_le_bytes());
+            body[12..20].copy_from_slice(&moved.to_le_bytes());
+            encode_response(out, opcode, request_id, Status::Ok, &body);
+        }
 
         Reply::TagSync(entries) => {
             let mut body = Vec::new();
@@ -229,6 +252,8 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
 }
 
 pub const HELLO_RESPONSE_LEN: usize = 16;
+/// `mode u8 | wrote u8 | reserved u16 | value u64 | applied u64`.
+pub const ARITHMETIC_RESPONSE_LEN: usize = 20;
 /// `mc_flags u32 | cas u64` ahead of the value bytes.
 pub const VALUE_PREFIX_LEN: usize = 12;
 /// `mode u8 | reserved u8 | peer_count u16` ahead of a `CLUSTER` peer list.
@@ -386,6 +411,71 @@ pub fn encode_set_body(out: &mut Vec<u8>, key: &[u8], value: &[u8], ttl_secs: u3
 }
 
 /// Builds a `TOUCH` body: `ttl_secs u32` followed by the key.
+/// Builds an `ARITHMETIC` body.
+///
+/// The three numbers are written as raw bits and reinterpreted by `mode`, so one
+/// fixed layout carries all three numeric domains — see
+/// [`arithmetic_mode`](super::decode::arithmetic_mode). A caller that wants the
+/// plain memcached counter passes `Delta::Counter` and ignores the bounds.
+pub fn encode_arithmetic_body(out: &mut Vec<u8>, op: &vash_core::Arithmetic<'_>) {
+    use super::decode::{arithmetic_flags, arithmetic_mode};
+    use vash_core::{Delta, Missing, OnBound, TtlChange};
+
+    let (mode, delta, lower, upper, decrement) = match op.delta {
+        Delta::Counter { delta, decrement } => (arithmetic_mode::COUNTER, delta, 0, 0, decrement),
+        Delta::Int {
+            delta,
+            lower,
+            upper,
+        } => (
+            arithmetic_mode::INT,
+            delta as u64,
+            lower as u64,
+            upper as u64,
+            false,
+        ),
+        Delta::Float {
+            delta,
+            lower,
+            upper,
+        } => (
+            arithmetic_mode::FLOAT,
+            delta.to_bits(),
+            lower.to_bits(),
+            upper.to_bits(),
+            false,
+        ),
+    };
+
+    let mut flags = 0u8;
+    if op.missing == Missing::CreateAtZero {
+        flags |= arithmetic_flags::CREATE_AT_ZERO;
+    }
+    if decrement {
+        flags |= arithmetic_flags::DECREMENT;
+    }
+
+    let (ttl_kind, ttl_secs) = match op.ttl {
+        TtlChange::Keep => (0u8, 0u32),
+        TtlChange::Set(secs) => (1, secs),
+        TtlChange::SetIfPersistent(secs) => (2, secs),
+    };
+
+    out.push(mode);
+    out.push(flags);
+    out.push(match op.on_bound {
+        OnBound::Fail => 0,
+        OnBound::Skip => 1,
+        OnBound::Clamp => 2,
+    });
+    out.push(ttl_kind);
+    out.extend_from_slice(&ttl_secs.to_le_bytes());
+    out.extend_from_slice(&delta.to_le_bytes());
+    out.extend_from_slice(&lower.to_le_bytes());
+    out.extend_from_slice(&upper.to_le_bytes());
+    out.extend_from_slice(op.key.as_bytes());
+}
+
 pub fn encode_touch_body(out: &mut Vec<u8>, key: &[u8], ttl_secs: u32) {
     out.extend_from_slice(&ttl_secs.to_le_bytes());
     out.extend_from_slice(key);
