@@ -479,6 +479,7 @@ vash-server/
     ├── plan.md                 # this file
     ├── protocol.md             # normative VCP spec
     ├── opcodes.md              # per-opcode implementation contract
+    ├── auth.md                 # authentication design (M9, not built)
     ├── storage.md              # on-disk format, sub-database schemas
     └── operations.md           # tuning, capacity planning, failure modes
 ```
@@ -828,7 +829,8 @@ queue_depth = 1024                # invalidations queued per peer before droppin
 [protocol]
 memcached = true
 flush_all_enabled = false         # off by default: it is a remote cache-wipe primitive
-auth_secret = ""                  # empty = no auth (bind to a private network)
+# Authentication is not built. It gets its own `[auth]` section rather than a
+# key here; the design is in auth.md and this sketch's `auth_secret` is dropped.
 
 [observability]
 admin_listen = "127.0.0.1:9090"
@@ -961,6 +963,7 @@ checked as well as the code — and any result that survives only one run is not
 | **M6** | Perf hardening, fuzz corpus, benchmark suite, packaging (static musl binary, Docker, systemd), docs | Performance goals in §13 met or consciously revised with data |
 | **M7** | Redis protocol: RESP2/RESP3 framing, the string and expiry command subset, `HELLO` negotiation | Real Redis clients drive the supported commands unchanged; the read-modify-write seam is documented rather than hidden |
 | **M8** | Listing: `LIST_KEYS`/`LIST_TAGS`, glob matching, pagination, the `listing_enabled` gate and `LISTING` capability bit | Paging covers a sharded keyspace without missing a live key or holding a read txn past its scan budget; disabled by default and fuzzed |
+| **M9** | Authentication: credential table, `AUTH` in all three dialects, the pre-auth gate and abuse budget, peer credentials — designed in [auth.md](auth.md) | Real memcached and Redis clients authenticate unchanged; no command in any dialect executes unauthenticated; a cluster converges with auth required, and a node missing a peer credential refuses to start |
 
 ---
 
