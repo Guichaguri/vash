@@ -290,6 +290,54 @@ impl Client {
             .ok_or(ClientError::Protocol("malformed cluster response"))
     }
 
+    /// One page of the live keys. Refused unless the server has
+    /// `protocol.listing_enabled` set.
+    ///
+    /// Pass an empty `cursor` for the first page, then the cursor from the
+    /// previous page, and stop when the reply carries none. An empty `pattern`
+    /// matches everything; `*` and `?` are the only metacharacters.
+    ///
+    /// Administrative — a linear scan over the keyspace. Not for building an
+    /// index on.
+    pub async fn list_keys(
+        &mut self,
+        limit: u32,
+        cursor: &[u8],
+        pattern: &[u8],
+    ) -> Result<vash_core::Listing> {
+        self.list(Opcode::ListKeys, limit, cursor, pattern).await
+    }
+
+    /// One page of the tag registry, in name order, with the generation this
+    /// node holds for each. Gated and paged exactly as [`Client::list_keys`].
+    pub async fn list_tags(
+        &mut self,
+        limit: u32,
+        cursor: &[u8],
+        pattern: &[u8],
+    ) -> Result<vash_core::Listing> {
+        self.list(Opcode::ListTags, limit, cursor, pattern).await
+    }
+
+    /// Both listings share a body, a reply and therefore this.
+    async fn list(
+        &mut self,
+        opcode: Opcode,
+        limit: u32,
+        cursor: &[u8],
+        pattern: &[u8],
+    ) -> Result<vash_core::Listing> {
+        let mut body = Vec::new();
+        vash_proto::vcp::encode_list_body(&mut body, limit, cursor, pattern);
+
+        let (status, payload) = self.round_trip(opcode, &body).await?;
+        if status != Status::Ok {
+            return Err(ClientError::Status(status));
+        }
+        vash_proto::vcp::decode_listing(&payload)
+            .ok_or(ClientError::Protocol("malformed listing response"))
+    }
+
     /// Empties the cache, returning the new flush epoch. Refused unless the
     /// server has `protocol.flush_enabled` set.
     pub async fn flush(&mut self) -> Result<u32> {

@@ -12,7 +12,9 @@ pub mod clock;
 pub mod cluster;
 pub mod command;
 pub mod error;
+pub mod glob;
 pub mod key;
+pub mod listing;
 pub mod record;
 pub mod value;
 
@@ -24,6 +26,7 @@ pub use command::{
 };
 pub use error::{CoreError, Result};
 pub use key::{Key, MAX_KEY_LEN};
+pub use listing::{ListEntry, ListRequest, Listing, MAX_LIST_LIMIT};
 pub use record::{
     ABSOLUTE_MAX_TAGS, DEFAULT_MAX_TAGS, MAX_TAG_LEN, NEVER, RECORD_CAS_OFFSET, RECORD_HEADER_LEN,
     RECORD_VERSION, RecordMeta, RecordRef, TagRef, encode_record, patch_cas, record_len,

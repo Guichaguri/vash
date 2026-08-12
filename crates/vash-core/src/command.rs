@@ -17,7 +17,11 @@ pub mod capability {
     pub const MEMCACHED: u32 = 1 << 1;
     /// Server participates in cluster-wide tag invalidation.
     pub const CLUSTER: u32 = 1 << 2;
-    /// `LIST_KEYS`/`LIST_TAGS` are enabled here. Reserved; not built.
+    /// `LIST_KEYS`/`LIST_TAGS` are enabled here.
+    ///
+    /// Enablement, not support — the same contract as [`CLUSTER`]. They are off
+    /// by default, so a client reads a clear bit as "not here" rather than
+    /// having to tell an `UNAUTHORIZED` apart from an older build.
     pub const LISTING: u32 = 1 << 3;
     /// This connection must send `AUTH` before any other command.
     ///
@@ -98,6 +102,11 @@ pub enum Command<'a> {
     },
     /// Cluster: this node's view of its peer list.
     Cluster,
+
+    /// Administrative: one page of the keys that are currently live.
+    ListKeys(crate::listing::ListRequest<'a>),
+    /// Administrative: one page of the tag registry.
+    ListTags(crate::listing::ListRequest<'a>),
 
     /// Protocol-level commands with no storage effect.
     Stats,
@@ -201,6 +210,9 @@ pub enum Reply {
     /// sender is behind on. Empty when the sender was already up to date.
     TagSync(Vec<crate::cluster::TagGeneration>),
     Cluster(crate::cluster::ClusterInfo),
+    /// One page of a listing. Shared by both listing opcodes, which is the
+    /// point of them having one shape.
+    Listing(crate::listing::Listing),
     Stats(Vec<(String, String)>),
     Version(&'static str),
     /// The client asked to hang up.

@@ -346,12 +346,43 @@ pub struct ObservabilityConfig {
     pub admin_listen: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProtocolConfig {
     /// `FLUSH` empties the whole cache on request from any client that can
     /// reach the port, so it is off unless deliberately enabled.
     pub flush_enabled: bool,
+
+    /// `LIST_KEYS` and `LIST_TAGS`, off unless deliberately enabled.
+    ///
+    /// Two separately sufficient reasons, and authentication retires neither.
+    /// **Disclosure**: cache keys routinely embed user and session identifiers,
+    /// so enumeration turns a reachable port into a dump of who is in the cache,
+    /// and every authenticated client here is equally trusted. **Cost**: these
+    /// are the only reads whose work is not bounded by the request — every other
+    /// one touches as many records as the client named.
+    pub listing_enabled: bool,
+
+    /// Records one `LIST_KEYS` call may examine before it stops early.
+    ///
+    /// This is what bounds how long a single request holds a read transaction
+    /// open, which is the thing that blocks LMDB from reusing freed pages. A
+    /// page that stops on the budget still advances its cursor, so paging makes
+    /// progress through a region of dead or non-matching records rather than
+    /// stalling on it.
+    pub listing_max_scan: usize,
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            flush_enabled: false,
+            listing_enabled: false,
+            // ~10-20ms of walking at the per-record cost measured in M6, which
+            // is a reasonable ceiling on one held read transaction.
+            listing_max_scan: 100_000,
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -512,6 +543,14 @@ impl Config {
         anyhow::ensure!(
             self.store.tags.reclaim_batch > 0,
             "store.tags.reclaim_batch must be > 0"
+        );
+        // A budget of zero would let a listing examine one record per request,
+        // so a client would page forever and never finish. Refused rather than
+        // treated as "unlimited", which is the other thing someone might mean
+        // by it and the more dangerous one.
+        anyhow::ensure!(
+            self.protocol.listing_max_scan > 0,
+            "protocol.listing_max_scan must be > 0"
         );
 
         let evict = &self.store.eviction;

@@ -42,8 +42,8 @@ for a different command, and a retired one stays reserved.
 | `0x30` | [`DELETE_BY_TAG`](#delete_by_tag-0x30) | implemented | write | every shard writer |
 | `0x31` | [`FLUSH`](#flush-0x31) | implemented, gated | write | every shard writer |
 | `0x40` | [`TAG_SYNC`](#tag_sync-0x40) | implemented | write | shard writers, as needed |
-| `0x50` | [`LIST_KEYS`](#list_keys-0x50) | **planned** | read (scan) | blocking pool |
-| `0x51` | [`LIST_TAGS`](#list_tags-0x51) | **planned** | none (RAM) | blocking pool |
+| `0x50` | [`LIST_KEYS`](#list_keys-0x50) | implemented, gated | read (scan) | blocking pool |
+| `0x51` | [`LIST_TAGS`](#list_tags-0x51) | implemented, gated | none (RAM) | blocking pool |
 
 "Runs on" is where the *work* happens, not where the frame is decoded. Every
 frame is decoded on whichever thread executes it — see below.
@@ -541,12 +541,12 @@ acknowledgement protocol.
 
 ---
 
-## Planned opcodes
+## Listing opcodes
 
-Not implemented. `Opcode::from_u8` does not know these values yet, so a server
-of this generation answers `UNSUPPORTED` (8) with the opcode echoed. The
-specification is here so that a client written against it does not have to be
-rewritten, and so the values cannot be claimed by anything else.
+Implemented in M8, and **off by default** — see [Gating](#gating). A server with
+`protocol.listing_enabled` clear answers `UNAUTHORIZED` (5), and the `LISTING`
+capability bit in the handshake is how a client tells that apart from a build
+that has never heard of them.
 
 They are **administrative and diagnostic commands**, and are specified as such:
 correctness and bounded cost matter, throughput does not. Neither is on any hot

@@ -1424,3 +1424,241 @@ fn data_and_the_expiry_index_survive_a_reopen() {
     assert!(next > cas, "CAS must not go backwards across a restart");
     store.close();
 }
+
+// ---- listing ---------------------------------------------------------------
+
+/// Pages a whole listing the way a client must, and returns the names in the
+/// order they arrived.
+///
+/// Deliberately a real paging loop rather than one big call: the cursor
+/// arithmetic across shard boundaries is the part worth testing, and a single
+/// call with a large limit would never exercise it.
+fn page_keys(store: &LmdbStore, limit: u32, pattern: &[u8], max_scan: usize) -> Vec<Vec<u8>> {
+    let mut names = Vec::new();
+    let mut cursor: Vec<u8> = Vec::new();
+    // A listing must terminate; a bound turns "the cursor stopped advancing"
+    // from a hung test into a failing one.
+    for _ in 0..10_000 {
+        let request = vash_core::ListRequest {
+            limit,
+            cursor: &cursor,
+            pattern,
+        };
+        let page = store.list_keys(&request, max_scan).unwrap();
+        assert!(
+            page.entries.len() <= limit as usize,
+            "a page must never exceed the limit it was given"
+        );
+        names.extend(page.entries.iter().map(|e| e.name.to_vec()));
+
+        match page.cursor {
+            Some(next) => cursor = next.to_vec(),
+            None => return names,
+        }
+    }
+    panic!("listing did not terminate");
+}
+
+#[test]
+fn listing_returns_every_live_key_exactly_once() {
+    let h = Harness::new();
+    for i in 0..250 {
+        h.set(format!("key:{i:04}").as_bytes(), b"v", 0);
+    }
+
+    let listed = page_keys(h.store(), 7, b"", 100_000);
+    let mut unique = listed.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(listed.len(), 250, "no key returned twice");
+    assert_eq!(unique.len(), 250, "no key missed");
+}
+
+#[test]
+fn the_page_size_does_not_change_the_result() {
+    // The property that matters for pagination: a limit is a transport detail,
+    // never a filter. A cursor bug at a shard boundary shows up here as a
+    // difference between page sizes.
+    let h = Harness::with(|c| c.shards = 4);
+    for i in 0..120 {
+        h.set(format!("k{i:03}").as_bytes(), b"v", 0);
+    }
+
+    let one_at_a_time = page_keys(h.store(), 1, b"", 100_000);
+    let in_bulk = page_keys(h.store(), 1024, b"", 100_000);
+    assert_eq!(one_at_a_time, in_bulk);
+    assert_eq!(one_at_a_time.len(), 120);
+}
+
+#[test]
+fn a_listing_never_shows_a_key_a_get_would_miss() {
+    let h = Harness::new();
+    h.set(b"live", b"v", 0);
+    h.set(b"tagged", b"v", 0);
+    h.set_tagged(b"doomed", b"v", 0, &[b"news"]);
+    h.set(b"expiring", b"v", 1);
+
+    h.store().delete_by_tag(b"news").unwrap();
+    h.wait_for("the TTL to pass", |h| h.get(b"expiring").is_none());
+
+    let listed = page_keys(h.store(), 100, b"", 100_000);
+    assert!(listed.contains(&b"live".to_vec()));
+    assert!(listed.contains(&b"tagged".to_vec()));
+    assert!(!listed.contains(&b"doomed".to_vec()), "tag-invalidated");
+    assert!(!listed.contains(&b"expiring".to_vec()), "expired");
+}
+
+#[test]
+fn a_pattern_filters_without_changing_the_paging() {
+    let h = Harness::with(|c| c.shards = 2);
+    for i in 0..40 {
+        h.set(format!("session:{i:03}").as_bytes(), b"v", 0);
+        h.set(format!("user:{i:03}").as_bytes(), b"v", 0);
+    }
+
+    let sessions = page_keys(h.store(), 6, b"session:*", 100_000);
+    assert_eq!(sessions.len(), 40);
+    assert!(sessions.iter().all(|k| k.starts_with(b"session:")));
+
+    let one = page_keys(h.store(), 3, b"user:007", 100_000);
+    assert_eq!(one, vec![b"user:007".to_vec()]);
+}
+
+#[test]
+fn a_scan_budget_truncates_a_page_but_still_advances() {
+    // The failure this guards against is a pager that cannot get past a region
+    // of non-matching records: if a truncated page did not advance its cursor,
+    // the client would re-scan the same prefix forever.
+    let h = Harness::new();
+    for i in 0..500 {
+        h.set(format!("noise:{i:04}").as_bytes(), b"v", 0);
+    }
+    h.set(b"zzz:wanted", b"v", 0);
+
+    let request = vash_core::ListRequest {
+        limit: 100,
+        cursor: &[],
+        pattern: b"zzz:*",
+    };
+    let first = h.store().list_keys(&request, 10).unwrap();
+    assert!(first.truncated, "the budget should have stopped this page");
+    assert!(first.entries.is_empty(), "nothing matching in the first 10");
+    assert!(
+        first.cursor.is_some(),
+        "a truncated page must still advance"
+    );
+
+    // And paging through with that tiny budget still finds the needle.
+    let found = page_keys(h.store(), 100, b"zzz:*", 10);
+    assert_eq!(found, vec![b"zzz:wanted".to_vec()]);
+}
+
+#[test]
+fn scanned_counts_the_records_walked_not_the_ones_returned() {
+    let h = Harness::new();
+    for i in 0..50 {
+        h.set(format!("k{i:02}").as_bytes(), b"v", 0);
+    }
+
+    let request = vash_core::ListRequest {
+        limit: 1024,
+        cursor: &[],
+        pattern: b"k49",
+    };
+    let page = h.store().list_keys(&request, 100_000).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.scanned, 50, "the cost of a non-selective pattern");
+}
+
+#[test]
+fn a_malformed_cursor_is_refused_rather_than_restarting_the_listing() {
+    // Silently restarting would loop a pager forever, handing back the first
+    // page every time and never saying why.
+    let h = Harness::new();
+    h.set(b"k", b"v", 0);
+
+    for bad in [
+        vec![1u8],              // shorter than the shard index
+        vec![0, 0],             // names no key
+        vec![0xff, 0xff, b'k'], // a shard this server does not have
+    ] {
+        let request = vash_core::ListRequest {
+            limit: 10,
+            cursor: &bad,
+            pattern: b"",
+        };
+        assert!(
+            h.store().list_keys(&request, 100_000).is_err(),
+            "cursor {bad:?} should be refused"
+        );
+    }
+}
+
+#[test]
+fn listing_tags_pages_in_name_order_with_generations() {
+    let h = Harness::new();
+    h.set_tagged(b"a", b"v", 0, &[b"sport", b"news", b"weather"]);
+    h.store().delete_by_tag(b"news").unwrap();
+
+    let mut entries = Vec::new();
+    let mut cursor: Vec<u8> = Vec::new();
+    loop {
+        let request = vash_core::ListRequest {
+            limit: 2,
+            cursor: &cursor,
+            pattern: b"",
+        };
+        let page = h.store().list_tags(&request).unwrap();
+        assert!(!page.truncated, "a RAM walk has no budget to exhaust");
+        entries.extend(page.entries.iter().map(|e| (e.name.to_vec(), e.version)));
+        match page.cursor {
+            Some(next) => cursor = next.to_vec(),
+            None => break,
+        }
+    }
+
+    let names: Vec<Vec<u8>> = entries.iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(
+        names,
+        vec![b"news".to_vec(), b"sport".to_vec(), b"weather".to_vec()],
+        "lexicographic, so two nodes' listings are comparable"
+    );
+
+    let generation = |want: &[u8]| entries.iter().find(|(n, _)| n == want).unwrap().1;
+    assert!(generation(b"news") > 0, "invalidated once");
+    assert_eq!(generation(b"sport"), 0, "registered but never invalidated");
+}
+
+#[test]
+fn a_tag_registered_mid_walk_does_not_shift_the_page_after_it() {
+    // Resuming by name rather than by position is what buys this: under offset
+    // paging a new entry sorting before the cursor would shift everything after
+    // it and skip a tag that was there the whole time.
+    let h = Harness::new();
+    h.set_tagged(b"a", b"v", 0, &[b"bbb", b"ddd"]);
+
+    let request = vash_core::ListRequest {
+        limit: 1,
+        cursor: &[],
+        pattern: b"",
+    };
+    let first = h.store().list_tags(&request).unwrap();
+    assert_eq!(&*first.entries[0].name, b"bbb");
+
+    // Sorts before the cursor, so it is missed — but nothing else moves.
+    h.set_tagged(b"b", b"v", 0, &[b"aaa"]);
+
+    let cursor = first.cursor.unwrap();
+    let request = vash_core::ListRequest {
+        limit: 10,
+        cursor: &cursor,
+        pattern: b"",
+    };
+    let rest = h.store().list_tags(&request).unwrap();
+    let names: Vec<Vec<u8>> = rest.entries.iter().map(|e| e.name.to_vec()).collect();
+    assert_eq!(
+        names,
+        vec![b"ddd".to_vec()],
+        "the tag present throughout the walk is still returned exactly once"
+    );
+}

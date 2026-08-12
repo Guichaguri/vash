@@ -617,7 +617,37 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, St
             }
             Ok(Reply::Flushed(state.store.flush().map_err(to_status)?))
         }
+
+        Command::ListKeys(request) => {
+            listing_gate(state)?;
+            Ok(Reply::Listing(
+                state
+                    .store
+                    .list_keys(request, state.listing_max_scan)
+                    .map_err(to_status)?,
+            ))
+        }
+
+        Command::ListTags(request) => {
+            listing_gate(state)?;
+            Ok(Reply::Listing(
+                state.store.list_tags(request).map_err(to_status)?,
+            ))
+        }
     }
+}
+
+/// Refuses a listing when enumeration is not enabled here.
+///
+/// Separate from the authentication gate and not redundant with it: that one
+/// decides *who may connect*, this one decides what any connected client may
+/// do, and every authenticated client on this server is equally trusted.
+fn listing_gate(state: &ServerState) -> Result<(), Status> {
+    if !state.listing_enabled {
+        warn!("rejected listing: disabled by configuration");
+        return Err(Status::Unauthorized);
+    }
+    Ok(())
 }
 
 /// Answers a peer's `TAG_SYNC`: merge what it knows, report what it is behind
@@ -779,10 +809,17 @@ pub fn server_info(
     max_value_len: usize,
     cluster: bool,
     auth_required: bool,
+    listing: bool,
 ) -> ServerInfo {
     let mut capabilities = vash_core::capability::TAGS | vash_core::capability::MEMCACHED;
     if cluster {
         capabilities |= vash_core::capability::CLUSTER;
+    }
+    // Enablement, not support: the bit says the listing opcodes will answer
+    // here, so a client discovers them without probing and without reading an
+    // `UNAUTHORIZED` as "this build has no such command".
+    if listing {
+        capabilities |= vash_core::capability::LISTING;
     }
     // Set from enforcement, not from the build supporting it: a client reads
     // this as "you must authenticate on this connection".

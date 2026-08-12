@@ -129,13 +129,13 @@ Fixed 12-byte header, little-endian, so it decodes as a single `zerocopy` cast:
 
 **Opcodes:** `HELLO 0x01`, `PING 0x02`, `AUTH 0x03`, `STATS 0x04`, `CLUSTER 0x05`, `GET 0x10`,
 `SET 0x11`, `DELETE 0x12`, `TOUCH 0x13`, `GET_MANY 0x20`, `SET_MANY 0x21`, `DELETE_MANY 0x22`,
-`DELETE_BY_TAG 0x30`, `FLUSH 0x31`, `TAG_SYNC 0x40`.
+`DELETE_BY_TAG 0x30`, `FLUSH 0x31`, `TAG_SYNC 0x40`, `LIST_KEYS 0x50`, `LIST_TAGS 0x51`.
 
 `TAG_SYNC` was added in M5 for peer-to-peer traffic (§10). Peers speak the ordinary protocol on
 the ordinary port — a peer is just another VCP client — which meant no second listener, no second
 codec and no second thing to fuzz.
 
-`LIST_KEYS 0x50` and `LIST_TAGS 0x51` are specified but not built (M8). They open a new group
+`LIST_KEYS 0x50` and `LIST_TAGS 0x51` were added in M8. They open a new group
 rather than extending `0x3x`, whose members are whole-keyspace *mutations*. Both are administrative:
 gated off by default, permitted to be a linear scan, and paginated by an **opaque cursor** rather
 than an offset — an offset re-walks what it skips, which is the quadratic resumption §5 already met

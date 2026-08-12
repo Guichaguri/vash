@@ -88,11 +88,12 @@ impl Server {
             config.store.max_value_bytes,
             cluster.active(),
             config.auth.required,
+            config.protocol.listing_enabled,
         );
         let state = ServerState::new(
             Arc::clone(&store),
             info,
-            config.protocol.flush_enabled,
+            config.protocol,
             auth_state,
             cluster,
             config.store.inline_reads,

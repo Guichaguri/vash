@@ -20,6 +20,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod expiry;
+mod listing;
 pub mod lmdb;
 pub mod reclaim;
 pub mod schema;
@@ -27,7 +28,7 @@ mod shard;
 pub mod tags;
 mod writer;
 
-use vash_core::{Key, Set, Stored, Value};
+use vash_core::{Key, Listing, Set, Stored, Value};
 
 pub use config::{Durability, EvictionConfig, StoreConfig, WriteConfig};
 pub use engine::Pressure;
@@ -204,6 +205,26 @@ pub trait Store: Send + Sync + 'static {
     /// peers forward invalidations without any acknowledgement protocol. See
     /// [`vash_core::cluster`].
     fn merge_tag_generation(&self, tag: &[u8], generation: u64) -> Result<u64>;
+
+    /// One page of the keys that are currently live, in shard-major key order.
+    ///
+    /// Administrative and diagnostic: a linear scan, bounded by `max_scan`
+    /// records examined so one request cannot hold a read transaction open
+    /// indefinitely. Entries are filtered by the same liveness rule as
+    /// [`Store::get`], so a listed key is one a read at that instant would hit,
+    /// and **nothing is written** — a listing does not reclaim the dead records
+    /// it walks past.
+    ///
+    /// Resumption is by cursor, never by offset: an offset re-walks what it
+    /// skips, which makes paging a large keyspace quadratic. See
+    /// `docs/opcodes.md`.
+    fn list_keys(&self, request: &vash_core::ListRequest<'_>, max_scan: usize) -> Result<Listing>;
+
+    /// One page of the tag registry, in lexicographic name order.
+    ///
+    /// Takes no budget because it needs none: the registry is in RAM, so this
+    /// opens no transaction and takes no reader slot.
+    fn list_tags(&self, request: &vash_core::ListRequest<'_>) -> Result<Listing>;
 
     /// Every registered tag name with the generation this node holds for it.
     ///

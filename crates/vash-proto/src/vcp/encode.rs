@@ -148,6 +148,34 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             encode_response(out, opcode, request_id, Status::Ok, &body);
         }
 
+        Reply::Listing(listing) => {
+            let cursor = listing.cursor.as_deref().unwrap_or(&[]);
+            let payload: usize = listing
+                .entries
+                .iter()
+                .map(|entry| 10 + entry.name.len())
+                .sum();
+
+            let mut body = Vec::with_capacity(LIST_RESPONSE_HEADER_LEN + cursor.len() + payload);
+            body.extend_from_slice(&(listing.entries.len() as u32).to_le_bytes());
+            body.push(if listing.truncated {
+                list_flags::TRUNCATED
+            } else {
+                0
+            });
+            body.extend_from_slice(&[0, 0, 0]); // reserved
+            body.extend_from_slice(&listing.scanned.to_le_bytes());
+            body.extend_from_slice(&(cursor.len() as u16).to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes()); // reserved
+            body.extend_from_slice(cursor);
+            for entry in &listing.entries {
+                body.extend_from_slice(&entry.version.to_le_bytes());
+                body.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
+                body.extend_from_slice(&entry.name);
+            }
+            encode_response(out, opcode, request_id, Status::Ok, &body);
+        }
+
         Reply::Cluster(info) => {
             let mut body = Vec::with_capacity(
                 CLUSTER_HEADER_LEN + info.peers.iter().map(|p| 3 + p.addr.len()).sum::<usize>(),
@@ -188,6 +216,73 @@ pub const HELLO_RESPONSE_LEN: usize = 16;
 pub const VALUE_PREFIX_LEN: usize = 12;
 /// `mode u8 | reserved u8 | peer_count u16` ahead of a `CLUSTER` peer list.
 pub const CLUSTER_HEADER_LEN: usize = 4;
+/// `count u32 | flags u8 | reserved u8*3 | scanned u64 | cursor_len u16 |
+/// reserved u16` ahead of a listing's cursor and entries.
+pub const LIST_RESPONSE_HEADER_LEN: usize = 20;
+
+/// Flags in a listing response.
+pub mod list_flags {
+    /// The page ended on the server's scan budget rather than on `limit`.
+    ///
+    /// Diagnostic only. Paging behaves identically either way, because a budget
+    /// exhaustion still advances the cursor — there is no `MORE` flag because an
+    /// absent cursor already says the listing is complete, and two ways to say
+    /// one thing is one of them lying eventually.
+    pub const TRUNCATED: u8 = 1 << 0;
+}
+
+/// Parses a listing response body.
+///
+/// Shared with the client and the tests so the layout has one definition.
+pub fn decode_listing(body: &[u8]) -> Option<vash_core::Listing> {
+    if body.len() < LIST_RESPONSE_HEADER_LEN {
+        return None;
+    }
+    let count = u32::from_le_bytes(body[0..4].try_into().ok()?) as usize;
+    let truncated = body[4] & list_flags::TRUNCATED != 0;
+    let scanned = u64::from_le_bytes(body[8..16].try_into().ok()?);
+    let cursor_len = u16::from_le_bytes(body[16..18].try_into().ok()?) as usize;
+
+    let mut pos = LIST_RESPONSE_HEADER_LEN;
+    let cursor = body.get(pos..pos + cursor_len)?;
+    pos += cursor_len;
+
+    // Bounded by what the body can actually hold: the smallest entry is ten
+    // bytes, so a count larger than that cannot be honest and must not size an
+    // allocation.
+    if count > body.len().saturating_sub(pos) / 10 {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let version = u64::from_le_bytes(body.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let name_len = u16::from_le_bytes(body.get(pos..pos + 2)?.try_into().ok()?) as usize;
+        pos += 2;
+        let name = body.get(pos..pos + name_len)?;
+        pos += name_len;
+        entries.push(vash_core::ListEntry::new(name.to_vec(), version));
+    }
+
+    Some(vash_core::Listing {
+        entries,
+        scanned,
+        cursor: (!cursor.is_empty()).then(|| cursor.to_vec().into_boxed_slice()),
+        truncated,
+    })
+}
+
+/// Builds a listing request body. Shared with the client and the tests.
+pub fn encode_list_body(out: &mut Vec<u8>, limit: u32, cursor: &[u8], pattern: &[u8]) {
+    out.reserve(super::decode::LIST_BODY_HEADER_LEN + cursor.len() + pattern.len());
+    out.extend_from_slice(&limit.to_le_bytes());
+    out.extend_from_slice(&(cursor.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(pattern.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    out.extend_from_slice(cursor);
+    out.extend_from_slice(pattern);
+}
 
 /// Builds a `TAG_SYNC` body. Shared by the server, the peer client and the
 /// tests, so the layout has one definition.
@@ -408,6 +503,93 @@ mod tests {
         let (full, entries) = crate::vcp::decode_tag_sync(body).unwrap();
         assert!(!full);
         assert_eq!(entries, vec![(b"news".as_slice(), 4), (b"sport", 1)]);
+    }
+
+    #[test]
+    fn a_listing_roundtrips() {
+        let listing = vash_core::Listing {
+            entries: vec![
+                vash_core::ListEntry::new(b"session:1".to_vec(), 7),
+                vash_core::ListEntry::new(b"session:2".to_vec(), u64::MAX),
+            ],
+            scanned: 4096,
+            cursor: Some(b"\x01\x00session:2".to_vec().into_boxed_slice()),
+            truncated: true,
+        };
+
+        let mut out = Vec::new();
+        encode_reply(
+            &mut out,
+            Opcode::ListKeys,
+            3,
+            &Reply::Listing(listing.clone()),
+        );
+        let body = &out[super::super::frame::HEADER_LEN..];
+        assert_eq!(decode_listing(body), Some(listing));
+    }
+
+    #[test]
+    fn a_complete_listing_carries_an_empty_cursor() {
+        // An absent cursor is the whole termination rule, so the encoding of
+        // "done" has to survive the round trip exactly.
+        let listing = vash_core::Listing {
+            entries: vec![vash_core::ListEntry::new(b"only".to_vec(), 1)],
+            scanned: 1,
+            cursor: None,
+            truncated: false,
+        };
+
+        let mut out = Vec::new();
+        encode_reply(
+            &mut out,
+            Opcode::ListTags,
+            1,
+            &Reply::Listing(listing.clone()),
+        );
+        let body = &out[super::super::frame::HEADER_LEN..];
+
+        assert_eq!(u16::from_le_bytes(body[16..18].try_into().unwrap()), 0);
+        let decoded = decode_listing(body).expect("valid listing");
+        assert_eq!(decoded, listing);
+        assert!(!decoded.has_more());
+    }
+
+    #[test]
+    fn an_empty_listing_is_valid_and_complete() {
+        let mut out = Vec::new();
+        encode_reply(
+            &mut out,
+            Opcode::ListKeys,
+            1,
+            &Reply::Listing(vash_core::Listing::empty()),
+        );
+        let body = &out[super::super::frame::HEADER_LEN..];
+        assert_eq!(decode_listing(body), Some(vash_core::Listing::empty()));
+    }
+
+    #[test]
+    fn a_truncated_listing_response_is_rejected_rather_than_half_read() {
+        let listing = vash_core::Listing {
+            entries: vec![vash_core::ListEntry::new(b"key".to_vec(), 1)],
+            scanned: 1,
+            cursor: Some(b"\x00\x00key".to_vec().into_boxed_slice()),
+            truncated: false,
+        };
+        let mut out = Vec::new();
+        encode_reply(&mut out, Opcode::ListKeys, 1, &Reply::Listing(listing));
+
+        let body = &out[super::super::frame::HEADER_LEN..];
+        assert!(decode_listing(&body[..body.len() - 1]).is_none());
+        assert!(decode_listing(&[]).is_none());
+    }
+
+    #[test]
+    fn a_lying_entry_count_allocates_nothing() {
+        // The count comes off the wire and sizes a Vec. A client parses this
+        // from whatever it is connected to, which may not be this server.
+        let mut body = vec![0u8; LIST_RESPONSE_HEADER_LEN];
+        body[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_listing(&body).is_none());
     }
 
     #[test]

@@ -113,6 +113,23 @@ fn validate_tag_name(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// What one shard produced for a page of a key listing.
+#[derive(Debug, Default)]
+pub struct ShardScan {
+    pub entries: Vec<vash_core::ListEntry>,
+    /// Records examined, including the dead and non-matching ones — which is
+    /// what makes it worth reporting.
+    pub scanned: u64,
+    /// The key the walk stopped on, or `None` if it reached the end of this
+    /// shard.
+    pub stopped_at: Option<Box<[u8]>>,
+    /// It stopped on the scan budget rather than on `limit`.
+    pub budget_exhausted: bool,
+    /// Records that would not parse. Logged, skipped, and counted so the caller
+    /// can surface that the database has a problem.
+    pub corrupt: u64,
+}
+
 /// A record encoded and ready to store, still missing its CAS token.
 ///
 /// Built on the calling thread so that the value copy and the record framing â€”
@@ -413,6 +430,85 @@ impl LmdbEngine {
         keys.iter()
             .map(|key| self.read_record(&rtxn, &lookup, key.as_bytes()))
             .collect()
+    }
+
+    /// One shard's contribution to a key listing.
+    ///
+    /// Walks `main` in key order from `after` (exclusive), collecting the live
+    /// keys that match, and stops at whichever of `limit` or `budget` runs out
+    /// first. **The only cursor walk over `main` in the server** — every other
+    /// read is a point lookup, and the sweeper and reclaimer walk their indexes
+    /// instead.
+    ///
+    /// Administrative, and specified to be a linear scan: the pattern is applied
+    /// after the record is read, not turned into a range seek. See
+    /// `docs/opcodes.md` for the optimisation deliberately not made.
+    pub fn list_keys(
+        &self,
+        request: &vash_core::ListRequest<'_>,
+        after: Option<&[u8]>,
+        limit: usize,
+        budget: usize,
+    ) -> Result<ShardScan> {
+        let rtxn = self.read_txn()?;
+        let lookup = self.tags.lookup();
+        let now_ms = self.now_ms();
+        let epoch = self.epoch();
+
+        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match after {
+            // Exclusive: resume just past the entry the last page ended on,
+            // exactly as the reclaimer resumes a half-finished job.
+            Some(key) => (Bound::Excluded(key), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+
+        let mut scan = ShardScan::default();
+        for entry in self
+            .main
+            .range(&rtxn, &bounds)
+            .map_err(StoreError::from_heed)?
+        {
+            let (key, blob) = entry.map_err(StoreError::from_heed)?;
+            scan.scanned += 1;
+
+            match RecordRef::parse(blob) {
+                Ok(record) => {
+                    // The same liveness rule as `GET`, so a listed key is one a
+                    // read at this instant would hit. A dead record costs a
+                    // `scanned` and nothing else: a listing never writes, so it
+                    // does not reclaim what it finds — that stays the sweeper's
+                    // and the reclaimer's job.
+                    if record.is_alive(now_ms, epoch, |id| lookup.generation(id))
+                        && request.matches(key)
+                    {
+                        scan.entries
+                            .push(vash_core::ListEntry::new(key.to_vec(), record.cas()));
+                    }
+                }
+                // Skipped rather than propagated, unlike every point read.
+                // Failing the page would make the keyspace past a corrupt
+                // record unlistable — the tool would break exactly when the
+                // database did, which is when it is wanted most.
+                Err(error) => {
+                    warn!(?key, %error, "skipping an unreadable record while listing");
+                    scan.corrupt += 1;
+                }
+            }
+
+            if scan.entries.len() >= limit {
+                scan.stopped_at = Some(key.into());
+                return Ok(scan);
+            }
+            if scan.scanned as usize >= budget {
+                scan.stopped_at = Some(key.into());
+                scan.budget_exhausted = true;
+                return Ok(scan);
+            }
+        }
+
+        // Ran off the end of this shard, so the next one starts at its own
+        // beginning and this shard is never revisited.
+        Ok(scan)
     }
 
     /// A live key's deadline, without copying its value.

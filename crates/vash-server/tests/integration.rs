@@ -1391,3 +1391,216 @@ async fn garbage_input_closes_the_connection_without_killing_the_server() {
         .await
         .expect("server survived a hostile client");
 }
+
+// ---- listing ---------------------------------------------------------------
+
+/// Pages a listing to exhaustion over the wire, exactly as a client must.
+async fn page_all(
+    client: &mut Client,
+    keys: bool,
+    limit: u32,
+    pattern: &[u8],
+) -> Vec<(Vec<u8>, u64)> {
+    let mut out = Vec::new();
+    let mut cursor: Vec<u8> = Vec::new();
+    for _ in 0..1_000 {
+        let page = if keys {
+            client.list_keys(limit, &cursor, pattern).await.unwrap()
+        } else {
+            client.list_tags(limit, &cursor, pattern).await.unwrap()
+        };
+        out.extend(page.entries.iter().map(|e| (e.name.to_vec(), e.version)));
+        match page.cursor {
+            Some(next) => cursor = next.to_vec(),
+            None => return out,
+        }
+    }
+    panic!("listing did not terminate");
+}
+
+#[tokio::test]
+async fn listing_is_refused_unless_enabled() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    client.set(b"k", b"v", 0).await.unwrap();
+
+    // Enumerating the cache is not available by default, and the capability
+    // bit says so rather than making a client discover it by being refused.
+    assert_eq!(
+        client.server_info().capabilities & vash_core::capability::LISTING,
+        0
+    );
+    assert!(matches!(
+        client.list_keys(10, b"", b"").await,
+        Err(ClientError::Status(Status::Unauthorized))
+    ));
+    assert!(matches!(
+        client.list_tags(10, b"", b"").await,
+        Err(ClientError::Status(Status::Unauthorized))
+    ));
+}
+
+#[tokio::test]
+async fn listing_pages_the_keyspace_over_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| {
+        config.protocol.listing_enabled = true;
+        config.store.shards = 4;
+    })
+    .await;
+    let mut client = server.client().await;
+
+    assert_ne!(
+        client.server_info().capabilities & vash_core::capability::LISTING,
+        0,
+        "the capability bit reports enablement"
+    );
+
+    for i in 0..100 {
+        client
+            .set(format!("key:{i:03}").as_bytes(), b"v", 0)
+            .await
+            .unwrap();
+    }
+
+    // A page size that does not divide the keyspace, across four shards, so a
+    // cursor mistake at a boundary has somewhere to hide.
+    let listed = page_all(&mut client, true, 7, b"").await;
+    let mut names: Vec<Vec<u8>> = listed.iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names.len(), 100, "no key returned twice");
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 100, "no key missed");
+
+    // The version is the CAS token, which is what makes two listings diffable.
+    let (name, version) = &listed[0];
+    let value = client.get(name).await.unwrap().expect("live");
+    assert_eq!(value.cas, *version);
+}
+
+#[tokio::test]
+async fn a_listing_reflects_writes_and_invalidations() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| config.protocol.listing_enabled = true).await;
+    let mut client = server.client().await;
+
+    client.set_tagged(b"a", b"1", 0, &[b"news"]).await.unwrap();
+    client.set(b"b", b"2", 0).await.unwrap();
+
+    let names = |listed: Vec<(Vec<u8>, u64)>| {
+        let mut n: Vec<Vec<u8>> = listed.into_iter().map(|(name, _)| name).collect();
+        n.sort();
+        n
+    };
+
+    assert_eq!(
+        names(page_all(&mut client, true, 100, b"").await),
+        vec![b"a".to_vec(), b"b".to_vec()]
+    );
+
+    // Invalidated keys stop being listed at the same moment they stop being
+    // served, because the listing applies the same liveness rule.
+    client.delete_by_tag(b"news").await.unwrap();
+    assert!(client.get(b"a").await.unwrap().is_none());
+    assert_eq!(
+        names(page_all(&mut client, true, 100, b"").await),
+        vec![b"b".to_vec()]
+    );
+
+    // The tag survives the invalidation, carrying its bumped generation.
+    let tags = page_all(&mut client, false, 100, b"").await;
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].0, b"news".to_vec());
+    assert!(tags[0].1 > 0, "generation bumped by the invalidation");
+}
+
+#[tokio::test]
+async fn a_pattern_selects_a_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| config.protocol.listing_enabled = true).await;
+    let mut client = server.client().await;
+
+    for i in 0..10 {
+        client
+            .set(format!("session:{i}").as_bytes(), b"v", 0)
+            .await
+            .unwrap();
+        client
+            .set(format!("user:{i}").as_bytes(), b"v", 0)
+            .await
+            .unwrap();
+    }
+
+    let sessions = page_all(&mut client, true, 4, b"session:*").await;
+    assert_eq!(sessions.len(), 10);
+    assert!(sessions.iter().all(|(n, _)| n.starts_with(b"session:")));
+
+    let single = page_all(&mut client, true, 4, b"user:?").await;
+    assert_eq!(single.len(), 10, "one byte each");
+}
+
+#[tokio::test]
+async fn malformed_listing_requests_are_refused_without_closing_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| config.protocol.listing_enabled = true).await;
+    let mut client = server.client().await;
+    client.set(b"k", b"v", 0).await.unwrap();
+
+    // A limit outside the range is refused rather than clamped: a client that
+    // asked for 10000 and silently got 1024 would page incorrectly.
+    assert!(matches!(
+        client.list_keys(0, b"", b"").await,
+        Err(ClientError::Status(Status::BadRequest))
+    ));
+    assert!(matches!(
+        client
+            .list_keys(vash_core::MAX_LIST_LIMIT + 1, b"", b"")
+            .await,
+        Err(ClientError::Status(Status::BadRequest))
+    ));
+
+    // An unterminated escape names a byte that is not there.
+    assert!(matches!(
+        client.list_keys(10, b"", b"bad\\").await,
+        Err(ClientError::Status(Status::BadRequest))
+    ));
+
+    // A fabricated cursor is refused rather than silently restarting the
+    // listing, which would loop a pager forever.
+    assert!(matches!(
+        client.list_keys(10, &[0xff, 0xff, b'k'], b"").await,
+        Err(ClientError::Status(Status::BadRequest))
+    ));
+
+    // Every one of those is recoverable: the connection carries on.
+    assert!(client.get(b"k").await.unwrap().is_some());
+    let listed = page_all(&mut client, true, 10, b"").await;
+    assert_eq!(listed.len(), 1);
+}
+
+#[tokio::test]
+async fn a_scan_budget_still_lets_a_listing_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| {
+        config.protocol.listing_enabled = true;
+        // Absurdly small on purpose: nearly every page will stop on the budget
+        // rather than on the limit, which is the case that must still converge.
+        config.protocol.listing_max_scan = 3;
+    })
+    .await;
+    let mut client = server.client().await;
+
+    for i in 0..60 {
+        client
+            .set(format!("k{i:02}").as_bytes(), b"v", 0)
+            .await
+            .unwrap();
+    }
+
+    let listed = page_all(&mut client, true, 100, b"").await;
+    assert_eq!(listed.len(), 60, "a truncated page still advances");
+
+    let page = client.list_keys(100, b"", b"").await.unwrap();
+    assert!(page.truncated, "and says that it was truncated");
+    assert!(page.scanned <= 3);
+}

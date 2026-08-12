@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
-use vash_core::{Key, Set, Stored, Value};
+use tracing::warn;
+use vash_core::{Key, Listing, Set, Stored, Value};
 
 use crate::config::StoreConfig;
 use crate::engine::{LmdbEngine, Pressure};
@@ -378,6 +379,96 @@ impl Store for LmdbStore {
             effective = effective.max(self.shards.for_key(tag).writer.merge_tag(tag, generation)?);
         }
         Ok(effective)
+    }
+
+    fn list_keys(&self, request: &vash_core::ListRequest<'_>, max_scan: usize) -> Result<Listing> {
+        let (start_shard, after) = crate::listing::decode(request.cursor, self.shards.len())?;
+
+        let limit = request.limit as usize;
+        let mut listing = Listing::default();
+        let mut after = after;
+
+        // Shard-major, and each shard's own key order within that. Not a global
+        // merge: that would mean one open cursor and one read transaction per
+        // shard held simultaneously for the length of the request, which is
+        // reader-slot pressure and complexity spent on prettiness in a
+        // debugging command.
+        for index in start_shard..self.shards.len() {
+            // Both are non-zero here, and that is an invariant rather than
+            // luck: the engine only ever returns without a `stopped_at` by
+            // running off the end of its shard, so a filled limit or an
+            // exhausted budget has already returned below. It matters because
+            // a cursor names a key to resume *after*, and there is no way to
+            // say "at the beginning of shard N" — nor any need to.
+            let remaining = limit - listing.entries.len();
+            let budget = max_scan.saturating_sub(listing.scanned as usize);
+
+            let scan = self.shards.all()[index]
+                .engine
+                .list_keys(request, after, remaining, budget)?;
+
+            listing.scanned += scan.scanned;
+            listing.entries.extend(scan.entries);
+            if scan.corrupt > 0 {
+                warn!(
+                    shard = index,
+                    count = scan.corrupt,
+                    "skipped unreadable records while listing"
+                );
+            }
+
+            if let Some(stopped) = scan.stopped_at {
+                listing.cursor = Some(crate::listing::encode(index, &stopped));
+                listing.truncated = scan.budget_exhausted;
+                return Ok(listing);
+            }
+
+            // Off the end of that shard: the next starts at its own beginning.
+            after = None;
+        }
+
+        // Every shard walked to its end, so there is nothing to resume from and
+        // the absent cursor is what tells the client it is done.
+        Ok(listing)
+    }
+
+    fn list_tags(&self, request: &vash_core::ListRequest<'_>) -> Result<Listing> {
+        // Entirely from RAM: the registry is loaded at boot and merged across
+        // shards by maximum, which is the same number this node reports to its
+        // peers. No transaction is opened and no reader slot is taken, which is
+        // why this needs no scan budget and can never be `truncated`.
+        let mut known = self.tag_generations()?;
+
+        // Lexicographic, not registration order: ids are per shard and differ
+        // between nodes, so registration order would make two nodes' listings
+        // incomparable — and comparing them is how convergence is observed.
+        known.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+
+        // Resuming by name rather than by position is what makes a concurrently
+        // registered tag harmless: it lands wherever it sorts and shifts
+        // nothing, so every name present throughout the walk is returned once.
+        let start = match request.cursor {
+            [] => 0,
+            cursor => known.partition_point(|entry| &*entry.name <= cursor),
+        };
+
+        let limit = request.limit as usize;
+        let mut listing = Listing::default();
+        for entry in &known[start..] {
+            listing.scanned += 1;
+            if !request.matches(&entry.name) {
+                continue;
+            }
+            listing.entries.push(vash_core::ListEntry::new(
+                entry.name.clone(),
+                entry.generation,
+            ));
+            if listing.entries.len() >= limit {
+                listing.cursor = Some(entry.name.clone());
+                break;
+            }
+        }
+        Ok(listing)
     }
 
     fn tag_generations(&self) -> Result<Vec<vash_core::TagGeneration>> {

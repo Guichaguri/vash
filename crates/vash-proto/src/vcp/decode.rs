@@ -1,4 +1,4 @@
-use vash_core::{Command, CoreError, Key, Set};
+use vash_core::{Command, CoreError, Key, ListRequest, Set};
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -96,6 +96,15 @@ pub const HELLO_BODY_LEN: usize = 4;
 pub const TOUCH_PREFIX_LEN: usize = 4;
 /// `kind u8 | reserved u8 * 3 | count u32` ahead of a `TAG_SYNC` entry list.
 pub const TAG_SYNC_HEADER_LEN: usize = 8;
+/// `limit u32 | cursor_len u16 | pattern_len u16 | reserved u32` ahead of a
+/// listing request's cursor and pattern.
+pub const LIST_BODY_HEADER_LEN: usize = 12;
+/// Longest cursor a client may send back.
+///
+/// The longest this server *produces* is `shard_index u16` plus a maximum-length
+/// key. Bounded here so a fabricated one is refused before it is copied
+/// anywhere, and so the limit is one number rather than an inference.
+pub const MAX_LIST_CURSOR_LEN: usize = 2 + vash_core::MAX_KEY_LEN;
 
 /// A bounds-checked forward reader over a frame body.
 ///
@@ -383,6 +392,13 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
 
         Opcode::Cluster => Command::Cluster,
 
+        Opcode::ListKeys => {
+            Command::ListKeys(decode_list_request(body).map_err(|(s, d)| fail(s, d))?)
+        }
+        Opcode::ListTags => {
+            Command::ListTags(decode_list_request(body).map_err(|(s, d)| fail(s, d))?)
+        }
+
         // Handled above; listed so this match stays exhaustive over the opcode
         // set rather than needing a catch-all that would swallow a new one.
         Opcode::Auth => unreachable!("AUTH returns before the command dispatch"),
@@ -401,6 +417,68 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
         },
         consumed,
     })
+}
+
+/// Parses a listing body, shared by `LIST_KEYS` and `LIST_TAGS`.
+///
+/// ```text
+/// limit u32 | cursor_len u16 | pattern_len u16 | reserved u32
+/// cursor bytes | pattern bytes
+/// ```
+///
+/// **Trailing bytes are rejected.** Extension happens through `reserved`, and
+/// silently ignoring a field this build does not read would let a client believe
+/// it took effect.
+///
+/// The cursor is not interpreted here — only length-bounded. Whether it points
+/// anywhere real depends on the shard count, which is storage configuration a
+/// codec has no business knowing; the store decodes it and reports a malformed
+/// one as `BAD_REQUEST` all the same.
+pub fn decode_list_request(body: &[u8]) -> Result<ListRequest<'_>, (Status, &'static str)> {
+    let mut c = Cursor::new(body);
+    let header = c.take(LIST_BODY_HEADER_LEN).ok_or((
+        Status::BadRequest,
+        "listing body is shorter than its header",
+    ))?;
+
+    let limit = u32::from_le_bytes(header[0..4].try_into().expect("8-byte header"));
+    let cursor_len = u16::from_le_bytes(header[4..6].try_into().expect("8-byte header")) as usize;
+    let pattern_len = u16::from_le_bytes(header[6..8].try_into().expect("8-byte header")) as usize;
+
+    // Bounded before either is used to slice, so a hostile length cannot read
+    // past the frame — `take` would refuse anyway, but refusing with the reason
+    // is what a client can act on.
+    if cursor_len > MAX_LIST_CURSOR_LEN {
+        return Err((Status::BadRequest, "listing cursor is too long"));
+    }
+    if pattern_len > vash_core::MAX_KEY_LEN {
+        return Err((Status::BadRequest, "listing pattern is too long"));
+    }
+
+    let cursor = c
+        .take(cursor_len)
+        .ok_or((Status::BadRequest, "truncated listing cursor"))?;
+    let pattern = c
+        .take(pattern_len)
+        .ok_or((Status::BadRequest, "truncated listing pattern"))?;
+
+    if c.pos != body.len() {
+        return Err((Status::BadRequest, "trailing bytes after the listing body"));
+    }
+
+    let request = ListRequest {
+        limit,
+        cursor,
+        pattern,
+    };
+    request.validate().map_err(|e| match e {
+        vash_core::CoreError::BadLimit { .. } => {
+            (Status::BadRequest, "listing limit is out of range")
+        }
+        _ => (Status::BadRequest, "listing pattern is malformed"),
+    })?;
+
+    Ok(request)
 }
 
 /// Parses an `AUTH` body.
@@ -681,6 +759,83 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn list_request_roundtrips() {
+        for (limit, cursor, pattern) in [
+            (1u32, b"".as_slice(), b"".as_slice()),
+            (1024, b"\x00\x00session:9", b"session:*"),
+            (10, b"", br"escaped\*"),
+        ] {
+            let mut body = Vec::new();
+            encode::encode_list_body(&mut body, limit, cursor, pattern);
+
+            let decoded = decode_list_request(&body).expect("valid listing body");
+            assert_eq!(decoded.limit, limit);
+            assert_eq!(decoded.cursor, cursor);
+            assert_eq!(decoded.pattern, pattern);
+        }
+    }
+
+    #[test]
+    fn both_listing_opcodes_share_one_body() {
+        let mut body = Vec::new();
+        encode::encode_list_body(&mut body, 32, b"", b"user:*");
+
+        for opcode in [Opcode::ListKeys, Opcode::ListTags] {
+            let buf = frame(opcode, 9, &body);
+            let Ok(Decoded::Request { request, .. }) = decode(&buf) else {
+                panic!("expected a request");
+            };
+            let (Command::ListKeys(request) | Command::ListTags(request)) = request.command else {
+                panic!("expected a listing");
+            };
+            assert_eq!(request.limit, 32);
+            assert_eq!(request.pattern, b"user:*");
+        }
+    }
+
+    #[test]
+    fn a_listing_limit_outside_the_range_is_rejected_rather_than_clamped() {
+        // Silently clamping would make a client page incorrectly: it would
+        // count on entries the server was never going to send.
+        for limit in [0, vash_core::MAX_LIST_LIMIT + 1, u32::MAX] {
+            let mut body = Vec::new();
+            encode::encode_list_body(&mut body, limit, b"", b"");
+            assert!(
+                decode_list_request(&body).is_err(),
+                "limit {limit} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_byte_after_the_listing_body_is_rejected() {
+        // The reserved field is the extension point. Ignoring a stray field
+        // would let a client believe something took effect that this build
+        // never read.
+        let mut body = Vec::new();
+        encode::encode_list_body(&mut body, 8, b"", b"a*");
+        body.push(0);
+        assert!(decode_list_request(&body).is_err());
+    }
+
+    #[test]
+    fn an_unterminated_escape_is_refused_at_decode() {
+        let mut body = Vec::new();
+        encode::encode_list_body(&mut body, 8, b"", br"trailing\");
+        assert!(decode_list_request(&body).is_err());
+    }
+
+    #[test]
+    fn an_oversized_listing_cursor_allocates_nothing() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&8u32.to_le_bytes());
+        body.extend_from_slice(&u16::MAX.to_le_bytes()); // cursor_len
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_list_request(&body).is_err());
     }
 
     #[test]

@@ -78,6 +78,25 @@ fn vcp_seeds(root: &Path) {
     );
     write(&dir, "tag_sync", &frame(Opcode::TagSync, &digest));
 
+    // The listing bodies carry two attacker-controlled lengths and a pattern
+    // the matcher then runs against every record it walks, so the fuzzer wants
+    // a first page, a resumed page and an escaped pattern to mutate from.
+    let mut first_page = Vec::new();
+    vash_proto::vcp::encode_list_body(&mut first_page, 64, b"", b"session:*");
+    write(&dir, "list_keys", &frame(Opcode::ListKeys, &first_page));
+
+    let mut resumed = Vec::new();
+    vash_proto::vcp::encode_list_body(&mut resumed, 1024, b"\x00\x00session:41", b"*");
+    write(
+        &dir,
+        "list_keys_resumed",
+        &frame(Opcode::ListKeys, &resumed),
+    );
+
+    let mut escaped = Vec::new();
+    vash_proto::vcp::encode_list_body(&mut escaped, 1, b"news", br"a\*b?c");
+    write(&dir, "list_tags", &frame(Opcode::ListTags, &escaped));
+
     // Two frames back to back: the pipelining path, where a boundary mistake
     // shows up as one request executed against another's bytes.
     let mut pipelined = frame(Opcode::Get, b"first");

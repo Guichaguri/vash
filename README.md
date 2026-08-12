@@ -47,6 +47,7 @@ Run with `--ephemeral` to start from an empty database and skip syncing, or
 | Capacity watermarks and eviction | Working — TTL-ordered, never LRU |
 | Metrics and admin endpoints | Working — `/metrics`, `/health`, `/stats` |
 | Cluster tag invalidation | Working — fan-out plus anti-entropy, see [Clustering](#clustering) |
+| `LIST_KEYS`, `LIST_TAGS` | Working — administrative, cursor-paged, glob-filtered, **off unless enabled** |
 
 The legacy memcached **binary** protocol (magic `0x80`) is not implemented and
 will not be: upstream deprecated it in favour of the meta commands.

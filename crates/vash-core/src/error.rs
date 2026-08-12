@@ -25,6 +25,20 @@ pub enum CoreError {
     #[error("tag name is {len} bytes, limit is {max}")]
     TagTooLong { len: usize, max: usize },
 
+    #[error("listing limit is {limit}, must be 1..={max}")]
+    BadLimit { limit: u32, max: u32 },
+
+    /// A listing pattern ended in a lone escape, naming a byte that is not
+    /// there.
+    #[error("pattern ends in an unterminated escape")]
+    BadPattern,
+
+    /// A listing cursor did not decode. Cursors are opaque to clients and are
+    /// only ever echoed back, so this means a client fabricated one, corrupted
+    /// one, or carried one across a change of shard count.
+    #[error("listing cursor is malformed: {0}")]
+    BadCursor(&'static str),
+
     /// A stored record could not be interpreted. This means on-disk corruption
     /// or a format written by an incompatible build.
     #[error("malformed record: {0}")]

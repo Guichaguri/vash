@@ -160,3 +160,75 @@ fn the_header_layout_is_the_on_disk_format() {
     assert_eq!(align_of::<RecordHeader>(), 1);
     assert_eq!(align_of::<TagRef>(), 1);
 }
+
+/// The glob matcher reads a pattern supplied by an unauthenticated stranger and
+/// applies it to every record a scan walks. Example tests cover the shapes
+/// someone thought of; these cover the ones that make it hang or panic.
+mod glob {
+    use super::*;
+    use vash_core::glob;
+
+    proptest! {
+        #[test]
+        fn matching_arbitrary_bytes_never_panics(
+            pattern in proptest::collection::vec(any::<u8>(), 0..64),
+            candidate in proptest::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let _ = glob::matches(&pattern, &candidate);
+        }
+
+        /// A non-empty pattern with no metacharacters is an equality test. If
+        /// this ever fails, some byte has quietly become special.
+        ///
+        /// Empty is excluded deliberately: it is the documented match-all, not
+        /// a literal that happens to be zero bytes long.
+        #[test]
+        fn a_literal_pattern_matches_only_itself(
+            literal in proptest::collection::vec(1u8..=127, 1..32),
+            other in proptest::collection::vec(1u8..=127, 0..32),
+        ) {
+            prop_assume!(!literal.iter().any(|b| matches!(b, b'*' | b'?' | b'\\')));
+            prop_assume!(!other.iter().any(|b| matches!(b, b'*' | b'?' | b'\\')));
+
+            prop_assert!(glob::matches(&literal, &literal));
+            prop_assert_eq!(glob::matches(&literal, &other), literal == other);
+        }
+
+        /// `*` on both ends is a substring search, which is the form an
+        /// operator reaches for most often.
+        #[test]
+        fn a_star_wrapped_pattern_is_a_substring_search(
+            prefix in proptest::collection::vec(1u8..=127, 0..16),
+            needle in proptest::collection::vec(1u8..=127, 1..16),
+            suffix in proptest::collection::vec(1u8..=127, 0..16),
+        ) {
+            prop_assume!(!needle.iter().any(|b| matches!(b, b'*' | b'?' | b'\\')));
+
+            let mut pattern = vec![b'*'];
+            pattern.extend_from_slice(&needle);
+            pattern.push(b'*');
+
+            let mut candidate = prefix;
+            candidate.extend_from_slice(&needle);
+            candidate.extend_from_slice(&suffix);
+
+            prop_assert!(glob::matches(&pattern, &candidate));
+        }
+
+        /// A validated pattern is one the matcher can finish on. The pairing
+        /// matters: validation runs once at decode, matching runs per record,
+        /// and anything validation lets through is applied a million times.
+        #[test]
+        fn validation_accepts_exactly_what_matching_can_use(
+            pattern in proptest::collection::vec(any::<u8>(), 0..48),
+            candidate in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            if glob::validate(&pattern).is_ok() {
+                let _ = glob::matches(&pattern, &candidate);
+            } else {
+                // The only rejection is a trailing escape.
+                prop_assert!(pattern.last() == Some(&b'\\'));
+            }
+        }
+    }
+}

@@ -125,6 +125,26 @@ batch = 512
 # byte, so there is nothing to turn on.
 flush_enabled = false
 
+# LIST_KEYS / LIST_TAGS page through the keyspace and the tag registry. Off
+# unless deliberately enabled, for two separately sufficient reasons — and
+# authentication retires neither, because it decides who may connect while this
+# decides what any connected client may do:
+#
+#   Disclosure. Cache keys routinely embed user and session identifiers, so
+#   enumeration turns a reachable port into a dump of who is in the cache.
+#   Cost. These are the only reads whose work is not bounded by the request;
+#   every other one touches as many records as the client named.
+#
+# They are administrative tools: a linear scan, paged by an opaque cursor.
+listing_enabled = false
+
+# Records one LIST_KEYS call may examine before it stops early and hands back a
+# cursor. This is what bounds how long a single request holds a read
+# transaction open — the thing that blocks LMDB from reusing freed pages. A page
+# that stops here still advances its cursor, so paging makes progress through a
+# region of dead or non-matching records rather than stalling on it.
+listing_max_scan = 100000
+
 [auth]
 # Who may use the cache port. Off by default.
 #

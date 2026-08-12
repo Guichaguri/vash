@@ -105,6 +105,15 @@ pub enum Opcode {
     /// the same protocol on the same port because a peer is just another VCP
     /// client from the server's point of view.
     TagSync = 0x40,
+
+    /// Administrative: page through the live keys.
+    ///
+    /// `0x50` opens a group rather than extending `0x3x`, whose members are
+    /// whole-keyspace *mutations*. A listing next to them invites the
+    /// assumption that the same danger applies in the same way.
+    ListKeys = 0x50,
+    /// Administrative: page through the tag registry.
+    ListTags = 0x51,
 }
 
 impl Opcode {
@@ -116,6 +125,13 @@ impl Opcode {
     /// would let a write block the whole runtime behind the writer queue, so
     /// this lists what is known to be safe rather than excluding what is not —
     /// an opcode added later is a write until someone says otherwise.
+    ///
+    /// **`ListKeys` and `ListTags` are deliberately absent**, though neither
+    /// ever touches the writer queue. The real question this predicate answers
+    /// is "is this cheap enough to run on a runtime worker", and a scan holding
+    /// a read transaction for milliseconds is not, however read-only it is. If
+    /// this ever grows a second caller that means "does not write", it has to be
+    /// split rather than reused.
     #[inline]
     pub fn is_read_only(self) -> bool {
         matches!(
@@ -141,6 +157,8 @@ impl Opcode {
             0x30 => Self::DeleteByTag,
             0x31 => Self::Flush,
             0x40 => Self::TagSync,
+            0x50 => Self::ListKeys,
+            0x51 => Self::ListTags,
             _ => return None,
         })
     }

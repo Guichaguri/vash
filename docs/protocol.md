@@ -151,13 +151,12 @@ requests, which produce none.
 | `0x30` | `DELETE_BY_TAG` | yes |
 | `0x31` | `FLUSH` | yes, if enabled server-side |
 | `0x40` | `TAG_SYNC` | yes — peer-to-peer, see [Cluster](#cluster) |
-| `0x50` | `LIST_KEYS` | planned — see [opcodes.md](opcodes.md#list_keys-0x50) |
-| `0x51` | `LIST_TAGS` | planned — see [opcodes.md](opcodes.md#list_tags-0x51) |
+| `0x50` | `LIST_KEYS` | yes, if enabled server-side — see [opcodes.md](opcodes.md#list_keys-0x50) |
+| `0x51` | `LIST_TAGS` | yes, if enabled server-side — see [opcodes.md](opcodes.md#list_tags-0x51) |
 
 An unknown opcode is answered with `UNSUPPORTED` (8), an empty body, and the
 **original opcode byte echoed**, so the client can still correlate. The
-connection stays open. That is what a server of this generation answers to the
-planned opcodes, so a client can probe for them safely.
+connection stays open.
 
 ## Status codes
 
@@ -223,7 +222,7 @@ atomic per shard only.
 | `0x01` | `TAGS` | Tags and `DELETE_BY_TAG` are available. |
 | `0x02` | `MEMCACHED` | The memcached protocol is served on this port. |
 | `0x04` | `CLUSTER` | An invalidation sent here reaches the rest of the cluster. |
-| `0x08` | `LISTING` | Planned. `LIST_KEYS` and `LIST_TAGS` are enabled here. |
+| `0x08` | `LISTING` | `LIST_KEYS` and `LIST_TAGS` are enabled here. |
 | `0x10` | `AUTH_REQUIRED` | This connection must send `AUTH` before anything else. |
 
 `CLUSTER` is set only when this node has peers configured **and** is set to
