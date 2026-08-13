@@ -482,11 +482,22 @@ have needed an enable flag and a prefix cap.
 
 ## 14. Testing
 
-**Differential.** These are the subcommands most worth running against
-`memcached:1.6-alpine` in `tests/compat/docker_differential.py`, comparing
-**shape** rather than values: line format, the `items:<class>:` and `<id>:`
-prefixes, and terminators. `sizes`, `extstore` and `proxy` can be compared
-byte for byte, since all three are exact.
+**Differential.** Built, as the `memcached/stats` suite in
+`tests/compat/docker_differential.py` — 11 identical and 3 known divergences
+against `memcached:1.6-alpine`.
+
+It compares two ways, because two different things are being claimed. `sizes`,
+`extstore`, `proxy` and the error replies go through the ordinary byte-for-byte
+path, since all four are exact. The sections carrying live counters declare a
+**shape reduction** instead: a leaf name collapses to `<field>` and a numeric
+segment to `<n>`, leaving the namespace structure a tool actually parses —
+`STAT <field>`, `STAT items:<n>:<field>`, `STAT <n>:<field>`, `END`. A line that
+is not a `STAT` survives verbatim, so a malformed reply still shows up as a
+difference rather than being reduced into agreement.
+
+The three refusals are probes too, with their reasons in `KNOWN_DIVERGENCES`.
+Recording a deliberate divergence is what keeps the suite green without losing
+the fact that it exists.
 
 **Unit.** The `settings` mapping table renders every configured value; the
 `items` class id is the same constant the dumps print.

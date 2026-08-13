@@ -4,13 +4,18 @@
     cargo build --release --bin vash-server
     python tests/compat/docker_differential.py
 
-Four combinations, because authentication is a startup flag on all three
-servers and cannot be turned on mid-connection:
+Five combinations. Four of them are split by authentication, which is a startup
+flag on all three servers and cannot be turned on mid-connection:
 
     memcached/core   plain memcached          vs  plain vash
     memcached/auth   memcached -Y authfile    vs  vash --require-auth
+    memcached/stats  plain memcached          vs  vash --enable-listing
     redis/core       plain redis              vs  plain vash
     redis/auth       redis --requirepass      vs  vash --require-auth
+
+`memcached/stats` needs its own combination for a different reason: `stats
+settings` reports the gates, so the subject has to be started with the ones
+whose reporting is being checked actually turned on.
 
 Pinning the reference images is the point. `apt-get install memcached` gives a
 different version on every distro and every year, which is not a baseline for a
@@ -47,7 +52,13 @@ def main():
     parser.add_argument(
         "--only",
         action="append",
-        choices=["memcached/core", "memcached/auth", "redis/core", "redis/auth"],
+        choices=[
+            "memcached/core",
+            "memcached/auth",
+            "memcached/stats",
+            "redis/core",
+            "redis/auth",
+        ],
         help="run only these combinations (repeatable)",
     )
     parser.add_argument("--verbose", action="store_true")
@@ -58,7 +69,16 @@ def main():
         return 2
     require_docker()
 
-    selected = set(args.only or ["memcached/core", "memcached/auth", "redis/core", "redis/auth"])
+    selected = set(
+        args.only
+        or [
+            "memcached/core",
+            "memcached/auth",
+            "memcached/stats",
+            "redis/core",
+            "redis/auth",
+        ]
+    )
     failures = 0
 
     with tempfile.TemporaryDirectory(prefix="vash-diff-creds-") as credential_dir:
@@ -77,6 +97,17 @@ def main():
             ):
                 failures += differential.run_suite(
                     "memcached", "auth", wrap(reference), wrap(subject), args.verbose
+                )
+
+        if "memcached/stats" in selected:
+            # `--enable-listing` because `stats settings` reports the gates, and
+            # a suite checking that report should see them on.
+            with (
+                Memcached() as reference,
+                Vash(args.binary, listing=True) as subject,
+            ):
+                failures += differential.run_suite(
+                    "memcached", "stats", wrap(reference), wrap(subject), args.verbose
                 )
 
         if "redis/core" in selected:

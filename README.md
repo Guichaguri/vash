@@ -410,8 +410,17 @@ python tests/compat/docker_differential.py
 |---|---|---|---|
 | memcached | `memcached:1.6-alpine` | 37 | 1 |
 | memcached, authenticated | `memcached -Y authfile` | 23 | 3 |
+| memcached, `stats` subcommands | `memcached:1.6-alpine` | 11 | 3 |
 | Redis | `redis:7.4-alpine` | 27 | 1 |
 | Redis, authenticated | `redis --requirepass` | 21 | 1 |
+
+The `stats` suite compares two ways, because two different things are being
+claimed. `sizes`, `extstore`, `proxy` and the error replies are byte-identical —
+a stock memcached leaves those empty too. The sections carrying live counters
+cannot be: a pid, an uptime and a field list differ between any two servers.
+Those are compared on **structure** — that every line is `STAT <name> <value>`,
+that `items:<n>:<field>` and `<n>:<field>` are namespaced the same way, and that
+the reply ends with `END` — which is what a tool actually parses.
 
 Every divergence is listed in the script with the reasoning; anything not on
 that list fails the run. They are all cases where copying upstream would hurt a

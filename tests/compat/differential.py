@@ -72,6 +72,40 @@ def memcached_auth(user=AUTH_USER, secret=AUTH_SECRET):
 
 
 # Probe: (name, commands, terminator that ends the whole exchange)
+def stat_shape(data):
+    """Reduces a `stats` reply to what two different servers can agree on.
+
+    The values cannot match and are not supposed to: a pid, an uptime and a
+    field list differ between any two servers, and vash reports a documented
+    subset of upstream's counters. What must match is the **structure a tool
+    parses** — that every line is `STAT <name> <value>`, that names are
+    namespaced the same way, and that the reply ends with `END`.
+
+    So a leaf name is collapsed to `<field>` and a numeric segment to `<n>`,
+    leaving the namespace shape:
+
+        pid 4711            -> STAT <field>
+        items:1:number 5    -> STAT items:<n>:<field>
+        1:get_hits 0        -> STAT <n>:<field>
+        26:addr tcp:...     -> STAT <n>:<field>
+
+    A line that is not a `STAT` at all survives verbatim, so a malformed reply
+    still shows up as a difference rather than being reduced into agreement.
+    """
+    shapes = set()
+    for line in data.split(b"\r\n"):
+        if not line:
+            continue
+        if not line.startswith(b"STAT "):
+            shapes.add(line)  # END, an error, or something neither server meant
+            continue
+        name = line[len(b"STAT ") :].split(b" ")[0]
+        segments = [b"<n>" if s.isdigit() else s for s in name.split(b":")]
+        segments[-1] = b"<field>"
+        shapes.add(b"STAT " + b":".join(segments))
+    return b"\n".join(sorted(shapes))
+
+
 MEMCACHED_PROBES = [
     ("basic set/get", [b"set ~1 5 0 3\r\nabc\r\n", b"get ~1\r\n"], b"END\r\n"),
     ("get miss", [b"get ~nothing-here\r\n"], b"END\r\n"),
@@ -304,9 +338,58 @@ REDIS_AUTH_PROBES = [
     ], b"\r\n"),
 ]
 
+# The `stats` subcommands, which the protocol document explicitly declines to
+# specify: "the kinds of arguments and the data sent are not documented in this
+# version of the protocol, and are subject to change for the convenience of
+# memcache developers". So the reference implementation is the contract, and
+# this suite is how that claim is checked.
+#
+# Two comparison modes, because two different things are being claimed. The
+# replies that are *constant* — an empty subsystem, a refusal — are compared
+# byte for byte like every other probe. The ones carrying live counters cannot
+# be: a pid, an uptime and a field list differ between any two servers, and this
+# one reports a documented subset. Those declare `shape=stat_shape`, which
+# reduces a reply to the structure a tool actually parses. See
+# `docs/stats-subcommands.md`.
+MEMCACHED_STATS_PROBES = [
+    # ---- byte for byte ----
+    #
+    # A stock memcached tracks item sizes only under `-o track_sizes` and
+    # answers an empty reply for subsystems that were not compiled in. There is
+    # no size tracking, no external storage and no proxy here either, so all
+    # three replies are exact rather than approximations — which is worth
+    # pinning, because it is the cheapest kind of compatibility there is.
+    ("stats sizes", [b"stats sizes\r\n"], b"END\r\n"),
+    ("stats extstore", [b"stats extstore\r\n"], b"END\r\n"),
+    ("stats proxy", [b"stats proxy\r\n"], b"END\r\n"),
+    # An unrecognised subcommand, and the two verbs 1.6.45 removed.
+    ("stats unknown subcommand", [b"stats frobnicate\r\n"], b"\r\n"),
+    ("stats sizes_enable", [b"stats sizes_enable\r\n"], b"\r\n"),
+    ("stats sizes_disable", [b"stats sizes_disable\r\n"], b"\r\n"),
+    # ---- structure only ----
+    ("stats", [b"stats\r\n"], b"END\r\n", stat_shape),
+    ("stats settings", [b"stats settings\r\n"], b"END\r\n", stat_shape),
+    (
+        "stats items",
+        [b"set ~1 0 0 1\r\nx\r\n", b"stats items\r\n"],
+        b"END\r\n",
+        stat_shape,
+    ),
+    ("stats slabs", [b"stats slabs\r\n"], b"END\r\n", stat_shape),
+    ("stats conns", [b"stats conns\r\n"], b"END\r\n", stat_shape),
+    # ---- deliberately refused ----
+    #
+    # Upstream implements all three; the divergence is recorded rather than
+    # hidden, which is what KNOWN_DIVERGENCES is for.
+    ("stats reset", [b"stats reset\r\n"], b"\r\n"),
+    ("stats cachedump", [b"stats cachedump 1 10\r\n"], b"\r\n"),
+    ("stats detail", [b"stats detail on\r\n"], b"\r\n"),
+]
+
 SUITES = {
     ("memcached", "core"): MEMCACHED_PROBES,
     ("memcached", "auth"): MEMCACHED_AUTH_PROBES,
+    ("memcached", "stats"): MEMCACHED_STATS_PROBES,
     ("redis", "core"): REDIS_PROBES,
     ("redis", "auth"): REDIS_AUTH_PROBES,
 }
@@ -344,6 +427,33 @@ KNOWN_DIVERGENCES = {
         "EXPERIMENTAL upstream, which is what this reads like. The probe's own "
         "subject — that vash consumes the refused command's declared data block "
         "rather than reading `get z` as a command — its reply proves."
+    ),
+    ("memcached", "stats", "stats reset"): (
+        "Upstream zeroes its counters and answers RESET; vash refuses by name. "
+        "The counters behind `stats` are the same atomics `/metrics` exports, "
+        "and a Prometheus counter that goes backwards corrupts every rate over "
+        "the window containing the reset. A baseline that `stats` subtracts "
+        "would avoid that and is the design in docs/stats-subcommands.md §9 — "
+        "it is not built because it buys a human a zeroed counter in a terminal "
+        "at the price of `stats` and `/metrics` permanently disagreeing, and "
+        "`/metrics` over a time range answers the question better."
+    ),
+    ("memcached", "stats", "stats cachedump"): (
+        "Upstream's older key dump. vash serves the command that replaced it — "
+        "`lru_crawler metadump` and `mgdump` — which carries more per key and "
+        "pages the whole keyspace where cachedump returns one capped page. Its "
+        "`ITEM <key> [<b> b; <ts> s]` is also a positional format with an "
+        "unencoded key, and the keyspace here is shared with Redis and VCP "
+        "clients that can store a key holding a space or a CRLF — which would "
+        "break the line with nowhere to put an encoding."
+    ),
+    ("memcached", "stats", "stats detail"): (
+        "Per-key-prefix hit counters. The only one of these that would put work "
+        "on the retrieval hot path — a hash lookup and four counters on every "
+        "get and store — which is why upstream ships it disabled, and why no "
+        "tooling depends on it. Upstream's table is also uncapped, so a client "
+        "that puts an id in the first path segment turns it into an unbounded "
+        "leak."
     ),
     ("redis", "core", "unknown command"): (
         "Redis names the arguments as well as the command in its "
@@ -450,10 +560,19 @@ def run_suite(dialect, suite, reference, subject, verbose=False):
     known = []
     differences = []
 
-    for name, raw_commands, terminator in probes:
+    for probe in probes:
+        # A probe is `(name, sends, terminator)`, optionally with a fourth
+        # element: a reduction applied to both replies before they are compared.
+        # Without one the comparison is byte for byte, which is the default and
+        # what almost every probe wants.
+        name, raw_commands, terminator = probe[:3]
+        reduce = probe[3] if len(probe) > 3 else None
+
         commands = [render(c, prefix) for c in raw_commands]
         expected = normalise(reference.run(commands, terminator), dialect)
         actual = normalise(subject.run(commands, terminator), dialect)
+        if reduce is not None:
+            expected, actual = reduce(expected), reduce(actual)
         key = (dialect, suite, name)
 
         if expected == actual:

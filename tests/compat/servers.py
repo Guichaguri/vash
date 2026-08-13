@@ -140,9 +140,13 @@ class Redis(Container):
 class Vash:
     """The subject, as a local process."""
 
-    def __init__(self, binary, credentials=None):
+    def __init__(self, binary, credentials=None, listing=False):
         self.binary = binary
         self.credentials = credentials
+        # Keyspace enumeration is off by default here and always on upstream, so
+        # a suite that compares what the gates *report* has to be able to turn
+        # them on. See the memcached/stats combination.
+        self.listing = listing
         self.port = _free_port()
         self.process = None
         self.data = None
@@ -160,6 +164,8 @@ class Vash:
             # which always has it.
             "--enable-flush",
         ]
+        if self.listing:
+            argv.append("--enable-listing")
         if self.credentials:
             argv += ["--require-auth", "--auth-file", self.credentials]
 
