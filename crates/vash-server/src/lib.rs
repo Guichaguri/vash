@@ -119,6 +119,17 @@ impl Server {
             },
         );
 
+        // Said once at startup because the per-connection close is logged at
+        // `debug`, where an operator at the default level will not see it — and
+        // the symptom on the client side is a bare disconnect that looks like a
+        // network fault rather than a decision someone made.
+        if !config.protocol.memcached_enabled {
+            info!("the memcached protocol is disabled; those connections will be closed");
+        }
+        if !config.protocol.resp_enabled {
+            info!("the Redis protocol is disabled; those connections will be closed");
+        }
+
         let info = dispatch::server_info(
             config.protocol,
             store.shard_count() as u16,

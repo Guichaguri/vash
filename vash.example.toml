@@ -158,7 +158,7 @@ listing_max_scan = 100000
 # settings, since a client that cannot connect cannot be told anything else.
 #
 # The native protocol has no switch: it is the one that can report what a node
-# serves.
+# serves. --disable-memcached and --disable-resp do the same from the CLI.
 memcached_enabled = true
 resp_enabled = true
 

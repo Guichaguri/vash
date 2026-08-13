@@ -335,10 +335,14 @@ readable by a VCP or Redis client and the other way round, client flags
 included.
 
 Either compatibility dialect can be switched off — `protocol.memcached_enabled`
-and `protocol.resp_enabled` — for a deployment that wants one parser reachable
-rather than three. A connection speaking a disabled dialect is closed at
-detection, and the `MEMCACHED` / `RESP` capability bits in the VCP handshake
-report which are served.
+and `protocol.resp_enabled`, or `--disable-memcached` and `--disable-resp` — for
+a deployment that wants one parser reachable rather than three. A connection
+speaking a disabled dialect is closed at detection, and the `MEMCACHED` / `RESP`
+capability bits in the VCP handshake report which are served.
+
+```bash
+vash-server --listen 0.0.0.0:11311 --disable-memcached --disable-resp
+```
 
 Existing memcached clients need no changes:
 

@@ -63,11 +63,14 @@ describes where it departs from it.
 or closes the connection.
 
 A dialect disabled in configuration (`protocol.memcached_enabled`,
-`protocol.resp_enabled`) is closed here too, on the same path as an
-unrecognised byte and before its parser runs — refusing in the dialect's own
-words would mean running the parser the operator turned off. VCP has no such
-switch: it is the native protocol, and the `MEMCACHED` and `RESP` capability
-bits make it the only one that can report what a node serves.
+`protocol.resp_enabled`, or `--disable-memcached` / `--disable-resp`) is closed
+here too, on the same path as an unrecognised byte and before its parser runs —
+refusing in the dialect's own words would mean running the parser the operator
+turned off. The close is logged at `debug`, once per connection; the disabled
+dialect is named at `info` at startup, because the client-side symptom is a bare
+disconnect that looks like a network fault. VCP has no such switch: it is the
+native protocol, and the `MEMCACHED` and `RESP` capability bits make it the only
+one that can report what a node serves.
 
 This is what makes `HELLO` mandatory as the opening frame: the requirement is
 enforced by the detector, not by per-connection session state. Nothing later

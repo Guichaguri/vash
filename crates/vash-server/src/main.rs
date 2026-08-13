@@ -44,6 +44,16 @@ struct Cli {
     #[arg(long)]
     enable_listing: bool,
 
+    /// Stop serving the memcached text and meta protocols. A connection opening
+    /// with one is closed unanswered, and the handshake stops advertising it.
+    #[arg(long)]
+    disable_memcached: bool,
+
+    /// Stop serving the Redis protocol, on the same terms as
+    /// `--disable-memcached`.
+    #[arg(long)]
+    disable_resp: bool,
+
     /// Address of another node's cache port, to forward tag invalidations to.
     /// Repeatable. Replaces the config file's peer list rather than adding to
     /// it, so the flag always describes the whole cluster.
@@ -103,6 +113,15 @@ fn main() -> anyhow::Result<()> {
     }
     if cli.enable_listing {
         config.protocol.listing_enabled = true;
+    }
+    // One-directional, like the `--enable-*` pair above it: a flag that is
+    // absent means "whatever the config file said", never "put it back". The
+    // asymmetry is the default's — these two are on, those two are off.
+    if cli.disable_memcached {
+        config.protocol.memcached_enabled = false;
+    }
+    if cli.disable_resp {
+        config.protocol.resp_enabled = false;
     }
     if let Some(path) = cli.auth_file {
         config.auth.file = path;

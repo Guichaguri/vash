@@ -42,14 +42,14 @@ other opcode first closes the connection, because the leading byte would be
 ambiguous. There is no in-band negotiation beyond this.
 
 Either compatibility dialect can be turned off — `protocol.memcached_enabled`
-and `protocol.resp_enabled`, both on by default — and a disabled one is
-**closed right here**, before its parser sees a byte, exactly as an
-unrecognised first byte is. A client speaking it gets a connect that succeeds
-and then EOF, with the reason only in the server's log; there is no error
-frame, because producing one would mean running the parser the operator turned
-off. The `MEMCACHED` and `RESP` [capability bits](#hello-0x01) are where a
-dialect's availability is stated, and VCP — which cannot be disabled — is the
-one dialect that can report it.
+and `protocol.resp_enabled`, both on by default, or `--disable-memcached` and
+`--disable-resp` — and a disabled one is **closed right here**, before its
+parser sees a byte, exactly as an unrecognised first byte is. A client speaking
+it gets a connect that succeeds and then EOF, with the reason only in the
+server's log; there is no error frame, because producing one would mean running
+the parser the operator turned off. The `MEMCACHED` and `RESP` [capability
+bits](#hello-0x01) are where a dialect's availability is stated, and VCP —
+which cannot be disabled — is the one dialect that can report it.
 
 It is also why **RESP inline commands are not accepted**: `get foo\r\n` is a
 valid inline Redis command *and* a valid memcached one, and no amount of
@@ -998,9 +998,10 @@ vash speaks the classic text protocol and the meta commands. The **legacy
 binary protocol (magic `0x80`) is not implemented and will not be** — upstream
 deprecated it in favour of the meta commands.
 
-Served by default, and turned off with `protocol.memcached_enabled = false`, in
-which case a connection opening with a memcached command is closed unanswered —
-see [First-byte detection](#first-byte-detection).
+Served by default, and turned off with `protocol.memcached_enabled = false` or
+`--disable-memcached`, in which case a connection opening with a memcached
+command is closed unanswered — see
+[First-byte detection](#first-byte-detection).
 
 Compatibility is checked in CI two ways: a real client library
 (`pymemcache`) driven against both vash and real memcached, and a byte-for-byte
@@ -1245,9 +1246,9 @@ no lists, hashes, sets, sorted sets, streams, transactions, scripting, pub/sub,
 `SCAN`, `SELECT` or replication commands, and there never will be — see
 [plan.md](plan.md) §16.
 
-Served by default, and turned off with `protocol.resp_enabled = false`, in which
-case a connection opening with a RESP array is closed unanswered — see
-[First-byte detection](#first-byte-detection).
+Served by default, and turned off with `protocol.resp_enabled = false` or
+`--disable-resp`, in which case a connection opening with a RESP array is closed
+unanswered — see [First-byte detection](#first-byte-detection).
 
 ## Framing
 
