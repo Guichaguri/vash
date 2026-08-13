@@ -162,6 +162,9 @@ impl Server {
 
         // Bound here rather than in `serve` so a port clash fails startup, and
         // so tests can read the assigned port before anything is served.
+        // Nothing is announced here: `admin::serve` already logs the bound
+        // address, which is the operator's confirmation that the endpoints they
+        // asked for are the ones being served.
         let admin = match config.observability.admin_listen.as_str() {
             "" => None,
             addr => Some(

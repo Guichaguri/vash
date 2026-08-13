@@ -312,7 +312,14 @@ client detects a cluster configured inconsistently.
 they can be bound to a private interface and a flood of scrapes cannot crowd out
 cache traffic.
 
+**Off until you name an address** — `--admin-listen`, or
+`observability.admin_listen`. The endpoints have no authentication of their own,
+and `/stats` describes what is in the cache and who is in the cluster, so the
+port is opened deliberately rather than closed after the fact.
+
 ```bash
+vash-server --listen 0.0.0.0:11311 --data ./data --admin-listen 127.0.0.1:9090
+
 curl -s localhost:9090/metrics | grep -E 'hits|misses|utilisation|evicted'
 curl -s localhost:9090/stats
 ```

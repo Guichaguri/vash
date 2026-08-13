@@ -285,9 +285,15 @@ log_level = "info"      # overridden by RUST_LOG when set
 
 # /metrics (Prometheus), /health and /stats (JSON).
 #
-# A separate port from cache traffic, so it can be bound to a private interface
-# and a flood of scrapes cannot crowd out real requests. Empty disables it.
+# Empty — the default — serves none of them. They have no authentication of
+# their own and report the store's size, its hit rate and the cluster's
+# membership to anyone who can reach the port, so it is opened deliberately
+# rather than closed after the fact. --admin-listen does the same from the CLI.
+#
+# Give it a private interface. It is a separate port from cache traffic so that
+# a flood of scrapes cannot crowd out real requests, which only holds if the two
+# are not the same interface.
 #
 # /health returns 503 when a shard has reached critical pressure and is
 # refusing writes: the process is up, but it is not doing its job.
-admin_listen = "127.0.0.1:9090"
+admin_listen = ""      # e.g. "127.0.0.1:9090"

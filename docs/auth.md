@@ -442,8 +442,8 @@ Set only when `auth.required` is on — the same contract as `CLUSTER` and
 
 **Pre-auth set: `HELLO` and `AUTH`. Nothing else, `PING` included.** `PING`
 looks harmless, but everything it could tell an unauthenticated party, `HELLO`
-already told them, and `/health` on the admin port is the health check an
-operator should be using. Every other opcode is `UNAUTHORIZED` (5).
+already told them, and `/health` on the admin port — which an operator enables
+for exactly this — is the health check they should be using. Every other opcode is `UNAUTHORIZED` (5).
 
 **`UNAUTHORIZED` (5) is reused rather than split.** Its documented meaning
 widens from "command disabled by configuration" to "refused by policy", which
@@ -666,8 +666,10 @@ comparison to add later. Not built; noted so the shape does not preclude it.
 ## 10. The admin port
 
 Out of scope, and stated so it is not assumed covered. `/metrics`, `/health` and
-`/stats` are on a separate port that defaults to `127.0.0.1` and can be switched
-off with `admin_listen = ""`. `/stats` discloses counters, not keys or values.
+`/stats` are on a separate port that serves nothing until `admin_listen` or
+`--admin-listen` names an address — being uncovered is why it is off by default
+rather than on and bound to loopback. `/stats` discloses counters, not keys or
+values.
 If it ever needs a control, a bearer token in an `Authorization` header is the
 whole design — HTTP already has the mechanism, and it shares nothing with the
 cache-port credential path.
@@ -823,4 +825,4 @@ release.
 | Credential file with loose permissions | Medium | Refused at startup on Unix, like `ssh` |
 | Pre-auth connections exhaust the connection budget | Medium | Separate cap plus an authentication deadline (§12) |
 | memcached's ASCII auth diverges from what is written here | Low | It is pinned by differential test against a real server, not by this document (§7) |
-| Operators assume the admin port is covered | Low | §10 says it is not; it defaults to loopback |
+| Operators assume the admin port is covered | Low | §10 says it is not, and it is off until an operator names an address |

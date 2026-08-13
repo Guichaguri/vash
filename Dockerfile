@@ -47,8 +47,10 @@ FROM scratch
 
 COPY --from=build --chown=65534:65534 /src/target/release/vash-server /vash-server
 
-# 11311 is the cache port for both protocols; 9090 is the admin port, which
-# should be published only to a private network if at all.
+# 11311 is the cache port for all three protocols. 9090 is the conventional
+# admin port, declared here for an operator who wants it — nothing listens on it
+# unless the command adds `--admin-listen 0.0.0.0:9090`, and it should be
+# published only to a private network even then.
 EXPOSE 11311 9090
 VOLUME ["/var/lib/vash"]
 

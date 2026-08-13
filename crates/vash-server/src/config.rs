@@ -339,10 +339,15 @@ pub struct ObservabilityConfig {
     /// `json` or `pretty`.
     pub log_format: String,
     pub log_level: String,
-    /// Address for `/metrics`, `/health` and `/stats`. Empty disables them.
+    /// Address for `/metrics`, `/health` and `/stats`. Empty — the default —
+    /// serves none of them.
     ///
-    /// A separate port from cache traffic, so it can be bound to a private
-    /// interface and a flood of scrapes cannot crowd out real requests.
+    /// Off unless asked for, because it has no authentication of its own: it
+    /// reports the store's size, its hit rate and the cluster's membership to
+    /// anyone who can reach it, and a default-on port is one an operator has to
+    /// know about in order to close. Enable it with an address, and give it a
+    /// private interface — a separate port from cache traffic is what lets a
+    /// flood of scrapes not crowd out real requests.
     pub admin_listen: String,
 }
 
@@ -479,7 +484,7 @@ impl Default for ObservabilityConfig {
         Self {
             log_format: "pretty".into(),
             log_level: "info".into(),
-            admin_listen: "127.0.0.1:9090".into(),
+            admin_listen: String::new(),
         }
     }
 }
@@ -721,6 +726,14 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().unwrap();
+    }
+
+    /// The endpoints report the store's contents and the cluster's shape with
+    /// no authentication in front of them, so nothing is served until an
+    /// operator names an address.
+    #[test]
+    fn the_admin_endpoint_is_off_until_given_an_address() {
+        assert_eq!(Config::default().observability.admin_listen, "");
     }
 
     /// The shipped example is the documentation for every setting, and

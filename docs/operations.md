@@ -24,14 +24,15 @@ A single static binary with no runtime dependencies. Three ways to run it:
 - **By hand** — it is one process; nothing needs root.
 
 Flags override the config file: `--listen`, `--data`, `--peer` (repeatable),
-`--ephemeral`, `--enable-flush`.
+`--ephemeral`, `--enable-flush`, `--enable-listing`, `--admin-listen`,
+`--disable-memcached`, `--disable-resp`.
 
 ### Ports
 
 | Port | Default | Expose to |
 |---|---|---|
 | Cache | 11311 | Clients **and cluster peers**. All three protocols share it. |
-| Admin | 9090 | Your monitoring only. |
+| Admin | **off** | Your monitoring only, once you turn it on. |
 
 **Authentication is off by default.** With `auth.required = false` — the
 default — anyone who can reach the cache port can read and write any key,
@@ -45,8 +46,11 @@ clear either way — so authentication decides who may *use* the cache, not who
 may read it in flight. Turning it on adds a layer; it does not replace the
 firewall rule. See [auth.md](auth.md) for the design and the rollout.
 
-Set `observability.admin_listen = ""` to switch the admin port off entirely; it
-has no authentication of its own and defaults to loopback.
+**The admin port serves nothing until you name an address**, with
+`observability.admin_listen` or `--admin-listen 127.0.0.1:9090`. It has no
+authentication of its own, and `/stats` describes the store's size, its hit rate
+and the cluster's membership to anyone who reaches it — so it is opened
+deliberately, on an interface your monitoring can reach and nothing else can.
 
 `flush_all` and the VCP `FLUSH` are off unless enabled: they empty the whole
 cache for anyone who can reach the port.
@@ -119,9 +123,10 @@ That is what makes `relaxed` the right default rather than a compromise.
 
 ## Monitoring
 
-`/metrics` (Prometheus), `/health` and `/stats` (JSON) on the admin port.
-`/health` returns 503 when a shard is refusing writes — the process is up but
-not doing its job, which is what a load balancer needs to know.
+`/metrics` (Prometheus), `/health` and `/stats` (JSON) on the admin port, which
+serves nothing until `observability.admin_listen` or `--admin-listen` names an
+address. `/health` returns 503 when a shard is refusing writes — the process is
+up but not doing its job, which is what a load balancer needs to know.
 
 ### Alert on these
 

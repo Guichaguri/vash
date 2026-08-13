@@ -336,7 +336,7 @@ check.
 
 `PING` is **not** in the pre-authentication set. Everything it could tell an
 unauthenticated party `HELLO` already told them, and `/health` on the admin port
-is the liveness check for an operator.
+— off until an operator enables it — is the liveness check for an operator.
 
 ### `AUTH` (0x03)
 

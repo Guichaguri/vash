@@ -44,6 +44,12 @@ struct Cli {
     #[arg(long)]
     enable_listing: bool,
 
+    /// Serve `/metrics`, `/health` and `/stats` on this address. Off unless
+    /// given one — the endpoints have no authentication of their own, so the
+    /// address should be a private interface.
+    #[arg(long, value_name = "HOST:PORT")]
+    admin_listen: Option<SocketAddr>,
+
     /// Stop serving the memcached text and meta protocols. A connection opening
     /// with one is closed unanswered, and the handshake stops advertising it.
     #[arg(long)]
@@ -122,6 +128,13 @@ fn main() -> anyhow::Result<()> {
     }
     if cli.disable_resp {
         config.protocol.resp_enabled = false;
+    }
+    // A `SocketAddr` rather than the config key's string, so a typo is a clap
+    // error instead of a failed bind — and because the flag can only turn the
+    // endpoint on, there is nothing to express with the empty string that it
+    // accepts.
+    if let Some(admin) = cli.admin_listen {
+        config.observability.admin_listen = admin.to_string();
     }
     if let Some(path) = cli.auth_file {
         config.auth.file = path;
