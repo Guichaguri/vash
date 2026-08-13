@@ -843,6 +843,10 @@ const UPSTREAM_FIELDS: &[&str] = &[
     "outofmemory",
     "get_hits",
     "cmd_set",
+    // Upstream allocates one chunk per item, so `used_chunks` tracks the live
+    // item count — measured against 1.6.45. There is no chunking here at all,
+    // so one record is one unit in use and the meaning carries over exactly.
+    "used_chunks",
     "active_slabs",
     "total_malloced",
     "addr",
@@ -1047,14 +1051,50 @@ async fn stats_slabs_reports_the_counters_a_slab_class_would_carry() {
     assert_eq!(fields["active_slabs"], "1");
     assert!(fields.contains_key("total_malloced"));
 
-    // Chunk geometry: a page here holds records of many sizes, so reporting one
-    // would let a tool compute a slab efficiency that means nothing.
-    for absent in ["1:chunk_size", "1:total_pages", "1:used_chunks"] {
+    // The rest of the geometry: a page here holds records of many sizes, so
+    // reporting one would let a tool compute a slab efficiency that means
+    // nothing. **`used_chunks` has no denominator to be divided by**, which is
+    // what keeps it honest while these stay out.
+    for absent in [
+        "1:chunk_size",
+        "1:chunks_per_page",
+        "1:total_pages",
+        "1:total_chunks",
+        "1:free_chunks",
+        "1:free_chunks_end",
+    ] {
         assert!(
             !fields.contains_key(absent),
             "{absent} describes a slab allocator"
         );
     }
+}
+
+/// Upstream allocates one chunk per item, so `used_chunks` tracks the live item
+/// count and falls when one is removed — measured against 1.6.45. There is no
+/// chunking here, so the mapping is exact, and the two numbers a tool can read
+/// for "how many items" must agree.
+#[tokio::test]
+async fn used_chunks_tracks_the_live_item_count() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    let used = |fields: &std::collections::HashMap<String, String>| fields["1:used_chunks"].clone();
+
+    assert_eq!(used(&stat_fields(&mut c, "stats slabs\r\n").await), "0");
+
+    for i in 0..3 {
+        c.line(&format!("set k{i} 0 0 1\r\nv\r\n")).await;
+    }
+    let after_writes = stat_fields(&mut c, "stats slabs\r\n").await;
+    assert_eq!(used(&after_writes), "3");
+
+    // The same quantity `stats items` reports, as upstream's two also are.
+    let items = stat_fields(&mut c, "stats items\r\n").await;
+    assert_eq!(used(&after_writes), items["items:1:number"]);
+
+    c.line("delete k0\r\n").await;
+    assert_eq!(used(&stat_fields(&mut c, "stats slabs\r\n").await), "2");
 }
 
 #[tokio::test]

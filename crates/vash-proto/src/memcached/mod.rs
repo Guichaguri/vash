@@ -84,6 +84,7 @@ pub fn parse(buf: &[u8]) -> Result<Outcome<'_>, ProtocolError> {
     };
 
     let line = &buf[..line_end];
+    println!("memcached line: {}", String::from_utf8_lossy(line));
     // Bytes through the end of the line, including its terminator.
     let after_line = line_end + line_terminator_len(buf, line_end);
 

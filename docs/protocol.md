@@ -1147,7 +1147,7 @@ list** is deliberately a subset. Full tables in
 |---|---|
 | `stats settings` | The configuration in force. `flush_enabled` and `dump_enabled` match upstream's meaning exactly; the slab, LRU, SSL and extstore geometry is absent. |
 | `stats items` | One synthetic class, `1` — the same id `lru_crawler metadump` prints as `cls=`, so the discover-then-dump loop every tool runs works. |
-| `stats slabs` | The per-class command counters plus `active_slabs` and `total_malloced`. Chunk geometry is absent: a page here holds records of many sizes, and reporting one would let a tool compute a slab efficiency that means nothing. |
+| `stats slabs` | The per-class command counters, `used_chunks`, `active_slabs` and `total_malloced`. The rest of the chunk geometry is absent: a page here holds records of many sizes, and reporting one would let a tool compute a slab efficiency that means nothing. `used_chunks` is exact — upstream allocates one chunk per item, and one record here is one unit of storage in use — and has no denominator left to be divided by. |
 | `stats conns` | One block per open connection, plus the listener. `<id>` is a **monotonic connection id, not a file descriptor** — an fd is reused the moment one closes, so the same number can mean two clients a second apart. |
 | `stats sizes` | `STAT sizes_status disabled`, which is **byte-identical** to a stock memcached: upstream tracks item sizes only under `-o track_sizes`. |
 | `stats extstore`, `stats proxy` | A bare `END`, which is what a memcached built without them answers. There is neither here. |

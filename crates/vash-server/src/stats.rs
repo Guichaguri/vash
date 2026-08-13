@@ -457,7 +457,7 @@ fn items(state: &ServerState) -> Vec<(String, String)> {
 
 /// `stats slabs` — what a slab allocator would report.
 ///
-/// LMDB is not one, so the geometry fields have no honest value: a page here
+/// LMDB is not one, so most of the geometry has no honest value: a page here
 /// holds records of many sizes, and reporting it as a chunk geometry would let
 /// a tool compute a slab efficiency that means nothing. What survives is the
 /// per-class command counters, which are real — and with one class, the class
@@ -478,12 +478,37 @@ fn slabs(state: &ServerState) -> Vec<(String, String)> {
                 + metrics.commands.total(CommandKind::SetMany))
             .to_string(),
         ),
-        ("active_slabs".into(), class.into()),
     ];
 
-    match state.store.stats() {
-        Ok(s) => slabs.push(("total_malloced".into(), s.map_size.to_string())),
-        Err(e) => error!(error = %e, "could not read store stats for slabs"),
+    // Read once, and used on both sides of the per-class/totals split below.
+    let store = state.store.stats();
+    if let Err(e) = &store {
+        error!(error = %e, "could not read store stats for slabs");
+    }
+
+    if let Ok(s) = &store {
+        // **The one geometry field with an exact meaning here**, and the reason
+        // it is reported where its siblings are not: upstream's `used_chunks`
+        // counts the chunks allocated to live items, and upstream allocates one
+        // per item — measured against 1.6.45, where it tracked the item count
+        // exactly and fell by one on a delete. There is no chunking at all in
+        // this store, so one record is one unit of storage in use and the
+        // mapping is exact rather than an approximation.
+        //
+        // `total_chunks`, `free_chunks` and `chunk_size` stay absent, and that
+        // is what keeps this one honest: the meaningless number a slab geometry
+        // invites is `used_chunks / total_chunks`, and without a denominator
+        // nobody can compute it.
+        slabs.push((format!("{class}:used_chunks"), s.entries.to_string()));
+    }
+
+    // The totals come after every per-class field, which is upstream's layout.
+    // The order is not part of any contract — upstream's own `stats settings`
+    // says its fields arrive in no particular order — but a reply read by a
+    // human should not interleave the two.
+    slabs.push(("active_slabs".into(), class.into()));
+    if let Ok(s) = &store {
+        slabs.push(("total_malloced".into(), s.map_size.to_string()));
     }
 
     slabs

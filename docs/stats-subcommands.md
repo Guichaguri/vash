@@ -277,13 +277,25 @@ server has — with one class, the class totals are the server totals.
 | `1:incr_hits` / `1:decr_hits` | P1 |
 | `1:cas_hits` / `1:cas_badval` | P1 |
 | `1:touch_hits` | P1 |
+| `1:used_chunks` | `StoreStats::entries` — see below |
 | `active_slabs` | `1` |
 | `total_malloced` | `map_size` |
 
+**`used_chunks` is the one geometry field with an exact meaning here.** Upstream
+counts the chunks allocated to live items and allocates one per item — measured
+against 1.6.45, where it tracked the item count exactly and fell by one on a
+delete, matching `items:1:number`. There is no chunking at all in this store, so
+one record is one unit of storage in use and the mapping is exact rather than an
+approximation.
+
 **Absent**: `chunk_size`, `chunks_per_page`, `total_pages`, `total_chunks`,
-`used_chunks`, `free_chunks`, `free_chunks_end`. A page here is an LMDB page
-holding records of many sizes; reporting it as a chunk geometry would let a tool
-compute a slab efficiency that means nothing.
+`free_chunks`, `free_chunks_end`. A page here is an LMDB page holding records of
+many sizes; reporting it as a chunk geometry would let a tool compute a slab
+efficiency that means nothing.
+
+That is also what keeps `used_chunks` honest while these stay out: the
+meaningless number a slab geometry invites is `used_chunks / total_chunks`, and
+without a denominator nobody can compute it.
 
 This is the thinnest of the subcommands, and that is the honest outcome for a
 question about a slab allocator asked of a B-tree. It is worth implementing
