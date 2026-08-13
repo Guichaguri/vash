@@ -45,7 +45,7 @@ RUN find crates -name "*.rs" -exec touch {} + \
 # image to have a CVE. There is no shell to exec into, which is the point.
 FROM scratch
 
-COPY --from=build /src/target/release/vash-server /vash-server
+COPY --from=build --chown=65534:65534 /src/target/release/vash-server /vash-server
 
 # 11311 is the cache port for both protocols; 9090 is the admin port, which
 # should be published only to a private network if at all.
