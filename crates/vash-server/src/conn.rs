@@ -104,6 +104,15 @@ pub async fn handle(
             match detect(&read_buf) {
                 None => continue, // still empty
                 Some(Ok(chosen)) => {
+                    // A dialect turned off in configuration is closed here
+                    // rather than refused by its own parser, because refusing
+                    // would mean running the parser we were told not to serve.
+                    // The client sees what an unrecognised opening byte gets: a
+                    // disconnect, with the reason in the server's log.
+                    if !state.protocol.dialect_enabled(chosen) {
+                        debug!(?chosen, "closing connection: dialect disabled");
+                        return Ok(());
+                    }
                     debug!(?chosen, "protocol selected");
                     protocol = Some(chosen);
                 }

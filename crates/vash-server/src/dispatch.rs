@@ -968,26 +968,41 @@ fn collect_stats(state: &ServerState) -> Vec<(String, String)> {
 
 /// Builds the handshake response advertised to clients.
 ///
-/// `cluster` is whether this node actually forwards invalidations to peers —
-/// not merely whether the build supports it. Claiming the capability on a node
-/// with no peers configured would make a client trust a cluster-wide
-/// invalidation that stops at one node.
+/// Every bit here reports what this node *does*, never what the build knows
+/// how to do. `cluster` is whether this node actually forwards invalidations to
+/// peers: claiming the capability on a node with no peers configured would make
+/// a client trust a cluster-wide invalidation that stops at one node. The
+/// command and dialect gates in `protocol` follow the same rule — a client that
+/// cannot tell "disabled here" from "too old to know it" has to discover the
+/// answer by trying, and for `FLUSH` that means wiping the cache to find out.
 pub fn server_info(
+    protocol: crate::config::ProtocolConfig,
     shards: u16,
     max_value_len: usize,
+    max_tags_per_record: usize,
     cluster: bool,
     auth_required: bool,
-    listing: bool,
 ) -> ServerInfo {
-    let mut capabilities = vash_core::capability::TAGS | vash_core::capability::MEMCACHED;
+    let mut capabilities = vash_core::capability::TAGS;
     if cluster {
         capabilities |= vash_core::capability::CLUSTER;
     }
-    // Enablement, not support: the bit says the listing opcodes will answer
-    // here, so a client discovers them without probing and without reading an
-    // `UNAUTHORIZED` as "this build has no such command".
-    if listing {
+    if protocol.listing_enabled {
         capabilities |= vash_core::capability::LISTING;
+    }
+    if protocol.flush_enabled {
+        capabilities |= vash_core::capability::FLUSH;
+    }
+    // A disabled dialect closes the connection at detection rather than
+    // answering, so these two bits are the only warning a client gets — and the
+    // client that needs the warning cannot read them, since it does not speak
+    // VCP. They are for the operator's own tooling and for a client that speaks
+    // more than one dialect.
+    if protocol.memcached_enabled {
+        capabilities |= vash_core::capability::MEMCACHED;
+    }
+    if protocol.resp_enabled {
+        capabilities |= vash_core::capability::RESP;
     }
     // Set from enforcement, not from the build supporting it: a client reads
     // this as "you must authenticate on this connection".
@@ -1001,5 +1016,8 @@ pub fn server_info(
         max_key_len: vash_core::MAX_KEY_LEN as u32,
         max_value_len: max_value_len as u32,
         capabilities,
+        // Validation caps this at `ABSOLUTE_MAX_TAGS`, so the cast cannot lose
+        // anything a client would then enforce wrongly.
+        max_tags_per_record: max_tags_per_record as u16,
     }
 }

@@ -22,6 +22,10 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    async fn start_with(tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.server.listen = "127.0.0.1:0".parse().unwrap();
@@ -29,6 +33,7 @@ impl TestServer {
         config.store.map_size_mb = 64;
         // Port 0: these run in parallel and would otherwise fight over 9090.
         config.observability.admin_listen = "127.0.0.1:0".into();
+        tweak(&mut config);
 
         let server = Server::bind(config).await.expect("binding");
         let addr = server.local_addr().unwrap();
@@ -138,6 +143,24 @@ impl Conn {
             self.fill(self.buf.len() + 1).await;
         }
     }
+}
+
+/// Turning the dialect off closes the connection at first-byte detection,
+/// before the RESP parser sees anything. Answering `-ERR` would mean running
+/// the parser we were told not to serve.
+#[tokio::test]
+async fn a_disabled_dialect_closes_the_connection_without_parsing() {
+    let server = TestServer::start_with(|c| c.protocol.resp_enabled = false).await;
+    let mut c = server.connect().await;
+
+    c.send(&request(&["SET", "foo", "hello"])).await;
+
+    let mut chunk = [0u8; 64];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), c.stream.read(&mut chunk))
+        .await
+        .expect("timed out waiting for the server to close")
+        .expect("reading");
+    assert_eq!(read, 0, "a disabled dialect answers nothing at all");
 }
 
 // ---- strings ------------------------------------------------------------

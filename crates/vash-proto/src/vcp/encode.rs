@@ -113,6 +113,7 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
             body[4..8].copy_from_slice(&info.max_key_len.to_le_bytes());
             body[8..12].copy_from_slice(&info.max_value_len.to_le_bytes());
             body[12..16].copy_from_slice(&info.capabilities.to_le_bytes());
+            body[16..18].copy_from_slice(&info.max_tags_per_record.to_le_bytes());
             encode_response(out, opcode, request_id, Status::Ok, &body);
         }
 
@@ -251,7 +252,15 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
     }
 }
 
-pub const HELLO_RESPONSE_LEN: usize = 16;
+/// `protocol_version u16 | shards u16 | max_key_len u32 | max_value_len u32 |
+/// capabilities u32 | max_tags_per_record u16`.
+///
+/// Grew from 16 bytes without a version bump, which the specification allows
+/// for precisely this: a client decodes by offset and tolerates a longer body,
+/// so a field appended past the ones it knows costs it nothing. Reading a
+/// *shorter* one is a truncated response and is refused — a limit guessed from
+/// a missing field would be enforced wrongly and silently.
+pub const HELLO_RESPONSE_LEN: usize = 18;
 /// `mode u8 | wrote u8 | reserved u16 | value u64 | applied u64`.
 pub const ARITHMETIC_RESPONSE_LEN: usize = 20;
 /// `mc_flags u32 | cas u64` ahead of the value bytes.
@@ -523,6 +532,7 @@ pub fn decode_hello_response(body: &[u8]) -> Option<ServerInfo> {
         max_key_len: u32::from_le_bytes(body[4..8].try_into().ok()?),
         max_value_len: u32::from_le_bytes(body[8..12].try_into().ok()?),
         capabilities: u32::from_le_bytes(body[12..16].try_into().ok()?),
+        max_tags_per_record: u16::from_le_bytes(body[16..18].try_into().ok()?),
     })
 }
 
@@ -566,11 +576,30 @@ mod tests {
             max_key_len: 511,
             max_value_len: 1 << 20,
             capabilities: 0b101,
+            max_tags_per_record: 32,
         };
         let mut out = Vec::new();
         encode_reply(&mut out, Opcode::Hello, 1, &Reply::Hello(info));
         let body = &out[super::super::frame::HEADER_LEN..];
         assert_eq!(decode_hello_response(body), Some(info));
+    }
+
+    /// A body one field short is a truncated response, not a server that
+    /// happens to have no tag limit.
+    #[test]
+    fn a_hello_response_missing_the_tag_limit_is_refused() {
+        let info = ServerInfo {
+            protocol_version: 1,
+            shards: 1,
+            max_key_len: 511,
+            max_value_len: 1 << 20,
+            capabilities: 0b101,
+            max_tags_per_record: 32,
+        };
+        let mut out = Vec::new();
+        encode_reply(&mut out, Opcode::Hello, 1, &Reply::Hello(info));
+        let body = &out[super::super::frame::HEADER_LEN..];
+        assert_eq!(decode_hello_response(&body[..HELLO_RESPONSE_LEN - 1]), None);
     }
 
     #[test]

@@ -120,11 +120,12 @@ impl Server {
         );
 
         let info = dispatch::server_info(
+            config.protocol,
             store.shard_count() as u16,
             config.store.max_value_bytes,
+            config.store.tags.max_per_record,
             cluster.active(),
             config.auth.required,
-            config.protocol.listing_enabled,
         );
         let state = ServerState::new(
             Arc::clone(&store),

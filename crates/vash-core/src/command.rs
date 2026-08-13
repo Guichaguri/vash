@@ -13,7 +13,12 @@ use crate::key::Key;
 pub mod capability {
     /// Server understands tags and `DELETE_BY_TAG`.
     pub const TAGS: u32 = 1 << 0;
-    /// Server also speaks the memcached protocol.
+    /// The memcached text and meta protocols are served on this port.
+    ///
+    /// Enablement, not support — the same contract as [`CLUSTER`]. A dialect
+    /// turned off in configuration is not merely refused: a connection opening
+    /// with it is closed at first-byte detection, before any parser sees it, so
+    /// a client that ignores this bit sees a bare disconnect and no error.
     pub const MEMCACHED: u32 = 1 << 1;
     /// Server participates in cluster-wide tag invalidation.
     pub const CLUSTER: u32 = 1 << 2;
@@ -31,6 +36,19 @@ pub mod capability {
     /// connection to open with it, so this bit is how a client discovers it
     /// must authenticate rather than guessing from a refusal.
     pub const AUTH_REQUIRED: u32 = 1 << 4;
+    /// `FLUSH` is enabled here.
+    ///
+    /// Enablement, not support, and for the same reason [`LISTING`] has a bit:
+    /// `FLUSH` is off by default and answers `UNAUTHORIZED` when disabled, so
+    /// without this a client cannot tell a server that refuses to flush from
+    /// one too old to know the opcode — and the only way to find out would be
+    /// to try wiping the cache.
+    pub const FLUSH: u32 = 1 << 5;
+    /// The Redis protocol (RESP2 and RESP3) is served on this port.
+    ///
+    /// Enablement, not support, and closed at detection when clear — the same
+    /// contract as [`MEMCACHED`].
+    pub const RESP: u32 = 1 << 6;
 }
 
 /// The VCP protocol version this build implements.
@@ -418,4 +436,14 @@ pub struct ServerInfo {
     pub max_key_len: u32,
     pub max_value_len: u32,
     pub capabilities: u32,
+    /// Tags one record may carry, from `store.tags.max_per_record`.
+    ///
+    /// Advertised for the same reason as `max_value_len`: it is configurable,
+    /// a breach is refused with a bare `BAD_REQUEST` that carries no detail,
+    /// and under `NO_REPLY` there is no refusal to read at all. A `u16` for a
+    /// limit the record header caps at [`ABSOLUTE_MAX_TAGS`], so the wire does
+    /// not have to change if that header ever grows.
+    ///
+    /// [`ABSOLUTE_MAX_TAGS`]: crate::ABSOLUTE_MAX_TAGS
+    pub max_tags_per_record: u16,
 }

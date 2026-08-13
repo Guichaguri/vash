@@ -62,6 +62,13 @@ describes where it departs from it.
 `HELLO` opcode — selects VCP. Any other opening byte selects memcached, Redis,
 or closes the connection.
 
+A dialect disabled in configuration (`protocol.memcached_enabled`,
+`protocol.resp_enabled`) is closed here too, on the same path as an
+unrecognised byte and before its parser runs — refusing in the dialect's own
+words would mean running the parser the operator turned off. VCP has no such
+switch: it is the native protocol, and the `MEMCACHED` and `RESP` capability
+bits make it the only one that can report what a node serves.
+
 This is what makes `HELLO` mandatory as the opening frame: the requirement is
 enforced by the detector, not by per-connection session state. Nothing later
 checks that a handshake happened or succeeded.
@@ -173,13 +180,22 @@ ignored. Only the first two bytes are read.
 open**, so a client can report a clear error instead of hanging. On a match the
 reply is `state.info`, a `ServerInfo` built once at startup by
 `dispatch::server_info` and never recomputed: shard count, `MAX_KEY_LEN` (511,
-LMDB's compile-time ceiling), the configured `max_value_len`, and the capability
-bits.
+LMDB's compile-time ceiling), the configured `max_value_len` and
+`max_tags_per_record`, and the capability bits.
 
-`TAGS` and `MEMCACHED` are always set. `CLUSTER` is set only when this node has
-peers **and** is configured to forward to them — not merely because the build
-supports it, because a client seeing the bit must be able to trust that one
-invalidation covers the cluster.
+`TAGS` is the only bit always set. Every other one reports what this node *does*
+rather than what the build knows how to do: `CLUSTER` only when this node has
+peers **and** is configured to forward to them, `LISTING` and `FLUSH` only when
+those opcodes are enabled, `MEMCACHED` and `RESP` only when those dialects are
+being served, `AUTH_REQUIRED` only when authentication is enforced. The rule is
+one thing — a client seeing a bit must be able to trust it, and a client seeing
+one clear must not have to guess whether the build is simply older.
+
+The two limits are advertised for the same reason as each other: both are
+configurable, both are enforced with a status that carries no detail
+(`TOO_LARGE`, `BAD_REQUEST`), and under `NO_REPLY` neither refusal is sent at
+all. `store.tags.max_tags` is deliberately *not* here — it bounds a shared
+registry, so it is not a limit a client can check its own request against.
 
 **Storage** — none.
 
@@ -548,7 +564,9 @@ resurrect every record ever invalidated under that tag.
 
 **Gate** — returns `UNAUTHORIZED` (5), logged, unless `protocol.flush_enabled`
 or `--enable-flush` is set. It is a remote cache-wipe primitive available to
-anyone who can reach the port, so it is off by default.
+anyone who can reach the port, so it is off by default. The `FLUSH = 0x20`
+capability bit reports the gate's state, so a client never has to discover it by
+wiping a cache that turned out to be flushable.
 
 **Execute** — per shard, in one transaction: bump the epoch (wrapping), persist
 it to `meta`, and clear `main`, `exp`, `tagidx` and `jobs`. Both halves are

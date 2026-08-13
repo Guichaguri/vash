@@ -371,6 +371,33 @@ pub struct ProtocolConfig {
     /// progress through a region of dead or non-matching records rather than
     /// stalling on it.
     pub listing_max_scan: usize,
+
+    /// Whether the memcached text and meta protocols are served.
+    ///
+    /// On by default: the dialects share the port with VCP and cost nothing
+    /// until someone speaks one. Turning a dialect off is for a deployment that
+    /// wants one parser reachable rather than three — the adapters are the only
+    /// code that reads bytes from unauthenticated clients, so an unused one is
+    /// attack surface with no compensating use.
+    pub memcached_enabled: bool,
+
+    /// Whether the Redis protocol (RESP2 and RESP3) is served. See
+    /// [`memcached_enabled`](Self::memcached_enabled).
+    pub resp_enabled: bool,
+}
+
+impl ProtocolConfig {
+    /// Whether a connection that opened with this dialect may proceed.
+    ///
+    /// VCP is not disableable: it is the native protocol, and it is the only
+    /// one that can report what a server does and does not serve.
+    pub fn dialect_enabled(&self, dialect: vash_proto::Protocol) -> bool {
+        match dialect {
+            vash_proto::Protocol::Vcp => true,
+            vash_proto::Protocol::Memcached => self.memcached_enabled,
+            vash_proto::Protocol::Resp => self.resp_enabled,
+        }
+    }
 }
 
 impl Default for ProtocolConfig {
@@ -381,6 +408,11 @@ impl Default for ProtocolConfig {
             // ~10-20ms of walking at the per-record cost measured in M6, which
             // is a reasonable ceiling on one held read transaction.
             listing_max_scan: 100_000,
+            // On, unlike the command gates above: these are compatibility with
+            // clients someone already has, and defaulting them off would make
+            // the drop-in replacement not one.
+            memcached_enabled: true,
+            resp_enabled: true,
         }
     }
 }
@@ -680,6 +712,26 @@ mod tests {
         assert_eq!(config.store.durability, Durability::Ephemeral);
         // Untouched keys keep their defaults.
         assert_eq!(config.store.map_size_mb, 4096);
+    }
+
+    /// The compatibility dialects are on unless turned off, and the native one
+    /// has no switch at all — it is what reports the other two.
+    #[test]
+    fn dialects_are_served_unless_disabled_and_vcp_always_is() {
+        use vash_proto::Protocol;
+
+        let mut protocol = ProtocolConfig::default();
+        assert!(protocol.dialect_enabled(Protocol::Memcached));
+        assert!(protocol.dialect_enabled(Protocol::Resp));
+
+        protocol.memcached_enabled = false;
+        protocol.resp_enabled = false;
+        assert!(!protocol.dialect_enabled(Protocol::Memcached));
+        assert!(!protocol.dialect_enabled(Protocol::Resp));
+        assert!(
+            protocol.dialect_enabled(Protocol::Vcp),
+            "a server with no reachable dialect would be unconfigurable"
+        );
     }
 
     #[test]

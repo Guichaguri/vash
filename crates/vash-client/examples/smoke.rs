@@ -19,8 +19,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = Client::connect(addr.as_str()).await?;
     let info = client.server_info();
     println!(
-        "connected to {addr}: protocol v{}, {} shard(s), max key {}B, max value {}B, capabilities {:#04b}",
-        info.protocol_version, info.shards, info.max_key_len, info.max_value_len, info.capabilities
+        "connected to {addr}: protocol v{}, {} shard(s), max key {}B, max value {}B, \
+         max {} tag(s) per record, capabilities {:#04b}",
+        info.protocol_version,
+        info.shards,
+        info.max_key_len,
+        info.max_value_len,
+        info.max_tags_per_record,
+        info.capabilities
     );
 
     client.ping().await?;

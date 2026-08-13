@@ -41,6 +41,16 @@ This is why **a VCP connection must open with a `HELLO` frame**. Sending any
 other opcode first closes the connection, because the leading byte would be
 ambiguous. There is no in-band negotiation beyond this.
 
+Either compatibility dialect can be turned off — `protocol.memcached_enabled`
+and `protocol.resp_enabled`, both on by default — and a disabled one is
+**closed right here**, before its parser sees a byte, exactly as an
+unrecognised first byte is. A client speaking it gets a connect that succeeds
+and then EOF, with the reason only in the server's log; there is no error
+frame, because producing one would mean running the parser the operator turned
+off. The `MEMCACHED` and `RESP` [capability bits](#hello-0x01) are where a
+dialect's availability is stated, and VCP — which cannot be disabled — is the
+one dialect that can report it.
+
 It is also why **RESP inline commands are not accepted**: `get foo\r\n` is a
 valid inline Redis command *and* a valid memcached one, and no amount of
 look-ahead settles which was meant. Every real Redis client library sends the
@@ -262,7 +272,7 @@ Notation: `u16`/`u32`/`u64` are little-endian; `bytes[n]` is a raw byte run.
 | 0 | `protocol_version` u16 — must be 1 |
 | 2 | `reserved` u16 — zero |
 
-**Response body** (16 bytes), status `OK`:
+**Response body** (18 bytes), status `OK`:
 
 | Offset | Field |
 |---|---|
@@ -271,15 +281,19 @@ Notation: `u16`/`u32`/`u64` are little-endian; `bytes[n]` is a raw byte run.
 | 4 | `max_key_len` u32 |
 | 8 | `max_value_len` u32 |
 | 12 | `capabilities` u32 |
+| 16 | `max_tags_per_record` u16 |
 
 Only the first four bytes of the request body are read; a longer one is accepted
 and the excess ignored. Decode the response by offset and tolerate a body
-**longer** than 16 bytes rather than requiring exactly 16.
+**longer** than 18 bytes rather than requiring exactly 18 — that is how this
+field was added without a version bump, and how the next one will be.
 
-`max_value_len` is the server's configured limit. `max_key_len` is fixed at 511
-by the storage engine and is reported rather than configured. Enforce both
-locally rather than discovering them through errors — over `NO_REPLY` there is
-no error to discover.
+`max_value_len` and `max_tags_per_record` are the server's configured limits.
+`max_key_len` is fixed at 511 by the storage engine and is reported rather than
+configured. Enforce all three locally rather than discovering them through
+errors — over `NO_REPLY` there is no error to discover, and the refusals carry
+no detail: an oversized value is a bare `TOO_LARGE` and an over-tagged record a
+bare `BAD_REQUEST`, neither of which says what the limit was.
 
 `shards` is how many independent storage environments back the server. It
 matters to a client for one reason: it decides whether a multi-key write is
@@ -295,13 +309,22 @@ atomic per shard only.
 | `0x04` | `CLUSTER` | An invalidation sent here reaches the rest of the cluster. |
 | `0x08` | `LISTING` | `LIST_KEYS` and `LIST_TAGS` are enabled here. |
 | `0x10` | `AUTH_REQUIRED` | This connection must send `AUTH` before anything else. |
+| `0x20` | `FLUSH` | `FLUSH` is enabled here. |
+| `0x40` | `RESP` | The Redis protocol is served on this port. |
 
+**Every bit reports what this node does, never what the build knows how to do.**
 `CLUSTER` is set only when this node has peers configured **and** is set to
-forward — not merely because the build supports it. A client seeing it clear
-must invalidate on every node itself. `LISTING` follows the same rule: it
-reports that the commands are enabled on this node, not that the build knows
-them. So does `AUTH_REQUIRED`: it reports that this server is enforcing
-authentication, not that it understands `AUTH`.
+forward, so a client seeing it clear must invalidate on every node itself.
+`LISTING` and `FLUSH` report that those opcodes are enabled here, not that the
+build knows them — without which the only way to test for `FLUSH` would be to
+wipe the cache and see. `AUTH_REQUIRED` reports that this server is enforcing
+authentication, not that it understands `AUTH`. `MEMCACHED` and `RESP` report
+that those dialects are being served: a disabled one is closed at first-byte
+detection, so a connection speaking it sees a bare disconnect and never an
+error frame. All five follow from the same rule — a client that cannot tell
+"disabled here" from "too old to know it" has to find out by trying.
+
+A default server answers `0x43` — `TAGS | MEMCACHED | RESP`.
 
 Unlisted bits are reserved; ignore them.
 
@@ -613,6 +636,11 @@ Returns `UNAUTHORIZED` (5) unless the server was started with
 `protocol.flush_enabled` or `--enable-flush`. Empties the entire cache; tag
 registrations survive.
 
+The `FLUSH` capability bit in the [handshake](#hello-0x01) is how a client tells
+"disabled here" apart from an older build that has never heard of the opcode —
+check the bit rather than probing, because probing this one means wiping the
+cache when it turns out to be enabled.
+
 A flush is **node-local**. It is not propagated to peers, and there is no
 cluster-wide flush.
 
@@ -802,12 +830,13 @@ write to an empty store.
   01 00 00 00  01 00 00 00  04 00 00 00     header: opcode 0x01, flags 0, status 0, id 1, body 4
   01 00 00 00                               version 1, reserved 0
 
-← 01 01 00 00  01 00 00 00  10 00 00 00     flags 0x01 = RESPONSE, status 0, body 16
+← 01 01 00 00  01 00 00 00  12 00 00 00     flags 0x01 = RESPONSE, status 0, body 18
   01 00                                     protocol_version 1
   01 00                                     shards 1
   ff 01 00 00                               max_key_len 511
   00 00 10 00                               max_value_len 1048576
-  03 00 00 00                               capabilities TAGS|MEMCACHED
+  43 00 00 00                               capabilities TAGS|MEMCACHED|RESP
+  20 00                                     max_tags_per_record 32
 
 → SET "foo" = "bar", ttl 300, request_id 2
   11 00 00 00  02 00 00 00  12 00 00 00     opcode 0x11, body 18
@@ -848,7 +877,8 @@ merely slow.
 - Treat unknown status codes as failures, not as protocol errors.
 - Treat unknown *opcodes* in a reply as correlatable: the raw request byte is
   echoed even when the server does not recognise it.
-- Enforce `max_key_len` and `max_value_len` from the handshake locally.
+- Enforce `max_key_len`, `max_value_len` and `max_tags_per_record` from the
+  handshake locally.
 - Expect no reply at all for `NO_REPLY` requests, including failures.
 - Expect a reply to `AUTH` even under `NO_REPLY`; it is the one opcode that
   overrides the flag.
@@ -929,7 +959,9 @@ gets that for free; one that cannot loses nothing it had.
   something a client can arrange.
 - **Enforce the handshake's limits locally.** Discovering `max_value_len` by
   sending a value and reading `TOO_LARGE` costs a round trip and, with
-  `NO_REPLY`, silently drops the write.
+  `NO_REPLY`, silently drops the write. The same goes for
+  `max_tags_per_record`, whose refusal is a bare `BAD_REQUEST` that does not
+  say what the limit was.
 - **TTL is an offset at every magnitude on VCP**, unlike memcached's `exptime`.
   If your client also speaks the memcached dialect, do not share the TTL
   conversion between the two.
@@ -965,6 +997,10 @@ corpus exists to check.
 vash speaks the classic text protocol and the meta commands. The **legacy
 binary protocol (magic `0x80`) is not implemented and will not be** — upstream
 deprecated it in favour of the meta commands.
+
+Served by default, and turned off with `protocol.memcached_enabled = false`, in
+which case a connection opening with a memcached command is closed unanswered —
+see [First-byte detection](#first-byte-detection).
 
 Compatibility is checked in CI two ways: a real client library
 (`pymemcache`) driven against both vash and real memcached, and a byte-for-byte
@@ -1209,6 +1245,10 @@ no lists, hashes, sets, sorted sets, streams, transactions, scripting, pub/sub,
 `SCAN`, `SELECT` or replication commands, and there never will be — see
 [plan.md](plan.md) §16.
 
+Served by default, and turned off with `protocol.resp_enabled = false`, in which
+case a connection opening with a RESP array is closed unanswered — see
+[First-byte detection](#first-byte-detection).
+
 ## Framing
 
 Requests are RESP arrays of bulk strings, exactly as the protocol specifies:
@@ -1434,6 +1474,13 @@ Two limits apply, both configurable:
 |---|---|---|---|
 | Tags on one record | `store.tags.max_per_record` | 32 | `BAD_REQUEST` |
 | Distinct names registered | `store.tags.max_tags` | 100000 | `CAPACITY_FULL` |
+
+The first is reported as `max_tags_per_record` in the
+[handshake](#hello-0x01) — enforce it locally, because the refusal is a bare
+`BAD_REQUEST` and under `NO_REPLY` there is no refusal at all. The second is
+not advertised and cannot be: it bounds a shared registry, so whether the next
+write fits depends on what every other client has registered, not on the
+request.
 
 `max_per_record` cannot exceed **255**: the record header counts tags in a single
 byte, and a server configured past that refuses to start. The default is 32

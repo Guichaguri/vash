@@ -674,12 +674,57 @@ async fn handshake_reports_server_limits() {
     assert_eq!(info.protocol_version, vash_core::PROTOCOL_VERSION);
     assert_eq!(info.max_key_len, vash_core::MAX_KEY_LEN as u32);
     assert_eq!(info.max_value_len, vash_core::DEFAULT_MAX_VALUE_LEN as u32);
-    // Capabilities are advertised only as each milestone lands: cluster
-    // invalidation (M5) is not claimed yet.
+    // Every limit a client is expected to enforce locally is here. Discovering
+    // this one by being refused costs a round trip, and under `NO_REPLY` there
+    // is no refusal to discover.
+    assert_eq!(info.max_tags_per_record, vash_core::DEFAULT_MAX_TAGS as u16);
+    // What a default server does: tags and both compatibility dialects. The
+    // gated commands and cluster fan-out are off, and the bits say so.
     assert_eq!(
         info.capabilities,
-        vash_core::capability::TAGS | vash_core::capability::MEMCACHED
+        vash_core::capability::TAGS
+            | vash_core::capability::MEMCACHED
+            | vash_core::capability::RESP
     );
+}
+
+#[tokio::test]
+async fn the_handshake_reports_which_dialects_are_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| {
+        config.protocol.memcached_enabled = false;
+        config.protocol.resp_enabled = false;
+    })
+    .await;
+    let client = server.client().await;
+
+    // A disabled dialect is closed at detection, so these bits are the only
+    // notice anything gets — and VCP, which cannot be disabled, is the only
+    // dialect left to carry it.
+    let capabilities = client.server_info().capabilities;
+    assert_eq!(capabilities & vash_core::capability::MEMCACHED, 0);
+    assert_eq!(capabilities & vash_core::capability::RESP, 0);
+    assert_eq!(capabilities, vash_core::capability::TAGS);
+}
+
+#[tokio::test]
+async fn the_handshake_reports_a_lowered_tag_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with(dir, |config| config.store.tags.max_per_record = 2).await;
+    let mut client = server.client().await;
+
+    assert_eq!(client.server_info().max_tags_per_record, 2);
+
+    // And the advertised number is the one actually enforced, which is the
+    // whole point of advertising it.
+    client
+        .set_tagged(b"ok", b"v", 0, &[b"a", b"b"])
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.set_tagged(b"no", b"v", 0, &[b"a", b"b", b"c"]).await,
+        Err(ClientError::Status(Status::BadRequest))
+    ));
 }
 
 #[tokio::test]
@@ -892,7 +937,13 @@ async fn flush_is_refused_unless_enabled() {
 
     client.set(b"k", b"v", 0).await.unwrap();
 
-    // A remote cache-wipe primitive must not be available by default.
+    // A remote cache-wipe primitive must not be available by default, and the
+    // capability bit says so — otherwise the only way to find out would be to
+    // wipe the cache.
+    assert_eq!(
+        client.server_info().capabilities & vash_core::capability::FLUSH,
+        0
+    );
     assert!(matches!(
         client.flush().await,
         Err(ClientError::Status(Status::Unauthorized))
@@ -908,6 +959,12 @@ async fn flush_empties_the_cache_when_enabled() {
     let dir = tempfile::tempdir().unwrap();
     let server = TestServer::start_with(dir, |config| config.protocol.flush_enabled = true).await;
     let mut client = server.client().await;
+
+    assert_ne!(
+        client.server_info().capabilities & vash_core::capability::FLUSH,
+        0,
+        "the capability bit reports enablement"
+    );
 
     client.set(b"a", b"1", 0).await.unwrap();
     client.set_tagged(b"b", b"2", 0, &[b"t"]).await.unwrap();

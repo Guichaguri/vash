@@ -120,9 +120,9 @@ batch = 512
 # FLUSH / flush_all empties the whole cache for anyone who can reach the port.
 # Off unless deliberately enabled; --enable-flush does the same from the CLI.
 #
-# The memcached text and meta protocols are always available: they share the
-# port with the native protocol and are told apart by the connection's first
-# byte, so there is nothing to turn on.
+# The FLUSH capability bit in the native handshake reports this setting, so a
+# client can tell "disabled here" from "server too old to know the opcode"
+# without having to wipe a cache to find out which it is.
 flush_enabled = false
 
 # LIST_KEYS / LIST_TAGS page through the keyspace and the tag registry. Off
@@ -144,6 +144,23 @@ listing_enabled = false
 # that stops here still advances its cursor, so paging makes progress through a
 # region of dead or non-matching records rather than stalling on it.
 listing_max_scan = 100000
+
+# The compatibility dialects. Both share the port with the native protocol and
+# are told apart by the connection's first byte, so both are on by default and
+# cost nothing until someone speaks one.
+#
+# Turn one off when nothing will use it: the protocol adapters are the only code
+# that reads bytes from unauthenticated clients, so an unused one is attack
+# surface bought for nothing. A connection opening with a disabled dialect is
+# closed at first-byte detection, before its parser runs — it gets no error,
+# only a disconnect, and the reason is logged here rather than sent. The
+# MEMCACHED and RESP capability bits in the native handshake report these
+# settings, since a client that cannot connect cannot be told anything else.
+#
+# The native protocol has no switch: it is the one that can report what a node
+# serves.
+memcached_enabled = true
+resp_enabled = true
 
 [auth]
 # Who may use the cache port. Off by default.

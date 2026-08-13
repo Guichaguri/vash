@@ -290,18 +290,24 @@ fn frames() -> String {
         shards: 1,
         max_key_len: 511,
         max_value_len: 1024 * 1024,
-        capabilities: vash_core::capability::TAGS | vash_core::capability::MEMCACHED,
+        capabilities: vash_core::capability::TAGS
+            | vash_core::capability::MEMCACHED
+            | vash_core::capability::RESP,
+        max_tags_per_record: vash_core::DEFAULT_MAX_TAGS as u16,
     };
     v.response(
         "hello_response",
-        "capabilities 0x03 = TAGS|MEMCACHED; CLUSTER absent means invalidate every node yourself",
+        "capabilities 0x43 = TAGS|MEMCACHED|RESP, what a DEFAULT server answers; CLUSTER absent \
+         means invalidate every node yourself, FLUSH and LISTING absent means those opcodes are \
+         disabled here",
         reply(Opcode::Hello, 1, &Reply::Hello(info)),
         vec![
             ("protocol_version", J::U(1)),
             ("shards", J::U(1)),
             ("max_key_len", J::U(511)),
             ("max_value_len", J::U(1048576)),
-            ("capabilities", J::U(3)),
+            ("capabilities", J::U(0x43)),
+            ("max_tags_per_record", J::U(32)),
         ],
     );
 

@@ -121,6 +121,23 @@ impl Conn {
         self.send(command.as_bytes()).await;
         self.read_until("END\r\n").await
     }
+
+    /// Reads until the server hangs up, returning whatever it said first.
+    async fn read_to_close(&mut self) -> String {
+        let mut chunk = [0u8; 8192];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        loop {
+            let read = tokio::time::timeout_at(deadline, self.stream.read(&mut chunk))
+                .await
+                .expect("timed out waiting for the server to close")
+                .expect("reading");
+            if read == 0 {
+                return String::from_utf8_lossy(&self.buf).into_owned();
+            }
+            self.buf.extend_from_slice(&chunk[..read]);
+        }
+    }
 }
 
 #[tokio::test]
@@ -133,6 +150,22 @@ async fn set_and_get_round_trip() {
         c.get("get foo\r\n").await,
         "VALUE foo 7 5\r\nhello\r\nEND\r\n",
         "client flags and length must round-trip exactly"
+    );
+}
+
+/// Turning the dialect off closes the connection at first-byte detection,
+/// before the memcached parser sees anything. Refusing in memcached's own words
+/// would mean running the parser we were told not to serve.
+#[tokio::test]
+async fn a_disabled_dialect_closes_the_connection_without_parsing() {
+    let server = TestServer::start_with(|c| c.protocol.memcached_enabled = false).await;
+    let mut c = server.connect().await;
+
+    c.send(b"set foo 0 0 5\r\nhello\r\n").await;
+    assert_eq!(
+        c.read_to_close().await,
+        "",
+        "a disabled dialect answers nothing at all"
     );
 }
 

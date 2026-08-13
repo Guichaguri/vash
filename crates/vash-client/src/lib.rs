@@ -98,6 +98,7 @@ impl Client {
                 max_key_len: 0,
                 max_value_len: 0,
                 capabilities: 0,
+                max_tags_per_record: 0,
             },
         };
 
