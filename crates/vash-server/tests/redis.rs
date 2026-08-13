@@ -1003,3 +1003,425 @@ async fn arity_and_syntax_errors_name_the_command() {
     )
     .await;
 }
+
+// ---- SCAN ---------------------------------------------------------------
+//
+// The command carrying the most design risk in this suite: its cursor is an
+// integer standing in for a position the server holds, and its guarantee is
+// about what a *sequence* of calls returns rather than any single one. Neither
+// is observable except end to end.
+
+fn listing_on(config: &mut Config) {
+    config.protocol.listing_enabled = true;
+}
+
+/// One page: `[cursor, [key …]]`.
+async fn scan_page(conn: &mut Conn, args: &[&str]) -> (String, Vec<String>) {
+    conn.send(&request(args)).await;
+
+    assert_eq!(conn.read_line().await, "*2\r\n");
+    conn.read_line().await; // the cursor's length header
+    let next = conn.read_line().await.trim_end().to_string();
+
+    let header = conn.read_line().await;
+    let len: usize = header
+        .trim_start_matches('*')
+        .trim_end()
+        .parse()
+        .unwrap_or_else(|_| panic!("expected an array of keys, got {header:?}"));
+
+    let mut keys = Vec::with_capacity(len);
+    for _ in 0..len {
+        conn.read_line().await; // length header
+        keys.push(conn.read_line().await.trim_end().to_string());
+    }
+    (next, keys)
+}
+
+/// Walks a whole keyspace, the way a client library's `scan_iter` does.
+async fn scan_all(conn: &mut Conn, extra: &[&str]) -> Vec<String> {
+    let mut cursor = "0".to_string();
+    let mut seen = Vec::new();
+    // Bounded, so a cursor that fails to advance fails the test instead of
+    // hanging it.
+    for _ in 0..10_000 {
+        let mut args = vec!["SCAN", &cursor];
+        args.extend_from_slice(extra);
+        let (next, keys) = scan_page(conn, &args).await;
+        seen.extend(keys);
+        if next == "0" {
+            seen.sort();
+            seen.dedup();
+            return seen;
+        }
+        cursor = next;
+    }
+    panic!("SCAN did not terminate; a cursor is not advancing");
+}
+
+/// The guarantee `SCAN` exists to provide, and the reason its cursor is a key
+/// rather than an offset: a key present for the whole walk comes back **exactly**
+/// once. Redis promises at least once; resuming by key is what makes this the
+/// stronger statement.
+#[tokio::test]
+async fn scan_returns_every_key_exactly_once() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    for i in 0..500 {
+        c.call(&["SET", &format!("k{i:04}"), "v"], "+OK\r\n").await;
+    }
+
+    // A small COUNT is the interesting one: it is Redis's own order of
+    // magnitude, and it means many pages and many cursors.
+    let seen = scan_all(&mut c, &["COUNT", "7"]).await;
+    assert_eq!(seen.len(), 500, "every key, and none of them twice");
+    assert_eq!(seen[0], "k0000");
+    assert_eq!(seen[499], "k0499");
+}
+
+/// A pooled client returns its connection between pages, so page two routinely
+/// lands on a different socket. This is the reason the cursor table is
+/// server-wide rather than per connection.
+#[tokio::test]
+async fn an_iteration_survives_moving_between_connections() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut writer = server.connect().await;
+    for i in 0..200 {
+        writer
+            .call(&["SET", &format!("k{i:04}"), "v"], "+OK\r\n")
+            .await;
+    }
+
+    let mut cursor = "0".to_string();
+    let mut seen = Vec::new();
+    for _ in 0..10_000 {
+        // A fresh connection for every single page.
+        let mut c = server.connect().await;
+        let (next, keys) = scan_page(&mut c, &["SCAN", &cursor, "COUNT", "10"]).await;
+        seen.extend(keys);
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 200);
+}
+
+#[tokio::test]
+async fn scan_filters_on_match() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    for i in 0..50 {
+        c.call(&["SET", &format!("user:{i}"), "v"], "+OK\r\n").await;
+    }
+    c.call(&["SET", "other", "v"], "+OK\r\n").await;
+
+    assert_eq!(scan_all(&mut c, &["COUNT", "10"]).await.len(), 51);
+
+    let matched = scan_all(&mut c, &["MATCH", "user:*", "COUNT", "10"]).await;
+    assert_eq!(matched.len(), 50);
+    assert!(matched.iter().all(|key| key.starts_with("user:")));
+}
+
+/// `COUNT` above the listing ceiling is **clamped, not refused** — Redis
+/// specifies it as a hint and clients pass large values freely. VCP's `limit`
+/// is rejected instead, because a client that asked for 10000 and silently got
+/// 1024 would page incorrectly there.
+#[tokio::test]
+async fn a_huge_count_is_clamped_rather_than_refused() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    for i in 0..20 {
+        c.call(&["SET", &format!("k{i}"), "v"], "+OK\r\n").await;
+    }
+
+    let (cursor, keys) = scan_page(&mut c, &["SCAN", "0", "COUNT", "1000000"]).await;
+    assert_eq!(cursor, "0", "one page covered the keyspace");
+    assert_eq!(keys.len(), 20);
+}
+
+#[tokio::test]
+async fn scan_argument_errors_match_redis() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+
+    // Redis's own wording, verified against 7.4.
+    c.call(&["SCAN", "abc"], "-ERR invalid cursor\r\n").await;
+    c.call(&["SCAN", "-1"], "-ERR invalid cursor\r\n").await;
+    c.call(&["SCAN", "0", "COUNT", "0"], "-ERR syntax error\r\n")
+        .await;
+    c.call(&["SCAN", "0", "BOGUS", "x"], "-ERR syntax error\r\n")
+        .await;
+    c.call(
+        &["SCAN"],
+        "-ERR wrong number of arguments for 'scan' command\r\n",
+    )
+    .await;
+
+    // This server's glob has no character classes, and matching `[` as a
+    // literal byte would make the pattern silently match nothing.
+    c.call(
+        &["SCAN", "0", "MATCH", "k[0-9]*"],
+        "-ERR character classes are not supported in MATCH\r\n",
+    )
+    .await;
+    // Escaped, it is an ordinary byte and the pattern is accepted.
+    c.call(&["SCAN", "0", "MATCH", "k\\[0"], "*2\r\n$1\r\n0\r\n*0\r\n")
+        .await;
+}
+
+/// Every value here is a string, so any other type genuinely has no keys —
+/// which is a completed iteration, not an empty page.
+#[tokio::test]
+async fn scan_by_type_answers_only_for_strings() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    c.call(&["SET", "k", "v"], "+OK\r\n").await;
+
+    c.call(
+        &["SCAN", "0", "TYPE", "string"],
+        "*2\r\n$1\r\n0\r\n*1\r\n$1\r\nk\r\n",
+    )
+    .await;
+    c.call(&["SCAN", "0", "TYPE", "hash"], "*2\r\n$1\r\n0\r\n*0\r\n")
+        .await;
+}
+
+/// Enumerating a keyspace is the same capability whichever dialect asks, so
+/// `SCAN` sits behind the same gate as `LIST_KEYS` and is off by default.
+#[tokio::test]
+async fn scan_is_refused_when_listing_is_disabled() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+    c.call(&["SET", "k", "v"], "+OK\r\n").await;
+    c.call(&["SCAN", "0"], "-ERR command disabled by configuration\r\n")
+        .await;
+}
+
+/// A token the table no longer holds is an error, **never a silent restart from
+/// the beginning** — which would spin a client's pager forever without ever
+/// saying why.
+#[tokio::test]
+async fn an_unknown_cursor_is_refused_rather_than_restarted() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    for i in 0..50 {
+        c.call(&["SET", &format!("k{i}"), "v"], "+OK\r\n").await;
+    }
+
+    c.call(
+        &["SCAN", "999999"],
+        "-ERR scan cursor expired; restart the iteration from 0\r\n",
+    )
+    .await;
+}
+
+/// Capacity eviction takes the *oldest* token, and a live iteration's token is
+/// always the newest it was handed — so a pager outlives a table far smaller
+/// than the number of pages it walks.
+#[tokio::test]
+async fn an_iteration_outlives_a_table_smaller_than_its_page_count() {
+    let server = TestServer::start_with(|config| {
+        config.protocol.listing_enabled = true;
+        config.protocol.scan_cursors = 2;
+    })
+    .await;
+    let mut c = server.connect().await;
+    for i in 0..100 {
+        c.call(&["SET", &format!("k{i:03}"), "v"], "+OK\r\n").await;
+    }
+
+    // Twenty pages against a two-slot table.
+    assert_eq!(scan_all(&mut c, &["COUNT", "5"]).await.len(), 100);
+}
+
+/// A page may come back empty with a live cursor — which Redis permits and
+/// clients handle — when the scan budget lands entirely on records that do not
+/// match. The walk must still finish, and still return everything.
+#[tokio::test]
+async fn an_empty_page_with_a_live_cursor_is_not_the_end() {
+    let server = TestServer::start_with(|config| {
+        config.protocol.listing_enabled = true;
+        // Two records examined per call. With a pattern that most of them fail,
+        // a page routinely spends its whole budget and collects nothing.
+        config.protocol.listing_max_scan = 2;
+    })
+    .await;
+    let mut c = server.connect().await;
+    for i in 0..30 {
+        c.call(&["SET", &format!("k{i:03}"), "v"], "+OK\r\n").await;
+    }
+    c.call(&["SET", "wanted", "v"], "+OK\r\n").await;
+
+    let mut cursor = "0".to_string();
+    let mut seen = Vec::new();
+    let mut empty_pages = 0;
+    for _ in 0..10_000 {
+        let (next, keys) =
+            scan_page(&mut c, &["SCAN", &cursor, "MATCH", "wanted", "COUNT", "10"]).await;
+        if keys.is_empty() && next != "0" {
+            empty_pages += 1;
+        }
+        seen.extend(keys);
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+
+    assert_eq!(seen, ["wanted"], "the walk still found the one match");
+    assert!(
+        empty_pages > 0,
+        "a budget spent on non-matching records should have produced empty pages"
+    );
+}
+
+// ---- INFO ---------------------------------------------------------------
+
+/// Reads an `INFO` reply into its `field:value` pairs, the way a client
+/// library's `parse_info` does.
+async fn info(conn: &mut Conn, args: &[&str]) -> std::collections::HashMap<String, String> {
+    conn.send(&request(args)).await;
+    let header = conn.read_line().await;
+    let len: usize = header
+        .trim_start_matches(['$', '='])
+        .trim_end()
+        .parse()
+        .unwrap_or_else(|_| panic!("expected a bulk or verbatim header, got {header:?}"));
+
+    conn.fill(len + 2).await;
+    let body = String::from_utf8_lossy(&conn.buf[..len]).into_owned();
+    conn.buf.drain(..len + 2);
+
+    body.lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_string(), value.trim_end().to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn info_reports_the_fields_clients_branch_on() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+    c.call(&["SET", "k", "v"], "+OK\r\n").await;
+
+    let fields = info(&mut c, &["INFO"]).await;
+
+    // **The load-bearing one.** A client that reads `1` here starts speaking
+    // Redis Cluster — `CLUSTER SLOTS`, `MOVED` redirection, hash-slot routing —
+    // none of which exists here.
+    assert_eq!(fields.get("cluster_enabled").map(String::as_str), Some("0"));
+
+    assert_eq!(
+        fields.get("redis_mode").map(String::as_str),
+        Some("standalone")
+    );
+    assert_eq!(fields.get("role").map(String::as_str), Some("master"));
+    assert_eq!(fields.get("loading").map(String::as_str), Some("0"));
+    assert!(fields["redis_version"].ends_with("-vash"));
+    assert_eq!(fields["vash_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(fields["db0"], "keys=1,avg_ttl=0");
+
+    // Counters out of the same snapshot memcached's `stats` prints.
+    assert!(fields.contains_key("used_memory"));
+    assert!(fields.contains_key("connected_clients"));
+    assert!(fields.contains_key("total_commands_processed"));
+
+    // Absent rather than zeroed, because nothing measures them.
+    for unmeasured in [
+        "used_memory_rss",
+        "mem_fragmentation_ratio",
+        "latest_fork_usec",
+    ] {
+        assert!(
+            !fields.contains_key(unmeasured),
+            "{unmeasured} is not measured and must not be reported"
+        );
+    }
+}
+
+/// Redis's `expires` counts keys carrying a TTL. The nearest counter here is
+/// rows in the expiry index, which has one per record whether or not it
+/// expires — a different quantity, so the field is absent rather than wrong.
+#[tokio::test]
+async fn the_keyspace_line_does_not_claim_an_expiry_count() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+    c.call(&["SET", "forever", "v"], "+OK\r\n").await;
+    c.call(&["SET", "soon", "v", "EX", "900"], "+OK\r\n").await;
+
+    let fields = info(&mut c, &["INFO", "keyspace"]).await;
+    assert_eq!(fields["db0"], "keys=2,avg_ttl=0");
+}
+
+#[tokio::test]
+async fn info_selects_sections_and_tolerates_unknown_ones() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    let clients = info(&mut c, &["INFO", "clients"]).await;
+    assert!(clients.contains_key("connected_clients"));
+    assert!(!clients.contains_key("redis_version"), "only that section");
+
+    // Case-insensitive, and several at once.
+    let two = info(&mut c, &["INFO", "SERVER", "clients"]).await;
+    assert!(two.contains_key("redis_version") && two.contains_key("connected_clients"));
+
+    // `vash` is out of the default set and in `all`, exactly as Redis keeps its
+    // optional sections out of a bare `INFO`.
+    assert!(!info(&mut c, &["INFO"]).await.contains_key("vash_shards"));
+    assert!(
+        info(&mut c, &["INFO", "all"])
+            .await
+            .contains_key("vash_shards")
+    );
+    assert!(
+        info(&mut c, &["INFO", "everything"])
+            .await
+            .contains_key("vash_shards")
+    );
+
+    // Redis answers an unrecognised section with an empty string, not an error.
+    c.call(&["INFO", "bogus"], "$0\r\n\r\n").await;
+}
+
+/// RESP3 has a verbatim string for text meant to be displayed, and `INFO` is
+/// what real Redis sends it for.
+#[tokio::test]
+async fn info_is_a_verbatim_string_under_resp3() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    let plain = "# Cluster\r\ncluster_enabled:0\r\n";
+    c.call(
+        &["INFO", "cluster"],
+        &format!("${}\r\n{plain}\r\n", plain.len()),
+    )
+    .await;
+
+    // Negotiate RESP3, then drain the handshake so the next reply starts at a
+    // known position. Drained by reading until the socket goes quiet rather
+    // than by counting lines, because the handshake's line count depends on
+    // which fields are bulk strings and which are integers.
+    c.send(&request(&["HELLO", "3"])).await;
+    c.fill(4).await;
+    assert_eq!(&c.buf[..4], b"%7\r\n", "RESP3 answers HELLO with a map");
+    c.buf.clear();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut chunk = [0u8; 4096];
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        c.stream.read(&mut chunk),
+    )
+    .await;
+
+    c.call(
+        &["INFO", "cluster"],
+        &format!("={}\r\ntxt:{plain}\r\n", plain.len() + 4),
+    )
+    .await;
+}

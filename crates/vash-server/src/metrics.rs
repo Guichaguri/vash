@@ -257,6 +257,19 @@ impl CommandMetrics {
         self.latency[index].observe(elapsed);
     }
 
+    /// How many times this command ran, across every dialect.
+    ///
+    /// What `stats` and `INFO` report: both describe the server, not the port a
+    /// request happened to arrive on. The per-dialect split stays available to
+    /// Prometheus, which is where the question "who is sending this" belongs.
+    pub fn total(&self, kind: CommandKind) -> u64 {
+        let base = kind.index() * Dialect::ALL.len();
+        self.counts[base..base + Dialect::ALL.len()]
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
+    }
+
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,

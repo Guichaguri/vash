@@ -148,8 +148,14 @@ impl LmdbEngine {
                     if record.is_alive(now_ms, epoch, |id| lookup.generation(id))
                         && request.matches(key)
                     {
-                        scan.entries
-                            .push(vash_core::ListEntry::new(key.to_vec(), record.cas()));
+                        // The deadline is read off the header this liveness
+                        // check just parsed, so carrying it costs nothing —
+                        // see `ListEntry::expires_at_ms`.
+                        scan.entries.push(vash_core::ListEntry::record(
+                            key.to_vec(),
+                            record.cas(),
+                            record.expires_at_ms(),
+                        ));
                     }
                 }
                 // Skipped rather than propagated, unlike every point read.

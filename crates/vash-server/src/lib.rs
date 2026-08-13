@@ -12,7 +12,9 @@ pub mod conn;
 pub mod dispatch;
 pub mod metrics;
 pub mod resp;
+pub mod scan;
 pub mod state;
+pub mod stats;
 
 use std::sync::Arc;
 
@@ -145,6 +147,7 @@ impl Server {
             auth_state,
             cluster,
             config.store.inline_reads,
+            config.server.max_connections as u64,
         );
 
         let listener = TcpListener::bind(config.server.listen)

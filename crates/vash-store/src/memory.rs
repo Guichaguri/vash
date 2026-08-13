@@ -497,7 +497,11 @@ impl Store for MemoryStore {
             if !inner.alive(entry, now) || !request.matches(key) {
                 continue;
             }
-            listing.entries.push(ListEntry::new(key.clone(), entry.cas));
+            listing.entries.push(ListEntry::record(
+                key.clone(),
+                entry.cas,
+                entry.expires_at_ms,
+            ));
             if listing.entries.len() >= limit {
                 listing.cursor = Some(crate::listing::encode(0, key));
                 return Ok(listing);

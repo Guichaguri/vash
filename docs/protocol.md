@@ -1041,7 +1041,9 @@ All are implemented with upstream semantics.
 | `incr <key> <delta> [noreply]` | the new value / `NOT_FOUND` / `CLIENT_ERROR cannot increment or decrement non-numeric value` |
 | `decr <key> <delta> [noreply]` | as `incr`; clamps at zero |
 | `flush_all [delay] [noreply]` | `OK`, or `CLIENT_ERROR` when disabled |
-| `stats` | `STAT <name> <value>` lines, then `END` |
+| `stats` | `STAT <name> <value>` lines, then `END`. **Takes no arguments** — see below |
+| `lru_crawler metadump <all\|hash\|1>` | `OK`, then `key=…` lines, then `END` |
+| `lru_crawler mgdump <all\|hash\|1>` | `OK`, then `mg <key>` lines, then `EN` |
 | `version` | `VERSION <string>` |
 | `verbosity <level> [noreply]` | `OK` — accepted and ignored |
 | `quit` | connection closes, no response |
@@ -1101,13 +1103,98 @@ A subset of memcached's counters — only what is actually measured — plus
 vash's own under a `vash_` prefix. Nothing is reported as a plausible zero
 just to fill the field out.
 
-`pid`, `version`, `pointer_size`, `curr_items`, `bytes`, `limit_maxbytes`, and:
-`vash_utilisation`, `vash_expiry_entries`, `vash_tags`,
-`vash_tag_index_entries`, `vash_pending_reclaims`, `vash_commits`,
-`vash_committed_ops`, `vash_mean_batch`, `vash_sweeps`,
-`vash_reclaimed`, `vash_tag_reclaimed`, `vash_sweep_lag_ms`,
-`vash_epoch`, `vash_readers_in_use`, `vash_cluster_mode`,
+`pid`, `version`, `pointer_size`, `uptime`, `time`, `max_connections`,
+`curr_connections`, `total_connections`, `rejected_connections`, `cmd_get`,
+`cmd_set`, `cmd_touch`, `cmd_flush`, `get_hits`, `get_misses`, `curr_items`,
+`bytes`, `limit_maxbytes`, `evictions`, and: `vash_commands`, `vash_reads`,
+`vash_writes`, `vash_shards`, `vash_utilisation`, `vash_expiry_entries`,
+`vash_tags`, `vash_tag_index_entries`, `vash_pending_reclaims`,
+`vash_commits`, `vash_committed_ops`, `vash_mean_batch`, `vash_sweeps`,
+`vash_reclaimed`, `vash_tag_reclaimed`, `vash_sweep_lag_ms`, `vash_epoch`,
+`vash_readers_in_use`, `vash_oldest_reader_age_ms`, `vash_cluster_mode`,
 `vash_cluster_peers`, `vash_cluster_peers_reachable`.
+
+`cmd_get` counts retrievals, `get_hits` counts keys — a multi-get adds one to
+the first and several to the second, which is upstream's own arithmetic.
+
+**Absent because nothing measures them**: `threads`, `bytes_read`,
+`bytes_written`, `total_items`, `delete_hits`/`delete_misses` (deletes are not
+split into hit and miss), `expired_unfetched`, `evicted_unfetched`.
+
+**Every subcommand is refused** with `CLIENT_ERROR bad command line format`.
+`stats items`, `slabs`, `sizes` and `conns` describe a slab allocator this
+server does not have; `cachedump` was upstream's own key dump and
+`lru_crawler metadump` replaced it; and `reset` would zero the same atomics
+`/metrics` exports, where a counter going backwards corrupts every rate over
+the window containing the reset. One rule rather than a table of special cases.
+
+### `lru_crawler`
+
+The key listing of this dialect, and — like `LIST_KEYS`, `LIST_TAGS` and Redis
+`SCAN` — behind `protocol.listing_enabled`, which is **off by default**. When
+it is clear, both dumps answer `CLIENT_ERROR command disabled by
+configuration`.
+
+```text
+lru_crawler metadump all
+→ OK
+  key=session%3A0001 exp=1786605851 cas=41 cls=1
+  key=session%3A0002 exp=-1 cas=57 cls=1
+  END
+
+lru_crawler mgdump all
+→ OK
+  mg session%3A0001
+  mg session%3A0002
+  EN
+```
+
+One walk, two renderings. `mgdump` emits a ready-to-send `mg` command per key,
+so a dump is its own replay script — which is also why it ends with the meta
+protocol's `EN`.
+
+**Framing, matched to upstream byte for byte** (verified against
+`memcached:1.6-alpine`): an `OK` acknowledgement before any key, `metadump`
+lines ending in a **trailing space and a bare `\n`**, `mgdump` lines ending in
+CRLF, and the terminator last.
+
+**Class ids.** There are no slab classes here, so everything is in class 1 and
+`all`, `hash` and `1` are three spellings of one dump. Any other class holds
+nothing and answers a bare terminator. A *missing* class is `ERROR`, which is
+upstream's answer too.
+
+**Keys are percent-encoded.** The keyspace is shared across dialects, so a Redis
+or VCP client can store a key containing a space or a CRLF — which no memcached
+client could have written, and which would otherwise end a dump early and let
+the rest of the key be read as further lines. Encoding makes that inert with no
+keys skipped. Upstream encodes `%` in `metadump` and not in `mgdump`, and that
+asymmetry is reproduced: an `mg` line has to name the key it will look up.
+
+**Fields.** Upstream guarantees only that a metadump line "will include at
+least" `key`, `exp`, `la`, `cas` and `fetch`. Of those, `la` and `fetch` are
+LRU bookkeeping and there is no LRU here (plan §6), so they are omitted rather
+than zeroed — a `la=0` would claim every key was last touched at the epoch.
+`size` and `flags` are not in the guaranteed set and are absent too; `mg <key>
+s f` answers both per key.
+
+**Paging and truncation.** The grammar has no cursor, so the server pages
+internally, spending `protocol.listing_max_scan` across as many pages as it
+needs. Each page opens and closes its own read transaction, so nothing pins a
+snapshot for the length of the dump. A dump that exhausts the budget ends with
+
+```text
+SERVER_ERROR dump exceeded the scan budget; use SCAN or LIST_KEYS to page the keyspace
+```
+
+**in place of its terminator** — a reader consumes lines until `END`/`EN`, so a
+truncated dump that ended in one would report a keyspace smaller than the real
+one. Use `LIST_KEYS` or Redis `SCAN` for a keyspace larger than the budget.
+
+The remaining `lru_crawler` subcommands — `enable`, `disable`, `sleep`,
+`tocrawl`, `crawl` — steer a background LRU crawler and answer
+`CLIENT_ERROR lru_crawler <name> is not implemented`. Upstream implements them,
+so the bytes diverge whatever is sent; naming the refusal is worth more than a
+shorter divergence.
 
 ## Meta commands
 
@@ -1234,6 +1321,12 @@ exceptions.
 | `mg … q` on a **hit** | returns the value; `q` suppresses only the `EN` of a miss | suppresses the whole reply, hit included | `q` is one `noreply` flag across every meta command here. It is not covered by the differential suite. **Do not use `q` with `mg` against vash** — the quiet-get-then-`mn` batching idiom returns nothing. |
 | `me` output | full internal item dump | `cas`, `size`, `fetch` only | The rest describes internals vash does not have. |
 | `stats` fields | full counter set | a subset, plus `vash_*` | Reporting an unmeasured counter as zero would mislead a dashboard. |
+| `stats <subcommand>` | `items`, `slabs`, `sizes`, `conns`, `cachedump`, `reset` | `CLIENT_ERROR bad command line format` | Four of them describe a slab allocator this server does not have, `cachedump` was superseded upstream by `lru_crawler metadump`, and `reset` would zero the atomics `/metrics` exports. See [`stats`](#stats). |
+| `lru_crawler` availability | always | behind `listing_enabled`, off by default | Keyspace enumeration is the same capability whichever dialect asks. |
+| `lru_crawler` other subcommands | `enable`, `disable`, `sleep`, `tocrawl`, `crawl` | `CLIENT_ERROR lru_crawler <name> is not implemented` | They steer a background LRU crawler; plan §6 rejected an on-disk LRU, so there is nothing to crawl. |
+| A dump pipelined behind other commands | `ERROR cannot pipeline other commands before metadump` | accepted | The dump is buffered and appended in order here, so pipelining is not a problem to refuse. Strictly more permissive. |
+| Metadump `la=`, `fetch=`, `size=`, `flags=` | present | omitted | The first two are LRU bookkeeping and there is no LRU; the last two are outside upstream's guaranteed field set and `mg <key> s f` answers both. |
+| Dump truncation | not reachable | `SERVER_ERROR …` **in place of** the terminator | A reader consumes lines until `END`; a truncated dump ending in one would report a keyspace smaller than the real one. |
 | Meta flags `b h l x I E R N` | implemented | `CLIENT_ERROR unsupported flag` | See [Refused flags](#refused-flags). |
 | Eviction under memory pressure | LRU | TTL-ordered | See [plan.md](plan.md) §6. |
 
@@ -1241,10 +1334,10 @@ exceptions.
 
 # Redis compatibility
 
-A subset of the Redis string and expiry commands, enough for a cache. There are
-no lists, hashes, sets, sorted sets, streams, transactions, scripting, pub/sub,
-`SCAN`, `SELECT` or replication commands, and there never will be — see
-[plan.md](plan.md) §16.
+A subset of the Redis string and expiry commands, enough for a cache, plus
+`SCAN` and `INFO` for introspection. There are no lists, hashes, sets, sorted
+sets, streams, transactions, scripting, pub/sub, `SELECT` or replication
+commands, and there never will be — see [plan.md](plan.md) §16.
 
 Served by default, and turned off with `protocol.resp_enabled = false` or
 `--disable-resp`, in which case a connection opening with a RESP array is closed
@@ -1320,6 +1413,8 @@ together rather than last-one-wins.
 | `INCRBY` / `DECRBY` | `INCRBY key increment` |
 | `INCRBYFLOAT` | `INCRBYFLOAT key increment` |
 | `INCREX` | `INCREX key [BYFLOAT inc \| BYINT inc] [LBOUND lb] [UBOUND ub] [SATURATE] [EX s \| PX ms \| EXAT ts \| PXAT ms \| PERSIST] [ENX]` |
+| `SCAN` | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` — see below |
+| `INFO` | `INFO [section …]`, plus `all` and `everything` — see below |
 | `HELLO` | `HELLO [protover [AUTH username password]]` |
 | `AUTH` | `AUTH password` (the `default` identity) or `AUTH username password` |
 | `PING` | `PING [message]` |
@@ -1331,6 +1426,83 @@ on, which is how a client library discovers a feature is missing.
 Numbers follow Redis's own `string2ll`, not Rust's `parse`: no `+`, no leading
 zeros, no surrounding whitespace. The same rule judges command arguments and
 stored counters, so a value `INCR` accepts is exactly a value it can write back.
+
+### `SCAN`
+
+Enumerating a keyspace is the same capability whichever dialect asks for it, so
+`SCAN` sits behind `protocol.listing_enabled` alongside `LIST_KEYS` — which is
+**off by default**. Until it is enabled, `SCAN` answers `-ERR command disabled
+by configuration`.
+
+**The guarantee is stronger than Redis's.** Redis promises that a key present
+for the whole iteration is returned *at least* once; because resumption here is
+by key rather than by hash bucket, it is returned **exactly** once. Keys created
+behind the cursor are missed and keys created ahead of it are seen, as in Redis,
+and a sequence of pages is still not a snapshot of anything.
+
+| Option | Behaviour |
+|---|---|
+| `COUNT` | Defaults to 10, **clamped** to 1024. Redis specifies it as a hint, so clamping is invisible; VCP's `limit` is rejected instead, because a client that asked for 10000 and silently got 1024 would page incorrectly there. |
+| `MATCH` | The [pattern](#patterns) syntax — `*`, `?`, `\`. Redis's character classes are **not** supported, and an unescaped `[` is refused by name rather than matched as a literal byte, which would silently match nothing. |
+| `TYPE` | Every value here is a string. `TYPE string` scans; anything else answers `["0", []]`, which is true rather than empty — no key can be another type. |
+
+**An empty page with a non-zero cursor is normal** and clients handle it: it is
+what a scan budget spent entirely on dead or non-matching records produces.
+Iterate until the cursor comes back `0`.
+
+**The cursor is a token, and it lives in this process.** Redis's cursor is a
+`u64` and every major client library parses it as one; this store's listing
+position is `shard ‖ key`, which does not fit in eight bytes. So the server
+holds the position and hands back an integer naming it. Consequences worth
+knowing:
+
+- Tokens are **server-wide**, so a pooled client whose next page lands on
+  another connection is fine — which is how `scan_iter` and its equivalents
+  work.
+- At most `protocol.scan_cursors` are live at once and one expires after
+  `protocol.scan_cursor_ttl_ms`. Only spent tokens are dropped: the one a live
+  iteration needs is always the newest it was handed.
+- A token that is gone answers `-ERR scan cursor expired; restart the iteration
+  from 0`, **never a silent restart** — which would spin a pager forever without
+  saying why.
+- **A `SCAN` does not survive a server restart**, where a VCP `LIST_KEYS` cursor
+  does: the position is still valid as bytes, but the mapping from the integer
+  the client holds is gone with the process.
+
+### `INFO`
+
+`INFO [section …]`, where a section is `server`, `clients`, `memory`,
+`persistence`, `stats`, `replication`, `cluster`, `keyspace` or `vash`, matched
+case-insensitively. A bare `INFO` prints everything except `vash`; `all` and
+`everything` add it. An unrecognised section contributes nothing, and naming
+only unrecognised ones answers an empty string — Redis's behaviour, so a client
+can probe for a section it may not have.
+
+A bulk string in RESP2 and a **verbatim string** in RESP3, which is what real
+Redis sends.
+
+The counters come from the same snapshot memcached's `stats` prints, so the two
+commands cannot disagree. Fields Redis reports and this server does not measure
+are **absent, not zeroed**: `used_memory_rss`, `mem_fragmentation_ratio`,
+`instantaneous_ops_per_sec`, `total_net_input_bytes`, `latest_fork_usec`,
+`commandstats`, `latencystats` and the rest.
+
+Three fields are worth calling out because clients act on them:
+
+| Field | Value | Why |
+|---|---|---|
+| `cluster_enabled` | `0` | A `1` sends a client into Redis Cluster's protocol — `CLUSTER SLOTS`, `MOVED`/`ASK` redirection, hash-slot routing — none of which exists here. vash's clustering is tag invalidation between shared-nothing nodes and is not the same thing under the same name. |
+| `role` | `master` | There is no replication, so this is true rather than aspirational. Sentinel-aware clients and health checks read it. |
+| `maxmemory_policy` | `volatile-ttl` | The closest true statement in Redis's vocabulary for plan §6's "expired first, then soonest-to-expire". An approximation; see the divergences below. |
+
+`db0` reports `keys=<n>,avg_ttl=0` and **omits `expires`**. Redis's `expires`
+counts keys carrying a TTL; the nearest thing measured here is rows in the
+expiry index, which has one per record whether or not it expires — a different
+quantity, so the field is absent rather than wrong. `avg_ttl` stays at `0`
+because that is Redis's own value for "not computed".
+
+`vash_version` reports what this actually is; `redis_version` is a
+compatibility claim, since client libraries gate features on it.
 
 ## Errors
 
@@ -1348,7 +1520,10 @@ stored counters, so a value `INCR` accepts is exactly a value it can write back.
 | `-ERR string exceeds maximum allowed size` | A value past `store.max_value_bytes`. |
 | `-ERR numkeys should be greater than 0` / `-ERR too many keys` | `MSETEX` with a non-positive `numkeys`, or more than 4096 pairs. |
 | `-ERR LBOUND must be less than or equal to UBOUND` | `INCREX` with an empty range. |
-| `-ERR command disabled by configuration` | A command gated off server-side. |
+| `-ERR command disabled by configuration` | A command gated off server-side — `SCAN` with `listing_enabled` clear. |
+| `-ERR invalid cursor` | A `SCAN` cursor that is not a non-negative integer. Redis's own wording. |
+| `-ERR scan cursor expired; restart the iteration from 0` | A `SCAN` token the server no longer holds. |
+| `-ERR character classes are not supported in MATCH` | An unescaped `[` in a `SCAN` pattern. |
 | `-ERR unsupported operation` / `-ERR invalid argument` / `-ERR internal error` | The remaining status codes, rendered in Redis's shape. |
 | `-ERR server is overloaded, try again` | Write queue full or shutting down. Retryable. |
 | `-OOM command not allowed when used memory > 'maxmemory'` | The map is full. Clients treat `OOM` as "back off", which is right. |
@@ -1372,6 +1547,13 @@ after it is still read correctly.
 | `SET … IFEQ/IFNE/IFDEQ/IFDNE` | supported | `-ERR … are not supported` | Value-conditional writes need a compare inside the write transaction, and the digest forms need a `DIGEST` command that does not exist here. Named explicitly rather than reported as a syntax error. |
 | `HELLO … SETNAME` | supported | `-ERR … is not supported` | There is no client registry, and accepting it would report back a name nothing had stored. `HELLO … AUTH` **is** supported. |
 | `RESET` | supported | `-ERR unknown command` | It exists partly to drop authentication state; a client that wants that can close the connection. |
+| `SCAN` availability | always | behind `listing_enabled`, off by default | Keyspace enumeration is the same capability whichever dialect asks; see [`SCAN`](#scan). |
+| `SCAN` cursor lifetime | stateless, survives anything | a process-local token, with a capacity and a TTL | Redis's cursor is a hash-bucket index that fits in a `u64`; a key does not. An expired one is refused rather than restarted. |
+| `SCAN … MATCH` character classes | `[a-z]`, `[^x]` | `-ERR character classes are not supported in MATCH` | The pattern matcher is two tokens and an escape by design; matching `[` as a literal would silently return nothing. |
+| `SCAN … COUNT` above 1024 | honoured as a hint | clamped to 1024 | Redis specifies `COUNT` as a hint, and the reply's cursor is what drives the loop. |
+| `KEYS` | supported | `-ERR unknown command` | An unbounded scan with no cursor. `listing_max_scan` exists so no request can hold a read transaction across the whole keyspace, and `KEYS` cannot be expressed without breaking it. `SCAN` is the answer in Redis too. |
+| `INFO db0:expires` | keys carrying a TTL | omitted | Nothing here measures that quantity; see [`INFO`](#info). |
+| `INFO maxmemory_policy` | the configured policy | `volatile-ttl` | The closest true statement in Redis's vocabulary for TTL-ordered eviction (plan §6). |
 | `ACL` command family | supported | `-ERR unknown command` | The credential table is config, loaded from a file and reloaded on `SIGHUP`. A runtime mutation command is a road that ends at `ACL SETUSER`; see [auth.md](auth.md#36-a-database-of-users). |
 | Empty key (`SET "" v`) | allowed | `-ERR invalid key` | LMDB has no empty key. |
 | Keys over 511 bytes | allowed | `-ERR invalid key` | LMDB's compile-time `MDB_MAXKEYSIZE`; see [storage.md](storage.md). |

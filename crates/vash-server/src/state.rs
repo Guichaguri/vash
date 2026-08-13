@@ -28,6 +28,18 @@ pub struct ServerState {
     /// Read-only requests skip the hop to the storage tier. See
     /// [`crate::config::StoreConfig::inline_reads`].
     pub inline_reads: bool,
+    /// Live `SCAN` cursors. See [`crate::scan`].
+    pub scan_cursors: crate::scan::ScanCursors,
+    /// When this process began serving, for `stats uptime` and `INFO
+    /// uptime_in_seconds`.
+    ///
+    /// An `Instant` rather than a unix stamp because it is only ever read as an
+    /// elapsed duration, and a monotonic clock cannot be walked backwards by
+    /// NTP into reporting a negative uptime.
+    pub started: std::time::Instant,
+    /// `server.max_connections`, reported as memcached's `max_connections` and
+    /// Redis's `maxclients`.
+    pub max_connections: u64,
 }
 
 impl ServerState {
@@ -38,6 +50,7 @@ impl ServerState {
         auth: AuthState,
         cluster: Arc<Cluster>,
         inline_reads: bool,
+        max_connections: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -47,6 +60,14 @@ impl ServerState {
             metrics: crate::metrics::ServerMetrics::default(),
             cluster,
             inline_reads,
+            scan_cursors: crate::scan::ScanCursors::new(
+                protocol.scan_cursors,
+                std::time::Duration::from_millis(protocol.scan_cursor_ttl_ms),
+            ),
+            // Started here rather than passed in: this is the moment the server
+            // became able to answer anything.
+            started: std::time::Instant::now(),
+            max_connections,
         })
     }
 }

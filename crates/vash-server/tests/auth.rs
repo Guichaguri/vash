@@ -537,6 +537,18 @@ async fn redis_refuses_commands_before_auth() {
         conn.read_until("\r\n").await,
         "-NOAUTH Authentication required.\r\n"
     );
+
+    // The introspection commands especially: one enumerates the keyspace and
+    // the other describes the server, so they disclose more than a miss on a
+    // key a stranger had to guess.
+    for command in [&["SCAN", "0"][..], &["INFO"][..], &["INFO", "server"][..]] {
+        conn.send(&resp(command)).await;
+        assert_eq!(
+            conn.read_until("\r\n").await,
+            "-NOAUTH Authentication required.\r\n",
+            "{command:?}"
+        );
+    }
 }
 
 /// Redis is *more* restrictive than VCP here, and deliberately: a bare `HELLO`
@@ -665,6 +677,20 @@ async fn memcached_refuses_commands_before_auth() {
         conn.text("mg k v\r\n").await,
         "CLIENT_ERROR unauthenticated\r\n"
     );
+
+    // And the introspection commands, which disclose the most: a keyspace dump
+    // and the server's counters.
+    for command in [
+        "stats\r\n",
+        "lru_crawler metadump all\r\n",
+        "lru_crawler mgdump all\r\n",
+    ] {
+        assert_eq!(
+            conn.text(command).await,
+            "CLIENT_ERROR unauthenticated\r\n",
+            "{command:?}"
+        );
+    }
 }
 
 /// The data block of a refused storage command must still be consumed, or every

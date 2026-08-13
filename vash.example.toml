@@ -136,6 +136,12 @@ flush_enabled = false
 #   every other one touches as many records as the client named.
 #
 # They are administrative tools: a linear scan, paged by an opaque cursor.
+#
+# This gate covers keyspace enumeration in EVERY dialect, not only the native
+# one: Redis SCAN and memcached lru_crawler metadump / mgdump are the same
+# capability asked for in another vocabulary, and are refused here too. A Redis
+# client will therefore see "ERR command disabled by configuration" from SCAN
+# until this is turned on.
 listing_enabled = false
 
 # Records one LIST_KEYS call may examine before it stops early and hands back a
@@ -143,7 +149,28 @@ listing_enabled = false
 # transaction open — the thing that blocks LMDB from reusing freed pages. A page
 # that stops here still advances its cursor, so paging makes progress through a
 # region of dead or non-matching records rather than stalling on it.
+#
+# It also caps a whole memcached lru_crawler dump. That grammar has no cursor,
+# so the server pages internally and spends this budget across as many pages as
+# it needs; a dump that runs out ends in a SERVER_ERROR *instead of* its
+# terminator, so a truncated dump can never be mistaken for a complete one.
 listing_max_scan = 100000
+
+# Live Redis SCAN cursors held at once, and how long an idle one stays
+# resumable.
+#
+# A SCAN cursor has to reach the client as an integer — every major client
+# library parses it as one — and this store's listing cursor is a key, which
+# does not fit in a u64. So the server holds the position and hands out a token.
+# The oldest are dropped once this many are live, which is safe because the
+# token a live iteration needs is always the newest one it was handed; what goes
+# is spent tokens and abandoned iterations.
+#
+# A client that comes back after the TTL, or after a restart, is told
+# "ERR scan cursor expired" rather than being silently restarted from the
+# beginning — which would spin its pager forever without ever saying why.
+scan_cursors = 1024
+scan_cursor_ttl_ms = 60000
 
 # The compatibility dialects. Both share the port with the native protocol and
 # are told apart by the connection's first byte, so both are on by default and

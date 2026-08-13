@@ -79,13 +79,40 @@ impl ListRequest<'_> {
 pub struct ListEntry {
     pub name: Box<[u8]>,
     pub version: u64,
+    /// Absolute expiry in unix milliseconds, or [`NEVER`].
+    ///
+    /// **Not on the wire, and deliberately so**: `docs/opcodes.md` keeps a key's
+    /// lifetime out of a listing, because a page's size should be a function of
+    /// the key lengths alone. It is carried here because the memcached
+    /// `lru_crawler metadump` line specifies an `exp` field, and the scan that
+    /// produces an entry has already parsed the record header this comes from —
+    /// so filling it costs nothing, where asking afterwards would cost a second
+    /// B-tree descent per key against a second snapshot.
+    ///
+    /// `None` for a listing whose entries are not records — `LIST_TAGS` — and an
+    /// `Option` rather than a bare [`NEVER`] for exactly that reason: a tag has
+    /// no expiry at all, which is a different statement from "never expires".
+    ///
+    /// [`NEVER`]: crate::record::NEVER
+    pub expires_at_ms: Option<u64>,
 }
 
 impl ListEntry {
+    /// An entry that names something which has no lifetime of its own — a tag,
+    /// or an entry decoded from the wire, which does not carry one.
     pub fn new(name: impl Into<Box<[u8]>>, version: u64) -> Self {
         Self {
             name: name.into(),
             version,
+            expires_at_ms: None,
+        }
+    }
+
+    /// An entry for a live record, carrying the deadline it was found with.
+    pub fn record(name: impl Into<Box<[u8]>>, version: u64, expires_at_ms: u64) -> Self {
+        Self {
+            expires_at_ms: Some(expires_at_ms),
+            ..Self::new(name, version)
         }
     }
 }

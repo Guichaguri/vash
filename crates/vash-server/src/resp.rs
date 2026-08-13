@@ -116,7 +116,13 @@ pub fn inline_safe(command: &Command<'_>) -> bool {
             | Command::Hello { .. }
             | Command::Auth(_)
             | Command::Quit
+            // Reads a few atomics and the store's environment statistics, none
+            // of which walks anything.
+            | Command::Info { .. }
     )
+    // `SCAN` is missing and must stay missing: it is bounded by
+    // `listing_max_scan` records, not by anything a runtime worker should be
+    // blocked for. `Command::ListKeys` — what it becomes — answers the same.
 }
 
 fn execute(
@@ -397,6 +403,14 @@ fn run(
             Ok(())
         }
 
+        // `SCAN` reaches storage like everything below, but not through
+        // `translate`: its cursor is a token that has to be resolved against
+        // the server's table before there is a `ListRequest` to translate into,
+        // and the next token has to be issued from the page that comes back.
+        // The boundary is still `dispatch::execute` — only the pure-function
+        // helper is bypassed.
+        Command::Scan(scan) => run_scan(state, scan, *version, out),
+
         // Everything past this point touches storage, so it goes through the
         // shared boundary: translated into a `vash_core::Command`, executed by
         // `dispatch::execute` — which is where it gets counted and where its
@@ -408,6 +422,85 @@ fn run(
             render(storage, &reply, *version, out)
         }
     }
+}
+
+/// Answers `SCAN`.
+///
+/// The three steps the token table exists for: turn the client's integer into a
+/// position, page the listing from it, and turn the position that comes back
+/// into the next integer. Everything between is `LIST_KEYS`, gate and budget
+/// included — `dispatch::execute` refuses this when `listing_enabled` is clear,
+/// which is why there is no gate check here.
+fn run_scan(
+    state: &ServerState,
+    scan: &vash_proto::resp::command::Scan<'_>,
+    version: Version,
+    out: &mut Vec<u8>,
+) -> Answered {
+    // Every value this server stores is a string, so any other type genuinely
+    // has no keys. Answering "complete, nothing matched" is the truth, and it
+    // costs no scan.
+    if !scan.only_strings {
+        return answer_scan(out, crate::scan::START, &[], version);
+    }
+
+    // `START` is Redis's "from the beginning" and names no stored position.
+    let resumed;
+    let cursor: &[u8] = if scan.token == crate::scan::START {
+        &[]
+    } else {
+        resumed = state.scan_cursors.resolve(scan.token).ok_or_else(|| {
+            // Never a silent restart from the beginning: that spins a client's
+            // pager forever without ever saying why. The same rule
+            // `listing::decode` applies to a fabricated VCP cursor.
+            Failure::client("scan cursor expired; restart the iteration from 0")
+        })?;
+        &resumed
+    };
+
+    let request = vash_core::ListRequest {
+        limit: scan.count,
+        cursor,
+        pattern: scan.pattern,
+    };
+    let reply = crate::dispatch::execute(
+        state,
+        &vash_core::Command::ListKeys(request),
+        crate::metrics::Dialect::Resp,
+    )
+    .map_err(resp_error)?;
+
+    let Reply::Listing(page) = reply else {
+        error!(?reply, "SCAN produced a reply it cannot render");
+        return Err(Failure::internal());
+    };
+
+    // An absent cursor is the listing's whole termination rule, and it maps onto
+    // Redis's `0` exactly. A page that stopped on the scan budget still carries
+    // one, so an empty page with a live cursor — which Redis permits and clients
+    // handle — is what a run of dead or non-matching records produces.
+    let next = match &page.cursor {
+        Some(position) => state.scan_cursors.issue(position),
+        None => crate::scan::START,
+    };
+    answer_scan(out, next, &page.entries, version)
+}
+
+/// `[cursor, [key …]]`, with the cursor as decimal text — which is what every
+/// client library expects, and several of them parse as an integer.
+fn answer_scan(
+    out: &mut Vec<u8>,
+    cursor: u64,
+    entries: &[vash_core::ListEntry],
+    _version: Version,
+) -> Answered {
+    encode::array(out, 2);
+    encode::bulk(out, cursor.to_string().as_bytes());
+    encode::array(out, entries.len());
+    for entry in entries {
+        encode::bulk(out, &entry.name);
+    }
+    Ok(())
 }
 
 /// Renders a reply in this dialect.
@@ -422,6 +515,14 @@ fn render(command: &Command<'_>, reply: &Reply, version: Version, out: &mut Vec<
             Some(message) => encode::bulk(out, message),
             None => encode::simple(out, "PONG"),
         },
+
+        // The counter list is memcached's `stats` payload, unchanged: one
+        // snapshot, and each dialect names the fields it reports. The table that
+        // does the naming is `encode::info`'s, and it is a pure function of
+        // these pairs — no state, no store.
+        (Command::Info { sections }, Reply::Stats(counters)) => {
+            encode::info(out, *sections, counters, version)
+        }
 
         (_, Reply::Value(value)) => encode::bulk(out, &value.data),
         (Command::Get { .. }, Reply::NotFound) => encode::null(out, version),
@@ -679,8 +780,14 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
 
         Command::IncrEx(op) => Domain::Arithmetic(translate_increx(op)?),
 
-        // Answered before translation is reached.
-        Command::Quit | Command::Auth(_) | Command::Hello { .. } => {
+        // `INFO` and memcached's `stats` are one question about the server, so
+        // they are one domain command; only the rendering differs.
+        Command::Info { .. } => Domain::Stats,
+
+        // Answered before translation is reached — `Scan` because its cursor
+        // has to be resolved against server state first, the rest because they
+        // are properties of this socket rather than operations on the cache.
+        Command::Quit | Command::Auth(_) | Command::Hello { .. } | Command::Scan(_) => {
             error!("a connection command reached the storage boundary");
             return Err(Failure::internal());
         }

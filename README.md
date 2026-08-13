@@ -359,6 +359,17 @@ which is part of the upstream protocol: a `G` flag on `ms` attaching a
 comma-separated tag list, and `mdt <tag>` (or `delete_by_tag <tag>` in the
 classic dialect) to invalidate one. Clients that never send them are unaffected.
 
+`stats` reports the counters this server measures, and takes no subcommand — the
+ones upstream has describe a slab allocator that is not here. Listing keys is
+`lru_crawler metadump` and `lru_crawler mgdump`, matching upstream's framing byte
+for byte, and both are **off by default** behind the same `listing_enabled` gate
+as `LIST_KEYS`:
+
+```bash
+vash-server --listen 0.0.0.0:11311 --enable-listing
+printf 'lru_crawler metadump all\r\n' | nc 127.0.0.1 11311
+```
+
 ### How compatibility is checked
 
 Two suites, both run in CI against the **real servers** as well as against vash,
@@ -411,11 +422,25 @@ redis-cli -3 -p 11311 INCREX ratelimit:42 BYINT 1 UBOUND 100 EX 60 ENX
 
 Supported: `GET` `SET` `DEL` `UNLINK` `MSET` `MGET` `MSETEX` `EXISTS` `TYPE`
 `EXPIRE` `EXPIREAT` `PERSIST` `TTL` `APPEND` `INCR` `INCRBY` `DECR` `DECRBY`
-`INCRBYFLOAT` `INCREX`, plus `HELLO`, `PING` and `QUIT` to negotiate and keep a
-connection. `TYPE` answers `string` or `none` — every value here is a string. `SET` takes `NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`;
+`INCRBYFLOAT` `INCREX` `SCAN` `INFO`, plus `HELLO`, `PING` and `QUIT` to
+negotiate and keep a connection. `TYPE` answers `string` or `none` — every value
+here is a string. `SET` takes `NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`;
 `EXPIRE` and `EXPIREAT` take `NX`/`XX`/`GT`/`LT`; `INCREX` takes its full option
 set. Anything else answers `unknown command`, which is how a client library
 discovers a feature is missing.
+
+`INFO` reports the counters this server actually measures — nothing is filled in
+with a plausible zero — and `cluster_enabled:0`, so a cluster-aware client does
+not try to speak a protocol that is not here. `SCAN` takes `MATCH`, `COUNT` and
+`TYPE`, and returns a key present throughout the walk **exactly** once, which is
+stronger than Redis's at-least-once. It is **off by default**: enumerating a
+keyspace is the same capability whichever dialect asks, so it sits behind the
+same `listing_enabled` gate as `LIST_KEYS`.
+
+```bash
+vash-server --listen 0.0.0.0:11311 --enable-listing
+redis-cli -p 11311 SCAN 0 MATCH 'session:*' COUNT 100
+```
 
 Two things to know before pointing a real workload at it. Expiry is rounded to
 whole seconds, because that is what the store's deadline field holds — so

@@ -98,6 +98,32 @@ pub enum Command<'a> {
         delta: Number,
     },
     IncrEx(IncrEx<'a>),
+
+    // ---- introspection ---------------------------------------------------
+    /// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`.
+    Scan(Scan<'a>),
+    /// `INFO [section [section …]]`.
+    Info {
+        sections: super::encode::Sections,
+    },
+}
+
+/// `SCAN`, decoded.
+///
+/// The cursor is still the **token** the client sent, not a position: turning
+/// one into the other needs the server's table and this parser has no state.
+/// See `vash_server::scan`.
+#[derive(Debug)]
+pub struct Scan<'a> {
+    pub token: u64,
+    /// `MATCH`. Empty matches everything, as an empty listing pattern does.
+    pub pattern: &'a [u8],
+    /// `COUNT`, already defaulted and clamped to what a listing page may hold.
+    pub count: u32,
+    /// `TYPE`. Every value here is a string, so anything else selects nothing —
+    /// carried rather than rejected because that is a true answer and Redis
+    /// gives it for a type that exists but has no keys.
+    pub only_strings: bool,
 }
 
 /// A name and a secret, as presented on the wire.
@@ -383,10 +409,105 @@ pub fn parse_command<'a>(
 
         b"INCREX" => parse_increx(args, consumed)?,
 
+        b"SCAN" => parse_scan(args, consumed)?,
+
+        // `INFO` never fails on its arguments: Redis answers an unrecognised
+        // section with an empty string rather than an error, so a client
+        // probing for a section it may not have gets a usable answer.
+        b"INFO" => {
+            let mut sections = match args.len() {
+                1 => super::encode::Sections::DEFAULT,
+                _ => super::encode::Sections::NONE,
+            };
+            for name in &args[1..] {
+                if name.eq_ignore_ascii_case(b"all") || name.eq_ignore_ascii_case(b"everything") {
+                    sections = super::encode::Sections::ALL;
+                } else if let Some(section) = super::encode::Sections::named(name) {
+                    sections = sections.with(section);
+                }
+            }
+            Command::Info { sections }
+        }
+
         _ => return Err(fail(ErrorReply::UnknownCommand(raw_verb))),
     };
 
     Ok(Parsed { command, consumed })
+}
+
+/// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`
+fn parse_scan<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, ProtocolError<'a>> {
+    let args = at_least(args, 2, "scan", consumed)?;
+    let fail = |reply: ErrorReply<'a>| ProtocolError::Recoverable { reply, consumed };
+
+    // Redis's own wording, and its own rule: the cursor is decimal and
+    // unsigned. A token this server never issued is refused later, by the table
+    // that would have issued it.
+    let token = std::str::from_utf8(args[1])
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or_else(|| fail(ErrorReply::Err("invalid cursor")))?;
+
+    let mut scan = Scan {
+        token,
+        pattern: b"",
+        // Redis's default, and a hint rather than a limit — see the clamp below.
+        count: 10,
+        only_strings: true,
+    };
+
+    let mut cursor = Options::new(&args[2..], "scan", consumed);
+    while let Some(token) = cursor.next() {
+        if eq(token, b"MATCH") {
+            scan.pattern = cursor.argument()?;
+            // This server's glob is `*`, `?` and `\` and deliberately nothing
+            // else; Redis's `stringmatchlen` also has `[a-z]` and `[^x]`.
+            // Treating `[` as a literal byte would make `MATCH k[0-9]*` match
+            // nothing and say nothing, so it is named — the same call
+            // `SET … IFEQ` makes.
+            if has_unescaped_class(scan.pattern) {
+                return Err(fail(ErrorReply::Err(
+                    "character classes are not supported in MATCH",
+                )));
+            }
+            vash_core::glob::validate(scan.pattern)
+                .map_err(|_| fail(ErrorReply::Err("invalid MATCH pattern")))?;
+        } else if eq(token, b"COUNT") {
+            let count =
+                parse_int(cursor.argument()?).ok_or_else(|| fail(ErrorReply::NOT_AN_INTEGER))?;
+            if count <= 0 {
+                return Err(fail(ErrorReply::SYNTAX));
+            }
+            // **Clamped, where VCP's `limit` is rejected.** `docs/opcodes.md`
+            // refuses an over-limit because a VCP client that asked for 10000
+            // and silently got 1024 would page incorrectly. Redis specifies
+            // `COUNT` as a hint the server may ignore, clients pass large ones
+            // freely, and it is the returned cursor that drives the loop — so
+            // clamping here is both legal and invisible.
+            scan.count = count.min(vash_core::MAX_LIST_LIMIT as i64) as u32;
+        } else if eq(token, b"TYPE") {
+            scan.only_strings = cursor.argument()?.eq_ignore_ascii_case(b"string");
+        } else {
+            return Err(fail(ErrorReply::SYNTAX));
+        }
+    }
+
+    Ok(Command::Scan(scan))
+}
+
+/// Whether a pattern opens a character class this server cannot match.
+///
+/// An escaped `\[` is a literal bracket and is fine; a bare one is a class.
+fn has_unescaped_class(pattern: &[u8]) -> bool {
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            vash_core::glob::ESCAPE => i += 2,
+            b'[' => return true,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// `SET key value [NX | XX] [GET] [EX s | PX ms | EXAT ts | PXAT ms | KEEPTTL]`

@@ -88,6 +88,16 @@ pub fn execute_memcached(
         return execute_memcached_unauthenticated(state, conn, parsed, out);
     }
 
+    // A dump answers with as many lines as the keyspace has, which is more than
+    // one `Reply` can carry — so it pages the listing itself and writes as it
+    // goes. See [`execute_dump`].
+    if let vash_proto::memcached::encode::ResponseStyle::Dump(dump) = &parsed.style {
+        if let Err(failed) = execute_dump(state, *dump, out) {
+            mc::encode_error(out, memcached_error(failed.status));
+        }
+        return Closing::No;
+    }
+
     let result = execute(state, &parsed.command, Dialect::Memcached);
     let closing = matches!(result, Ok(Reply::Closing));
 
@@ -191,6 +201,96 @@ fn execute_memcached_unauthenticated(
             );
             state.metrics.auth_failed();
             refuse_memcached(state, parsed, out, "authentication failure")
+        }
+    }
+}
+
+/// Answers an `lru_crawler` dump, paging the listing until it runs out.
+///
+/// **The grammar has no cursor**, so resumption happens here: each iteration is
+/// an ordinary `LIST_KEYS` that opens and closes its own read transaction, so
+/// nothing pins a snapshot for the length of the dump — the footgun plan §9
+/// exists to avoid, and the reason `LIST_KEYS` pages at all. Going through
+/// [`execute`] each time is what keeps the gate, the counters and the error
+/// classification on the shared boundary; only the line writing is this
+/// dialect's.
+///
+/// A dump therefore counts as one listing per page rather than one in total.
+/// That is honest — it is that many scans — and worth knowing when reading
+/// `vash_command_total{command="listing"}`.
+fn execute_dump(
+    state: &ServerState,
+    dump: vash_proto::memcached::encode::Dump,
+    out: &mut Vec<u8>,
+) -> Result<(), Failed> {
+    use vash_proto::memcached::encode as mc;
+
+    // Checked even when the class selects nothing: "this command is disabled"
+    // is true regardless of which class was named, and answering `END` would
+    // say the class was merely empty.
+    listing_gate(state)?;
+
+    // Upstream acknowledges before it streams anything, and does so even for a
+    // class holding nothing. A client that mistook it for the first line would
+    // lose a key.
+    out.extend_from_slice(mc::DumpStyle::ACK);
+
+    if !dump.selected {
+        out.extend_from_slice(dump.style.terminator());
+        return Ok(());
+    }
+
+    // One dump gets one `LIST_KEYS` call's budget, spent across as many pages as
+    // it needs. Each page is allowed its own full budget by `execute`, so the
+    // true ceiling is one page's overshoot past this — bounded, which is the
+    // point, rather than exact.
+    let budget = state.protocol.listing_max_scan as u64;
+    let mut scanned = 0u64;
+    let mut cursor: Option<Box<[u8]>> = None;
+
+    loop {
+        let request = vash_core::ListRequest {
+            limit: vash_core::MAX_LIST_LIMIT,
+            cursor: cursor.as_deref().unwrap_or(&[]),
+            pattern: &[],
+        };
+        let reply = execute(state, &Command::ListKeys(request), Dialect::Memcached)?;
+        let Reply::Listing(page) = reply else {
+            error!("a listing produced a reply it cannot render");
+            return Err(Failed::status(Status::Internal));
+        };
+
+        for entry in &page.entries {
+            mc::dump_line(out, dump.style, entry);
+        }
+        scanned += page.scanned;
+
+        match page.cursor {
+            // More to walk, and budget left to walk it with.
+            Some(next) if scanned < budget => cursor = Some(next),
+
+            // Cut short. **The error replaces the terminator rather than
+            // following it**, and that substitution is the whole point: a tool
+            // reads lines until the terminator, so ending a truncated dump with
+            // one would report a keyspace smaller than the real one. An error
+            // where the terminator belongs cannot be mistaken for a complete
+            // answer.
+            Some(_) => {
+                warn!(scanned, budget, "dump exceeded its scan budget");
+                mc::encode_error(
+                    out,
+                    vash_proto::memcached::ErrorKind::Server(
+                        "dump exceeded the scan budget; use SCAN or LIST_KEYS to page the keyspace",
+                    ),
+                );
+                return Ok(());
+            }
+
+            // Walked to the end of the keyspace.
+            None => {
+                out.extend_from_slice(dump.style.terminator());
+                return Ok(());
+            }
         }
     }
 }
@@ -675,7 +775,7 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, Fa
             None => Ok(Reply::NotFound),
         },
 
-        Command::Stats => Ok(Reply::Stats(collect_stats(state))),
+        Command::Stats => Ok(Reply::Stats(crate::stats::collect(state))),
         Command::Version => Ok(Reply::Version(vash_proto::memcached::encode::VERSION)),
         Command::Quit => Ok(Reply::Closing),
 
@@ -902,68 +1002,6 @@ fn to_failed(err: StoreError) -> Failed {
             Failed::status(Status::Internal)
         }
     }
-}
-
-/// The `stats` payload.
-///
-/// A subset of memcached's counters, restricted to what this server actually
-/// measures — plus its own. Reporting a plausible-looking zero for something we
-/// do not track would mislead any dashboard reading it.
-fn collect_stats(state: &ServerState) -> Vec<(String, String)> {
-    let mut stats = vec![
-        ("pid".into(), std::process::id().to_string()),
-        (
-            "version".into(),
-            vash_proto::memcached::encode::VERSION.into(),
-        ),
-        ("pointer_size".into(), usize::BITS.to_string()),
-    ];
-
-    match state.store.stats() {
-        Ok(s) => stats.extend([
-            ("curr_items".into(), s.entries.to_string()),
-            ("bytes".into(), s.used_bytes.to_string()),
-            ("limit_maxbytes".into(), s.map_size.to_string()),
-            // Beyond memcached's set, but they are what this server is actually
-            // about.
-            ("vash_utilisation".into(), format!("{:.4}", s.utilisation)),
-            ("vash_expiry_entries".into(), s.expiry_entries.to_string()),
-            ("vash_tags".into(), s.tags.to_string()),
-            (
-                "vash_tag_index_entries".into(),
-                s.tag_index_entries.to_string(),
-            ),
-            (
-                "vash_pending_reclaims".into(),
-                s.pending_reclaims.to_string(),
-            ),
-            ("vash_commits".into(), s.commits.to_string()),
-            ("vash_committed_ops".into(), s.committed_ops.to_string()),
-            (
-                "vash_mean_batch".into(),
-                format!("{:.2}", s.mean_batch_size()),
-            ),
-            ("vash_sweeps".into(), s.sweeps.to_string()),
-            ("vash_reclaimed".into(), s.reclaimed.to_string()),
-            ("vash_tag_reclaimed".into(), s.tag_reclaimed.to_string()),
-            ("vash_sweep_lag_ms".into(), s.sweep_lag_ms.to_string()),
-            ("vash_epoch".into(), s.epoch.to_string()),
-            ("vash_readers_in_use".into(), s.readers_in_use.to_string()),
-        ]),
-        Err(e) => error!(error = %e, "could not read store stats"),
-    }
-
-    let view = state.cluster.view();
-    stats.extend([
-        ("vash_cluster_mode".into(), view.mode.as_str().to_string()),
-        ("vash_cluster_peers".into(), view.peers.len().to_string()),
-        (
-            "vash_cluster_peers_reachable".into(),
-            state.cluster.peers_reachable().to_string(),
-        ),
-    ]);
-
-    stats
 }
 
 /// Builds the handshake response advertised to clients.

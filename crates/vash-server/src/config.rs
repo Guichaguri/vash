@@ -370,7 +370,27 @@ pub struct ProtocolConfig {
     /// page that stops on the budget still advances its cursor, so paging makes
     /// progress through a region of dead or non-matching records rather than
     /// stalling on it.
+    ///
+    /// It also caps a whole memcached `lru_crawler` dump, which has no cursor in
+    /// its grammar and so pages internally: one dump gets one `LIST_KEYS` call's
+    /// budget, spent across as many pages as it needs.
     pub listing_max_scan: usize,
+
+    /// Live Redis `SCAN` cursors held at once.
+    ///
+    /// A `SCAN` cursor must reach the client as an integer — the major client
+    /// libraries parse it as one — and this store's listing cursor is a key,
+    /// which does not fit in a `u64`. So the server holds the position and hands
+    /// out a token. Oldest are dropped first once this many are live; the token
+    /// a live iteration needs is always the newest, so only spent ones go. See
+    /// [`crate::scan`].
+    pub scan_cursors: usize,
+
+    /// How long a `SCAN` cursor stays resumable.
+    ///
+    /// Enforced when a token is looked up, not only when the table is swept, so
+    /// how long a cursor lasts does not depend on how busy the server is.
+    pub scan_cursor_ttl_ms: u64,
 
     /// Whether the memcached text and meta protocols are served.
     ///
@@ -408,6 +428,11 @@ impl Default for ProtocolConfig {
             // ~10-20ms of walking at the per-record cost measured in M6, which
             // is a reasonable ceiling on one held read transaction.
             listing_max_scan: 100_000,
+            // Worst case ~0.5 MB, and only while that many iterations are
+            // genuinely in flight. `SCAN` is administrative; this is not a
+            // number a healthy server approaches.
+            scan_cursors: 1_024,
+            scan_cursor_ttl_ms: 60_000,
             // On, unlike the command gates above: these are compatibility with
             // clients someone already has, and defaulting them off would make
             // the drop-in replacement not one.
@@ -583,6 +608,18 @@ impl Config {
         anyhow::ensure!(
             self.protocol.listing_max_scan > 0,
             "protocol.listing_max_scan must be > 0"
+        );
+        // Zero of either would make every `SCAN` past the first page answer
+        // "cursor expired", which is a working server that cannot complete an
+        // iteration — a failure better refused at startup than discovered by a
+        // client's pager.
+        anyhow::ensure!(
+            self.protocol.scan_cursors > 0,
+            "protocol.scan_cursors must be > 0"
+        );
+        anyhow::ensure!(
+            self.protocol.scan_cursor_ttl_ms > 0,
+            "protocol.scan_cursor_ttl_ms must be > 0"
         );
 
         let evict = &self.store.eviction;

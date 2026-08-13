@@ -758,3 +758,349 @@ async fn an_unrecognised_opening_byte_closes_the_connection() {
     let mut other = server.connect().await;
     assert!(other.line("version\r\n").await.starts_with("VERSION "));
 }
+
+// ---- stats --------------------------------------------------------------
+
+/// **`stats` takes no arguments here.** Upstream implements `items`, `slabs`,
+/// `sizes`, `conns`, `cachedump` and `reset`; none of them describes this
+/// server, and `reset` would zero the atomics `/metrics` exports — a Prometheus
+/// counter going backwards corrupts every rate over the window containing it.
+///
+/// One rule rather than a table of special cases.
+#[tokio::test]
+async fn every_stats_subcommand_is_refused() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    for argument in [
+        "items",
+        "slabs",
+        "sizes",
+        "conns",
+        "reset",
+        "cachedump 1 0",
+        "bogus",
+    ] {
+        assert_eq!(
+            c.line(&format!("stats {argument}\r\n")).await,
+            "CLIENT_ERROR bad command line format\r\n",
+            "stats {argument}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stats_reports_the_counters_it_measures() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.line("set k 0 0 1\r\nv\r\n").await;
+    c.get("get k\r\n").await;
+    c.get("get missing\r\n").await;
+
+    c.send(b"stats\r\n").await;
+    let body = c.read_until("END\r\n").await;
+    let fields: std::collections::HashMap<&str, &str> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("STAT "))
+        .filter_map(|line| line.split_once(' '))
+        .collect();
+
+    assert_eq!(fields["curr_items"], "1");
+    assert_eq!(fields["cmd_set"], "1");
+    assert_eq!(fields["cmd_get"], "2");
+    assert_eq!(fields["get_hits"], "1");
+    assert_eq!(fields["get_misses"], "1");
+    assert!(fields.contains_key("uptime"));
+    assert!(fields.contains_key("max_connections"));
+    assert!(fields.contains_key("evictions"));
+    assert!(fields["version"].ends_with("-vash"));
+
+    // Absent rather than zeroed: nothing measures them.
+    for unmeasured in ["bytes_read", "bytes_written", "total_items", "delete_hits"] {
+        assert!(
+            !fields.contains_key(unmeasured),
+            "{unmeasured} is not measured and must not be reported"
+        );
+    }
+}
+
+// ---- lru_crawler --------------------------------------------------------
+//
+// The key listing of this dialect. The grammar has no cursor, so the server
+// pages the listing internally and writes as it goes — which is why these
+// assert on whole dumps rather than on single replies.
+
+fn listing_on(config: &mut Config) {
+    config.protocol.listing_enabled = true;
+}
+
+/// Every `key=` from a metadump, in the order it arrived.
+fn dumped_keys(body: &str) -> Vec<&str> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("key="))
+        .filter_map(|line| line.split(' ').next())
+        .collect()
+}
+
+/// The framing, byte for byte, against what `memcached:1.6-alpine` sends: an
+/// `OK` acknowledgement first, data lines ending in a **bare `\n` with a
+/// trailing space**, and `END\r\n` last. Every one of those is a detail a
+/// parser keyed on line endings would notice.
+#[tokio::test]
+async fn metadump_matches_upstream_framing() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    c.line("set solo 0 0 1\r\nv\r\n").await;
+
+    c.send(b"lru_crawler metadump all\r\n").await;
+    let body = c.read_until("END\r\n").await;
+
+    let mut lines = body.split_inclusive('\n');
+    assert_eq!(lines.next().unwrap(), "OK\r\n");
+
+    let entry = lines.next().unwrap();
+    assert!(entry.ends_with(" \n"), "trailing space, bare LF: {entry:?}");
+    assert!(!entry.contains('\r'), "no CR on a data line: {entry:?}");
+    assert!(entry.starts_with("key=solo exp=-1 cas="), "{entry:?}");
+    assert!(entry.contains(" cls=1 "), "{entry:?}");
+
+    assert_eq!(lines.next().unwrap(), "END\r\n");
+    assert_eq!(lines.next(), None);
+}
+
+/// `mgdump` emits a ready-to-send `mg` command per key and ends with the meta
+/// protocol's `EN`, which is what lets a dump be piped back in.
+#[tokio::test]
+async fn mgdump_emits_replayable_commands() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    c.line("set solo 0 0 1\r\nv\r\n").await;
+
+    c.send(b"lru_crawler mgdump all\r\n").await;
+    assert_eq!(c.read_until("EN\r\n").await, "OK\r\nmg solo\r\nEN\r\n");
+
+    // And it really is a command: sent back, it hits.
+    assert_eq!(c.line("mg solo v\r\n").await, "VA 1\r\nv\r\n");
+}
+
+/// There are no slab classes here, so everything is in class 1 and `all`,
+/// `hash` and `1` are three spellings of one dump. Any other class is genuinely
+/// empty, and a missing one is upstream's bare `ERROR`.
+#[tokio::test]
+async fn the_dump_class_argument_follows_upstreams_vocabulary() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    for i in 0..3 {
+        c.line(&format!("set k{i} 0 0 1\r\nv\r\n")).await;
+    }
+
+    let mut dumps = Vec::new();
+    for class in ["all", "hash", "1"] {
+        c.send(format!("lru_crawler metadump {class}\r\n").as_bytes())
+            .await;
+        let body = c.read_until("END\r\n").await;
+        let mut keys = dumped_keys(&body);
+        keys.sort_unstable();
+        dumps.push(keys.join(","));
+    }
+    assert_eq!(dumps[0], "k0,k1,k2");
+    assert_eq!(dumps[0], dumps[1], "`hash` is the same dump");
+    assert_eq!(
+        dumps[0], dumps[2],
+        "and so is the class this server reports"
+    );
+
+    // A class this server does not have holds nothing — and says so with a
+    // terminator, not an error.
+    c.send(b"lru_crawler metadump 7\r\n").await;
+    assert_eq!(c.read_until("END\r\n").await, "OK\r\nEND\r\n");
+    c.send(b"lru_crawler mgdump 42\r\n").await;
+    assert_eq!(c.read_until("EN\r\n").await, "OK\r\nEN\r\n");
+
+    // Verified against upstream: a missing class is `ERROR`, not a client error.
+    assert_eq!(c.line("lru_crawler metadump\r\n").await, "ERROR\r\n");
+    assert_eq!(c.line("lru_crawler bogus\r\n").await, "ERROR\r\n");
+}
+
+/// The rest of `lru_crawler` steers a background LRU crawler, and plan §6
+/// rejected an on-disk LRU — so there is nothing to enable, sleep or crawl.
+/// Refused by name, since upstream implements these and the bytes diverge
+/// either way.
+#[tokio::test]
+async fn the_other_lru_crawler_subcommands_are_refused_by_name() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+
+    for (command, expected) in [
+        ("lru_crawler enable", "enable"),
+        ("lru_crawler disable", "disable"),
+        ("lru_crawler sleep 1000", "sleep"),
+        ("lru_crawler tocrawl 100", "tocrawl"),
+        ("lru_crawler crawl 1", "crawl"),
+    ] {
+        assert_eq!(
+            c.line(&format!("{command}\r\n")).await,
+            format!("CLIENT_ERROR lru_crawler {expected} is not implemented\r\n")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dump_returns_every_key_across_its_internal_pages() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    // Past `MAX_LIST_LIMIT`, so the dump has to page more than once.
+    for i in 0..2_500 {
+        c.line(&format!("set k{i:05} 0 0 1\r\nv\r\n")).await;
+    }
+
+    c.send(b"lru_crawler metadump all\r\n").await;
+    let body = c.read_until("END\r\n").await;
+
+    let mut keys = dumped_keys(&body);
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), 2_500, "every key, exactly once");
+}
+
+/// **The error replaces the terminator rather than following it.** A tool reads
+/// lines until `END`, so a truncated dump ending in one would report a keyspace
+/// smaller than the real one.
+#[tokio::test]
+async fn a_dump_cut_short_by_its_budget_ends_in_an_error_not_a_terminator() {
+    let server = TestServer::start_with(|config| {
+        config.protocol.listing_enabled = true;
+        config.protocol.listing_max_scan = 10;
+    })
+    .await;
+    let mut c = server.connect().await;
+    for i in 0..2_000 {
+        c.line(&format!("set k{i:05} 0 0 1\r\nv\r\n")).await;
+    }
+
+    c.send(b"lru_crawler metadump all\r\n").await;
+    let body = c.read_until("\r\n").await;
+    assert!(
+        body.ends_with("SERVER_ERROR dump exceeded the scan budget; use SCAN or LIST_KEYS to page the keyspace\r\n"),
+        "{body:?}"
+    );
+    assert!(
+        !body.contains("END\r\n"),
+        "a cut-short dump must never look complete"
+    );
+}
+
+/// Enumerating a keyspace is the same capability whichever dialect asks, so the
+/// dumps sit behind the same gate as `LIST_KEYS` — including for a class that
+/// would have been empty, because "disabled" is true regardless of which class
+/// was named.
+#[tokio::test]
+async fn the_dumps_are_refused_when_listing_is_disabled() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+    c.line("set k 0 0 1\r\nv\r\n").await;
+
+    for command in [
+        "lru_crawler metadump all",
+        "lru_crawler mgdump all",
+        "lru_crawler metadump 7",
+    ] {
+        assert_eq!(
+            c.line(&format!("{command}\r\n")).await,
+            "CLIENT_ERROR command disabled by configuration\r\n",
+            "{command}"
+        );
+    }
+}
+
+/// **The cross-dialect hazard.** The keyspace is shared, so a Redis or VCP
+/// client can store a key holding a space and a CRLF — which no memcached client
+/// could have written, and which would otherwise close the dump early and inject
+/// a line of the attacker's choosing.
+#[tokio::test]
+async fn a_key_no_memcached_client_could_write_cannot_break_the_dump() {
+    let server = TestServer::start_with(listing_on).await;
+
+    // Written over Redis, into the same keyspace.
+    let mut redis = server.connect().await;
+    let hostile = "danger key\r\nEND\r\nkey=injected exp=-1 cas=1 cls=1 ";
+    redis
+        .send(
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{hostile}\r\n$1\r\nv\r\n",
+                hostile.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+    assert_eq!(redis.read_until("\r\n").await, "+OK\r\n");
+
+    let mut c = server.connect().await;
+    c.send(b"lru_crawler metadump all\r\n").await;
+    let body = c.read_until("END\r\n").await;
+
+    assert_eq!(
+        body.matches("END\r\n").count(),
+        1,
+        "one terminator: {body:?}"
+    );
+    assert_eq!(dumped_keys(&body).len(), 1, "one key: {body:?}");
+    // The payload survives as *text inside the encoded key*, which is the
+    // point: it is no longer a line of its own, so it cannot be read as a
+    // record or as the end of the dump.
+    assert!(
+        !body.lines().any(|line| line.starts_with("key=injected")),
+        "the payload must not become a line: {body:?}"
+    );
+    assert!(
+        body.contains("key=danger%20key%0D%0AEND%0D%0Akey=injected%20exp=-1%20cas=1%20cls=1%20 "),
+        "percent-encoded rather than skipped: {body:?}"
+    );
+
+    // Every data line still parses as `field=value` pairs.
+    for line in body.lines().filter(|line| line.starts_with("key=")) {
+        assert!(
+            line.split(' ')
+                .all(|field| field.is_empty() || field.contains('='))
+        );
+    }
+}
+
+/// The expiry a dump reports is the record's own deadline, in absolute unix
+/// seconds — and `-1` for a key that never expires, which is upstream's
+/// convention in this line.
+#[tokio::test]
+async fn a_dump_reports_the_deadline_each_record_holds() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    c.line("set forever 0 0 1\r\nv\r\n").await;
+    c.line("set soon 0 900 1\r\nv\r\n").await;
+
+    c.send(b"lru_crawler metadump all\r\n").await;
+    let body = c.read_until("END\r\n").await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    for line in body.lines().filter(|line| line.starts_with("key=")) {
+        let exp: i64 = line
+            .split(' ')
+            .find_map(|field| field.strip_prefix("exp="))
+            .expect("every line carries an exp")
+            .parse()
+            .expect("exp is a number");
+
+        if line.starts_with("key=forever ") {
+            assert_eq!(exp, -1, "never expires");
+        } else {
+            let remaining = exp - now as i64;
+            assert!(
+                (890..=901).contains(&remaining),
+                "expected ~900s of life, got {remaining}"
+            );
+        }
+    }
+}

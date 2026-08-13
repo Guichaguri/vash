@@ -140,12 +140,30 @@ pub fn parse<'a>(
             }))
         }
 
-        b"stats" => Ok(Outcome::Command(Parsed {
-            command: Command::Stats,
-            consumed,
-            noreply: false,
-            style: ResponseStyle::Stats,
-        })),
+        // **`stats` takes no arguments here.** Upstream has a subcommand for
+        // slabs, item classes, sizes, connections and a counter reset; none of
+        // them describes this server. `items` and `cachedump` exist upstream so
+        // a tool can discover slab class ids and dump one — there are no slab
+        // classes here, and `lru_crawler metadump` is upstream's own replacement
+        // for `cachedump` anyway. `reset` would have to zero the atomics
+        // `/metrics` exports, and a Prometheus counter that goes backwards
+        // corrupts every rate over the window containing the reset.
+        //
+        // One rule beats a table of special cases, and `stats <anything>` is a
+        // command line this server cannot honour.
+        b"stats" => {
+            if tokens.next().is_some() {
+                return Err(fail(ErrorKind::Client(BAD_LINE)));
+            }
+            Ok(Outcome::Command(Parsed {
+                command: Command::Stats,
+                consumed,
+                noreply: false,
+                style: ResponseStyle::Stats,
+            }))
+        }
+
+        b"lru_crawler" => parse_lru_crawler(tokens, consumed),
         b"version" => Ok(Outcome::Command(Parsed {
             command: Command::Version,
             consumed,
@@ -186,6 +204,80 @@ pub fn parse<'a>(
 
         _ => Err(fail(ErrorKind::Error)),
     }
+}
+
+/// `lru_crawler metadump|mgdump <all | hash | 1>`
+///
+/// The two dumps are the key listing of this dialect. Everything else
+/// `lru_crawler` does steers a background LRU crawler, and there is no LRU here
+/// to crawl — plan §6 rejected an on-disk one.
+///
+/// Those are refused **by name**. Upstream answers a bare `ERROR` for a
+/// subcommand it does not recognise, but it does recognise these, so the bytes
+/// diverge whichever we send; given that, saying which command was refused is
+/// worth more than a shorter divergence. The same call `SET … IFEQ` makes on the
+/// Redis side.
+fn parse_lru_crawler<'a>(
+    mut tokens: impl Iterator<Item = &'a [u8]>,
+    consumed: usize,
+) -> Result<Outcome<'a>, ProtocolError> {
+    let fail = |kind: ErrorKind| ProtocolError::Recoverable {
+        response: kind,
+        consumed,
+    };
+
+    let style = match tokens.next() {
+        Some(b"metadump") => super::encode::DumpStyle::Meta,
+        Some(b"mgdump") => super::encode::DumpStyle::Mg,
+        Some(b"enable") => {
+            return Err(fail(ErrorKind::Client(
+                "lru_crawler enable is not implemented",
+            )));
+        }
+        Some(b"disable") => {
+            return Err(fail(ErrorKind::Client(
+                "lru_crawler disable is not implemented",
+            )));
+        }
+        Some(b"sleep") => {
+            return Err(fail(ErrorKind::Client(
+                "lru_crawler sleep is not implemented",
+            )));
+        }
+        Some(b"tocrawl") => {
+            return Err(fail(ErrorKind::Client(
+                "lru_crawler tocrawl is not implemented",
+            )));
+        }
+        Some(b"crawl") => {
+            return Err(fail(ErrorKind::Client(
+                "lru_crawler crawl is not implemented",
+            )));
+        }
+        // A subcommand upstream does not have either, so its own answer applies.
+        Some(_) => return Err(fail(ErrorKind::Error)),
+        None => return Err(fail(ErrorKind::Error)),
+    };
+
+    // `all`, `hash` and the one class this server reports are three spellings of
+    // one dump. Any other class is genuinely empty and answers a bare
+    // terminator; a *missing* class is a bare `ERROR`, which is upstream's own
+    // answer — verified against 1.6.
+    let class = tokens.next().ok_or_else(|| fail(ErrorKind::Error))?;
+    let selected = matches!(class, b"all" | b"hash") || class == super::encode::DUMP_CLASS;
+
+    Ok(Outcome::Command(Parsed {
+        // The dump is a key listing, so it is one — gate, budget, liveness rule
+        // and all. The executor pages it, since this grammar has no cursor.
+        command: Command::ListKeys(vash_core::ListRequest {
+            limit: vash_core::MAX_LIST_LIMIT,
+            cursor: &[],
+            pattern: &[],
+        }),
+        consumed,
+        noreply: false,
+        style: ResponseStyle::Dump(super::encode::Dump { style, selected }),
+    }))
 }
 
 /// `<verb> <key> <flags> <exptime> <bytes> [<cas>] [noreply]\r\n<data>\r\n`

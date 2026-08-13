@@ -6,6 +6,8 @@
 //! RESP2/RESP3 split for this command set: requests are identical, and the
 //! remaining reply types are byte-for-byte the same in both.
 
+use std::fmt::Write as _;
+
 use super::{ErrorReply, Version};
 
 /// The version this server reports to `HELLO`.
@@ -160,6 +162,380 @@ pub fn hello(out: &mut Vec<u8>, version: Version) {
     array(out, 0);
 }
 
+/// A RESP3 verbatim string: text that carries its own format hint.
+///
+/// What real Redis answers `INFO` and `LATENCY DOCTOR` with, so that a client
+/// knows the payload is prose to be displayed rather than a value to be parsed.
+/// RESP2 has no such type and takes the bulk string, exactly as [`double`]
+/// falls back — the length includes the three-character hint and its colon.
+pub fn verbatim(out: &mut Vec<u8>, text: &str, version: Version) {
+    match version {
+        Version::Resp2 => bulk(out, text.as_bytes()),
+        Version::Resp3 => {
+            out.push(b'=');
+            out.extend_from_slice(itoa((text.len() + 4) as i64).as_bytes());
+            out.extend_from_slice(b"\r\ntxt:");
+            out.extend_from_slice(text.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
+// ---- INFO ---------------------------------------------------------------
+
+/// One `INFO` section.
+///
+/// The set is Redis's, minus the sections whose entire content would be
+/// unmeasured here — `commandstats`, `latencystats`, `cpu`, `errorstats` — plus
+/// [`Section::Vash`] for the counters that have no Redis name at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Server,
+    Clients,
+    Memory,
+    Persistence,
+    Stats,
+    Replication,
+    Cluster,
+    Keyspace,
+    /// This server's own counters, under their own names. Not in the default
+    /// set, exactly as Redis keeps its optional sections out of it.
+    Vash,
+}
+
+impl Section {
+    /// Every section, in the order `INFO` prints them.
+    pub const ALL: [Section; 9] = [
+        Self::Server,
+        Self::Clients,
+        Self::Memory,
+        Self::Persistence,
+        Self::Stats,
+        Self::Replication,
+        Self::Cluster,
+        Self::Keyspace,
+        Self::Vash,
+    ];
+
+    /// The `# Header` this section prints under, and the name a client selects
+    /// it by — lower-cased.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Server => "Server",
+            Self::Clients => "Clients",
+            Self::Memory => "Memory",
+            Self::Persistence => "Persistence",
+            Self::Stats => "Stats",
+            Self::Replication => "Replication",
+            Self::Cluster => "Cluster",
+            Self::Keyspace => "Keyspace",
+            Self::Vash => "Vash",
+        }
+    }
+
+    fn matches(self, name: &[u8]) -> bool {
+        name.eq_ignore_ascii_case(self.title().as_bytes())
+    }
+}
+
+/// Which sections one `INFO` asked for.
+///
+/// A bitmask rather than a list: the set is fixed and small, a client may name
+/// the same section twice, and `Copy` keeps it out of the borrowed-argument
+/// lifetime that every other part of a parsed command lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sections(u16);
+
+impl Sections {
+    /// Nothing selected. What an unrecognised section name leaves behind, and
+    /// Redis answers that with an empty string rather than an error.
+    pub const NONE: Self = Self(0);
+
+    /// What a bare `INFO` prints: everything except [`Section::Vash`], which
+    /// only `all` and `everything` reach — the same shape as Redis keeping
+    /// `commandstats` out of the default.
+    pub const DEFAULT: Self = Self(0b1111_1111);
+
+    /// `INFO all` / `INFO everything`.
+    pub const ALL: Self = Self(0b1_1111_1111);
+
+    /// The section a name selects, or `None` if it is not one.
+    pub fn named(name: &[u8]) -> Option<Section> {
+        Section::ALL.into_iter().find(|s| s.matches(name))
+    }
+
+    pub fn with(self, section: Section) -> Self {
+        Self(self.0 | 1 << section as u16)
+    }
+
+    pub fn contains(self, section: Section) -> bool {
+        self.0 & 1 << section as u16 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Where an `INFO` field's value comes from.
+enum Source {
+    /// A counter of this name in the `stats` list. A field whose counter is
+    /// absent — the store could not be queried — is **omitted**, never zeroed.
+    Stat(&'static str),
+    /// A constant this build knows and no counter carries.
+    Literal(&'static str),
+    /// Derived from one or more counters. See [`computed`].
+    Computed(Computed),
+}
+
+enum Computed {
+    Os,
+    UptimeInDays,
+    UsedMemoryHuman,
+    Keyspace,
+}
+
+/// The `INFO` field table: Redis's name on the left, where it comes from on the
+/// right.
+///
+/// Everything a client can read out of `INFO` is here, so what this server
+/// claims about itself is one screen of text rather than a rendering function to
+/// be read. Fields Redis has and this server cannot measure are absent, not
+/// zeroed — `used_memory_rss`, `mem_fragmentation_ratio`,
+/// `instantaneous_ops_per_sec`, `latest_fork_usec` and the rest.
+const FIELDS: &[(Section, &str, Source)] = &[
+    (Section::Server, "redis_version", Source::Literal(VERSION)),
+    (Section::Server, "redis_mode", Source::Literal("standalone")),
+    (Section::Server, "os", Source::Computed(Computed::Os)),
+    (Section::Server, "arch_bits", Source::Stat("pointer_size")),
+    (Section::Server, "process_id", Source::Stat("pid")),
+    (Section::Server, "uptime_in_seconds", Source::Stat("uptime")),
+    (
+        Section::Server,
+        "uptime_in_days",
+        Source::Computed(Computed::UptimeInDays),
+    ),
+    // What this actually is. `redis_version` above is a compatibility claim —
+    // client libraries gate features on it — and this is the honest neighbour.
+    (
+        Section::Server,
+        "vash_version",
+        Source::Literal(env!("CARGO_PKG_VERSION")),
+    ),
+    (
+        Section::Clients,
+        "connected_clients",
+        Source::Stat("curr_connections"),
+    ),
+    (
+        Section::Clients,
+        "maxclients",
+        Source::Stat("max_connections"),
+    ),
+    // Measured, and always zero: no command here can block a client. An honest
+    // constant rather than an unmeasured one.
+    (Section::Clients, "blocked_clients", Source::Literal("0")),
+    (Section::Memory, "used_memory", Source::Stat("bytes")),
+    (
+        Section::Memory,
+        "used_memory_human",
+        Source::Computed(Computed::UsedMemoryHuman),
+    ),
+    (Section::Memory, "maxmemory", Source::Stat("limit_maxbytes")),
+    // The closest true statement in Redis's vocabulary for plan §6's "expired
+    // first, then soonest-to-expire". An approximation, and in the divergences
+    // table as one.
+    (
+        Section::Memory,
+        "maxmemory_policy",
+        Source::Literal("volatile-ttl"),
+    ),
+    // Nothing here loads, forks or rewrites, so all three are honestly zero —
+    // and a client that checks `loading` before issuing traffic needs to see it.
+    (Section::Persistence, "loading", Source::Literal("0")),
+    (
+        Section::Persistence,
+        "rdb_bgsave_in_progress",
+        Source::Literal("0"),
+    ),
+    (Section::Persistence, "aof_enabled", Source::Literal("0")),
+    (
+        Section::Stats,
+        "total_connections_received",
+        Source::Stat("total_connections"),
+    ),
+    (
+        Section::Stats,
+        "total_commands_processed",
+        Source::Stat("vash_commands"),
+    ),
+    (
+        Section::Stats,
+        "rejected_connections",
+        Source::Stat("rejected_connections"),
+    ),
+    (Section::Stats, "keyspace_hits", Source::Stat("get_hits")),
+    (
+        Section::Stats,
+        "keyspace_misses",
+        Source::Stat("get_misses"),
+    ),
+    (
+        Section::Stats,
+        "expired_keys",
+        Source::Stat("vash_reclaimed"),
+    ),
+    (Section::Stats, "evicted_keys", Source::Stat("evictions")),
+    (
+        Section::Stats,
+        "total_reads_processed",
+        Source::Stat("vash_reads"),
+    ),
+    (
+        Section::Stats,
+        "total_writes_processed",
+        Source::Stat("vash_writes"),
+    ),
+    // There is no replication, so this is true rather than aspirational.
+    // Sentinel-aware clients and health checks parse `role`.
+    (Section::Replication, "role", Source::Literal("master")),
+    (
+        Section::Replication,
+        "connected_slaves",
+        Source::Literal("0"),
+    ),
+    // **Load-bearing.** Client libraries read this to decide whether to speak
+    // Redis Cluster — `CLUSTER SLOTS`, `MOVED`/`ASK` redirection, hash-slot
+    // routing — none of which exists here. vash's clustering is tag
+    // invalidation between shared-nothing nodes and is not the same thing under
+    // the same name. A `1` here breaks every cluster-aware client on connect.
+    (Section::Cluster, "cluster_enabled", Source::Literal("0")),
+    (
+        Section::Keyspace,
+        "db0",
+        Source::Computed(Computed::Keyspace),
+    ),
+];
+
+/// The counter names [`FIELDS`] reads from.
+///
+/// Exported so `vash-server` can assert that every one of them is a counter
+/// `stats::collect` actually emits. The table and the counters live in
+/// different crates, so without that check a rename on either side would drop a
+/// field from `INFO` silently — which is the failure mode this whole module is
+/// written to avoid.
+pub fn info_sourced_names() -> impl Iterator<Item = &'static str> {
+    FIELDS.iter().filter_map(|(_, _, source)| match source {
+        Source::Stat(name) => Some(*name),
+        _ => None,
+    })
+}
+
+/// Renders `INFO`.
+///
+/// A pure function of the counter list: it opens nothing and reads no state,
+/// which is what lets it live beside the other encoders rather than in the
+/// server.
+pub fn info(out: &mut Vec<u8>, sections: Sections, stats: &[(String, String)], version: Version) {
+    let mut text = String::with_capacity(1024);
+    for section in Section::ALL {
+        if !sections.contains(section) {
+            continue;
+        }
+
+        // Built into a scratch buffer so a section whose every field is
+        // unavailable prints no header either, rather than a title with nothing
+        // under it.
+        let mut body = String::new();
+        if section == Section::Vash {
+            // Rendered by prefix rather than from a table: these are already
+            // named for this server, and a second list of them would be a
+            // second thing to keep in step with `stats::collect`.
+            for (name, value) in stats.iter().filter(|(name, _)| name.starts_with("vash_")) {
+                let _ = writeln!(body, "{name}:{value}\r");
+            }
+        } else {
+            for (_, name, source) in FIELDS.iter().filter(|(s, _, _)| *s == section) {
+                let value = match source {
+                    Source::Stat(stat) => find(stats, stat).map(str::to_owned),
+                    Source::Literal(literal) => Some((*literal).to_owned()),
+                    Source::Computed(computed) => compute(computed, stats),
+                };
+                if let Some(value) = value {
+                    let _ = writeln!(body, "{name}:{value}\r");
+                }
+            }
+        }
+
+        if !body.is_empty() {
+            // A blank line **before** each section after the first, which is
+            // Redis's own framing — not one after each, which would leave a
+            // trailing blank the real thing does not send.
+            if !text.is_empty() {
+                text.push_str("\r\n");
+            }
+            let _ = writeln!(text, "# {}\r", section.title());
+            text.push_str(&body);
+        }
+    }
+
+    verbatim(out, &text, version);
+}
+
+/// A counter's value, or `None` when it is not in the list.
+fn find<'a>(stats: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    stats
+        .iter()
+        .find(|(known, _)| known == name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// The handful of fields that are not a counter copied across.
+fn compute(what: &Computed, stats: &[(String, String)]) -> Option<String> {
+    let find = |name: &str| find(stats, name);
+    Some(match what {
+        // Redis reports `Linux 5.15.0 x86_64`. There is no portable way to read
+        // a kernel version here, so the two parts that are known are reported
+        // and the one that is not is left out.
+        Computed::Os => format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        Computed::UptimeInDays => (find("uptime")?.parse::<u64>().ok()? / 86_400).to_string(),
+        Computed::UsedMemoryHuman => human_bytes(find("bytes")?.parse::<u64>().ok()?),
+        Computed::Keyspace => {
+            let keys: u64 = find("curr_items")?.parse().ok()?;
+            // Redis omits the line for an empty database rather than printing a
+            // zero, and `redis-py`'s `parse_info` expects that.
+            if keys == 0 {
+                return None;
+            }
+            // **`expires` is absent, and `vash_expiry_entries` is not it.**
+            // Redis's `expires` counts keys carrying a TTL; that counter is
+            // rows in the expiry index, which has one per record whether or not
+            // it expires — a store with two keys and one deadline reports two.
+            // Nothing here measures Redis's quantity, so nothing here claims to.
+            //
+            // `avg_ttl` stays because zero is Redis's own value for "not
+            // computed", which is the one place a zero is honest: averaging it
+            // would mean walking the index on every `INFO`.
+            format!("keys={keys},avg_ttl=0")
+        }
+    })
+}
+
+/// Redis's `bytesToHuman`, to the digit.
+fn human_bytes(bytes: u64) -> String {
+    const K: f64 = 1024.0;
+    let n = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if n < K * K {
+        format!("{:.2}K", n / K)
+    } else if n < K * K * K {
+        format!("{:.2}M", n / (K * K))
+    } else {
+        format!("{:.2}G", n / (K * K * K))
+    }
+}
+
 /// Renders a float the way Redis does, re-exported from the domain crate.
 ///
 /// It moved for the same reason the numeric parsers did: this renders the reply,
@@ -251,6 +627,160 @@ mod tests {
     fn hello_is_a_map_in_resp3_and_a_flat_array_in_resp2() {
         assert!(rendered(|out| hello(out, Version::Resp3)).starts_with("%7\r\n"));
         assert!(rendered(|out| hello(out, Version::Resp2)).starts_with("*14\r\n"));
+    }
+
+    fn counters() -> Vec<(String, String)> {
+        [
+            ("pid", "42"),
+            ("pointer_size", "64"),
+            ("uptime", "172800"),
+            ("max_connections", "10000"),
+            ("curr_connections", "3"),
+            ("total_connections", "9"),
+            ("rejected_connections", "0"),
+            ("get_hits", "7"),
+            ("get_misses", "2"),
+            ("vash_commands", "18"),
+            ("vash_reads", "9"),
+            ("vash_writes", "9"),
+            ("curr_items", "5"),
+            ("bytes", "1048576"),
+            ("limit_maxbytes", "17179869184"),
+            ("evictions", "0"),
+            ("vash_reclaimed", "1"),
+            ("vash_shards", "4"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+    }
+
+    fn rendered_info(sections: Sections, stats: &[(String, String)]) -> String {
+        let mut out = Vec::new();
+        info(&mut out, sections, stats, Version::Resp2);
+        let text = String::from_utf8(out).expect("info is ascii");
+        // Strip the bulk header and its trailing CRLF.
+        let body = text.split_once("\r\n").expect("a bulk header").1;
+        body[..body.len() - 2].to_string()
+    }
+
+    /// Redis puts a blank line **before** each section after the first, not
+    /// after each one — so a reply has no trailing blank. Verified against
+    /// redis 7.4.
+    #[test]
+    fn sections_are_separated_the_way_redis_separates_them() {
+        let body = rendered_info(Sections::DEFAULT, &counters());
+        assert!(body.starts_with("# Server\r\n"));
+        assert!(body.contains("\r\n\r\n# Clients\r\n"));
+        assert!(
+            !body.ends_with("\r\n\r\n"),
+            "no trailing blank line: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_whose_counter_is_missing_is_omitted_rather_than_zeroed() {
+        // What a store that could not be queried leaves behind.
+        let sparse: Vec<(String, String)> = counters()
+            .into_iter()
+            .filter(|(name, _)| name != "bytes" && name != "curr_items")
+            .collect();
+        let body = rendered_info(Sections::ALL, &sparse);
+
+        assert!(!body.contains("used_memory:"), "{body:?}");
+        assert!(!body.contains("used_memory_human:"), "{body:?}");
+        assert!(
+            !body.contains("db0:"),
+            "an unknown keyspace is not an empty one"
+        );
+        // The section header goes too when nothing under it survived.
+        assert!(!body.contains("# Keyspace"), "{body:?}");
+        // Neighbouring fields are unaffected.
+        assert!(body.contains("maxmemory:17179869184\r\n"));
+    }
+
+    /// The three fields a client library actually branches on.
+    #[test]
+    fn the_fields_clients_branch_on_are_present_and_honest() {
+        let body = rendered_info(Sections::DEFAULT, &counters());
+        // A `1` here sends a client into Redis Cluster's protocol, which this
+        // server does not speak.
+        assert!(body.contains("cluster_enabled:0\r\n"));
+        assert!(body.contains("role:master\r\n"));
+        assert!(body.contains("loading:0\r\n"));
+        assert!(body.contains(&format!("redis_version:{VERSION}\r\n")));
+    }
+
+    #[test]
+    fn computed_fields_follow_redis_arithmetic() {
+        let body = rendered_info(Sections::ALL, &counters());
+        assert!(body.contains("uptime_in_seconds:172800\r\n"));
+        assert!(body.contains("uptime_in_days:2\r\n"));
+        assert!(body.contains("used_memory_human:1.00M\r\n"));
+        // `expires` is deliberately absent: the nearest counter here is rows in
+        // the expiry index, which is a different quantity from keys with a TTL.
+        assert!(body.contains("db0:keys=5,avg_ttl=0\r\n"));
+    }
+
+    #[test]
+    fn human_bytes_matches_redis_bytes_to_human() {
+        assert_eq!(human_bytes(0), "0B");
+        assert_eq!(human_bytes(1023), "1023B");
+        assert_eq!(human_bytes(1024), "1.00K");
+        assert_eq!(human_bytes(1024 * 1024), "1.00M");
+        assert_eq!(human_bytes(1536 * 1024), "1.50M");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.00G");
+    }
+
+    #[test]
+    fn the_vash_section_is_out_of_the_default_and_in_all() {
+        assert!(!rendered_info(Sections::DEFAULT, &counters()).contains("vash_shards"));
+
+        let all = rendered_info(Sections::ALL, &counters());
+        assert!(all.contains("# Vash\r\n"));
+        assert!(all.contains("vash_shards:4\r\n"));
+    }
+
+    #[test]
+    fn sections_are_selected_by_name_case_insensitively() {
+        assert_eq!(Sections::named(b"server"), Some(Section::Server));
+        assert_eq!(Sections::named(b"KEYSPACE"), Some(Section::Keyspace));
+        assert_eq!(Sections::named(b"Vash"), Some(Section::Vash));
+        assert_eq!(Sections::named(b"commandstats"), None);
+
+        let one = Sections::NONE.with(Section::Clients);
+        assert!(one.contains(Section::Clients) && !one.contains(Section::Server));
+        // Naming the same section twice is not an error, which is why this is a
+        // bitmask rather than a list.
+        assert_eq!(one.with(Section::Clients), one);
+    }
+
+    /// An unrecognised section renders as an empty reply, not an error — which
+    /// is Redis's behaviour, and lets a client probe for a section it may not
+    /// have.
+    #[test]
+    fn an_empty_selection_renders_as_an_empty_reply() {
+        assert_eq!(
+            rendered(|out| info(out, Sections::NONE, &counters(), Version::Resp2)),
+            "$0\r\n\r\n"
+        );
+        assert_eq!(
+            rendered(|out| info(out, Sections::NONE, &counters(), Version::Resp3)),
+            "=4\r\ntxt:\r\n"
+        );
+    }
+
+    #[test]
+    fn verbatim_strings_carry_their_hint_only_in_resp3() {
+        assert_eq!(
+            rendered(|out| verbatim(out, "hello", Version::Resp3)),
+            "=9\r\ntxt:hello\r\n",
+            "the declared length covers the hint"
+        );
+        assert_eq!(
+            rendered(|out| verbatim(out, "hello", Version::Resp2)),
+            "$5\r\nhello\r\n"
+        );
     }
 
     #[test]

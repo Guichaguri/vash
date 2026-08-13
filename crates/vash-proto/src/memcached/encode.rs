@@ -32,7 +32,64 @@ pub enum ResponseStyle {
     Version,
     Quit,
     Meta(MetaStyle),
+    /// An `lru_crawler` key dump. Rendered by the executor rather than here,
+    /// because it pages the listing internally — see `dump_line`.
+    Dump(Dump),
 }
+
+/// Which dump was asked for, and whether its class argument named anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dump {
+    pub style: DumpStyle,
+    /// The class argument selected this server's one class. When clear, the
+    /// answer is a bare terminator: the class named is genuinely empty, so
+    /// there is nothing to scan for.
+    pub selected: bool,
+}
+
+/// The two `lru_crawler` dumps.
+///
+/// One walk, two line formats. `metadump` describes each key for a reader;
+/// `mgdump` emits a ready-to-send `mg` command, so a dump is its own replay
+/// script — which is also why its terminator is the meta protocol's `EN`
+/// rather than `END`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DumpStyle {
+    Meta,
+    Mg,
+}
+
+impl DumpStyle {
+    /// The acknowledgement upstream sends before a single key.
+    ///
+    /// Verified against `memcached:1.6-alpine`: a dump is `OK`, then the lines,
+    /// then the terminator — and the `OK` comes even when the class named holds
+    /// nothing. A client that reads it as the first data line would lose a key,
+    /// so it is not optional.
+    pub const ACK: &'static [u8] = b"OK\r\n";
+
+    /// What ends the dump when it completes.
+    ///
+    /// Never written when the dump was cut short — see the executor. A tool
+    /// reads lines until it sees this, so a truncated dump ending in one would
+    /// claim the keyspace is smaller than it is.
+    ///
+    /// `mgdump` ends with the meta protocol's `EN` rather than `END`, which is
+    /// what lets its output be piped back in as commands.
+    pub fn terminator(self) -> &'static [u8] {
+        match self {
+            Self::Meta => b"END\r\n",
+            Self::Mg => b"EN\r\n",
+        }
+    }
+}
+
+/// The slab class this server reports.
+///
+/// There are no slab classes here, so everything is in one and this is both the
+/// `cls=` a dump prints and the class id its argument accepts. One constant, so
+/// the two cannot drift apart.
+pub const DUMP_CLASS: &[u8] = b"1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetaStyle {
@@ -108,6 +165,95 @@ pub fn encode(out: &mut Vec<u8>, style: &ResponseStyle, command: &Command<'_>, r
         ResponseStyle::Quit => {}
 
         ResponseStyle::Meta(meta) => encode_meta(out, meta, command, reply),
+
+        // Written line by line as the executor pages the listing, so there is
+        // no single `Reply` to render here. Reaching this arm means a dump was
+        // routed through the ordinary path; answering with the terminator keeps
+        // the stream framed rather than leaving the client waiting.
+        ResponseStyle::Dump(dump) => out.extend_from_slice(dump.style.terminator()),
+    }
+}
+
+/// Appends one dumped key.
+///
+/// `metadump` is measured against upstream's specification, which guarantees
+/// only that the fields "will include at least" `key`, `exp`, `la`, `cas` and
+/// `fetch`. Of those, `la` and `fetch` are LRU bookkeeping and there is no LRU
+/// here (plan §6), so they are **omitted rather than zeroed** — a `la=0` would
+/// claim every key was last touched at the epoch. `size` is not in the
+/// guaranteed set and is absent for a different reason: it would mean carrying a
+/// value length on every `ListEntry` that every VCP listing pays for and never
+/// reads, and `mg <key> s` already answers it per key.
+pub fn dump_line(out: &mut Vec<u8>, style: DumpStyle, entry: &vash_core::ListEntry) {
+    match style {
+        // `mg <key>\r\n`, and **`%` is left alone** — upstream does not encode
+        // it here, and this line is meant to be sent back as a command, so a
+        // key holding a `%` has to replay as itself. Verified against 1.6.
+        DumpStyle::Mg => {
+            out.extend_from_slice(b"mg ");
+            uriencode(out, &entry.name, Percent::Literal);
+            out.extend_from_slice(b"\r\n");
+        }
+
+        // Space-separated `field=value` pairs, a **trailing space**, and a bare
+        // `\n` — not a CRLF. Both are upstream's, verified byte for byte, and
+        // both are the kind of detail a parser keyed on the line ending notices.
+        DumpStyle::Meta => {
+            out.extend_from_slice(b"key=");
+            uriencode(out, &entry.name, Percent::Encoded);
+
+            out.extend_from_slice(b" exp=");
+            match entry.expires_at_ms {
+                // `-1` is upstream's "never expires" in this line, and the same
+                // convention `Value::remaining_ttl_secs` already uses.
+                Some(vash_core::NEVER) | None => out.extend_from_slice(b"-1"),
+                Some(at) => out.extend_from_slice((at / 1_000).to_string().as_bytes()),
+            }
+
+            out.extend_from_slice(b" cas=");
+            out.extend_from_slice(entry.version.to_string().as_bytes());
+
+            out.extend_from_slice(b" cls=");
+            out.extend_from_slice(DUMP_CLASS);
+            out.extend_from_slice(b" \n");
+        }
+    }
+}
+
+/// Whether `%` is itself encoded.
+///
+/// Upstream's own asymmetry, reproduced rather than tidied: `metadump` encodes
+/// it, `mgdump` does not. The two lines have different jobs — one is read, one
+/// is replayed — and a client parsing either against a real memcached must see
+/// what a real memcached sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Percent {
+    Encoded,
+    Literal,
+}
+
+/// Percent-encodes a key, as upstream does.
+///
+/// **Load-bearing rather than cosmetic.** The keyspace is shared across
+/// dialects, so a Redis or VCP client can store a key holding a space, a control
+/// byte or a CRLF — none of which the memcached parser could have produced, and
+/// any of which would corrupt a dump line and desynchronise the reader. Encoding
+/// turns that into a non-issue with no keys skipped and no escape scheme nobody
+/// parses.
+///
+/// Upstream never meets such a key, because its own parser refuses to store one;
+/// this server can, which is why the encoding matters more here than there.
+fn uriencode(out: &mut Vec<u8>, key: &[u8], percent: Percent) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in key {
+        let literal = matches!(byte, 0x21..=0x7e) && (*byte != b'%' || percent == Percent::Literal);
+        if literal {
+            out.push(*byte);
+        } else {
+            out.push(b'%');
+            out.push(HEX[(byte >> 4) as usize]);
+            out.push(HEX[(byte & 0x0f) as usize]);
+        }
     }
 }
 
@@ -489,6 +635,75 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn dumped(style: DumpStyle, name: &[u8], version: u64, expires_at_ms: Option<u64>) -> String {
+        let mut entry = vash_core::ListEntry::new(name.to_vec(), version);
+        entry.expires_at_ms = expires_at_ms;
+        let mut out = Vec::new();
+        dump_line(&mut out, style, &entry);
+        String::from_utf8(out).expect("dump lines are ascii once encoded")
+    }
+
+    /// Checked against `memcached:1.6-alpine` byte for byte: a **trailing
+    /// space** and a **bare `\n`**, not a CRLF. Both are the kind of detail a
+    /// parser keyed on line endings would notice.
+    #[test]
+    fn a_metadump_line_matches_upstreams_framing() {
+        assert_eq!(
+            dumped(DumpStyle::Meta, b"alpha", 4, Some(vash_core::NEVER)),
+            "key=alpha exp=-1 cas=4 cls=1 \n"
+        );
+        assert_eq!(
+            dumped(DumpStyle::Meta, b"beta", 7, Some(1_786_605_851_000)),
+            "key=beta exp=1786605851 cas=7 cls=1 \n"
+        );
+        // A listing that carries no deadline — a tag, or an entry off the wire
+        // — reports "never" rather than inventing one.
+        assert_eq!(
+            dumped(DumpStyle::Meta, b"gamma", 1, None),
+            "key=gamma exp=-1 cas=1 cls=1 \n"
+        );
+    }
+
+    /// `mgdump` emits a command, so its line ends in CRLF like every other
+    /// command does.
+    #[test]
+    fn an_mgdump_line_is_a_command() {
+        assert_eq!(dumped(DumpStyle::Mg, b"alpha", 4, None), "mg alpha\r\n");
+    }
+
+    /// The keyspace is shared across dialects, so a Redis or VCP client can
+    /// store a key that would otherwise end the dump early and inject a line of
+    /// its own choosing.
+    #[test]
+    fn a_key_that_would_break_the_framing_is_encoded_rather_than_skipped() {
+        let hostile = b"a b\r\nEND\r\n";
+        let line = dumped(DumpStyle::Meta, hostile, 1, None);
+        assert_eq!(line, "key=a%20b%0D%0AEND%0D%0A exp=-1 cas=1 cls=1 \n");
+        assert_eq!(line.matches('\n').count(), 1, "still exactly one line");
+
+        // High bytes and control characters go the same way.
+        assert_eq!(
+            dumped(DumpStyle::Meta, b"\x00\xff", 1, None),
+            "key=%00%FF exp=-1 cas=1 cls=1 \n"
+        );
+    }
+
+    /// Upstream's own asymmetry, reproduced rather than tidied: `metadump`
+    /// encodes `%` and `mgdump` does not, because the second is meant to be sent
+    /// back and would otherwise name a different key.
+    #[test]
+    fn percent_is_encoded_in_a_metadump_and_left_alone_in_an_mgdump() {
+        assert!(dumped(DumpStyle::Meta, b"be%ta", 1, None).starts_with("key=be%25ta "));
+        assert_eq!(dumped(DumpStyle::Mg, b"be%ta", 1, None), "mg be%ta\r\n");
+    }
+
+    #[test]
+    fn the_dumps_end_with_the_terminator_their_readers_expect() {
+        assert_eq!(DumpStyle::Meta.terminator(), b"END\r\n");
+        assert_eq!(DumpStyle::Mg.terminator(), b"EN\r\n");
+        assert_eq!(DumpStyle::ACK, b"OK\r\n");
     }
 
     #[test]
