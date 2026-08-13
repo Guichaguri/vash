@@ -28,13 +28,48 @@ pub enum ResponseStyle {
     Counter,
     /// `OK`.
     Ok,
-    Stats,
+    /// `STAT <name> <value>` lines, then `END`. The section decides which
+    /// counters those are.
+    Stats(StatsSection),
     Version,
     Quit,
     Meta(MetaStyle),
     /// An `lru_crawler` key dump. Rendered by the executor rather than here,
     /// because it pages the listing internally — see `dump_line`.
     Dump(Dump),
+}
+
+/// Which `stats` was asked for.
+///
+/// The upstream specification declines to document these — "the kinds of
+/// arguments and the data sent are not documented in this version of the
+/// protocol, and are subject to change for the convenience of memcache
+/// developers" — so the *framing* is matched against what memcached 1.6.45
+/// actually sends, and the field list is deliberately a subset. See
+/// `docs/stats-subcommands.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsSection {
+    /// `stats` — the general counters, and the only section that travels as a
+    /// [`vash_core::Command::Stats`]. The rest describe the server rather than
+    /// the cache, so there is no storage command for them to be.
+    General,
+    /// `stats settings` — the configuration this node is running.
+    Settings,
+    /// `stats items` — per slab class, of which there is one.
+    Items,
+    /// `stats slabs` — what a slab allocator would report. LMDB is not one, so
+    /// this is the per-class command counters and the two totals.
+    Slabs,
+    /// `stats conns` — one block per open connection.
+    Conns,
+    /// `stats sizes` — the item-size histogram, which upstream only keeps under
+    /// `-o track_sizes`. Answering `sizes_status disabled` is **byte-identical
+    /// to a stock memcached**, and is a constant rather than an approximation.
+    Sizes,
+    /// `stats extstore` and `stats proxy` — a bare `END`, which is what a
+    /// memcached without external storage or the proxy compiled in answers.
+    /// There is neither here, so the empty reply is exact.
+    Empty,
 }
 
 /// Which dump was asked for, and whether its class argument named anything.
@@ -148,15 +183,9 @@ pub fn encode(out: &mut Vec<u8>, style: &ResponseStyle, command: &Command<'_>, r
             out.extend_from_slice(b"\r\n");
         }
 
-        ResponseStyle::Stats => {
+        ResponseStyle::Stats(_) => {
             if let Reply::Stats(entries) = reply {
-                for (name, value) in entries {
-                    out.extend_from_slice(b"STAT ");
-                    out.extend_from_slice(name.as_bytes());
-                    out.push(b' ');
-                    out.extend_from_slice(value.as_bytes());
-                    out.extend_from_slice(b"\r\n");
-                }
+                stat_lines(out, entries);
             }
             out.extend_from_slice(b"END\r\n");
         }
@@ -171,6 +200,20 @@ pub fn encode(out: &mut Vec<u8>, style: &ResponseStyle, command: &Command<'_>, r
         // routed through the ordinary path; answering with the terminator keeps
         // the stream framed rather than leaving the client waiting.
         ResponseStyle::Dump(dump) => out.extend_from_slice(dump.style.terminator()),
+    }
+}
+
+/// Appends `STAT <name> <value>` lines, without a terminator.
+///
+/// Shared by every `stats` section: they differ in which counters they carry,
+/// never in how a counter is written.
+pub fn stat_lines(out: &mut Vec<u8>, entries: &[(String, String)]) {
+    for (name, value) in entries {
+        out.extend_from_slice(b"STAT ");
+        out.extend_from_slice(name.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
 }
 

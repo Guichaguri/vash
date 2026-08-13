@@ -140,28 +140,7 @@ pub fn parse<'a>(
             }))
         }
 
-        // **`stats` takes no arguments here.** Upstream has a subcommand for
-        // slabs, item classes, sizes, connections and a counter reset; none of
-        // them describes this server. `items` and `cachedump` exist upstream so
-        // a tool can discover slab class ids and dump one — there are no slab
-        // classes here, and `lru_crawler metadump` is upstream's own replacement
-        // for `cachedump` anyway. `reset` would have to zero the atomics
-        // `/metrics` exports, and a Prometheus counter that goes backwards
-        // corrupts every rate over the window containing the reset.
-        //
-        // One rule beats a table of special cases, and `stats <anything>` is a
-        // command line this server cannot honour.
-        b"stats" => {
-            if tokens.next().is_some() {
-                return Err(fail(ErrorKind::Client(BAD_LINE)));
-            }
-            Ok(Outcome::Command(Parsed {
-                command: Command::Stats,
-                consumed,
-                noreply: false,
-                style: ResponseStyle::Stats,
-            }))
-        }
+        b"stats" => parse_stats(tokens, consumed),
 
         b"lru_crawler" => parse_lru_crawler(tokens, consumed),
         b"version" => Ok(Outcome::Command(Parsed {
@@ -204,6 +183,85 @@ pub fn parse<'a>(
 
         _ => Err(fail(ErrorKind::Error)),
     }
+}
+
+/// `stats [<subcommand> [args]]`
+///
+/// The specification declines to document these at all — "the kinds of
+/// arguments and the data sent are not documented in this version of the
+/// protocol, and are subject to change for the convenience of memcache
+/// developers" — so what is matched here is what memcached 1.6.45 actually
+/// answers, verified against `memcached:1.6-alpine`. See
+/// `docs/stats-subcommands.md`.
+fn parse_stats<'a>(
+    mut tokens: impl Iterator<Item = &'a [u8]>,
+    consumed: usize,
+) -> Result<Outcome<'a>, ProtocolError> {
+    use super::encode::StatsSection;
+
+    let fail = |kind: ErrorKind| ProtocolError::Recoverable {
+        response: kind,
+        consumed,
+    };
+
+    let section = match tokens.next() {
+        None => StatsSection::General,
+        Some(b"settings") => StatsSection::Settings,
+        Some(b"items") => StatsSection::Items,
+        Some(b"slabs") => StatsSection::Slabs,
+        Some(b"conns") => StatsSection::Conns,
+        // Upstream keeps the item-size histogram only under `-o track_sizes`,
+        // and answers these two lines otherwise. Nothing here tracks sizes, so
+        // the constant reply is exact rather than an approximation.
+        Some(b"sizes") => StatsSection::Sizes,
+        // Neither external storage nor the proxy exists here, and a memcached
+        // built without them answers a bare `END` — so does this.
+        Some(b"extstore" | b"proxy") => StatsSection::Empty,
+
+        // Recognised upstream, deliberately not built. Named rather than
+        // lumped into `ERROR`, which is the call `lru_crawler enable` and
+        // `SET … IFEQ` already make: upstream implements these, so the bytes
+        // diverge whatever is sent, and saying which command was refused is
+        // worth more than a shorter divergence. Reasons in
+        // `docs/stats-subcommands.md` §9.
+        Some(b"reset") => {
+            return Err(fail(ErrorKind::Client("stats reset is not implemented")));
+        }
+        Some(b"cachedump") => {
+            return Err(fail(ErrorKind::Client(
+                "stats cachedump is not implemented; use lru_crawler metadump",
+            )));
+        }
+        Some(b"detail") => {
+            return Err(fail(ErrorKind::Client("stats detail is not implemented")));
+        }
+
+        // 1.6.45 removed both verbs and answers `ERROR`. Listed rather than
+        // left to the catch-all so that reintroducing them upstream is a
+        // deliberate decision here rather than a silent divergence.
+        Some(b"sizes_enable" | b"sizes_disable") => return Err(fail(ErrorKind::Error)),
+
+        // A subcommand upstream does not have either, so its own answer applies.
+        Some(_) => return Err(fail(ErrorKind::Error)),
+    };
+
+    // None of the implemented sections takes an argument. Upstream tolerates
+    // trailing tokens on some of them; refusing is the arity rule the rest of
+    // this parser applies, and a client sending one meant something.
+    if tokens.next().is_some() {
+        return Err(fail(ErrorKind::Client(BAD_LINE)));
+    }
+
+    Ok(Outcome::Command(Parsed {
+        // Only the general section is a question about the cache. The rest
+        // describe the server — its configuration, its connections — and are
+        // answered without a storage command; `Command::Stats` is carried
+        // anyway so the reply type and the counting path stay uniform.
+        command: Command::Stats,
+        consumed,
+        noreply: false,
+        style: ResponseStyle::Stats(section),
+    }))
 }
 
 /// `lru_crawler metadump|mgdump <all | hash | 1>`

@@ -35,6 +35,9 @@ pub async fn handle(
     // counts connections that have presented nothing rather than connections in
     // total. `None` when authentication is not being enforced.
     mut pre_auth: Option<tokio::sync::OwnedSemaphorePermit>,
+    // This connection's row in `stats conns`. Held for its whole life; the
+    // accept loop removes it.
+    registered: std::sync::Arc<crate::connections::ConnInfo>,
 ) -> std::io::Result<()> {
     // Cache traffic is small and latency-sensitive; Nagle would batch a reply
     // against the next one and add up to 40ms for nothing.
@@ -85,6 +88,13 @@ pub async fn handle(
         if n == 0 {
             return Ok(()); // clean disconnect
         }
+        // One relaxed add per syscall, which is nothing beside the syscall. The
+        // pair is what turns a request rate into a bandwidth figure.
+        state
+            .metrics
+            .outcomes
+            .bytes_read
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
         // A connection that has presented nothing must not be able to make the
         // server hold arbitrary bytes. Everything legal before authenticating
@@ -114,6 +124,7 @@ pub async fn handle(
                         return Ok(());
                     }
                     debug!(?chosen, "protocol selected");
+                    registered.dialect_chosen(chosen);
                     protocol = Some(chosen);
                 }
                 Some(Err(unknown)) => {
@@ -181,8 +192,20 @@ pub async fn handle(
         if pre_auth.is_some() && conn_auth.is_authenticated() {
             pre_auth = None;
         }
+        if conn_auth.is_authenticated() {
+            registered.authenticated();
+        }
+        // One relaxed store per batch of commands, into a word only this
+        // connection writes — so `stats conns` gets an idle clock without the
+        // request path touching a lock.
+        registered.touched(state.connections.epoch());
 
         if !write_buf.is_empty() {
+            state
+                .metrics
+                .outcomes
+                .bytes_written
+                .fetch_add(write_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
             stream.write_all(&write_buf).await?;
             write_buf.clear();
         }

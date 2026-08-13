@@ -98,6 +98,35 @@ pub fn execute_memcached(
         return Closing::No;
     }
 
+    // Every `stats` section except the general one describes the *server* — its
+    // configuration, its connections, the shape of its storage — rather than
+    // the cache. There is no storage command for those to be, so they are
+    // rendered from `crate::stats` directly instead of travelling as
+    // `Command::Stats`. They are still counted, at the same point everything
+    // else is.
+    if let vash_proto::memcached::encode::ResponseStyle::Stats(section) = &parsed.style
+        && *section != vash_proto::memcached::encode::StatsSection::General
+    {
+        state.metrics.other();
+        mc::stat_lines(out, &crate::stats::section(state, *section));
+        out.extend_from_slice(b"END\r\n");
+        return Closing::No;
+    }
+
+    // The one thing that distinguishes the two memcached dialects at execution
+    // time, and the only place that knows: the parser records which grammar a
+    // command came from, and the storage layer never learns there are two.
+    if matches!(
+        parsed.style,
+        vash_proto::memcached::encode::ResponseStyle::Meta(_)
+    ) {
+        state
+            .metrics
+            .outcomes
+            .meta_commands
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let result = execute(state, &parsed.command, Dialect::Memcached);
     let closing = matches!(result, Ok(Reply::Closing));
 
@@ -644,43 +673,58 @@ pub fn execute(
     // Counted here, at the single point every command passes through, so the
     // numbers cannot drift apart from what was actually served.
     match &outcome {
-        Ok(reply) => match reply {
-            Reply::Value(_) => state.metrics.read(1, 0),
-            Reply::Values(values) => {
-                let hits = values.iter().filter(|v| v.is_some()).count() as u64;
-                state.metrics.read(hits, values.len() as u64 - hits);
+        Ok(reply) => {
+            // What the command *found*, as opposed to how many ran: the
+            // per-command hit and miss splits, and the stores that applied.
+            state.metrics.outcomes.observe(command, reply);
+            match reply {
+                Reply::Value(_) => state.metrics.read(1, 0),
+                Reply::Values(values) => {
+                    let hits = values.iter().filter(|v| v.is_some()).count() as u64;
+                    state.metrics.read(hits, values.len() as u64 - hits);
+                }
+                // A deadline query is a read that never copies a value: `TTL`,
+                // `TYPE` and `EXISTS` all reduce to one, and all count their hits
+                // the same way a `GET` does.
+                Reply::Deadline(deadline) => state
+                    .metrics
+                    .read(u64::from(deadline.is_some()), u64::from(deadline.is_none())),
+                Reply::Deadlines(deadlines) => {
+                    let live = deadlines.iter().filter(|d| d.is_some()).count() as u64;
+                    state.metrics.read(live, deadlines.len() as u64 - live);
+                }
+                Reply::NotFound if is_read(command) => state.metrics.read(0, 1),
+                // A skipped conditional change wrote nothing, so it is not counted
+                // as a write — the same rule the arithmetic path applies through
+                // `Applied::wrote`.
+                Reply::Applied(false) => state.metrics.other(),
+                Reply::Arithmetic(applied) if !applied.wrote => state.metrics.other(),
+                Reply::Stored(_)
+                | Reply::Swapped { .. }
+                | Reply::StoredMany(_)
+                | Reply::Applied(true)
+                | Reply::Length(_)
+                | Reply::Deleted
+                | Reply::DeletedMany(_)
+                | Reply::Touched
+                | Reply::Arithmetic(_)
+                | Reply::Invalidated(_)
+                | Reply::Flushed(_) => state.metrics.write(),
+                _ => state.metrics.other(),
             }
-            // A deadline query is a read that never copies a value: `TTL`,
-            // `TYPE` and `EXISTS` all reduce to one, and all count their hits
-            // the same way a `GET` does.
-            Reply::Deadline(deadline) => state
-                .metrics
-                .read(u64::from(deadline.is_some()), u64::from(deadline.is_none())),
-            Reply::Deadlines(deadlines) => {
-                let live = deadlines.iter().filter(|d| d.is_some()).count() as u64;
-                state.metrics.read(live, deadlines.len() as u64 - live);
-            }
-            Reply::NotFound if is_read(command) => state.metrics.read(0, 1),
-            // A skipped conditional change wrote nothing, so it is not counted
-            // as a write — the same rule the arithmetic path applies through
-            // `Applied::wrote`.
-            Reply::Applied(false) => state.metrics.other(),
-            Reply::Arithmetic(applied) if !applied.wrote => state.metrics.other(),
-            Reply::Stored(_)
-            | Reply::Swapped { .. }
-            | Reply::StoredMany(_)
-            | Reply::Applied(true)
-            | Reply::Length(_)
-            | Reply::Deleted
-            | Reply::DeletedMany(_)
-            | Reply::Touched
-            | Reply::Arithmetic(_)
-            | Reply::Invalidated(_)
-            | Reply::Flushed(_) => state.metrics.write(),
-            _ => state.metrics.other(),
-        },
+        }
         Err(failed) => {
             state.metrics.other();
+            // Its own counter as well as an error class: a client writing values
+            // past the ceiling is a different problem from a full map, and
+            // memcached reports the two separately for that reason.
+            if failed.status == Status::TooLarge {
+                state
+                    .metrics
+                    .outcomes
+                    .store_too_large
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             state.metrics.error(match failed.status {
                 Status::CapacityFull => ErrorClass::Capacity,
                 Status::Overloaded => ErrorClass::Overloaded,

@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use vash_core::Command;
+use vash_core::{Command, Reply};
 use vash_store::StoreStats;
 
 /// Upper bounds of the latency buckets, in microseconds.
@@ -304,6 +304,121 @@ impl CommandMetrics {
     }
 }
 
+/// Per-command outcomes: how often each command found what it was aimed at.
+///
+/// The aggregate `hits`/`misses` pair answers "is the cache working"; this
+/// answers "which command is missing", which is a different and often more
+/// useful question — a delete miss rate climbing means a client is deleting keys
+/// that expired underneath it, and nothing else in the server would say so.
+///
+/// **Not memcached-shaped, despite being what `stats` needed.** Every one of
+/// these is derivable from a reply the executor already inspects, in any
+/// dialect, so they are exported to Prometheus too. A counter visible over one
+/// wire format and not the others would be an odd thing to have built.
+#[derive(Debug, Default)]
+pub struct OutcomeMetrics {
+    pub delete_hits: AtomicU64,
+    pub delete_misses: AtomicU64,
+    pub incr_hits: AtomicU64,
+    pub incr_misses: AtomicU64,
+    pub decr_hits: AtomicU64,
+    pub decr_misses: AtomicU64,
+    /// A `cas` against a key that exists but has moved on. Distinct from a miss,
+    /// and the distinction is the whole point of CAS: it separates "somebody
+    /// else got there first" from "it is not there at all".
+    pub cas_hits: AtomicU64,
+    pub cas_misses: AtomicU64,
+    pub cas_badval: AtomicU64,
+    pub touch_hits: AtomicU64,
+    pub touch_misses: AtomicU64,
+    /// Writes refused for exceeding `store.max_value_bytes`.
+    pub store_too_large: AtomicU64,
+    /// Stores that actually applied — a guarded write that was rejected does
+    /// not count, which is what makes this "items stored" rather than "stores
+    /// attempted".
+    pub total_items: AtomicU64,
+    /// Commands that arrived on the memcached *meta* dialect rather than the
+    /// classic one.
+    pub meta_commands: AtomicU64,
+    pub bytes_read: AtomicU64,
+    pub bytes_written: AtomicU64,
+}
+
+impl OutcomeMetrics {
+    #[inline]
+    fn add(counter: &AtomicU64, n: u64) {
+        if n > 0 {
+            counter.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Records what a command found, from the reply the executor already has.
+    ///
+    /// One place, at the single point every command passes through, so the
+    /// numbers cannot drift from what was actually served — the same reasoning
+    /// that put the hit/miss counting there.
+    pub fn observe(&self, command: &Command<'_>, reply: &Reply) {
+        use vash_core::{Delta, SetMode, Stored};
+
+        match (command, reply) {
+            (Command::Delete { .. }, Reply::Deleted) => Self::add(&self.delete_hits, 1),
+            (Command::Delete { .. }, Reply::NotFound) => Self::add(&self.delete_misses, 1),
+            (Command::DeleteMany(_), Reply::DeletedMany(hits)) => {
+                let found = hits.iter().filter(|hit| **hit).count() as u64;
+                Self::add(&self.delete_hits, found);
+                Self::add(&self.delete_misses, hits.len() as u64 - found);
+            }
+
+            (Command::Touch { .. }, Reply::Touched) => Self::add(&self.touch_hits, 1),
+            (Command::Touch { .. }, Reply::NotFound) => Self::add(&self.touch_misses, 1),
+
+            // Direction is a property of the operation, not of the dialect:
+            // memcached's `decr` and Redis's `DECRBY` both move a counter down,
+            // and an operator asking "how many decrements" means both.
+            (Command::Arithmetic(op), reply) => {
+                let down = match op.delta {
+                    Delta::Counter { decrement, .. } => decrement,
+                    Delta::Int { delta, .. } => delta < 0,
+                    Delta::Float { delta, .. } => delta < 0.0,
+                };
+                let (hits, misses) = if down {
+                    (&self.decr_hits, &self.decr_misses)
+                } else {
+                    (&self.incr_hits, &self.incr_misses)
+                };
+                match reply {
+                    Reply::Arithmetic(_) => Self::add(hits, 1),
+                    Reply::NotFound => Self::add(misses, 1),
+                    _ => {}
+                }
+            }
+
+            // CAS is the one write whose three outcomes are all distinct, and
+            // the only place `Exists` means something other than an error.
+            (Command::Set(set), Reply::Stored(outcome)) if matches!(set.mode, SetMode::Cas(_)) => {
+                match outcome {
+                    Stored::Stored(_) => {
+                        Self::add(&self.cas_hits, 1);
+                        Self::add(&self.total_items, 1);
+                    }
+                    Stored::Exists => Self::add(&self.cas_badval, 1),
+                    Stored::NotFound | Stored::NotStored => Self::add(&self.cas_misses, 1),
+                }
+            }
+
+            (_, Reply::Stored(Stored::Stored(_))) => Self::add(&self.total_items, 1),
+            (_, Reply::Swapped { outcome, .. }) => {
+                if matches!(outcome, Stored::Stored(_)) {
+                    Self::add(&self.total_items, 1);
+                }
+            }
+            (_, Reply::StoredMany(stored)) => Self::add(&self.total_items, stored.len() as u64),
+
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ServerMetrics {
     pub connections_total: AtomicU64,
@@ -339,6 +454,8 @@ pub struct ServerMetrics {
 
     /// Per-command rates and latencies. See [`CommandMetrics`].
     pub commands: CommandMetrics,
+    /// What each command found. See [`OutcomeMetrics`].
+    pub outcomes: OutcomeMetrics,
 }
 
 impl Default for ServerMetrics {
@@ -362,6 +479,7 @@ impl Default for ServerMetrics {
             errors_overloaded: AtomicU64::new(0),
             errors_internal: AtomicU64::new(0),
             commands: CommandMetrics::new(),
+            outcomes: OutcomeMetrics::default(),
         }
     }
 }
@@ -590,6 +708,69 @@ pub fn render_prometheus(
     );
 
     server.commands.render(&mut out);
+
+    // Exported as well as reported over memcached's `stats`, because a delete
+    // miss rate is an operational number in any dialect. One family with two
+    // labels rather than eighteen series, so a dashboard can sum over either
+    // axis.
+    let _ = writeln!(
+        out,
+        "# HELP vash_command_outcome_total What a command found, by command and outcome."
+    );
+    let _ = writeln!(out, "# TYPE vash_command_outcome_total counter");
+    for (command, outcome, value) in [
+        ("delete", "hit", load(&server.outcomes.delete_hits)),
+        ("delete", "miss", load(&server.outcomes.delete_misses)),
+        ("incr", "hit", load(&server.outcomes.incr_hits)),
+        ("incr", "miss", load(&server.outcomes.incr_misses)),
+        ("decr", "hit", load(&server.outcomes.decr_hits)),
+        ("decr", "miss", load(&server.outcomes.decr_misses)),
+        ("cas", "hit", load(&server.outcomes.cas_hits)),
+        ("cas", "miss", load(&server.outcomes.cas_misses)),
+        // A `cas` against a key that exists but has moved on — somebody else
+        // got there first, which is a different event from a miss.
+        ("cas", "badval", load(&server.outcomes.cas_badval)),
+        ("touch", "hit", load(&server.outcomes.touch_hits)),
+        ("touch", "miss", load(&server.outcomes.touch_misses)),
+    ] {
+        let _ = writeln!(
+            out,
+            "vash_command_outcome_total{{command=\"{command}\",outcome=\"{outcome}\"}} {value}"
+        );
+    }
+
+    metric!(
+        "vash_items_stored_total",
+        "counter",
+        "Stores that applied. A guarded write that was rejected is not one, \
+         which is what separates this from the store command rate.",
+        load(&server.outcomes.total_items).to_string(),
+    );
+    metric!(
+        "vash_store_too_large_total",
+        "counter",
+        "Writes refused for exceeding store.max_value_bytes. Distinct from a \
+         full map: this is the client's problem, not the cache's size.",
+        load(&server.outcomes.store_too_large).to_string(),
+    );
+    metric!(
+        "vash_meta_commands_total",
+        "counter",
+        "Commands that arrived on the memcached meta dialect rather than the classic one.",
+        load(&server.outcomes.meta_commands).to_string(),
+    );
+    metric!(
+        "vash_network_read_bytes_total",
+        "counter",
+        "Bytes read from client sockets.",
+        load(&server.outcomes.bytes_read).to_string(),
+    );
+    metric!(
+        "vash_network_written_bytes_total",
+        "counter",
+        "Bytes written to client sockets.",
+        load(&server.outcomes.bytes_written).to_string(),
+    );
 
     for (class, value) in [
         ("client", load(&server.errors_client)),

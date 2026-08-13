@@ -761,32 +761,340 @@ async fn an_unrecognised_opening_byte_closes_the_connection() {
 
 // ---- stats --------------------------------------------------------------
 
-/// **`stats` takes no arguments here.** Upstream implements `items`, `slabs`,
-/// `sizes`, `conns`, `cachedump` and `reset`; none of them describes this
-/// server, and `reset` would zero the atomics `/metrics` exports — a Prometheus
-/// counter going backwards corrupts every rate over the window containing it.
+/// Every upstream field name this server is allowed to claim.
 ///
-/// One rule rather than a table of special cases.
+/// A name is on this list because its **meaning** matches upstream's, not
+/// because the word fits. `reclaimed` is the cautionary one and is deliberately
+/// absent: upstream's counts entries stored into the memory of an expired one —
+/// slab reuse — where this server's sweeper reclaim count is a different
+/// quantity that happens to share the word.
+const UPSTREAM_FIELDS: &[&str] = &[
+    // general
+    "pid",
+    "uptime",
+    "time",
+    "version",
+    "pointer_size",
+    "max_connections",
+    "curr_connections",
+    "total_connections",
+    "rejected_connections",
+    "accepting_conns",
+    "cmd_get",
+    "cmd_set",
+    "cmd_touch",
+    "cmd_flush",
+    "cmd_meta",
+    "get_hits",
+    "get_misses",
+    "delete_hits",
+    "delete_misses",
+    "incr_hits",
+    "incr_misses",
+    "decr_hits",
+    "decr_misses",
+    "cas_hits",
+    "cas_misses",
+    "cas_badval",
+    "touch_hits",
+    "touch_misses",
+    "total_items",
+    "store_too_large",
+    "store_no_memory",
+    "auth_cmds",
+    "auth_errors",
+    "bytes_read",
+    "bytes_written",
+    "curr_items",
+    "bytes",
+    "limit_maxbytes",
+    "evictions",
+    // settings
+    "maxbytes",
+    "maxconns",
+    "tcpport",
+    "udpport",
+    "inter",
+    "verbosity",
+    "domain_socket",
+    "shutdown_command",
+    "cas_enabled",
+    "auth_enabled_sasl",
+    "auth_enabled_ascii",
+    "item_size_max",
+    "maxconns_fast",
+    "flush_enabled",
+    "dump_enabled",
+    "lru_crawler",
+    "lru_crawler_tocrawl",
+    "lru_maintainer_thread",
+    "temp_lru",
+    "track_sizes",
+    "detail_enabled",
+    "ssl_enabled",
+    "proxy_enabled",
+    "client_flags_size",
+    // items / slabs / conns / sizes
+    "number",
+    // Upstream's `items:<class>:evicted` counts items dropped from that class
+    // to make room, which is what this counts. Its sibling `evictions` in the
+    // general set is the same event seen server-wide.
+    "evicted",
+    "outofmemory",
+    "get_hits",
+    "cmd_set",
+    "active_slabs",
+    "total_malloced",
+    "addr",
+    "listen_addr",
+    "state",
+    "secs_since_last_cmd",
+    "sizes_status",
+];
+
+/// **The rule, pinned.** Every field name every subcommand emits is either a
+/// reviewed upstream name or carries the `vash_` prefix.
+///
+/// Without this, a counter added later could quietly claim an upstream name
+/// whose meaning it does not share — which is exactly the mistake `reclaimed`
+/// would have been, and the kind a reader of a dashboard never catches.
 #[tokio::test]
-async fn every_stats_subcommand_is_refused() {
+async fn no_field_claims_an_upstream_name_it_was_not_given() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    c.line("set k 0 0 1\r\nv\r\n").await;
+
+    for section in ["", "settings", "items", "slabs", "conns", "sizes"] {
+        let command = format!("stats {section}\r\n");
+        let command = format!("{}\r\n", command.trim_end());
+        for name in stat_fields(&mut c, &command).await.keys() {
+            // `items:1:number` and `1:get_hits` and `7:addr` are namespaced by
+            // class or connection id; the field is the last segment.
+            let field = name.rsplit(':').next().expect("a field name");
+            assert!(
+                field.starts_with("vash_") || UPSTREAM_FIELDS.contains(&field),
+                "`{name}` (from `stats {section}`) claims the upstream name \
+                 `{field}` without being on the reviewed list. Either its \
+                 meaning matches upstream's — add it there — or it does not, \
+                 and it needs a vash_ prefix."
+            );
+        }
+    }
+}
+
+/// Reads a `STAT`-line reply into its fields.
+async fn stat_fields(conn: &mut Conn, command: &str) -> std::collections::HashMap<String, String> {
+    conn.send(command.as_bytes()).await;
+    let body = conn.read_until("END\r\n").await;
+    body.lines()
+        .filter_map(|line| line.strip_prefix("STAT "))
+        .filter_map(|line| line.split_once(' '))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Three subcommands upstream implements and this server does not, refused **by
+/// name** — the call `lru_crawler enable` already makes. Upstream implements
+/// them, so the bytes diverge whatever is sent, and saying which command was
+/// refused is worth more than a shorter divergence.
+#[tokio::test]
+async fn the_unimplemented_subcommands_are_refused_by_name() {
     let server = TestServer::start().await;
     let mut c = server.connect().await;
 
-    for argument in [
-        "items",
-        "slabs",
-        "sizes",
-        "conns",
-        "reset",
-        "cachedump 1 0",
-        "bogus",
+    assert_eq!(
+        c.line("stats reset\r\n").await,
+        "CLIENT_ERROR stats reset is not implemented\r\n"
+    );
+    assert_eq!(
+        c.line("stats cachedump 1 10\r\n").await,
+        "CLIENT_ERROR stats cachedump is not implemented; use lru_crawler metadump\r\n"
+    );
+    assert_eq!(
+        c.line("stats detail on\r\n").await,
+        "CLIENT_ERROR stats detail is not implemented\r\n"
+    );
+
+    // An unrecognised subcommand still gets upstream's bare `ERROR`, so the two
+    // cases stay distinguishable — "we do not have that" against "we chose not
+    // to build that".
+    assert_eq!(c.line("stats bogus\r\n").await, "ERROR\r\n");
+    // 1.6.45 removed both verbs and answers the same.
+    assert_eq!(c.line("stats sizes_enable\r\n").await, "ERROR\r\n");
+    assert_eq!(c.line("stats sizes_disable\r\n").await, "ERROR\r\n");
+
+    // None of the implemented sections takes an argument.
+    assert_eq!(
+        c.line("stats settings extra\r\n").await,
+        "CLIENT_ERROR bad command line format\r\n"
+    );
+}
+
+/// `sizes`, `extstore` and `proxy` are answered **byte-identically to a stock
+/// memcached**: upstream tracks item sizes only under `-o track_sizes`, and
+/// answers an empty reply for subsystems that were not compiled in. There is no
+/// size tracking, no external storage and no proxy here, so each reply is exact
+/// rather than an approximation.
+#[tokio::test]
+async fn the_sections_that_a_stock_memcached_also_leaves_empty() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.send(b"stats sizes\r\n").await;
+    assert_eq!(
+        c.read_until("END\r\n").await,
+        "STAT sizes_status disabled\r\nEND\r\n"
+    );
+
+    for section in ["extstore", "proxy"] {
+        c.send(format!("stats {section}\r\n").as_bytes()).await;
+        assert_eq!(c.read_until("END\r\n").await, "END\r\n", "stats {section}");
+    }
+}
+
+#[tokio::test]
+async fn stats_settings_reports_the_configuration_in_force() {
+    let server = TestServer::start_with(|config| {
+        config.protocol.flush_enabled = true;
+        config.protocol.listing_enabled = true;
+    })
+    .await;
+    let mut c = server.connect().await;
+
+    let fields = stat_fields(&mut c, "stats settings\r\n").await;
+
+    // The two that match upstream exactly in meaning, not merely in name.
+    assert_eq!(fields["flush_enabled"], "yes");
+    assert_eq!(fields["dump_enabled"], "yes");
+    assert_eq!(fields["lru_crawler"], "yes");
+
+    // Measurements of a decision, not placeholders.
+    assert_eq!(fields["udpport"], "0");
+    assert_eq!(fields["ssl_enabled"], "no");
+    assert_eq!(fields["proxy_enabled"], "no");
+    assert_eq!(fields["auth_enabled_sasl"], "no");
+    assert_eq!(fields["lru_maintainer_thread"], "no");
+    assert_eq!(fields["track_sizes"], "no");
+    assert_eq!(fields["detail_enabled"], "no");
+    assert_eq!(fields["cas_enabled"], "yes");
+    assert_eq!(fields["client_flags_size"], "4");
+
+    // The bound port, not the configured one — the test server asks for 0.
+    assert_eq!(fields["tcpport"], server.addr.port().to_string());
+    assert_ne!(fields["tcpport"], "0", "port 0 is a request, not an answer");
+
+    assert!(fields.contains_key("maxbytes"));
+    assert!(fields.contains_key("item_size_max"));
+    assert!(fields.contains_key("vash_shards"));
+
+    // Slab, LRU and extstore geometry: absent, not zeroed.
+    for absent in [
+        "growth_factor",
+        "chunk_size",
+        "hot_lru_pct",
+        "ext_item_size",
     ] {
-        assert_eq!(
-            c.line(&format!("stats {argument}\r\n")).await,
-            "CLIENT_ERROR bad command line format\r\n",
-            "stats {argument}"
+        assert!(!fields.contains_key(absent), "{absent} has no meaning here");
+    }
+}
+
+#[tokio::test]
+async fn stats_settings_follows_the_gates_it_reports() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    let fields = stat_fields(&mut c, "stats settings\r\n").await;
+    assert_eq!(fields["flush_enabled"], "no", "off by default");
+    assert_eq!(fields["dump_enabled"], "no");
+    assert_eq!(fields["lru_crawler"], "no");
+}
+
+#[tokio::test]
+async fn stats_items_reports_the_class_the_dumps_accept() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    for i in 0..3 {
+        c.line(&format!("set k{i} 0 0 1\r\nv\r\n")).await;
+    }
+
+    let fields = stat_fields(&mut c, "stats items\r\n").await;
+    assert_eq!(fields["items:1:number"], "3");
+    assert_eq!(fields["items:1:evicted"], "0");
+    assert!(fields.contains_key("items:1:outofmemory"));
+
+    // The class id a tool reads here must be one the dumps answer to, or the
+    // discover-then-dump loop every memcached tool runs would go nowhere.
+    c.send(b"lru_crawler metadump 1\r\n").await;
+    let dump = c.read_until("END\r\n").await;
+    assert_eq!(dumped_keys(&dump).len(), 3);
+
+    // LRU segmentation and item age: absent, not zeroed.
+    for absent in ["items:1:number_hot", "items:1:age", "items:1:evicted_time"] {
+        assert!(!fields.contains_key(absent), "{absent} needs an LRU");
+    }
+}
+
+#[tokio::test]
+async fn stats_slabs_reports_the_counters_a_slab_class_would_carry() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+    c.line("set k 0 0 1\r\nv\r\n").await;
+    c.get("get k\r\n").await;
+
+    let fields = stat_fields(&mut c, "stats slabs\r\n").await;
+    assert_eq!(fields["1:get_hits"], "1");
+    assert_eq!(fields["1:cmd_set"], "1");
+    assert_eq!(fields["active_slabs"], "1");
+    assert!(fields.contains_key("total_malloced"));
+
+    // Chunk geometry: a page here holds records of many sizes, so reporting one
+    // would let a tool compute a slab efficiency that means nothing.
+    for absent in ["1:chunk_size", "1:total_pages", "1:used_chunks"] {
+        assert!(
+            !fields.contains_key(absent),
+            "{absent} describes a slab allocator"
         );
     }
+}
+
+#[tokio::test]
+async fn stats_conns_lists_connections_while_they_are_open() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+    c.line("version\r\n").await;
+
+    let fields = stat_fields(&mut c, "stats conns\r\n").await;
+
+    // The listener itself, which is the one state that is unambiguous.
+    assert_eq!(fields["0:state"], "conn_listening");
+    assert!(fields["0:addr"].starts_with("tcp:"));
+
+    // The asking connection is in there, having just run a memcached command.
+    let dialects: Vec<&String> = fields
+        .iter()
+        .filter(|(name, _)| name.ends_with(":vash_dialect"))
+        .map(|(_, value)| value)
+        .collect();
+    assert!(
+        dialects.iter().any(|d| *d == "memcached"),
+        "the asking connection should be listed: {fields:?}"
+    );
+
+    // A second connection appears, and is gone once it closes.
+    let count = |fields: &std::collections::HashMap<String, String>| {
+        fields.keys().filter(|k| k.ends_with(":addr")).count()
+    };
+    let before = count(&fields);
+    {
+        let mut other = server.connect().await;
+        other.line("version\r\n").await;
+        let with_both = stat_fields(&mut c, "stats conns\r\n").await;
+        assert_eq!(count(&with_both), before + 1);
+    }
+
+    // Upstream keys this table by file descriptor, which is reused; a
+    // monotonic id is what makes two calls comparable.
+    assert!(!fields.contains_key("1:state"), "no invented conn state");
 }
 
 #[tokio::test]
@@ -811,18 +1119,115 @@ async fn stats_reports_the_counters_it_measures() {
     assert_eq!(fields["cmd_get"], "2");
     assert_eq!(fields["get_hits"], "1");
     assert_eq!(fields["get_misses"], "1");
+    assert_eq!(fields["total_items"], "1");
+    assert_eq!(fields["accepting_conns"], "1");
     assert!(fields.contains_key("uptime"));
     assert!(fields.contains_key("max_connections"));
     assert!(fields.contains_key("evictions"));
     assert!(fields["version"].ends_with("-vash"));
+    // Bytes crossed the socket to get here, so neither can be zero.
+    assert_ne!(fields["bytes_read"], "0");
+    assert_ne!(fields["bytes_written"], "0");
 
     // Absent rather than zeroed: nothing measures them.
-    for unmeasured in ["bytes_read", "bytes_written", "total_items", "delete_hits"] {
+    //
+    // `reclaimed` is the interesting one. Upstream's counts entries stored into
+    // the memory of an expired one — slab reuse. This server's sweeper reclaim
+    // count is a different quantity that happens to share the word, so it is
+    // reported as `vash_reclaimed` and upstream's name is not claimed.
+    for unmeasured in [
+        "reclaimed",
+        "get_expired",
+        "get_flushed",
+        "expired_unfetched",
+        "rusage_user",
+        "hash_power_level",
+    ] {
         assert!(
             !fields.contains_key(unmeasured),
             "{unmeasured} is not measured and must not be reported"
         );
     }
+    assert!(fields.contains_key("vash_reclaimed"));
+}
+
+/// The per-command splits, which is what `stats items`, `stats slabs` and half
+/// of upstream's general set are built from.
+#[tokio::test]
+async fn stats_reports_what_each_command_found() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.line("set counter 0 0 1\r\n5\r\n").await;
+    c.line("incr counter 1\r\n").await; // hit
+    c.line("incr missing 1\r\n").await; // miss
+    c.line("decr counter 1\r\n").await; // hit
+    c.line("touch counter 100\r\n").await; // hit
+    c.line("touch missing 100\r\n").await; // miss
+    c.line("delete counter\r\n").await; // hit
+    c.line("delete missing\r\n").await; // miss
+
+    let fields = stat_fields(&mut c, "stats\r\n").await;
+    assert_eq!(fields["incr_hits"], "1");
+    assert_eq!(fields["incr_misses"], "1");
+    assert_eq!(fields["decr_hits"], "1");
+    assert_eq!(fields["decr_misses"], "0");
+    assert_eq!(fields["touch_hits"], "1");
+    assert_eq!(fields["touch_misses"], "1");
+    assert_eq!(fields["delete_hits"], "1");
+    assert_eq!(fields["delete_misses"], "1");
+}
+
+/// CAS is the one write whose three outcomes are all distinct, and telling
+/// `badval` from a miss is the whole point of it.
+#[tokio::test]
+async fn stats_separates_a_lost_cas_race_from_a_miss() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.line("set k 0 0 1\r\nv\r\n").await;
+    let token: u64 = c
+        .get("gets k\r\n")
+        .await
+        .lines()
+        .next()
+        .and_then(|line| line.split(' ').nth(4))
+        .and_then(|cas| cas.parse().ok())
+        .expect("gets reports a cas token");
+
+    assert_eq!(
+        c.line(&format!("cas k 0 0 1 {token}\r\nw\r\n")).await,
+        "STORED\r\n"
+    );
+    // The token is spent, so the same one now names a value that has moved on.
+    assert_eq!(
+        c.line(&format!("cas k 0 0 1 {token}\r\nx\r\n")).await,
+        "EXISTS\r\n"
+    );
+    assert_eq!(
+        c.line(&format!("cas gone 0 0 1 {token}\r\ny\r\n")).await,
+        "NOT_FOUND\r\n"
+    );
+
+    let fields = stat_fields(&mut c, "stats\r\n").await;
+    assert_eq!(fields["cas_hits"], "1");
+    assert_eq!(fields["cas_badval"], "1");
+    assert_eq!(fields["cas_misses"], "1");
+}
+
+/// Meta commands are counted apart from the classic ones — the single thing
+/// that distinguishes the two grammars once a command has been parsed.
+#[tokio::test]
+async fn stats_counts_the_meta_dialect_separately() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.line("set k 0 0 1\r\nv\r\n").await;
+    c.line("mg k v\r\n").await;
+    c.line("mn\r\n").await;
+
+    let fields = stat_fields(&mut c, "stats\r\n").await;
+    assert_eq!(fields["cmd_meta"], "2");
 }
 
 // ---- lru_crawler --------------------------------------------------------

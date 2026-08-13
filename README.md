@@ -366,11 +366,15 @@ which is part of the upstream protocol: a `G` flag on `ms` attaching a
 comma-separated tag list, and `mdt <tag>` (or `delete_by_tag <tag>` in the
 classic dialect) to invalidate one. Clients that never send them are unaffected.
 
-`stats` reports the counters this server measures, and takes no subcommand — the
-ones upstream has describe a slab allocator that is not here. Listing keys is
-`lru_crawler metadump` and `lru_crawler mgdump`, matching upstream's framing byte
-for byte, and both are **off by default** behind the same `listing_enabled` gate
-as `LIST_KEYS`:
+`stats` reports the counters this server measures — never a plausible zero for
+one it does not — and answers `settings`, `items`, `slabs`, `conns`, `sizes`,
+`extstore` and `proxy`. The last three are byte-identical to a stock memcached,
+which leaves them empty too. `reset`, `cachedump` and `detail` are refused by
+name.
+
+Listing keys is `lru_crawler metadump` and `lru_crawler mgdump`, matching
+upstream's framing byte for byte, and both are **off by default** behind the
+same `listing_enabled` gate as `LIST_KEYS`:
 
 ```bash
 vash-server --listen 0.0.0.0:11311 --enable-listing

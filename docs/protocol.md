@@ -1041,7 +1041,7 @@ All are implemented with upstream semantics.
 | `incr <key> <delta> [noreply]` | the new value / `NOT_FOUND` / `CLIENT_ERROR cannot increment or decrement non-numeric value` |
 | `decr <key> <delta> [noreply]` | as `incr`; clamps at zero |
 | `flush_all [delay] [noreply]` | `OK`, or `CLIENT_ERROR` when disabled |
-| `stats` | `STAT <name> <value>` lines, then `END`. **Takes no arguments** — see below |
+| `stats [<section>]` | `STAT <name> <value>` lines, then `END` — see below |
 | `lru_crawler metadump <all\|hash\|1>` | `OK`, then `key=…` lines, then `END` |
 | `lru_crawler mgdump <all\|hash\|1>` | `OK`, then `mg <key>` lines, then `EN` |
 | `version` | `VERSION <string>` |
@@ -1104,29 +1104,73 @@ vash's own under a `vash_` prefix. Nothing is reported as a plausible zero
 just to fill the field out.
 
 `pid`, `version`, `pointer_size`, `uptime`, `time`, `max_connections`,
-`curr_connections`, `total_connections`, `rejected_connections`, `cmd_get`,
-`cmd_set`, `cmd_touch`, `cmd_flush`, `get_hits`, `get_misses`, `curr_items`,
-`bytes`, `limit_maxbytes`, `evictions`, and: `vash_commands`, `vash_reads`,
-`vash_writes`, `vash_shards`, `vash_utilisation`, `vash_expiry_entries`,
-`vash_tags`, `vash_tag_index_entries`, `vash_pending_reclaims`,
-`vash_commits`, `vash_committed_ops`, `vash_mean_batch`, `vash_sweeps`,
-`vash_reclaimed`, `vash_tag_reclaimed`, `vash_sweep_lag_ms`, `vash_epoch`,
-`vash_readers_in_use`, `vash_oldest_reader_age_ms`, `vash_cluster_mode`,
-`vash_cluster_peers`, `vash_cluster_peers_reachable`.
+`curr_connections`, `total_connections`, `rejected_connections`,
+`accepting_conns`, `cmd_get`, `cmd_set`, `cmd_touch`, `cmd_flush`, `cmd_meta`,
+`get_hits`, `get_misses`, `delete_hits`, `delete_misses`, `incr_hits`,
+`incr_misses`, `decr_hits`, `decr_misses`, `cas_hits`, `cas_misses`,
+`cas_badval`, `touch_hits`, `touch_misses`, `total_items`, `store_too_large`,
+`store_no_memory`, `auth_cmds`, `auth_errors`, `bytes_read`, `bytes_written`,
+`curr_items`, `bytes`, `limit_maxbytes`, `evictions`, and: `vash_commands`,
+`vash_reads`, `vash_writes`, `vash_shards`, `vash_utilisation`,
+`vash_expiry_entries`, `vash_tags`, `vash_tag_index_entries`,
+`vash_pending_reclaims`, `vash_commits`, `vash_committed_ops`,
+`vash_mean_batch`, `vash_sweeps`, `vash_reclaimed`, `vash_tag_reclaimed`,
+`vash_sweep_lag_ms`, `vash_epoch`, `vash_readers_in_use`,
+`vash_oldest_reader_age_ms`, `vash_cluster_mode`, `vash_cluster_peers`,
+`vash_cluster_peers_reachable`.
 
 `cmd_get` counts retrievals, `get_hits` counts keys — a multi-get adds one to
 the first and several to the second, which is upstream's own arithmetic.
 
-**Absent because nothing measures them**: `threads`, `bytes_read`,
-`bytes_written`, `total_items`, `delete_hits`/`delete_misses` (deletes are not
-split into hit and miss), `expired_unfetched`, `evicted_unfetched`.
+**Absent because nothing measures them**: `threads`, `reclaimed`,
+`get_expired`, `get_flushed`, `expired_unfetched`, `evicted_unfetched`,
+`evicted_active`, `rusage_user`, `rusage_system`, `libevent`,
+`connection_structures`, `reserved_fds`, `conn_yields`, `hash_power_level`,
+and every `slab_*`, `lru_*`, `log_*` and `proxy_*` counter.
 
-**Every subcommand is refused** with `CLIENT_ERROR bad command line format`.
-`stats items`, `slabs`, `sizes` and `conns` describe a slab allocator this
-server does not have; `cachedump` was upstream's own key dump and
-`lru_crawler metadump` replaced it; and `reset` would zero the same atomics
-`/metrics` exports, where a counter going backwards corrupts every rate over
-the window containing the reset. One rule rather than a table of special cases.
+`reclaimed` is the one worth explaining. Upstream's counts entries stored into
+the memory of an expired one — a slab-reuse number — where this server's
+sweeper reclaim count is a different quantity that happens to share the word. It
+is reported as `vash_reclaimed`, and an integration test refuses any field name
+that claims an upstream name without being on a reviewed list.
+
+### `stats` subcommands
+
+The specification declines to document these at all — "the kinds of arguments
+and the data sent are not documented in this version of the protocol, and are
+subject to change for the convenience of memcache developers" — so the
+**framing** is matched byte for byte against memcached 1.6.45 and the **field
+list** is deliberately a subset. Full tables in
+[stats-subcommands.md](stats-subcommands.md).
+
+| Subcommand | Answer |
+|---|---|
+| `stats settings` | The configuration in force. `flush_enabled` and `dump_enabled` match upstream's meaning exactly; the slab, LRU, SSL and extstore geometry is absent. |
+| `stats items` | One synthetic class, `1` — the same id `lru_crawler metadump` prints as `cls=`, so the discover-then-dump loop every tool runs works. |
+| `stats slabs` | The per-class command counters plus `active_slabs` and `total_malloced`. Chunk geometry is absent: a page here holds records of many sizes, and reporting one would let a tool compute a slab efficiency that means nothing. |
+| `stats conns` | One block per open connection, plus the listener. `<id>` is a **monotonic connection id, not a file descriptor** — an fd is reused the moment one closes, so the same number can mean two clients a second apart. |
+| `stats sizes` | `STAT sizes_status disabled`, which is **byte-identical** to a stock memcached: upstream tracks item sizes only under `-o track_sizes`. |
+| `stats extstore`, `stats proxy` | A bare `END`, which is what a memcached built without them answers. There is neither here. |
+| `stats reset`, `stats cachedump`, `stats detail` | `CLIENT_ERROR stats <name> is not implemented`. See below. |
+| `stats sizes_enable`, `stats sizes_disable` | `ERROR` — 1.6.45 removed both verbs. |
+| anything else | `ERROR`, upstream's answer for a subcommand it does not recognise. |
+
+`stats conns` reports no `state` for a live connection. Upstream's ten values
+name positions in an event-loop state machine that does not exist here — a
+connection is an async task — so `vash_dialect` and `vash_authenticated` are
+offered instead, which answer the question an operator was actually asking. The
+listener does carry `state conn_listening`, which is the one value that is
+unambiguous.
+
+**The three refusals.** `stats reset` would leave `stats` and `/metrics`
+reporting different numbers for the same counter, and `/metrics` over a time
+range answers the question better. `stats cachedump` was superseded upstream by
+`lru_crawler metadump`, which is implemented, pages the whole keyspace, and can
+encode a key — where `cachedump`'s `ITEM <key> [<b> b; <ts> s]` is positional and
+unencoded, so a key holding a space would break the line. `stats detail` is the
+only one that would put work on the retrieval hot path, and upstream ships it
+disabled for that reason. Named rather than lumped into `ERROR`, so
+"deliberately not built" stays distinguishable from "not recognised".
 
 ### `lru_crawler`
 
@@ -1321,7 +1365,10 @@ exceptions.
 | `mg … q` on a **hit** | returns the value; `q` suppresses only the `EN` of a miss | suppresses the whole reply, hit included | `q` is one `noreply` flag across every meta command here. It is not covered by the differential suite. **Do not use `q` with `mg` against vash** — the quiet-get-then-`mn` batching idiom returns nothing. |
 | `me` output | full internal item dump | `cas`, `size`, `fetch` only | The rest describes internals vash does not have. |
 | `stats` fields | full counter set | a subset, plus `vash_*` | Reporting an unmeasured counter as zero would mislead a dashboard. |
-| `stats <subcommand>` | `items`, `slabs`, `sizes`, `conns`, `cachedump`, `reset` | `CLIENT_ERROR bad command line format` | Four of them describe a slab allocator this server does not have, `cachedump` was superseded upstream by `lru_crawler metadump`, and `reset` would zero the atomics `/metrics` exports. See [`stats`](#stats). |
+| `stats reset` / `cachedump` / `detail` | implemented | `CLIENT_ERROR stats <name> is not implemented` | See [`stats` subcommands](#stats-subcommands). |
+| `stats items` / `slabs` classes | one per slab class | one synthetic class, `1` | There is no slab allocator. The id matches what the dumps print as `cls=`, so tooling's discover-then-dump loop still works. |
+| `stats conns` identifiers | file descriptors, reused | monotonic connection ids | An fd is reused the moment one closes, so the same number can mean two clients a second apart. |
+| `stats conns` `state` | ten event-loop states | absent; `vash_dialect` instead | A connection here is an async task, not a position in a state machine. |
 | `lru_crawler` availability | always | behind `listing_enabled`, off by default | Keyspace enumeration is the same capability whichever dialect asks. |
 | `lru_crawler` other subcommands | `enable`, `disable`, `sleep`, `tocrawl`, `crawl` | `CLIENT_ERROR lru_crawler <name> is not implemented` | They steer a background LRU crawler; plan §6 rejected an on-disk LRU, so there is nothing to crawl. |
 | A dump pipelined behind other commands | `ERROR cannot pipeline other commands before metadump` | accepted | The dump is buffered and appended in order here, so pipelining is not a problem to refuse. Strictly more permissive. |

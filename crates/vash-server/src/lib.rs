@@ -9,6 +9,7 @@ pub mod auth;
 pub mod cluster;
 pub mod config;
 pub mod conn;
+pub mod connections;
 pub mod dispatch;
 pub mod metrics;
 pub mod resp;
@@ -140,6 +141,14 @@ impl Server {
             cluster.active(),
             config.auth.required,
         );
+        // Bound before the state is built, because the state reports the
+        // address it is *actually* serving on: a configured port of 0 is a
+        // request for one, not an answer, and `stats settings` has to tell a
+        // client which port that turned out to be.
+        let listener = TcpListener::bind(config.server.listen)
+            .await
+            .with_context(|| format!("binding {}", config.server.listen))?;
+
         let state = ServerState::new(
             Arc::clone(&store),
             info,
@@ -147,12 +156,13 @@ impl Server {
             auth_state,
             cluster,
             config.store.inline_reads,
-            config.server.max_connections as u64,
+            state::Binding {
+                addr: listener.local_addr()?,
+                max_connections: config.server.max_connections as u64,
+                max_blocking_threads: config.server.max_blocking_threads as u64,
+                read_buffer: config.server.read_buffer as u64,
+            },
         );
-
-        let listener = TcpListener::bind(config.server.listen)
-            .await
-            .with_context(|| format!("binding {}", config.server.listen))?;
 
         info!(
             addr = %listener.local_addr()?,
@@ -289,10 +299,18 @@ impl Server {
                     let read_buffer = config.server.read_buffer;
                     let stopping = conn_stopped.clone();
                     conn_state.metrics.connection_opened();
+                    // Registered here rather than inside the handler so that a
+                    // connection is listed from the moment it is accepted —
+                    // including one that never sends a byte, which is exactly
+                    // the connection an operator running `stats conns` is
+                    // usually looking for.
+                    let registered = conn_state.connections.open(peer);
                     tokio::spawn(async move {
-                        if let Err(e) = conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping, pre_auth_permit).await {
+                        let id = registered.id;
+                        if let Err(e) = conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping, pre_auth_permit, registered).await {
                             debug!(%peer, error = %e, "connection ended with an error");
                         }
+                        conn_state.connections.close(id);
                         conn_state.metrics.connection_closed();
                         drop(permit);
                     });
