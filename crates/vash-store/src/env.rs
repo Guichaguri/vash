@@ -216,7 +216,11 @@ impl LmdbEngine {
         // trade.
         let mut prefaulted = 0;
         if config.prefault {
-            match crate::prefault::prefault(&config.path) {
+            // How far LMDB has ever written, which on Linux is the only thing
+            // separating the data from a sparse file the size of the whole map.
+            // See `prefault` — getting this wrong is expensive and silent.
+            let high_water = (env.info().last_page_number as u64 + 1) * env.stat().page_size as u64;
+            match crate::prefault::prefault(&config.path, high_water) {
                 Ok(bytes) => prefaulted = bytes,
                 Err(err) => warn!(%err, "could not prefault the map; serving without it"),
             }

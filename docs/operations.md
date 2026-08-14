@@ -120,12 +120,29 @@ have waited ~100 µs on the device takes a minor fault instead — page-table wo
 against memory that is already there, well under a microsecond, and never a
 block on I/O.
 
+**Measured** by `cargo run --release -p vash-store --example prefault_bench`,
+which evicts the page cache with `posix_fadvise` and proves it with `mincore`.
+On a 5.9 GiB four-shard store, 20,000 random `GET`s:
+
+| | cold | prefaulted |
+|---|---|---|
+| p50 | 800 µs | **6.6 µs** |
+| p99 | 2.9 ms – 58 ms | **80 µs** |
+| throughput | 445 – 1,094 ops/s | **~75,000 ops/s** |
+
+The p99 swinging from 2.9 ms to 58 ms between otherwise identical rounds is the
+point, more than the averages are: that is the tail-latency collapse the
+hand-off exists to prevent, arriving unpredictably with the page cache's mood.
+
 It is off by default because it trades the one thing a memory-mapped store is
 unusually good at: a cold start that serves immediately because nothing is
-loaded. **Measured at ~260 ms per GiB** with the file already cached — a 1 GiB
-shard took a 4 ms open to 264 ms — and a genuinely cold file adds whatever the
-device charges on top. That is a good trade for a long-lived node whose tail
-latency matters and a bad one for anything that restarts often.
+loaded. That costs **~2.2–3.7 s per GiB cold**, and ~260 ms per GiB when the
+file is already cached. A good trade for a long-lived node whose tail latency
+matters; a bad one for anything that restarts often.
+
+Those absolutes came off WSL2 against a virtual disk, where a cold read costs
+~800 µs rather than the ~100 µs plan §9 assumes of NVMe — so treat the ratio as
+a ceiling. The direction is not in doubt.
 
 On Linux the warmed mapping is additionally handed to `madvise` — `MADV_POPULATE_READ`
 on 5.14 and later — which builds the page tables too and removes even the minor

@@ -36,16 +36,40 @@
 //! not the mechanism: the sequential read is what removes the stall, and it
 //! works everywhere.
 //!
+//! # What it buys, measured
+//!
+//! `examples/prefault_bench` is the measurement, and it is the only honest way
+//! to take one: the effect exists only against a cold page cache, so it evicts
+//! the data files with `posix_fadvise(DONTNEED)` and checks with `mincore` that
+//! they went. On a 5.9 GiB four-shard store, 20,000 random `GET`s:
+//!
+//! | | cold | prefaulted |
+//! |---|---|---|
+//! | p50 | 800 µs | **6.6 µs** |
+//! | p99 | 2.9 ms – 58 ms | **80 µs** |
+//! | throughput | 445 – 1,094 ops/s | **~75,000 ops/s** |
+//!
+//! Two things to read carefully. The **p99 spread across rounds** — 2.9 ms in
+//! one, 58 ms in the next — is not noise to be averaged away; it is the
+//! tail-latency collapse plan §9 exists to prevent, appearing and disappearing
+//! with the page cache's mood. And the run was on a kernel too old for
+//! `MADV_POPULATE_READ`, so **every bit of this came from the sequential read
+//! alone**, which is the strongest evidence that the read is the mechanism and
+//! the `madvise` below is only a refinement.
+//!
+//! The absolute figures are inflated: this was WSL2 against a virtual disk,
+//! where a cold read costs ~800 µs rather than the ~100 µs plan §9 assumes of
+//! NVMe. Read the ratio as a ceiling and the direction as certain.
+//!
 //! # What it costs
 //!
-//! Startup time proportional to the data file, at sequential-read bandwidth.
-//! **Measured: ~260 ms per GiB** on the development machine with the file
-//! already cached — that is the copy floor, and a cold file adds whatever the
-//! device charges to deliver it. A 10 GB database is therefore seconds, against
-//! the sub-second cold start plan §13 asks for, and that is why this is off by
-//! default. It buys predictable tail latency for the first requests after a
-//! restart, and it is the precondition that makes `inline_reads` an informed
-//! choice rather than a gamble.
+//! Startup time proportional to the data, at sequential-read bandwidth:
+//! **~2.2–3.7 s per GiB cold** on the rig above, and ~260 ms per GiB when the
+//! file is already cached, which is the copy floor. A 10 GB database is
+//! therefore tens of seconds against the sub-second cold start plan §13 asks
+//! for, and that is why this is off by default. It buys predictable tail
+//! latency for the first requests after a restart, and it is the precondition
+//! that makes `inline_reads` an informed choice rather than a gamble.
 
 use std::io::Read;
 use std::path::Path;
@@ -63,12 +87,32 @@ const CHUNK: usize = 1024 * 1024;
 
 /// Warms one environment's map. Returns the bytes made resident.
 ///
+/// `high_water` is how far into the file LMDB has ever written —
+/// `(last_page_number + 1) × page_size` — and it is not optional. **On Linux
+/// LMDB creates `data.mdb` at the full map size and leaves it sparse**, so the
+/// file's own length is `store.map_size` from the moment the environment is
+/// created and says nothing about how much data exists. Reading to that length
+/// warms gigabytes of holes.
+///
+/// This was measured rather than reasoned about, and it was not subtle: on a
+/// 4-shard store holding 3 GiB behind a 4 GiB-per-shard map, the file length
+/// said 16 GiB. Warming it took 21–31 s, and on a 9 GB machine it filled the
+/// page cache with zeroes and evicted the real data on the way past — so the
+/// flag cost half a minute of startup to make reads no faster. Bounded here
+/// instead, the same store warms ~1.5 GiB per shard of pages that exist.
+///
+/// Note that the bound is deliberately the high-water mark and **not**
+/// [`crate::engine::LmdbEngine::used_bytes_in`], which excludes the free list.
+/// Free pages sit interleaved with live ones below the high-water mark; they
+/// are real blocks on disk, and reading straight through them costs less than
+/// seeking around them.
+///
 /// Errors are the caller's to log and ignore: everything here is a performance
 /// measure, and a database that could not be warmed is still a database that
 /// serves correctly.
-pub(crate) fn prefault(dir: &Path) -> std::io::Result<u64> {
+pub(crate) fn prefault(dir: &Path, high_water: u64) -> std::io::Result<u64> {
     let path = dir.join(DATA_FILE);
-    let bytes = warm_page_cache(&path)?;
+    let bytes = warm_page_cache(&path, high_water)?;
 
     #[cfg(target_os = "linux")]
     populate_page_tables(&path, bytes);
@@ -76,24 +120,28 @@ pub(crate) fn prefault(dir: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
-/// Reads the data file end to end, so its pages are in the OS page cache.
+/// Reads the data file up to `limit`, so its pages are in the OS page cache.
 ///
 /// The bytes are read into a buffer and thrown away — the copy is the point of
 /// contact, not the data. Sequential, so the device delivers it at streaming
 /// bandwidth rather than at the random-access rate a fault-driven warm-up would
 /// get.
-fn warm_page_cache(path: &Path) -> std::io::Result<u64> {
+fn warm_page_cache(path: &Path, limit: u64) -> std::io::Result<u64> {
     let mut file = std::fs::File::open(path)?;
     let mut buf = vec![0u8; CHUNK];
     let mut total = 0u64;
-    loop {
-        match file.read(&mut buf) {
+    while total < limit {
+        let want = CHUNK.min(usize::try_from(limit - total).unwrap_or(CHUNK));
+        match file.read(&mut buf[..want]) {
+            // Short file: the environment was created with a larger map than it
+            // has ever filled, which is the ordinary case everywhere but Linux.
             Ok(0) => return Ok(total),
             Ok(n) => total += n as u64,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
         }
     }
+    Ok(total)
 }
 
 /// Populates this process's page tables over LMDB's mapping, so that even the
@@ -110,7 +158,7 @@ fn warm_page_cache(path: &Path) -> std::io::Result<u64> {
 /// too old, or the range is refused, the caller has already got the part that
 /// mattered.
 #[cfg(target_os = "linux")]
-fn populate_page_tables(path: &Path, file_len: u64) {
+fn populate_page_tables(path: &Path, warmed: u64) {
     use std::os::unix::fs::MetadataExt;
 
     /// Prefault a range for reading — `MAP_POPULATE` after the fact, and the
@@ -119,7 +167,7 @@ fn populate_page_tables(path: &Path, file_len: u64) {
     /// carried it only since 0.2.113.
     const MADV_POPULATE_READ: libc::c_int = 22;
 
-    if file_len == 0 {
+    if warmed == 0 {
         return;
     }
     let Ok(inode) = std::fs::metadata(path).map(|meta| meta.ino()) else {
@@ -156,16 +204,17 @@ fn populate_page_tables(path: &Path, file_len: u64) {
         ) else {
             continue;
         };
-        // The map is a reservation — `store.map_size`, gigabytes of it — while
-        // the file is only as long as the data. The pages beyond it have no
-        // backing and cannot be populated: `madvise` gives up when it reaches
-        // them rather than populating the part that was real, so an unclamped
-        // call is not merely wasteful, it is the difference between this
-        // working and doing nothing. Measured — advising the whole 512 MiB
-        // reservation over an 8 MiB file is refused outright. Clamped to what
-        // the file covers at this range's own offset, which is also what keeps
-        // a mapping the kernel has split into several ranges correct.
-        let Some(backed) = file_len.checked_sub(offset).filter(|n| *n > 0) else {
+        // The map is a reservation — `store.map_size`, gigabytes of it — and on
+        // Linux the file is that long too, sparse above the high-water mark.
+        // Neither the reservation nor the holes can be populated: `madvise`
+        // gives up when it reaches them rather than populating the part that
+        // was real, so an unclamped call is not merely wasteful, it is the
+        // difference between this working and doing nothing. Measured —
+        // advising a whole 512 MiB reservation over an 8 MiB file is refused
+        // outright. Clamped to what was warmed, at this range's own offset,
+        // which is also what keeps a mapping the kernel has split into several
+        // ranges correct.
+        let Some(backed) = warmed.checked_sub(offset).filter(|n| *n > 0) else {
             continue;
         };
         let len = end
@@ -199,18 +248,49 @@ fn populate_page_tables(path: &Path, file_len: u64) {
 mod tests {
     use super::*;
 
-    /// The warm pass reports the whole file, and is not confused by a database
-    /// whose map reserves far more than the file occupies.
-    #[test]
-    fn warms_the_whole_data_file() {
+    fn with_data_file(len: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(DATA_FILE);
-        // Larger than one chunk, so the read loop goes round more than once.
-        let contents = vec![7u8; CHUNK + 4096];
-        std::fs::write(&path, &contents).expect("write");
+        std::fs::write(dir.path().join(DATA_FILE), vec![7u8; len]).expect("write");
+        dir
+    }
 
-        let bytes = prefault(dir.path()).expect("prefault");
-        assert_eq!(bytes, contents.len() as u64);
+    /// The warm pass covers everything below the high-water mark, over more
+    /// than one chunk so the read loop goes round.
+    #[test]
+    fn warms_up_to_the_high_water_mark() {
+        let len = CHUNK + 4096;
+        let dir = with_data_file(len);
+        assert_eq!(
+            prefault(dir.path(), len as u64).expect("prefault"),
+            len as u64
+        );
+    }
+
+    /// **The regression that made the flag worse than useless.** On Linux LMDB
+    /// creates `data.mdb` at the full map size and leaves it sparse, so the
+    /// file is `store.map_size` long from the moment it exists. Warming to the
+    /// file's length read gigabytes of holes, which on a machine smaller than
+    /// the map evicted the real data on the way past. Nothing above the mark
+    /// may be touched, however long the file is.
+    #[test]
+    fn stops_at_the_high_water_mark_of_a_sparse_file() {
+        let dir = with_data_file(8 * CHUNK);
+        let high_water = CHUNK as u64;
+        assert_eq!(
+            prefault(dir.path(), high_water).expect("prefault"),
+            high_water
+        );
+    }
+
+    /// A mark beyond the file — an environment whose map has never been filled,
+    /// which is every platform but Linux — stops at what is actually there.
+    #[test]
+    fn stops_at_the_end_of_a_short_file() {
+        let dir = with_data_file(4096);
+        assert_eq!(
+            prefault(dir.path(), 8 * CHUNK as u64).expect("prefault"),
+            4096
+        );
     }
 
     /// An environment directory without a data file is a startup failure to
@@ -218,6 +298,6 @@ mod tests {
     #[test]
     fn reports_a_missing_data_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(prefault(dir.path()).is_err());
+        assert!(prefault(dir.path(), CHUNK as u64).is_err());
     }
 }
