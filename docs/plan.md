@@ -949,10 +949,11 @@ read-to-write ratio a cache actually sees: at 9:1 the mixed workload measured 27
 
 **The GET goal is met.** Throughput falls with value size — 337k ops/s at 4 KiB — but that is data
 movement rather than per-request work: it is 1.4 GB/s of value bytes leaving the process with the
-client reading them on the same memory bus. The value is still copied three times on the read path
-(out of the map, into the reply, into the write buffer) where §8 promised one. Removing the first
-means encoding the response while the read transaction is still open, which trades away the clean
-`Store`/`Reply` boundary; it is the obvious next move and was deliberately not made.
+client reading them on the same memory bus. At the time of measurement the value was still copied
+three times on the read path (out of the map, into the reply, into the write buffer) where §8
+promised one. Removing the first means encoding the response while the read transaction is still
+open, which trades away the clean `Store`/`Reply` boundary; it was the obvious next move and was
+deliberately not made **during M6**. It has since been taken — see *Since M6* below.
 
 **What M6 actually found**, in order of size:
 
@@ -960,13 +961,37 @@ means encoding the response while the read transaction is still open, which trad
    that was never built. 86k → 1.28M ops/s through the whole server. See §9.
 2. **The native protocol is about 6× cheaper to parse than the text one** — 15.6ns against 99.8ns to
    decode a `GET`, and 67ns against 452ns to encode a 1 KiB hit. That is §3's "text framing costs",
-   measured.
+   measured. Most of the encoding half turned out not to be framing at all — see *Since M6*.
 3. **The hot path is otherwise where it should be**: parsing a record is 12.5ns and flat in tag
    count, the liveness check is 1.5ns untagged and 16.8ns with the full 32 tags, and decoding a
    `SET` does not scale with the value — the zero-copy claims in §8 hold.
 4. **Two expected wins were not wins.** The hand-off to the storage tier (§9) and `mimalloc` (§2)
    both measured within noise. Recording that is worth as much as recording the one that worked:
    both were plausible, both had a number attached in advance, and neither survived being measured.
+
+### Since M6
+
+Three changes to the read path, each measured against the arm it replaced rather than end to end —
+a loopback run on this box has ±25% between identical runs, which is wider than any of them.
+
+| Change | Measured |
+|---|---|
+| Render a `GET` hit straight out of the store, inside the read transaction (`Store::get_with`) | ~200ns at 1 KiB, ~400ns at 4 KiB, plus the allocation every hit made |
+| Spell reply integers into a stack buffer instead of a `String` each | memcached `VALUE` line with cas 174–187ns → 43–47ns; RESP bulk 75–82ns → 22–26ns |
+| Fuse the single-key plain memcached `get`, the one every client library sends | 384ns → 230ns at 1 KiB, of which ~75ns is the batch reply's vector and is flat in value size |
+
+**The second one is the correction to M6's finding 2.** The text encoders looked expensive because
+they were measured as framing, and roughly 45ns of each integer they wrote was a malloc and a free
+rather than any part of the format. A `VALUE` line spells three. What is left after removing them is
+the framing cost §3 actually predicted, and it is a good deal smaller than 452ns.
+
+**A note on measuring any of this here.** Divan's default sampling cannot see these: an LMDB read
+transaction throws an occasional 20µs outlier, which collapses the auto-tuned sample size to one
+iteration, and the 100ns timer then quantises every arm to the same figure. The read-path arms pin
+`sample_size = 500` for that reason. Independently, this box interleaves whole rounds where every
+arm — including ones the change under test does not touch — is six times slower; a round where an
+untouched control moved is a round to discard, which is the same lesson as the note below arrived at
+from the other direction.
 
 **A methodological note, because it nearly produced wrong numbers.** An earlier campaign measured
 `inline_reads` as a 30% win and GET at 648k. Both were artifacts of a disk that had silently filled
