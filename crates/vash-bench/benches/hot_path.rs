@@ -28,7 +28,7 @@ const VALUE: &[u8] = &[b'x'; 1024];
 // ---- framing ---------------------------------------------------------------
 
 /// Decoding a `GET`: the single most executed piece of code in the server.
-#[divan::bench]
+#[divan::bench(sample_size = 500)]
 fn vcp_decode_get(bencher: divan::Bencher) {
     let mut frame = Vec::new();
     encode_request(&mut frame, Opcode::Get, 1, b"user:1234:profile");
@@ -122,6 +122,30 @@ fn memcached_parse_set(bencher: divan::Bencher) {
 fn memcached_parse_meta_get(bencher: divan::Bencher) {
     let line = b"mg user:1234:profile v f s c t k Oopaque\r\n";
     bencher.bench(|| divan::black_box(memcached::parse(divan::black_box(line)).is_ok()));
+}
+
+/// The same request over RESP, which is what a Redis client sends.
+///
+/// Unlike the memcached arms there is no allocation-free control command to
+/// compare against — every RESP command travels as the same multibulk array —
+/// so a change here is judged against the memcached and VCP arms in the same
+/// run, which it does not touch. A round where those moved is a round to
+/// discard. See plan §13.
+#[divan::bench(sample_size = 500)]
+fn resp_parse_get(bencher: divan::Bencher) {
+    let line = b"*2\r\n$3\r\nGET\r\n$17\r\nuser:1234:profile\r\n";
+    bencher.bench(|| divan::black_box(vash_proto::resp::parse(divan::black_box(line)).is_ok()));
+}
+
+/// `SET key value EX 300` — five arguments, which is the shape a client library
+/// sends for a write with a TTL and the widest common command.
+#[divan::bench(sample_size = 500)]
+fn resp_parse_set(bencher: divan::Bencher) {
+    let mut input = b"*5\r\n$3\r\nSET\r\n$17\r\nuser:1234:profile\r\n$1024\r\n".to_vec();
+    input.extend_from_slice(VALUE);
+    input.extend_from_slice(b"\r\n$2\r\nEX\r\n$3\r\n300\r\n");
+
+    bencher.bench(|| divan::black_box(vash_proto::resp::parse(divan::black_box(&input)).is_ok()));
 }
 
 // ---- record and liveness ---------------------------------------------------

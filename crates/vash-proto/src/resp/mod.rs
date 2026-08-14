@@ -132,7 +132,7 @@ pub fn parse(buf: &[u8]) -> Result<Outcome<'_>, ProtocolError<'_>> {
             continue;
         }
 
-        let mut args: Vec<&[u8]> = Vec::with_capacity(count as usize);
+        let mut args = Args::with_capacity(count as usize);
         let mut cursor = after_header;
         for _ in 0..count {
             let Some((arg, next)) = read_bulk(buf, cursor)? else {
@@ -143,6 +143,80 @@ pub fn parse(buf: &[u8]) -> Result<Outcome<'_>, ProtocolError<'_>> {
         }
 
         return parse_command(&args, cursor).map(Outcome::Command);
+    }
+}
+
+/// How many arguments one command holds without touching the heap.
+///
+/// Eight covers every fixed-arity command in the dialect — `GET` sends two and
+/// `SET key value EX 300 XX GET` sends eight, which is the widest — so the heap
+/// is reached only by the genuinely variadic ones (`MGET`, `MSET`, `DEL`),
+/// where the allocation is proportional to a batch the client chose to send.
+const INLINE_ARGS: usize = 8;
+
+/// The argument slices of one RESP command.
+///
+/// **Why this is not a `Vec`.** Every RESP command is a multibulk array, so
+/// every RESP command allocated a vector of borrowed slices to hold the two or
+/// three it actually has — and paid for it twice, because the connection parses
+/// each block once in `conn::measure_resp` to find where its commands end and
+/// again in `resp::execute_block` to run them. Unlike the memcached dialect
+/// there is no single-key command that escapes this: `GET` is a multibulk array
+/// exactly as `MSET` is.
+///
+/// The header states the count before any argument is read, so this is inline
+/// or heap from the first push and never grows.
+enum Args<'a> {
+    Inline {
+        buf: [&'a [u8]; INLINE_ARGS],
+        len: usize,
+    },
+    Heap(Vec<&'a [u8]>),
+}
+
+impl<'a> Args<'a> {
+    fn with_capacity(count: usize) -> Self {
+        if count <= INLINE_ARGS {
+            Self::Inline {
+                buf: [b""; INLINE_ARGS],
+                len: 0,
+            }
+        } else {
+            Self::Heap(Vec::with_capacity(count))
+        }
+    }
+
+    fn push(&mut self, arg: &'a [u8]) {
+        match self {
+            Self::Inline { buf, len } if *len < INLINE_ARGS => {
+                buf[*len] = arg;
+                *len += 1;
+            }
+            // Unreachable by construction: the caller sizes this from the
+            // header and then pushes exactly that many. Promoting rather than
+            // indexing past the end means a later change to that loop is a
+            // slower parse instead of a panic, and this parser reads bytes from
+            // unauthenticated clients.
+            Self::Inline { buf, len } => {
+                let mut heap = Vec::with_capacity(*len + 1);
+                heap.extend_from_slice(&buf[..*len]);
+                heap.push(arg);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(heap) => heap.push(arg),
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for Args<'a> {
+    type Target = [&'a [u8]];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Inline { buf, len } => &buf[..*len],
+            Self::Heap(heap) => heap,
+        }
     }
 }
 
@@ -220,6 +294,37 @@ mod tests {
         match parse(input) {
             Ok(Outcome::Command(parsed)) => parsed,
             other => panic!("expected a command, got {other:?}"),
+        }
+    }
+
+    /// [`Args`] holds [`INLINE_ARGS`] slices inline and spills to the heap past
+    /// that, so the boundary is a seam where an off-by-one would either drop an
+    /// argument or panic. Walked across it here, one argument at a time, using
+    /// `MGET` because it is the command that accepts any number of them.
+    ///
+    /// The count is what the *parser* sees, verb included, so an `MGET` of
+    /// seven keys is the eight-argument case.
+    #[test]
+    fn arguments_survive_the_boundary_between_inline_and_heap() {
+        for key_count in 1..=(INLINE_ARGS + 4) {
+            let mut input = format!("*{}\r\n$4\r\nMGET\r\n", key_count + 1).into_bytes();
+            for i in 0..key_count {
+                let key = format!("k{i}");
+                input.extend_from_slice(format!("${}\r\n{key}\r\n", key.len()).as_bytes());
+            }
+
+            let parsed = command(&input);
+            let Command::MGet { keys } = parsed.command else {
+                panic!("expected an MGET for {key_count} keys")
+            };
+            assert_eq!(keys.len(), key_count, "wrong key count at {key_count}");
+            // The last key is the one a lost argument takes with it.
+            assert_eq!(
+                keys[key_count - 1],
+                format!("k{}", key_count - 1).as_bytes(),
+                "wrong final key at {key_count}"
+            );
+            assert_eq!(parsed.consumed, input.len());
         }
     }
 
