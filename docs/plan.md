@@ -980,6 +980,7 @@ a loopback run on this box has ±25% between identical runs, which is wider than
 | Spell reply integers into a stack buffer instead of a `String` each | memcached `VALUE` line with cas 174–187ns → 43–47ns; RESP bulk 75–82ns → 22–26ns |
 | Fuse the single-key plain memcached `get`, the one every client library sends | 384ns → 230ns at 1 KiB, of which ~75ns is the batch reply's vector and is flat in value size |
 | Take the tag registry's lock only when a record carries tags | ~15–25ns, single-threaded. The contention it was meant to remove did not measure at all — see below |
+| Hold a one-key retrieval's key inline instead of in a `Vec` (`KeyList`) | memcached `get` parse 93–116ns → 48–49ns, against an unchanged control at 46–50ns. ~100ns per command, because the parse happens twice |
 
 **The second one is the correction to M6's finding 2.** The text encoders looked expensive because
 they were measured as framing, and roughly 45ns of each integer they wrote was a malloc and a free
@@ -992,6 +993,20 @@ a contended cache line, and `read_bench` scaling only 1.14x from four threads to
 exactly like one. It is not: interleaved A/B over four pairs shows no difference at any thread
 count. The single-threaded saving is real and is just the uncontended acquire. Whatever bounds
 concurrent reads on this box, it is not that lock, and finding out what does is open.
+
+**The largest remaining cost on the text path is that a block is parsed twice.**
+`conn::measure_memcached` runs the full parser to find where each command ends, and the executor
+runs it again to execute — so a `get` pays ~50ns of decode twice, and every `set` pays its own
+decode twice. `KeyList` halved what that duplication costs but did not remove the duplication.
+
+The fix is not a second, cheaper scanner. Boundaries for the text dialects are decided by the parser
+today, and that is a **security property rather than an accident**: a framing pass that disagreed
+with the decoder about where a command ends is precisely a request-smuggling bug, and these are the
+bytes plan §13 calls out as coming from unauthenticated clients. Splitting `parse` into a `frame`
+step and a `decode` step that *shares* the boundary logic would be sound — one definition, two entry
+points — and is the shape to reach for. It is a refactor of a fuzzed parser and was not attempted
+here. VCP already has this shape and pays nothing: `peek_frame_len` reads the length header, and the
+body is decoded once.
 
 ### Measuring on this box, which took three tries to get right
 
