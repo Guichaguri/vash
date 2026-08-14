@@ -377,12 +377,25 @@ MEMCACHED_STATS_PROBES = [
     ),
     ("stats slabs", [b"stats slabs\r\n"], b"END\r\n", stat_shape),
     ("stats conns", [b"stats conns\r\n"], b"END\r\n", stat_shape),
+    # ---- cachedump ----
+    #
+    # An empty dump is byte-comparable, and so are the argument errors — where
+    # upstream distinguishes a short line from an unreadable one down to a
+    # single word. The dump of a populated class is not: upstream walks only the
+    # COLD segment of a class's LRU, so a key just written does not appear until
+    # its maintainer thread has moved it, while this server has no LRU and dumps
+    # every live key. Comparing contents would be comparing eviction policies.
+    ("stats cachedump of an empty class", [b"stats cachedump 2 10\r\n"], b"END\r\n"),
+    ("stats cachedump limit 0", [b"stats cachedump 1 0\r\n"], b"END\r\n"),
+    ("stats cachedump missing limit", [b"stats cachedump 1\r\n"], b"\r\n"),
+    ("stats cachedump no arguments", [b"stats cachedump\r\n"], b"\r\n"),
+    ("stats cachedump bad limit", [b"stats cachedump 1 abc\r\n"], b"\r\n"),
+    ("stats cachedump bad class", [b"stats cachedump abc 10\r\n"], b"\r\n"),
     # ---- deliberately refused ----
     #
-    # Upstream implements all three; the divergence is recorded rather than
-    # hidden, which is what KNOWN_DIVERGENCES is for.
+    # Upstream implements both; the divergence is recorded rather than hidden,
+    # which is what KNOWN_DIVERGENCES is for.
     ("stats reset", [b"stats reset\r\n"], b"\r\n"),
-    ("stats cachedump", [b"stats cachedump 1 10\r\n"], b"\r\n"),
     ("stats detail", [b"stats detail on\r\n"], b"\r\n"),
 ]
 
@@ -438,14 +451,16 @@ KNOWN_DIVERGENCES = {
         "at the price of `stats` and `/metrics` permanently disagreeing, and "
         "`/metrics` over a time range answers the question better."
     ),
-    ("memcached", "stats", "stats cachedump"): (
-        "Upstream's older key dump. vash serves the command that replaced it — "
-        "`lru_crawler metadump` and `mgdump` — which carries more per key and "
-        "pages the whole keyspace where cachedump returns one capped page. Its "
-        "`ITEM <key> [<b> b; <ts> s]` is also a positional format with an "
-        "unencoded key, and the keyspace here is shared with Redis and VCP "
-        "clients that can store a key holding a space or a CRLF — which would "
-        "break the line with nowhere to put an encoding."
+    ("memcached", "stats", "stats cachedump limit 0"): (
+        "The probe's subject — that a limit of 0 means *no limit* rather than "
+        "'nothing' — matches: both servers dump the class. What differs is the "
+        "`size` field, which vash reports as a constant 0. It cannot be omitted "
+        "from a positional bracket format the way a `key=value` field can be, "
+        "and carrying a real length would mean a `value_len` on every "
+        "`ListEntry` that every VCP listing pays for and never reads. "
+        "`mg <key> s` answers the size of one key without that. It is the one "
+        "place in this server where a zero is not a measurement, and "
+        "docs/protocol.md says so."
     ),
     ("memcached", "stats", "stats detail"): (
         "Per-key-prefix hit counters. The only one of these that would put work "

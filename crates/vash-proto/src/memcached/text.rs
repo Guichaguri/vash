@@ -20,6 +20,12 @@ use super::{ErrorKind, MAX_KEY_LEN, Outcome, Parsed, ProtocolError};
 /// server, so a friendlier message would read as a divergence.
 pub(crate) const BAD_LINE: &str = "bad command line format";
 
+/// What upstream answers a command line that is *short* rather than malformed —
+/// note the missing "format". Verified against 1.6.45, where
+/// `stats cachedump 1` gets this and `stats cachedump 1 abc` gets [`BAD_LINE`].
+/// A one-word difference, and the differential compares bytes.
+pub(crate) const SHORT_LINE: &str = "bad command line";
+
 pub fn parse<'a>(
     verb: &[u8],
     line: &'a [u8],
@@ -227,11 +233,9 @@ fn parse_stats<'a>(
         Some(b"reset") => {
             return Err(fail(ErrorKind::Client("stats reset is not implemented")));
         }
-        Some(b"cachedump") => {
-            return Err(fail(ErrorKind::Client(
-                "stats cachedump is not implemented; use lru_crawler metadump",
-            )));
-        }
+        // Takes arguments, so it builds its own reply rather than naming a
+        // section.
+        Some(b"cachedump") => return parse_cachedump(tokens, consumed),
         Some(b"detail") => {
             return Err(fail(ErrorKind::Client("stats detail is not implemented")));
         }
@@ -261,6 +265,62 @@ fn parse_stats<'a>(
         consumed,
         noreply: false,
         style: ResponseStyle::Stats(section),
+    }))
+}
+
+/// `stats cachedump <class> <limit>`
+///
+/// **Neither argument may be omitted**, and upstream distinguishes a short line
+/// from an unreadable one down to a single word: `stats cachedump 1` answers
+/// `bad command line` and `stats cachedump 1 abc` answers `bad command line
+/// format`. Verified against 1.6.45, and reproduced because the differential
+/// compares bytes.
+fn parse_cachedump<'a>(
+    mut tokens: impl Iterator<Item = &'a [u8]>,
+    consumed: usize,
+) -> Result<Outcome<'a>, ProtocolError> {
+    let fail = |kind: ErrorKind| ProtocolError::Recoverable {
+        response: kind,
+        consumed,
+    };
+
+    let short = || fail(ErrorKind::Client(SHORT_LINE));
+    let class = tokens.next().ok_or_else(short)?;
+    let limit = tokens.next().ok_or_else(short)?;
+
+    // Both are numeric upstream, and a non-numeric one is the *other* error.
+    let limit = parse_u64(Some(limit)).ok_or_else(|| fail(ErrorKind::Client(BAD_LINE)))?;
+    if parse_u64(Some(class)).is_none() {
+        return Err(fail(ErrorKind::Client(BAD_LINE)));
+    }
+
+    // **`0` means no limit upstream**, not "nothing" — verified against 1.6.45,
+    // where `stats cachedump 1 0` dumped the class. Resolved here so that
+    // nothing downstream carries a zero meaning the opposite of zero.
+    //
+    // Clamped rather than refused above the ceiling: this is a page size, the
+    // reply has no cursor to page with, and a client asking for more than a
+    // page can hold is asking for the page.
+    let limit = match limit {
+        0 => vash_core::MAX_LIST_LIMIT,
+        n => n.min(vash_core::MAX_LIST_LIMIT as u64) as u32,
+    };
+
+    Ok(Outcome::Command(Parsed {
+        // A key listing like the `lru_crawler` dumps, so it is one — gate,
+        // budget, liveness rule and all.
+        command: Command::ListKeys(vash_core::ListRequest {
+            limit,
+            cursor: &[],
+            pattern: &[],
+        }),
+        consumed,
+        noreply: false,
+        style: ResponseStyle::CacheDump(super::encode::CacheDump {
+            // There is one class here, so any other names something empty.
+            selected: class == super::encode::DUMP_CLASS,
+            limit,
+        }),
     }))
 }
 

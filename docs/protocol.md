@@ -1151,7 +1151,8 @@ list** is deliberately a subset. Full tables in
 | `stats conns` | One block per open connection, plus the listener. `<id>` is a **monotonic connection id, not a file descriptor** — an fd is reused the moment one closes, so the same number can mean two clients a second apart. |
 | `stats sizes` | `STAT sizes_status disabled`, which is **byte-identical** to a stock memcached: upstream tracks item sizes only under `-o track_sizes`. |
 | `stats extstore`, `stats proxy` | A bare `END`, which is what a memcached built without them answers. There is neither here. |
-| `stats reset`, `stats cachedump`, `stats detail` | `CLIENT_ERROR stats <name> is not implemented`. See below. |
+| `stats cachedump <class> <limit>` | `ITEM <key> [<size> b; <exp> s]` lines, then `END`. **`size` is always `0`** — see below. |
+| `stats reset`, `stats detail` | `CLIENT_ERROR stats <name> is not implemented`. See below. |
 | `stats sizes_enable`, `stats sizes_disable` | `ERROR` — 1.6.45 removed both verbs. |
 | anything else | `ERROR`, upstream's answer for a subcommand it does not recognise. |
 
@@ -1162,15 +1163,52 @@ offered instead, which answer the question an operator was actually asking. The
 listener does carry `state conn_listening`, which is the one value that is
 unambiguous.
 
-**The three refusals.** `stats reset` would leave `stats` and `/metrics`
-reporting different numbers for the same counter, and `/metrics` over a time
-range answers the question better. `stats cachedump` was superseded upstream by
-`lru_crawler metadump`, which is implemented, pages the whole keyspace, and can
-encode a key — where `cachedump`'s `ITEM <key> [<b> b; <ts> s]` is positional and
-unencoded, so a key holding a space would break the line. `stats detail` is the
-only one that would put work on the retrieval hot path, and upstream ships it
-disabled for that reason. Named rather than lumped into `ERROR`, so
-"deliberately not built" stays distinguishable from "not recognised".
+#### `stats cachedump`
+
+```text
+stats cachedump 1 10
+→ ITEM __MEM_INDEX_01__ [0 b; 1786683924 s]
+  ITEM teste2 [0 b; 0 s]
+  ITEM teste [0 b; 0 s]
+  END
+```
+
+Upstream's older key dump, superseded there by `lru_crawler metadump` — which is
+also served here, carries more per key, and pages the whole keyspace where this
+returns one page. Both arguments are required. A class other than `1` holds
+nothing and answers a bare `END`; a **limit of `0` means no limit**, not
+"nothing", and is capped at 1024 like every other page.
+
+`exp` is an absolute unix timestamp and **`0` means "never expires"** — note
+that `metadump` spells the same thing `-1`. That asymmetry is upstream's and is
+reproduced rather than tidied.
+
+**`size` is always `0` and must not be read.** It is the one field in this
+server that is not a measurement. The field cannot be dropped — this is a
+positional bracket format, unlike `metadump`'s `key=value` pairs, so a parser
+would break — and carrying a real length would put a value length on every
+listing entry that the native protocol pays for and never reads. `mg <key> s`
+answers the size of one key without that.
+
+Keys are percent-encoded only where they would otherwise break the line, so
+every key a memcached client could have written appears byte-identically to
+upstream. Upstream never needs to encode, because its own parser refuses to
+store a key with a space or a CRLF in it; this keyspace is shared with Redis and
+VCP clients that can.
+
+One place this server is *more* complete than upstream: `cachedump` there walks
+only the COLD segment of a class's LRU, so a freshly written key does not appear
+until the maintainer thread has moved it. There is no LRU here, so every live
+key is dumped.
+
+#### The two refusals
+
+`stats reset` would leave `stats` and `/metrics` reporting different numbers for
+the same counter, and `/metrics` over a time range answers the question better.
+`stats detail` is the only subcommand that would put work on the retrieval hot
+path, and upstream ships it disabled for that reason. Named rather than lumped
+into `ERROR`, so "deliberately not built" stays distinguishable from "not
+recognised".
 
 ### `lru_crawler`
 
@@ -1365,7 +1403,9 @@ exceptions.
 | `mg … q` on a **hit** | returns the value; `q` suppresses only the `EN` of a miss | suppresses the whole reply, hit included | `q` is one `noreply` flag across every meta command here. It is not covered by the differential suite. **Do not use `q` with `mg` against vash** — the quiet-get-then-`mn` batching idiom returns nothing. |
 | `me` output | full internal item dump | `cas`, `size`, `fetch` only | The rest describes internals vash does not have. |
 | `stats` fields | full counter set | a subset, plus `vash_*` | Reporting an unmeasured counter as zero would mislead a dashboard. |
-| `stats reset` / `cachedump` / `detail` | implemented | `CLIENT_ERROR stats <name> is not implemented` | See [`stats` subcommands](#stats-subcommands). |
+| `stats reset` / `detail` | implemented | `CLIENT_ERROR stats <name> is not implemented` | See [`stats` subcommands](#stats-subcommands). |
+| `stats cachedump` item size | the item's real size | always `0` | The field cannot be dropped from a positional format, and carrying a length would put one on every listing entry the native protocol pays for and never reads. `mg <key> s` answers it per key. |
+| `stats cachedump` coverage | the class's COLD LRU segment only | every live key in the class | There is no LRU here. Upstream's omits a key until its maintainer thread has moved it. |
 | `stats items` / `slabs` classes | one per slab class | one synthetic class, `1` | There is no slab allocator. The id matches what the dumps print as `cls=`, so tooling's discover-then-dump loop still works. |
 | `stats conns` identifiers | file descriptors, reused | monotonic connection ids | An fd is reused the moment one closes, so the same number can mean two clients a second apart. |
 | `stats conns` `state` | ten event-loop states | absent; `vash_dialect` instead | A connection here is an async task, not a position in a state machine. |

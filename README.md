@@ -369,8 +369,10 @@ classic dialect) to invalidate one. Clients that never send them are unaffected.
 `stats` reports the counters this server measures — never a plausible zero for
 one it does not — and answers `settings`, `items`, `slabs`, `conns`, `sizes`,
 `extstore` and `proxy`. The last three are byte-identical to a stock memcached,
-which leaves them empty too. `reset`, `cachedump` and `detail` are refused by
-name.
+which leaves them empty too. `cachedump` is served as well, with one documented
+exception to that rule: its item size is always `0`, because the field cannot be
+dropped from a positional format and carrying a real length would cost every
+native listing bytes it never reads. `reset` and `detail` are refused by name.
 
 Listing keys is `lru_crawler metadump` and `lru_crawler mgdump`, matching
 upstream's framing byte for byte, and both are **off by default** behind the
@@ -410,7 +412,7 @@ python tests/compat/docker_differential.py
 |---|---|---|---|
 | memcached | `memcached:1.6-alpine` | 37 | 1 |
 | memcached, authenticated | `memcached -Y authfile` | 23 | 3 |
-| memcached, `stats` subcommands | `memcached:1.6-alpine` | 11 | 3 |
+| memcached, `stats` subcommands | `memcached:1.6-alpine` | 16 | 3 |
 | Redis | `redis:7.4-alpine` | 27 | 1 |
 | Redis, authenticated | `redis --requirepass` | 21 | 1 |
 

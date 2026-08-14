@@ -37,6 +37,34 @@ pub enum ResponseStyle {
     /// An `lru_crawler` key dump. Rendered by the executor rather than here,
     /// because it pages the listing internally — see `dump_line`.
     Dump(Dump),
+    /// `stats cachedump`. Rendered by the executor for the same reason.
+    CacheDump(CacheDump),
+}
+
+/// `stats cachedump <class> <limit>` — upstream's older key dump.
+///
+/// Superseded upstream by `lru_crawler metadump`, which is also implemented
+/// here and is the better command in every respect: it pages the whole keyspace
+/// where this returns one capped page, and its `key=value` line has room for an
+/// encoding where this positional one does not.
+///
+/// Implemented anyway because older tooling calls it, and because upstream's own
+/// version is *less* complete than this one: `cachedump` walks only the COLD
+/// segment of a class's LRU, so a freshly written key does not appear until the
+/// maintainer thread has moved it — measured against 1.6.45, where two keys were
+/// invisible for several seconds after being stored. There is no LRU here, so
+/// every live key in the class is dumped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheDump {
+    /// The class argument named this server's one class.
+    pub selected: bool,
+    /// Entries to return at most, already resolved to `1..=MAX_LIST_LIMIT`.
+    ///
+    /// Upstream reads a limit of `0` as **no limit**, not as "nothing" —
+    /// verified against 1.6.45, where `stats cachedump 1 0` dumped the class.
+    /// That is resolved by the parser, so nothing downstream carries a zero
+    /// that means the opposite of zero.
+    pub limit: u32,
 }
 
 /// Which `stats` was asked for.
@@ -196,11 +224,49 @@ pub fn encode(out: &mut Vec<u8>, style: &ResponseStyle, command: &Command<'_>, r
         ResponseStyle::Meta(meta) => encode_meta(out, meta, command, reply),
 
         // Written line by line as the executor pages the listing, so there is
-        // no single `Reply` to render here. Reaching this arm means a dump was
+        // no single `Reply` to render here. Reaching either arm means a dump was
         // routed through the ordinary path; answering with the terminator keeps
         // the stream framed rather than leaving the client waiting.
         ResponseStyle::Dump(dump) => out.extend_from_slice(dump.style.terminator()),
+        ResponseStyle::CacheDump(_) => out.extend_from_slice(b"END\r\n"),
     }
+}
+
+/// Appends one `stats cachedump` line.
+///
+/// ```text
+/// ITEM session%3A01 [0 b; 1786683924 s]
+/// ```
+///
+/// **`size` is always `0` and must not be read.** The field cannot be omitted —
+/// this is a positional bracket format, unlike `metadump`'s `key=value` pairs,
+/// so dropping it would break every parser that reads the line. Carrying a real
+/// length would mean a `value_len` on every `ListEntry`, which every VCP listing
+/// would pay for and never read; `mg <key> s` answers the size of one key
+/// without that. So the field is present, constant, and documented as
+/// meaningless — the one place in this server where a zero does not mean a
+/// measurement, and it is spelled out in `docs/protocol.md` because of it.
+///
+/// `exp` is absolute unix seconds, and **`0` means "never expires"** — note that
+/// `metadump` spells the same thing `-1`. That asymmetry is upstream's, verified
+/// against 1.6.45, and is reproduced rather than tidied.
+pub fn cachedump_line(out: &mut Vec<u8>, entry: &vash_core::ListEntry) {
+    out.extend_from_slice(b"ITEM ");
+    // `Percent::Literal`, as `mgdump` uses: every printable byte passes through
+    // including `%`, so the line is byte-identical to upstream's for every key
+    // a memcached client could have written. Upstream does not encode here at
+    // all — it never has to, because its own parser refuses to store a key with
+    // a space or a CRLF in it. This keyspace is shared with Redis and VCP
+    // clients that can, and such a key would otherwise end the line early and
+    // let the rest of it be read as further items.
+    uriencode(out, &entry.name, Percent::Literal);
+
+    out.extend_from_slice(b" [0 b; ");
+    match entry.expires_at_ms {
+        Some(vash_core::NEVER) | None => out.push(b'0'),
+        Some(at) => out.extend_from_slice((at / 1_000).to_string().as_bytes()),
+    }
+    out.extend_from_slice(b" s]\r\n");
 }
 
 /// Appends `STAT <name> <value>` lines, without a terminator.

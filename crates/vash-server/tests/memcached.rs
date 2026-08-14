@@ -911,10 +911,6 @@ async fn the_unimplemented_subcommands_are_refused_by_name() {
         "CLIENT_ERROR stats reset is not implemented\r\n"
     );
     assert_eq!(
-        c.line("stats cachedump 1 10\r\n").await,
-        "CLIENT_ERROR stats cachedump is not implemented; use lru_crawler metadump\r\n"
-    );
-    assert_eq!(
         c.line("stats detail on\r\n").await,
         "CLIENT_ERROR stats detail is not implemented\r\n"
     );
@@ -1068,6 +1064,169 @@ async fn stats_slabs_reports_the_counters_a_slab_class_would_carry() {
             "{absent} describes a slab allocator"
         );
     }
+}
+
+/// `stats cachedump` — upstream's older key dump, in its positional bracket
+/// format. Superseded by `lru_crawler metadump`, and implemented because older
+/// tooling calls it.
+#[tokio::test]
+async fn cachedump_lists_keys_in_upstreams_format() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    c.line("set teste 0 0 6\r\nabcdef\r\n").await;
+    c.line("set teste2 0 900 9\r\n123456789\r\n").await;
+
+    c.send(b"stats cachedump 1 10\r\n").await;
+    let body = c.read_until("END\r\n").await;
+
+    let items: Vec<&str> = body
+        .lines()
+        .filter(|line| line.starts_with("ITEM "))
+        .collect();
+    assert_eq!(items.len(), 2, "{body:?}");
+
+    // `size` is always 0 and must not be read: the field cannot be dropped from
+    // a positional format, and carrying a real length would put a `value_len`
+    // on every `ListEntry` that every VCP listing pays for and never reads.
+    // `mg <key> s` answers the size of one key without that.
+    let never = items
+        .iter()
+        .find(|line| line.starts_with("ITEM teste "))
+        .expect("the key with no deadline");
+    assert_eq!(
+        *never, "ITEM teste [0 b; 0 s]",
+        "0 means never expires here"
+    );
+
+    // …and note that `metadump` spells the same thing `-1`. Upstream's own
+    // asymmetry, reproduced rather than tidied.
+    c.send(b"lru_crawler metadump all\r\n").await;
+    let meta = c.read_until("END\r\n").await;
+    assert!(
+        meta.contains("key=teste exp=-1 "),
+        "metadump uses -1 where cachedump uses 0: {meta:?}"
+    );
+
+    let expiring = items
+        .iter()
+        .find(|line| line.starts_with("ITEM teste2 "))
+        .expect("the key with a deadline");
+    let stamp: i64 = expiring
+        .split(' ')
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("an absolute unix stamp: {expiring:?}"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        (890..=901).contains(&(stamp - now)),
+        "expected ~900s of life, got {}",
+        stamp - now
+    );
+}
+
+#[tokio::test]
+async fn cachedump_arguments_follow_upstream() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    c.line("set k 0 0 1\r\nv\r\n").await;
+
+    // A class this server does not have holds nothing.
+    c.send(b"stats cachedump 2 10\r\n").await;
+    assert_eq!(c.read_until("END\r\n").await, "END\r\n");
+
+    // **A limit of 0 means no limit**, not "nothing" — upstream's reading,
+    // verified against 1.6.45 and caught by the differential when this was
+    // implemented the other way round.
+    c.send(b"stats cachedump 1 0\r\n").await;
+    let body = c.read_until("END\r\n").await;
+    assert_eq!(
+        body.lines().filter(|l| l.starts_with("ITEM ")).count(),
+        1,
+        "a limit of 0 dumps the class: {body:?}"
+    );
+
+    // Upstream distinguishes a short line from an unreadable one, down to the
+    // word "format". Verified against 1.6.45.
+    assert_eq!(
+        c.line("stats cachedump 1\r\n").await,
+        "CLIENT_ERROR bad command line\r\n"
+    );
+    assert_eq!(
+        c.line("stats cachedump\r\n").await,
+        "CLIENT_ERROR bad command line\r\n"
+    );
+    assert_eq!(
+        c.line("stats cachedump 1 abc\r\n").await,
+        "CLIENT_ERROR bad command line format\r\n"
+    );
+    assert_eq!(
+        c.line("stats cachedump abc 10\r\n").await,
+        "CLIENT_ERROR bad command line format\r\n"
+    );
+}
+
+#[tokio::test]
+async fn cachedump_honours_its_limit_and_the_listing_gate() {
+    let server = TestServer::start_with(listing_on).await;
+    let mut c = server.connect().await;
+    for i in 0..20 {
+        c.line(&format!("set k{i:02} 0 0 1\r\nv\r\n")).await;
+    }
+
+    c.send(b"stats cachedump 1 5\r\n").await;
+    let body = c.read_until("END\r\n").await;
+    assert_eq!(body.lines().filter(|l| l.starts_with("ITEM ")).count(), 5);
+
+    // Enumerating a keyspace is the same capability whichever command asks.
+    let closed = TestServer::start().await;
+    let mut d = closed.connect().await;
+    assert_eq!(
+        d.line("stats cachedump 1 10\r\n").await,
+        "CLIENT_ERROR command disabled by configuration\r\n"
+    );
+}
+
+/// The cross-dialect hazard, in the format least able to cope with it: `ITEM`
+/// lines are positional and upstream does not encode the key, because its own
+/// parser refuses to store one that would need it. This keyspace is shared.
+#[tokio::test]
+async fn a_key_no_memcached_client_could_write_cannot_break_a_cachedump() {
+    let server = TestServer::start_with(listing_on).await;
+
+    let mut redis = server.connect().await;
+    let hostile = "danger key\r\nITEM injected [0 b; 0 s]";
+    redis
+        .send(
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{hostile}\r\n$1\r\nv\r\n",
+                hostile.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+    assert_eq!(redis.read_until("\r\n").await, "+OK\r\n");
+
+    let mut c = server.connect().await;
+    c.send(b"stats cachedump 1 10\r\n").await;
+    let body = c.read_until("END\r\n").await;
+
+    assert_eq!(
+        body.matches("END\r\n").count(),
+        1,
+        "one terminator: {body:?}"
+    );
+    assert_eq!(
+        body.lines().filter(|l| l.starts_with("ITEM ")).count(),
+        1,
+        "one item: {body:?}"
+    );
+    assert!(
+        body.contains("ITEM danger%20key%0D%0AITEM%20injected%20[0%20b;%200%20s] [0 b; 0 s]"),
+        "encoded rather than able to inject a line: {body:?}"
+    );
 }
 
 /// Upstream allocates one chunk per item, so `used_chunks` tracks the live item

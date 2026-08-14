@@ -98,6 +98,15 @@ pub fn execute_memcached(
         return Closing::No;
     }
 
+    // `stats cachedump` is one page and writes `ITEM` lines, so it does not
+    // share the paging loop above — but it is the same listing underneath.
+    if let vash_proto::memcached::encode::ResponseStyle::CacheDump(dump) = &parsed.style {
+        if let Err(failed) = execute_cachedump(state, *dump, out) {
+            mc::encode_error(out, memcached_error(failed.status));
+        }
+        return Closing::No;
+    }
+
     // Every `stats` section except the general one describes the *server* — its
     // configuration, its connections, the shape of its storage — rather than
     // the cache. There is no storage command for those to be, so they are
@@ -322,6 +331,50 @@ fn execute_dump(
             }
         }
     }
+}
+
+/// Answers `stats cachedump <class> <limit>`.
+///
+/// One page, no acknowledgement and no cursor — the whole command is a single
+/// `LIST_KEYS`, which is why this does not share [`execute_dump`]'s loop. Gated
+/// with everything else that enumerates the keyspace; upstream gates its own
+/// behind `dump_enabled`, which is the same setting under another name.
+fn execute_cachedump(
+    state: &ServerState,
+    dump: vash_proto::memcached::encode::CacheDump,
+    out: &mut Vec<u8>,
+) -> Result<(), Failed> {
+    use vash_proto::memcached::encode as mc;
+
+    // Checked before the class and the limit, because "this command is
+    // disabled" is true regardless of either — answering `END` would say the
+    // class was merely empty.
+    listing_gate(state)?;
+
+    // A class this server does not have holds nothing, and needs no scan to say
+    // so. The limit is already resolved to a page size by the parser, so there
+    // is no zero to special-case here.
+    if !dump.selected {
+        out.extend_from_slice(b"END\r\n");
+        return Ok(());
+    }
+
+    let request = vash_core::ListRequest {
+        limit: dump.limit,
+        cursor: &[],
+        pattern: &[],
+    };
+    let reply = execute(state, &Command::ListKeys(request), Dialect::Memcached)?;
+    let Reply::Listing(page) = reply else {
+        error!("a listing produced a reply it cannot render");
+        return Err(Failed::status(Status::Internal));
+    };
+
+    for entry in &page.entries {
+        mc::cachedump_line(out, entry);
+    }
+    out.extend_from_slice(b"END\r\n");
+    Ok(())
 }
 
 fn refuse_memcached(

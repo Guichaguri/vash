@@ -8,8 +8,11 @@ Every field table below was built from two sources and checked against both: the
 upstream specification, and the bytes `memcached:1.6-alpine` (1.6.45) actually
 sends.
 
-Three subcommands stay refused — `reset`, `cachedump` and `detail` — and §9 says
-why each.
+Two subcommands stay refused — `reset` and `detail` — and §9 says why each.
+
+**`cachedump` was refused here and is now built**, on the decision that the one
+field forcing the earlier "no" — a real item size — should be reported as a
+constant `0` rather than kept out. §9 records what that costs.
 
 Two things changed while building it, both for the same reason the rest of this
 document gives:
@@ -87,14 +90,14 @@ Two corollaries worth stating, because both bit during this design:
 | `stats extstore` | Bare `END`, which is 1.6.45's answer | nothing |
 | `stats proxy` | Bare `END`, which is 1.6.45's answer | nothing |
 | `stats reset` | **Refused by name** — §9 | nothing |
-| `stats cachedump <class> <limit>` | **Refused by name** — §9 | nothing |
+| `stats cachedump <class> <limit>` | Implemented, `size` a constant `0` — §9 | nothing |
 | `stats detail on\|off\|dump` | **Refused by name** — §9 | nothing |
 | anything else | `ERROR`, which is upstream's answer | nothing |
 
-Note the last group: **seven of the thirteen forms are answered correctly
-without new state** — four because a stock memcached without the relevant
-compile-time option answers exactly what this server would, and three because
-they are refused.
+Note the last group: **six of the thirteen forms are answered correctly without
+new state** — four because a stock memcached without the relevant compile-time
+option answers exactly what this server would, and two because they are
+refused.
 
 ---
 
@@ -117,7 +120,6 @@ lands. Fields already shipped are marked ✓.
 | `total_connections` | `connections_total` | ✓ |
 | `rejected_connections` | `connections_rejected` | ✓ |
 | `accepting_conns` | `1` — the listener is never disabled; over the limit a connection is rejected, not queued | new |
-| `threads` | `store.max_blocking_threads` — the ceiling on concurrent storage work, which is the number an operator tunes | new |
 | `cmd_get` | `Get + GetMany + GetAndTouch` | ✓ |
 | `cmd_set` | `Set + SetMany` | ✓ |
 | `cmd_touch` | `Touch` | ✓ |
@@ -177,7 +179,6 @@ nearly every field is a configuration value, and this server has configuration.
 | `evictions` | `on` — capacity pressure always evicts |
 | `domain_socket` | `NULL` |
 | `shutdown_command` | `no` |
-| `num_threads` | `store.max_blocking_threads` |
 | `cas_enabled` | `yes` |
 | `auth_enabled_sasl` | `no` — SASL lives only in the binary protocol, which is a standing non-goal |
 | `auth_enabled_ascii` | `auth.required` |
@@ -204,7 +205,8 @@ needs to see:
 `vash_read_buffer`, `vash_inline_reads`, `vash_max_tags`,
 `vash_max_tags_per_record`, `vash_evict_soft`, `vash_evict_hard`,
 `vash_evict_critical`, `vash_sweep_interval_ms`, `vash_sweep_batch`,
-`vash_write_batch`, `vash_queue_depth`, `vash_scan_cursors`,
+`vash_write_batch`, `vash_queue_depth`, `vash_max_blocking_threads`,
+`vash_scan_cursors`,
 `vash_scan_cursor_ttl_ms`, `vash_memcached_enabled`, `vash_resp_enabled`,
 `vash_cluster_mode`, `vash_cluster_peers`.
 
@@ -336,13 +338,12 @@ owns. Registration and deregistration take a lock; the hot path does not.
 
 ---
 
-## 9. The three that stay refused
+## 9. `cachedump`, and the two that stay refused
 
-`stats reset`, `stats cachedump` and `stats detail` are answered
+`stats reset` and `stats detail` are answered
 
 ```text
 CLIENT_ERROR stats reset is not implemented
-CLIENT_ERROR stats cachedump is not implemented
 CLIENT_ERROR stats detail is not implemented
 ```
 
@@ -361,21 +362,54 @@ it, and it leaves `stats` and `/metrics` reporting different numbers for the sam
 thing — a discrepancy someone eventually has to be told about. `/metrics` with a
 time range is the better answer to the question it asks.
 
-**`stats cachedump`** is upstream's older key dump, and this server already
-serves the command that replaced it. Three reasons compound:
+**`stats cachedump` is built**, and this section originally argued it should not
+be. Three reasons were given; two of them turned out to be answerable and the
+third was a trade rather than an obstacle.
 
-- `lru_crawler metadump` and `mgdump` are implemented, carry more per key, and
-  page across the whole keyspace where `cachedump` returns one capped page.
-- Its `ITEM <key> [<b> b; <ts> s]` is a **positional bracket format with an
-  unencoded key**. The keyspace is shared across dialects, so a key holding a
-  space or a CRLF — which a Redis or VCP client can write — would break the
-  line, and unlike the `key=…` format there is nowhere to put an encoding.
-  Entries would have to be silently skipped.
-- Implementing it would mean putting `value_len` back on `ListEntry`, which
-  [introspection.md](introspection.md) §6 removed on the argument that `size` is
-  not in the guaranteed field set and `mg <key> s` answers it per key. **That
-  decision now stands unreversed**, and every VCP listing keeps the 8 bytes per
-  entry it would otherwise have paid.
+```text
+stats cachedump 1 10
+→ ITEM __MEM_INDEX_01__ [0 b; 1786683924 s]
+  ITEM teste [0 b; 0 s]
+  END
+```
+
+- *"`metadump` replaced it and carries more."* True, and it is still the command
+  to reach for. It is not a reason to answer an error to a tool that asks for
+  this one.
+- *"The positional format has nowhere to put an encoding, so entries would have
+  to be silently skipped."* Wrong, as it turned out. `ITEM` fields are separated
+  by spaces, so percent-encoding only the bytes that would break the line keeps
+  every key visible **and** leaves the output byte-identical to upstream's for
+  every key a memcached client could have written — upstream never has to encode
+  because its own parser refuses to store one that would need it. Same encoder
+  `mgdump` uses.
+- *"It needs `value_len` back on `ListEntry`."* This was the real one, and it is
+  resolved by **reporting `size` as a constant `0`**. The field cannot be
+  omitted — a positional bracket is not a `key=value` line — so the choice was
+  between a meaningless constant and 8 bytes on every listing entry that the
+  native protocol pays for and never reads. The constant wins, and
+  [introspection.md](introspection.md) §6 still stands unreversed.
+
+**What that costs, stated plainly:** `size` is the one field in this server that
+is not a measurement, and `0 b` looks exactly like an empty value. It is the
+deliberate exception to the rule §2 sets out, it is in `protocol.md`'s divergence
+table, and the differential records it as a known divergence rather than
+normalising it away. `mg <key> s` reports a real size for a key that needs one.
+
+Two behaviours worth recording, both found by probing 1.6.45 rather than
+reasoning:
+
+- **A limit of `0` means *no limit*, not "nothing".** An early reading had it
+  backwards — a probe returned `END` for `cachedump 1 0` and the conclusion drawn
+  was that zero selected nothing. It was returning `END` for `cachedump 1 10`
+  too, for the reason below. The differential caught the mistake.
+- **Upstream dumps only the COLD segment of a class's LRU**, so a key just
+  written is invisible until the maintainer thread has moved it — several
+  seconds, in the probe. There is no LRU here, so every live key in the class is
+  dumped, and this server's answer is the more complete one. It also means the
+  contents of a populated dump are not comparable between the two servers, which
+  is why the differential compares the empty and error cases byte for byte and
+  the populated one only for the `size` divergence.
 
 **`stats detail`** is per-key-prefix hit counters, and it is the only proposal
 here that would put work on the retrieval hot path — a hash lookup and four
@@ -422,8 +456,9 @@ external storage here and no proxy, so the empty reply is exact.
 
 ## 11. Prerequisites
 
-Three, down from six: dropping `reset`, `cachedump` and `detail` removed the
-counter baseline, the `ListEntry` field and the prefix table with them.
+Three, down from six: refusing `reset` and `detail` removed the counter
+baseline and the prefix table, and reporting `cachedump`'s `size` as a constant
+removed the `ListEntry` field it would otherwise have needed.
 
 ### P1. Per-command outcome counters
 
@@ -475,8 +510,8 @@ This is also what a future Redis `CLIENT LIST` would need, and what makes
 
 **None.** Every subcommand implemented here reads state the server already has,
 and the three that would have needed a setting are the three being refused.
-`cachedump` would have ridden `listing_enabled` with the dumps; `detail` would
-have needed an enable flag and a prefix cap.
+`cachedump` rides `listing_enabled` with the dumps; `detail` would have needed
+an enable flag and a prefix cap.
 
 ---
 
@@ -485,7 +520,8 @@ have needed an enable flag and a prefix cap.
 | Reply | When |
 |---|---|
 | `ERROR` | An unrecognised subcommand, `sizes_enable`, `sizes_disable`. Upstream's answer, and it replaces today's blanket `CLIENT_ERROR bad command line format`. |
-| `CLIENT_ERROR stats <name> is not implemented` | `reset`, `cachedump`, `detail` — recognised upstream, deliberately not built. §9. |
+| `CLIENT_ERROR stats <name> is not implemented` | `reset`, `detail` — recognised upstream, deliberately not built. §9. |
+| `CLIENT_ERROR bad command line` | `stats cachedump` missing an argument. Upstream's wording, and note the absent "format". |
 | `CLIENT_ERROR bad command line format` | A recognised subcommand given arguments it does not take. |
 | `CLIENT_ERROR unauthenticated` | Any of them before authenticating, as today. |
 | `END` | `extstore`, `proxy`, and any implemented subcommand with nothing to report. |
@@ -517,7 +553,7 @@ the fact that it exists.
 **Integration.** Each subcommand parses under `pymemcache`'s `stats()` — which
 takes an argument and is the client path these actually travel. `stats conns`
 lists a connection that exists and drops it on close. `stats reset`,
-`cachedump` and `detail` are refused by name, and an unknown subcommand is
+`reset` and `detail` are refused by name, and an unknown subcommand is
 still a bare `ERROR` — the two cases must stay distinguishable.
 
 **A test that pins the rule.** Every field name any subcommand emits is either
