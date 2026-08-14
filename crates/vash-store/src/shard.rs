@@ -64,6 +64,36 @@ pub(crate) fn shard_path(config: &StoreConfig, index: usize) -> std::path::PathB
     }
 }
 
+/// One item of a batch, and where it came from.
+pub(crate) struct Placed<'a, T> {
+    shard: usize,
+    /// Its index in the request, so its result can be put back in order.
+    pub position: usize,
+    pub item: &'a T,
+}
+
+/// A batch's items grouped by the shard that owns them.
+pub(crate) struct Grouped<'a, T> {
+    /// Every item, ordered so that one shard's items are contiguous.
+    placed: Vec<Placed<'a, T>>,
+    /// `bounds[i]..bounds[i + 1]` is shard `i`'s run. One longer than the shard
+    /// count, so the last run needs no special case.
+    bounds: Vec<usize>,
+}
+
+impl<'a, T> Grouped<'a, T> {
+    /// Each shard holding at least one item, with that shard's run.
+    ///
+    /// Empty shards are skipped rather than yielded: every caller opened by
+    /// discarding them, and a shard with nothing to do must not be sent a
+    /// transaction with nothing in it.
+    pub fn runs(&self) -> impl Iterator<Item = (usize, &[Placed<'a, T>])> {
+        (0..self.bounds.len() - 1)
+            .map(move |shard| (shard, &self.placed[self.bounds[shard]..self.bounds[shard + 1]]))
+            .filter(|(_, run)| !run.is_empty())
+    }
+}
+
 pub(crate) struct Shards {
     shards: Vec<Shard>,
 }
@@ -109,16 +139,41 @@ impl Shards {
     ///
     /// Borrows rather than copies, so it works for values as large as a whole
     /// `Set` without duplicating them.
-    pub fn group<'a, T>(
-        &self,
-        items: &'a [T],
-        key_of: impl Fn(&T) -> &[u8],
-    ) -> Vec<Vec<(usize, &'a T)>> {
-        let mut grouped: Vec<Vec<(usize, &'a T)>> = vec![Vec::new(); self.shards.len()];
-        for (position, item) in items.iter().enumerate() {
-            grouped[self.index_of(key_of(item))].push((position, item));
+    ///
+    /// One buffer holds every item, sorted so that a shard's items are
+    /// contiguous. The obvious shape — a `Vec` per shard — allocated one vector
+    /// per shard whether or not it was used, and each started empty and grew by
+    /// doubling, so a batch large enough to matter paid a reallocation every
+    /// time one of them filled. This pays two allocations regardless of the
+    /// batch size, and the sort is over a slice already sized exactly.
+    pub fn group<'a, T>(&self, items: &'a [T], key_of: impl Fn(&T) -> &[u8]) -> Grouped<'a, T> {
+        let mut placed: Vec<Placed<'a, T>> = Vec::with_capacity(items.len());
+        placed.extend(items.iter().enumerate().map(|(position, item)| Placed {
+            // Hashed once per item, here, and never again: sorting by a key
+            // that had to be recomputed would hash O(n log n) times.
+            shard: self.index_of(key_of(item)),
+            position,
+            item,
+        }));
+        placed.sort_unstable_by_key(|entry| entry.shard);
+
+        // Where each shard's run begins. Walking the sorted items once is enough
+        // to find every boundary, and starting them all at the end means a shard
+        // with nothing in it yields an empty run rather than a wrong one.
+        let count = self.shards.len();
+        let mut bounds = vec![placed.len(); count + 1];
+        for (index, entry) in placed.iter().enumerate().rev() {
+            bounds[entry.shard] = index;
         }
-        grouped
+        // A shard with no items must not inherit the *end* of the buffer, or its
+        // run would start after the run of the shard following it. Filling
+        // backwards from the tail gives every empty shard the start of the next
+        // non-empty one, which makes its run correctly empty.
+        for index in (0..count).rev() {
+            bounds[index] = bounds[index].min(bounds[index + 1]);
+        }
+
+        Grouped { placed, bounds }
     }
 
     /// Releases every environment, blocking until LMDB has let go of each.

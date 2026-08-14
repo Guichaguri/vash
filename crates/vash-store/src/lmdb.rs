@@ -84,11 +84,11 @@ impl LmdbStore {
             return Ok(());
         }
 
-        for shard_items in self.shards.group(sets, |set| set.key.as_bytes()) {
+        for (_, shard_items) in self.shards.group(sets, |set| set.key.as_bytes()).runs() {
             let mut missing: Vec<(Box<[u8]>, u64)> = Vec::new();
             let mut shard = None;
 
-            for (_, set) in &shard_items {
+            for set in shard_items.iter().map(|placed| placed.item) {
                 if set.tags.is_empty() {
                     continue;
                 }
@@ -127,21 +127,14 @@ impl LmdbStore {
         }
 
         let mut results = vec![T::default(); keys.len()];
-        for (index, group) in self
-            .shards
-            .group(keys, |key| key.as_bytes())
-            .iter()
-            .enumerate()
-        {
-            if group.is_empty() {
-                continue;
-            }
-            let shard_keys: Vec<Key<'_>> = group.iter().map(|(_, key)| **key).collect();
-            for ((position, _), value) in group
+        let grouped = self.shards.group(keys, |key| key.as_bytes());
+        for (index, group) in grouped.runs() {
+            let shard_keys: Vec<Key<'_>> = group.iter().map(|placed| *placed.item).collect();
+            for (placed, value) in group
                 .iter()
                 .zip(read(&self.shards.all()[index].engine, &shard_keys)?)
             {
-                results[*position] = value;
+                results[placed.position] = value;
             }
         }
         Ok(results)
@@ -196,15 +189,8 @@ impl Store for LmdbStore {
         self.ensure_tags_registered(sets)?;
 
         let mut results = vec![0u64; sets.len()];
-        for (index, group) in self
-            .shards
-            .group(sets, |set| set.key.as_bytes())
-            .iter()
-            .enumerate()
-        {
-            if group.is_empty() {
-                continue;
-            }
+        let grouped = self.shards.group(sets, |set| set.key.as_bytes());
+        for (index, group) in grouped.runs() {
             let shard = &self.shards.all()[index];
 
             // Encoding happens here, on the caller's thread, so the value
@@ -212,7 +198,8 @@ impl Store for LmdbStore {
             // serialising behind the writer.
             let prepared = group
                 .iter()
-                .map(|(_, set)| {
+                .map(|placed| {
+                    let set = placed.item;
                     let tags = shard.engine.tags().resolve(&set.tags).map_err(|name| {
                         crate::StoreError::Corrupt(format!(
                             "tag {name:?} vanished between registration and use"
@@ -224,8 +211,8 @@ impl Store for LmdbStore {
 
             // One transaction per shard. A batch spanning shards is therefore
             // atomic per shard, not overall — see the module note in `shard`.
-            for ((position, _), cas) in group.iter().zip(shard.writer.set_many(prepared)?) {
-                results[*position] = cas;
+            for (placed, cas) in group.iter().zip(shard.writer.set_many(prepared)?) {
+                results[placed.position] = cas;
             }
         }
         Ok(results)
@@ -307,16 +294,12 @@ impl Store for LmdbStore {
 
         // One writer round trip per shard, not one per key: a `gat` over ten
         // keys used to queue ten operations and wait for ten commits.
-        for (index, group) in self
-            .shards
-            .group(&live, |key| key.as_bytes())
-            .iter()
-            .enumerate()
-        {
-            if group.is_empty() {
-                continue;
-            }
-            let owned = group.iter().map(|(_, key)| key.as_bytes().into()).collect();
+        let grouped = self.shards.group(&live, |key| key.as_bytes());
+        for (index, group) in grouped.runs() {
+            let owned = group
+                .iter()
+                .map(|placed| placed.item.as_bytes().into())
+                .collect();
             self.shards.all()[index]
                 .writer
                 .touch_many(owned, ttl_secs)?;
@@ -335,19 +318,15 @@ impl Store for LmdbStore {
 
     fn delete_many(&self, keys: &[Key<'_>]) -> Result<Vec<bool>> {
         let mut results = vec![false; keys.len()];
-        for (index, group) in self
-            .shards
-            .group(keys, |key| key.as_bytes())
-            .iter()
-            .enumerate()
-        {
-            if group.is_empty() {
-                continue;
-            }
-            let owned = group.iter().map(|(_, key)| key.as_bytes().into()).collect();
+        let grouped = self.shards.group(keys, |key| key.as_bytes());
+        for (index, group) in grouped.runs() {
+            let owned = group
+                .iter()
+                .map(|placed| placed.item.as_bytes().into())
+                .collect();
             let hits = self.shards.all()[index].writer.delete_many(owned)?;
-            for ((position, _), hit) in group.iter().zip(hits) {
-                results[*position] = hit;
+            for (placed, hit) in group.iter().zip(hits) {
+                results[placed.position] = hit;
             }
         }
         Ok(results)

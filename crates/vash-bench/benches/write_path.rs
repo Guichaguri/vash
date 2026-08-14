@@ -42,8 +42,19 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::sharded(1)
+    }
+
+    /// A store across `shards` environments.
+    ///
+    /// The default of one is what most of these benchmarks want, but it takes
+    /// the single-shard fast path through every batch operation and so never
+    /// reaches the grouping. The server's own default resolves to
+    /// `min(cpus, 4)`, so four is the shape worth measuring.
+    fn sharded(shards: usize) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = StoreConfig {
+            shards,
             path: dir.path().join("db"),
             map_size: 1024 * 1024 * 1024,
             durability: vash_store::Durability::Ephemeral,
@@ -546,6 +557,30 @@ fn deadline_hit(bencher: divan::Bencher) {
 #[divan::bench(args = [1, 16, 128])]
 fn get_many_hits(bencher: divan::Bencher, key_count: usize) {
     let fixture = Fixture::new();
+    let value = vec![b'x'; 64];
+    let names: Vec<Vec<u8>> = (0..key_count)
+        .map(|i| format!("user:{i}:profile").into_bytes())
+        .collect();
+    for name in &names {
+        fixture.write(name, &value);
+    }
+    let keys: Vec<Key<'_>> = names.iter().map(|n| Key::new(n).expect("valid")).collect();
+
+    bencher.bench(|| {
+        divan::black_box(
+            fixture
+                .store()
+                .get_many(divan::black_box(&keys))
+                .expect("read"),
+        )
+    });
+}
+
+/// A multi-get across four shards, which is where the batch grouping lives: the
+/// single-shard store short-circuits past it entirely.
+#[divan::bench(args = [4, 16, 128])]
+fn get_many_sharded(bencher: divan::Bencher, key_count: usize) {
+    let fixture = Fixture::sharded(4);
     let value = vec![b'x'; 64];
     let names: Vec<Vec<u8>> = (0..key_count)
         .map(|i| format!("user:{i}:profile").into_bytes())

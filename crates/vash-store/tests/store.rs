@@ -1231,6 +1231,59 @@ fn batches_are_reassembled_into_request_order_across_shards() {
 }
 
 #[test]
+fn a_batch_smaller_than_the_shard_count_still_lands_in_order() {
+    // The test above uses more keys than shards, so every shard has work and the
+    // empty case never arises. A batch this small leaves most of them with
+    // nothing, which is where grouping goes wrong: an empty shard whose run is
+    // computed from the wrong end of the buffer either swallows another shard's
+    // items or hands back a slice that overlaps one.
+    let h = Harness::with(|c| c.shards = 8);
+
+    for count in [1usize, 2, 3] {
+        let names: Vec<String> = (0..count).map(|i| format!("small{count}-{i}")).collect();
+        let sets: Vec<Set<'_>> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Set {
+                key: Key::new(name.as_bytes()).unwrap(),
+                // Distinct per position, so a result landing in the wrong slot
+                // is visible rather than accidentally equal.
+                value: name.as_bytes(),
+                ttl: vash_core::TtlChange::Set(0),
+                return_previous: false,
+                mc_flags: 0,
+                tags: Vec::new(),
+                mode: vash_core::SetMode::Set,
+            })
+            .chain(std::iter::empty())
+            .collect();
+        assert_eq!(sets.len(), count);
+
+        let cas = h.store().set_many(&sets).unwrap();
+        assert_eq!(cas.len(), count, "one token per set, in request order");
+        assert!(cas.iter().all(|token| *token > 0));
+
+        let keys: Vec<Key<'_>> = names
+            .iter()
+            .map(|n| Key::new(n.as_bytes()).unwrap())
+            .collect();
+        let values = h.store().get_many(&keys).unwrap();
+        for (i, value) in values.iter().enumerate() {
+            assert_eq!(
+                value.as_ref().map(|v| v.data.to_vec()).as_deref(),
+                Some(names[i].as_bytes()),
+                "{} keys: position {i} came back holding the wrong value",
+                count
+            );
+        }
+
+        let hits = h.store().delete_many(&keys).unwrap();
+        assert_eq!(hits.len(), count);
+        assert!(hits.iter().all(|hit| *hit), "every key was there to delete");
+    }
+}
+
+#[test]
 fn cas_tokens_are_unique_across_shards() {
     use std::collections::HashSet;
 
