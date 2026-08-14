@@ -136,20 +136,58 @@ pub fn execute_memcached(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // The fused read path, which in this dialect is `mg` alone: plain `get` is
-    // a multi-key retrieval even when it names one key, and stays on the
-    // `Reply` path. A `T` flag turns `mg` into a get-and-touch, which writes —
-    // the parser renders that as `GetAndTouch`, so matching the command rather
-    // than the style is what keeps this off the write path.
+    // A plain `get` or `gets` naming exactly one key. That is what every
+    // memcached client library sends for a single-key read — `pymemcache`'s
+    // `get`, `libmemcached`'s `memcached_get` — so it is the most executed
+    // command this server has, and it was on the copying path purely because
+    // the *grammar* admits more than one key.
+    //
+    // Only the one-key case fuses. A genuine multi-key `get` cannot: its keys
+    // are grouped by shard before they are read, so the values come back out of
+    // request order, and putting them back in order is what the `Vec` this
+    // avoids is for.
+    //
+    // `GetAndTouch` shares this response style and must not come through here —
+    // it writes. Matching the command rather than the style is what excludes
+    // it, exactly as it is for `mg` below.
+    if let vash_proto::memcached::encode::ResponseStyle::Retrieval { with_cas } = parsed.style
+        && let Command::GetMany(keys) = &parsed.command
+        && let [key] = keys.as_slice()
+        && !parsed.noreply
+    {
+        let rendered = execute_get_into(
+            state,
+            *key,
+            CommandKind::GetMany,
+            Dialect::Memcached,
+            &mut |value| mc::encode_value_line(out, with_cas, key.as_bytes(), value),
+        );
+        match rendered {
+            // A miss writes no `VALUE` line at all — memcached omits misses
+            // rather than reporting them — so both outcomes end the same way.
+            Ok(_) => out.extend_from_slice(mc::RETRIEVAL_END),
+            Err(failed) => mc::encode_error(out, memcached_error(failed.status)),
+        }
+        return Closing::No;
+    }
+
+    // The fused read path for the meta dialect, which is `mg` alone. A `T` flag
+    // turns `mg` into a get-and-touch, which writes — the parser renders that
+    // as `GetAndTouch`, so matching the command rather than the style is what
+    // keeps this off the write path.
     if let vash_proto::memcached::encode::ResponseStyle::Meta(
         vash_proto::memcached::encode::MetaStyle::Get(flags),
     ) = &parsed.style
         && let Command::Get { key } = parsed.command
         && !parsed.noreply
     {
-        let rendered = execute_get_into(state, key, Dialect::Memcached, &mut |value| {
-            mc::encode_meta_get_hit(out, flags, &parsed.command, value)
-        });
+        let rendered = execute_get_into(
+            state,
+            key,
+            CommandKind::Get,
+            Dialect::Memcached,
+            &mut |value| mc::encode_meta_get_hit(out, flags, &parsed.command, value),
+        );
         match rendered {
             Ok(true) => {}
             Ok(false) => out.extend_from_slice(b"EN\r\n"),
@@ -547,9 +585,10 @@ pub fn execute_frame_into(
                 && !request.no_reply
             {
                 let (opcode, request_id) = (request.opcode, request.request_id);
-                let rendered = execute_get_into(state, key, Dialect::Vcp, &mut |value| {
-                    vash_proto::vcp::encode::encode_value(out, opcode, request_id, value)
-                });
+                let rendered =
+                    execute_get_into(state, key, CommandKind::Get, Dialect::Vcp, &mut |value| {
+                        vash_proto::vcp::encode::encode_value(out, opcode, request_id, value)
+                    });
                 match rendered {
                     Ok(true) => {}
                     // Through `encode_reply` rather than writing the status
@@ -763,14 +802,22 @@ fn offset_to_store_ttl(
 /// The cost of stepping around that boundary is that the counting `execute`
 /// does has to be reproduced here. For a `GET` that is exactly two things — the
 /// command histogram and the hit/miss split — because [`Outcomes::observe`] has
-/// no `Command::Get` arm. That is load-bearing rather than lucky, so
+/// no `Command::Get` arm, and none for `Command::GetMany` either. That is
+/// load-bearing rather than lucky, so
 /// `metrics::tests::observe_has_nothing_to_say_about_a_get` fails if anyone
 /// adds one.
+///
+/// `kind` is which histogram to charge, and is **not** always
+/// [`CommandKind::Get`]: a plain memcached `get` naming one key comes through
+/// here too, and it is a `get_many` as far as an operator reading `stats` is
+/// concerned. Taking it as an argument is what keeps the fused path from
+/// quietly moving a command from one counter to another.
 ///
 /// [`Outcomes::observe`]: crate::metrics::Outcomes::observe
 pub fn execute_get_into(
     state: &ServerState,
     key: vash_core::Key<'_>,
+    kind: CommandKind,
     dialect: Dialect,
     render: &mut dyn FnMut(vash_core::ValueRef<'_>),
 ) -> Result<bool, Failed> {
@@ -782,7 +829,7 @@ pub fn execute_get_into(
     state
         .metrics
         .commands
-        .observe(CommandKind::Get, dialect, started.elapsed());
+        .observe(kind, dialect, started.elapsed());
 
     let hit = outcome.map_err(to_failed)?;
     state.metrics.read(u64::from(hit), u64::from(!hit));

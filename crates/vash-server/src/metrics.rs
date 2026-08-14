@@ -977,6 +977,12 @@ mod tests {
     /// Adding a `Get` arm to `observe` would therefore silently stop counting
     /// whatever it counted, on every `GET` the server serves. This fails first
     /// instead.
+    ///
+    /// `Command::GetMany` is held to the same rule, because a plain memcached
+    /// `get` naming one key is fused as well and arrives as one — see the
+    /// retrieval branch of `dispatch::execute_memcached`. A `GetMany` arm here
+    /// would be lost for exactly the single-key reads that matter most, and
+    /// kept for the multi-key ones, which is the worst of both.
     #[test]
     fn observe_has_nothing_to_say_about_a_get() {
         let rendered = |metrics: &ServerMetrics| {
@@ -1000,18 +1006,25 @@ mod tests {
         };
         metrics
             .outcomes
-            .observe(&Command::Get { key }, &Reply::Value(value));
+            .observe(&Command::Get { key }, &Reply::Value(value.clone()));
         metrics
             .outcomes
             .observe(&Command::Get { key }, &Reply::NotFound);
 
+        // The single-key `get` the memcached path fuses, in both outcomes.
+        let one = Command::GetMany(vec![key]);
+        metrics
+            .outcomes
+            .observe(&one, &Reply::Values(vec![Some(value)]));
+        metrics.outcomes.observe(&one, &Reply::Values(vec![None]));
+
         assert_eq!(
             before,
             rendered(&metrics),
-            "observe now counts something for a GET, which the fused read path \
-             in dispatch::execute_get_into bypasses -- that counting would be \
-             silently lost. Either count it in execute_get_into too, or take \
-             GET off the fused path."
+            "observe now counts something for a GET or a one-key GET_MANY, \
+             which the fused read path in dispatch::execute_get_into bypasses \
+             -- that counting would be silently lost. Either count it in \
+             execute_get_into too, or take that command off the fused path."
         );
     }
 

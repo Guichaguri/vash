@@ -266,7 +266,7 @@ fn resp_encode_bulk_reusing_the_buffer(bencher: divan::Bencher) {
 
 /// Today's path: `get` copies the value out of the map, then the encoder copies
 /// it into the write buffer.
-#[divan::bench(args = [64, 1024, 4096, 16384])]
+#[divan::bench(args = [64, 1024, 4096, 16384], sample_size = 500)]
 fn read_copy_then_encode(bencher: divan::Bencher, value_len: usize) {
     let store = ReadFixture::new(value_len);
     let key = vash_core::Key::from_stored(ReadFixture::KEY);
@@ -284,9 +284,32 @@ fn read_copy_then_encode(bencher: divan::Bencher, value_len: usize) {
     });
 }
 
+/// What a plain memcached `get` naming one key used to do: a batch read, whose
+/// reply is a `Vec<Option<Value>>` — so the copy above plus a heap allocation
+/// for the vector and the `Option` slot holding it.
+///
+/// This is the single most executed command the server serves, because it is
+/// what every memcached client library sends for a one-key read. It was on this
+/// path only because the grammar admits more than one key.
+#[divan::bench(args = [64, 1024, 4096, 16384], sample_size = 500)]
+fn read_batch_of_one_then_encode(bencher: divan::Bencher, value_len: usize) {
+    let store = ReadFixture::new(value_len);
+    let keys = [vash_core::Key::from_stored(ReadFixture::KEY)];
+
+    let mut out = Vec::with_capacity(value_len + 64);
+    bencher.bench_local(|| {
+        out.clear();
+        let values = vash_store::Store::get_many(&store.store, divan::black_box(&keys)).unwrap();
+        for value in values.into_iter().flatten() {
+            out.extend_from_slice(&value.data);
+        }
+        divan::black_box(out.len())
+    });
+}
+
 /// The proposed path: the value is appended straight out of the map, inside the
 /// read transaction, and never lands in a `Value` at all.
-#[divan::bench(args = [64, 1024, 4096, 16384])]
+#[divan::bench(args = [64, 1024, 4096, 16384], sample_size = 500)]
 fn read_encode_in_txn(bencher: divan::Bencher, value_len: usize) {
     let store = ReadFixture::new(value_len);
     let key = vash_core::Key::from_stored(ReadFixture::KEY);

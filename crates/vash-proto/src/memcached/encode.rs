@@ -367,6 +367,41 @@ fn uriencode(out: &mut Vec<u8>, key: &[u8], percent: Percent) {
     }
 }
 
+/// What terminates a retrieval reply, whether or not anything was found.
+///
+/// Public because the fused single-key `get` writes it itself — see
+/// [`encode_value_line`].
+pub const RETRIEVAL_END: &[u8] = b"END\r\n";
+
+/// One `VALUE` line: the header, then the data, then the terminator that
+/// separates it from the next line.
+///
+/// Takes a [`ValueRef`] rather than a [`Value`] so the fused single-key `get`
+/// in `vash_server::dispatch` can render straight out of the read transaction,
+/// where there is no `Value` and never will be. Batch retrievals reach it
+/// through [`Value::borrowed`].
+///
+/// **One definition on purpose.** Two renderings of a `VALUE` line — one for
+/// the batch path and one for the fused single-key path — would agree on the
+/// day they were written and drift by the next release, and the drift would be
+/// a wire-format difference between `get k` and `get k1 k2` that only a real
+/// client would notice.
+pub fn encode_value_line(out: &mut Vec<u8>, with_cas: bool, key: &[u8], value: ValueRef<'_>) {
+    out.extend_from_slice(b"VALUE ");
+    out.extend_from_slice(key);
+    out.push(b' ');
+    push_u64(out, u64::from(value.mc_flags));
+    out.push(b' ');
+    push_u64(out, value.data.len() as u64);
+    if with_cas {
+        out.push(b' ');
+        push_u64(out, value.cas);
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(value.data);
+    out.extend_from_slice(b"\r\n");
+}
+
 fn encode_retrieval(out: &mut Vec<u8>, with_cas: bool, command: &Command<'_>, reply: &Reply) {
     let keys = match command {
         Command::GetMany(keys) | Command::GetAndTouch { keys, .. } => keys.as_slice(),
@@ -378,22 +413,10 @@ fn encode_retrieval(out: &mut Vec<u8>, with_cas: bool, command: &Command<'_>, re
     if let Reply::Values(values) = reply {
         for (key, value) in keys.iter().zip(values) {
             let Some(value) = value else { continue };
-            out.extend_from_slice(b"VALUE ");
-            out.extend_from_slice(key.as_bytes());
-            out.push(b' ');
-            push_u64(out, u64::from(value.mc_flags));
-            out.push(b' ');
-            push_u64(out, value.data.len() as u64);
-            if with_cas {
-                out.push(b' ');
-                push_u64(out, value.cas);
-            }
-            out.extend_from_slice(b"\r\n");
-            out.extend_from_slice(&value.data);
-            out.extend_from_slice(b"\r\n");
+            encode_value_line(out, with_cas, key.as_bytes(), value.borrowed());
         }
     }
-    out.extend_from_slice(b"END\r\n");
+    out.extend_from_slice(RETRIEVAL_END);
 }
 
 fn encode_meta(out: &mut Vec<u8>, style: &MetaStyle, command: &Command<'_>, reply: &Reply) {

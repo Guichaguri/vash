@@ -420,6 +420,7 @@ fn run(
             let hit = crate::dispatch::execute_get_into(
                 state,
                 key_of(key)?,
+                crate::metrics::CommandKind::Get,
                 crate::metrics::Dialect::Resp,
                 &mut |value| encode::bulk(out, value.data),
             )
