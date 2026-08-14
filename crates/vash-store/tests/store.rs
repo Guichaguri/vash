@@ -1832,6 +1832,37 @@ fn writing_over_an_expired_record_clears_the_rows_it_left() {
         "one row for the counter and one for the appended key, and no leftovers"
     );
     assert_eq!(h.tag_index_entries(), 0);
+
+    // And for a guarded write, which reads the record to judge its guard and
+    // carries that read forward. `add` is the sharpest case: it applies only
+    // because the expired record reads as absent, so the very thing that lets
+    // the write through is the thing that hides the rows it has to clear.
+    h.set_tagged(b"g", b"x", 1, &[b"news"]);
+    std::thread::sleep(Duration::from_millis(1_200));
+    let written = h
+        .store()
+        .store(&Set {
+            key: Key::new(b"g").unwrap(),
+            value: b"fresh",
+            ttl: vash_core::TtlChange::Set(0),
+            return_previous: false,
+            mc_flags: 0,
+            tags: Vec::new(),
+            mode: vash_core::SetMode::Add,
+        })
+        .unwrap();
+    assert!(
+        matches!(written.outcome, vash_core::Stored::Stored(_)),
+        "an expired key reads as absent, so `add` applies: {:?}",
+        written.outcome
+    );
+
+    assert_eq!(
+        h.expiry_entries(),
+        3,
+        "the guarded write must clear the expired record's row too"
+    );
+    assert_eq!(h.tag_index_entries(), 0);
 }
 
 #[test]

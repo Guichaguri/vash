@@ -45,6 +45,9 @@ pub struct PreparedSet {
     pub tags: Vec<TagRef>,
     /// Capture what the key held before replacing it (Redis `SET … GET`).
     pub return_previous: bool,
+    /// The record being replaced, when the caller has already read it. See
+    /// [`PreRead`]; `None` everywhere except the conditional path.
+    pre_read: Option<PreRead>,
 }
 
 /// What a guarded write did, and what it displaced.
@@ -54,6 +57,69 @@ pub struct Written {
     /// The value the key held beforehand, when the write asked for it. Always
     /// `None` otherwise, which is why the caller has to know what it requested.
     pub previous: Option<Value>,
+}
+
+/// The index rows a stored record owns, which a write over it has to clear.
+///
+/// Taken off a record the caller already has in hand. Owned rather than
+/// borrowed because clearing them needs the transaction mutably, which would end
+/// any borrow of the memory map.
+#[derive(Debug, Clone)]
+struct IndexRows {
+    expires_at_ms: u64,
+    cas: u64,
+    tag_ids: Vec<u32>,
+}
+
+impl IndexRows {
+    fn of(record: &RecordRef<'_>) -> Self {
+        Self {
+            expires_at_ms: record.expires_at_ms(),
+            cas: record.cas(),
+            tag_ids: record.tags.iter().map(|t| t.tag_id.get()).collect(),
+        }
+    }
+}
+
+/// A read of the record being replaced, performed by the caller rather than by
+/// [`LmdbEngine::apply_set`].
+///
+/// **This exists for one caller**, [`LmdbEngine::apply_conditional_set`], and
+/// for one reason: it has to read the record to judge its guard, and on
+/// `SET … GET` the value was then copied out of the map a second time by
+/// `displace`. Two copies of a value the client asked for once.
+///
+/// It is not worth doing for the sake of the *lookup* alone. The second descent
+/// is into the same key in the same transaction microseconds after the first, so
+/// its pages are always warm — that was measured, on a keyspace large enough for
+/// a descent to cost real memory traffic, and it never rose above the noise. The
+/// copy is what pays.
+struct PreRead {
+    /// Rows to clear, or `None` when the key held nothing at all.
+    ///
+    /// **Presence, not liveness.** A record that has expired or been invalidated
+    /// still owns its index rows, and a write over it still has to clear them or
+    /// they outlive the record they describe. That is why this comes from
+    /// [`LmdbEngine::read_for_update`] and not from the liveness check, which
+    /// cannot tell an empty key from a dead one.
+    rows: Option<IndexRows>,
+    /// Everything [`LmdbEngine::apply_set`] would otherwise have read the record
+    /// again to work out.
+    displaced: Displaced,
+}
+
+/// A record found under a key, and whether a client would still be served it.
+#[derive(Clone, Copy)]
+struct Found<'t> {
+    record: RecordRef<'t>,
+    live: bool,
+}
+
+impl<'t> Found<'t> {
+    /// The record as a client sees it: absent once it is dead.
+    fn live(self) -> Option<RecordRef<'t>> {
+        self.live.then_some(self.record)
+    }
 }
 
 /// What the record an overwrite replaced was holding.
@@ -117,6 +183,9 @@ impl LmdbEngine {
             ttl: set.ttl,
             tags,
             return_previous: set.return_previous,
+            // Nothing has read the key here: this runs on the caller's thread,
+            // outside any transaction.
+            pre_read: None,
         })
     }
 
@@ -161,9 +230,9 @@ impl LmdbEngine {
         };
         let record = RecordRef::parse(blob)?;
 
-        let expires_at_ms = record.expires_at_ms();
-        let cas = record.cas();
-        let tag_ids: Vec<u32> = record.tags.iter().map(|t| t.tag_id.get()).collect();
+        let rows = IndexRows::of(&record);
+        let expires_at_ms = rows.expires_at_ms;
+        let cas = rows.cas;
 
         // Everything the caller learns is gathered before the deletes below,
         // because those need the transaction mutably and would end this borrow
@@ -185,20 +254,29 @@ impl LmdbEngine {
             }
         };
 
+        self.clear_index_rows(wtxn, key, &rows)?;
+        Ok(displaced)
+    }
+
+    /// Removes the expiry and tag index rows a record owned.
+    ///
+    /// The half of [`Self::displace`] that reads nothing, so a caller holding
+    /// [`IndexRows`] from its own read can reach it without a second lookup.
+    fn clear_index_rows(&self, wtxn: &mut RwTxn, key: &[u8], rows: &IndexRows) -> Result<()> {
         // Every record is indexed, including those that never expire, so the
         // delete is unconditional too.
-        let index_key = crate::expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms);
+        let index_key =
+            crate::expiry::encode_key(rows.expires_at_ms, rows.cas, self.bucket_granularity_ms);
         self.exp
             .delete(wtxn, &index_key)
             .map_err(StoreError::from_heed)?;
 
-        for tag_id in tag_ids {
+        for tag_id in &rows.tag_ids {
             self.tagidx
-                .delete(wtxn, &reclaim::index_key(tag_id, key))
+                .delete(wtxn, &reclaim::index_key(*tag_id, key))
                 .map_err(StoreError::from_heed)?;
         }
-
-        Ok(displaced)
+        Ok(())
     }
 
     /// Reads the record currently under `key`, if it is live.
@@ -207,16 +285,26 @@ impl LmdbEngine {
     /// an expired-but-unswept record counts as absent. Otherwise `add` would
     /// fail against a key that reads as a miss.
     fn live_record<'t>(&self, wtxn: &'t RwTxn, key: &[u8]) -> Result<Option<RecordRef<'t>>> {
+        Ok(self.read_for_update(wtxn, key)?.and_then(Found::live))
+    }
+
+    /// Reads the record under `key`, keeping *present* and *live* apart.
+    ///
+    /// [`Self::live_record`] answers the question a client's semantics ask, and
+    /// folds "the key held nothing" together with "the key held something dead"
+    /// because a client cannot tell them apart. A write can: the dead record is
+    /// still on disk and still owns index rows it must clear. A caller building
+    /// a [`PreRead`] has to come through here, or a write over an expired record
+    /// leaves that record's expiry and tag rows behind.
+    fn read_for_update<'t>(&self, wtxn: &'t RwTxn, key: &[u8]) -> Result<Option<Found<'t>>> {
         let Some(blob) = self.main.get(wtxn, key).map_err(StoreError::from_heed)? else {
             return Ok(None);
         };
         let record = RecordRef::parse(blob)?;
 
         let lookup = self.tags.lookup();
-        if !record.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id)) {
-            return Ok(None);
-        }
-        Ok(Some(record))
+        let live = record.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id));
+        Ok(Some(Found { record, live }))
     }
 
     /// Evaluates a conditional write's guard, and for the concatenating modes
@@ -236,15 +324,48 @@ impl LmdbEngine {
         // the shard's single writer thread and thrown away unread. The header
         // fields below are what the guards actually judge, and they are three
         // integers.
-        let wants_value =
-            prepared.return_previous || matches!(mode, SetMode::Append | SetMode::Prepend);
-        let existing = self.live_record(wtxn, &prepared.key)?.map(|r| {
+        //
+        // `Bytes` rather than a `Vec`, because on `SET … GET` this same value is
+        // also what the write reports back, and a `Bytes` is shared by refcount
+        // rather than copied again. That second copy is what this read is
+        // carried forward to avoid: `displace` used to take its own, so a
+        // successful `SET … GET` copied the old value out of the map twice —
+        // once for a refusal that did not happen, and once for the reply.
+        let concatenating = matches!(mode, SetMode::Append | SetMode::Prepend);
+        let wants_value = prepared.return_previous || concatenating;
+
+        let found = self.read_for_update(wtxn, &prepared.key)?;
+        // From the record as *found*, so a write over an expired one still
+        // clears what it left behind — see [`PreRead::rows`].
+        let rows = found.map(|f| IndexRows::of(&f.record));
+        let existing = found.and_then(Found::live).map(|r| {
             (
                 r.cas(),
                 r.mc_flags(),
                 r.expires_at_ms(),
-                wants_value.then(|| r.value.to_vec()),
+                wants_value.then(|| Bytes::copy_from_slice(r.value)),
             )
+        });
+
+        // Assembled here, while the record is still in hand, and handed to
+        // `apply_set` below in place of the lookup it would otherwise do.
+        // `previous` is filled only when the client asked for it, never merely
+        // because a concatenation needed the bytes.
+        prepared.pre_read = Some(PreRead {
+            rows,
+            displaced: Displaced {
+                live: existing.is_some(),
+                deadline: existing.as_ref().map(|(_, _, expires_at_ms, _)| *expires_at_ms),
+                previous: match (&existing, prepared.return_previous) {
+                    (Some((cas, mc_flags, expires_at_ms, Some(value))), true) => Some(Value {
+                        data: value.clone(),
+                        mc_flags: *mc_flags,
+                        cas: *cas,
+                        expires_at_ms: Some(*expires_at_ms),
+                    }),
+                    _ => None,
+                },
+            },
         });
 
         // A guard that refuses the write still has to answer `SET … GET`, which
@@ -259,7 +380,7 @@ impl LmdbEngine {
                 // drift apart.
                 previous: match (&existing, prepared.return_previous) {
                     (Some((cas, mc_flags, expires_at_ms, Some(value))), true) => Some(Value {
-                        data: Bytes::copy_from_slice(value),
+                        data: value.clone(),
                         mc_flags: *mc_flags,
                         cas: *cas,
                         expires_at_ms: Some(*expires_at_ms),
@@ -365,6 +486,7 @@ impl LmdbEngine {
             ttl: TtlChange::Keep,
             tags,
             return_previous: false,
+            pre_read: None,
         };
         self.apply_set(wtxn, &mut prepared)
             .map(|applied| applied.cas)
@@ -579,7 +701,15 @@ impl LmdbEngine {
         let cas = self.next_cas(wtxn)?;
         patch_cas(&mut prepared.record, cas)?;
 
-        let displaced = self.displace(wtxn, &prepared.key, prepared.return_previous)?;
+        let displaced = match prepared.pre_read.take() {
+            None => self.displace(wtxn, &prepared.key, prepared.return_previous)?,
+            Some(pre) => {
+                if let Some(rows) = &pre.rows {
+                    self.clear_index_rows(wtxn, &prepared.key, rows)?;
+                }
+                pre.displaced
+            }
+        };
 
         // A deadline `prepare_set` could not settle off-thread is settled here,
         // against the record this write is replacing, and patched into the
@@ -681,6 +811,7 @@ impl LmdbEngine {
             ttl: TtlChange::Set(ttl_secs),
             tags,
             return_previous: false,
+            pre_read: None,
         };
         self.apply_set(wtxn, &mut prepared)?;
 

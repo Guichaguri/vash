@@ -145,6 +145,29 @@ fn overwrite_existing(bencher: divan::Bencher, value_len: usize) {
     });
 }
 
+/// `SET k v GET` over a key that already holds a value: Redis's set-and-return.
+///
+/// The one write that legitimately wants the displaced value, and so the one
+/// where it matters how many times that value is copied out of the map. The
+/// `overwrite_existing` benchmark above is the same write without `GET`, which
+/// wants no copy at all — read the two together.
+#[divan::bench(args = [1024, 65536])]
+fn set_get_over_existing(bencher: divan::Bencher, value_len: usize) {
+    let fixture = Fixture::new();
+    let value = vec![b'x'; value_len];
+    fixture.write(b"hot", &value);
+
+    bencher.bench(|| {
+        let mut set = set_of(b"hot", divan::black_box(&value), SetMode::Set);
+        set.return_previous = true;
+        let written = fixture.store().store(&set).expect("stored");
+        // Asserted, not assumed: a benchmark that quietly stopped returning the
+        // value would be measuring the cheaper path and reporting a win.
+        debug_assert!(written.previous.is_some());
+        divan::black_box(written)
+    });
+}
+
 /// An untagged single write through the batch entry point, which is where the
 /// tag registration scan sits.
 #[divan::bench]
