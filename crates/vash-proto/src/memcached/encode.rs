@@ -10,6 +10,7 @@ use vash_core::{Command, Reply, Stored, Value, ValueRef};
 
 use super::ErrorKind;
 use super::meta::MetaFlags;
+use crate::digits::{push_i64, push_u64};
 
 /// How to render the reply to a particular command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,7 +265,7 @@ pub fn cachedump_line(out: &mut Vec<u8>, entry: &vash_core::ListEntry) {
     out.extend_from_slice(b" [0 b; ");
     match entry.expires_at_ms {
         Some(vash_core::NEVER) | None => out.push(b'0'),
-        Some(at) => out.extend_from_slice((at / 1_000).to_string().as_bytes()),
+        Some(at) => push_u64(out, at / 1_000),
     }
     out.extend_from_slice(b" s]\r\n");
 }
@@ -316,11 +317,11 @@ pub fn dump_line(out: &mut Vec<u8>, style: DumpStyle, entry: &vash_core::ListEnt
                 // `-1` is upstream's "never expires" in this line, and the same
                 // convention `Value::remaining_ttl_secs` already uses.
                 Some(vash_core::NEVER) | None => out.extend_from_slice(b"-1"),
-                Some(at) => out.extend_from_slice((at / 1_000).to_string().as_bytes()),
+                Some(at) => push_u64(out, at / 1_000),
             }
 
             out.extend_from_slice(b" cas=");
-            out.extend_from_slice(entry.version.to_string().as_bytes());
+            push_u64(out, entry.version);
 
             out.extend_from_slice(b" cls=");
             out.extend_from_slice(DUMP_CLASS);
@@ -380,12 +381,12 @@ fn encode_retrieval(out: &mut Vec<u8>, with_cas: bool, command: &Command<'_>, re
             out.extend_from_slice(b"VALUE ");
             out.extend_from_slice(key.as_bytes());
             out.push(b' ');
-            out.extend_from_slice(value.mc_flags.to_string().as_bytes());
+            push_u64(out, u64::from(value.mc_flags));
             out.push(b' ');
-            out.extend_from_slice(value.data.len().to_string().as_bytes());
+            push_u64(out, value.data.len() as u64);
             if with_cas {
                 out.push(b' ');
-                out.extend_from_slice(value.cas.to_string().as_bytes());
+                push_u64(out, value.cas);
             }
             out.extend_from_slice(b"\r\n");
             out.extend_from_slice(&value.data);
@@ -423,7 +424,7 @@ fn encode_meta(out: &mut Vec<u8>, style: &MetaStyle, command: &Command<'_>, repl
                     out.extend_from_slice(b"HD");
                     if flags.want_cas {
                         out.extend_from_slice(b" c");
-                        out.extend_from_slice(cas.to_string().as_bytes());
+                        push_u64(out, *cas);
                     }
                     write_key_and_opaque(out, flags, command);
                 }
@@ -451,7 +452,7 @@ fn encode_meta(out: &mut Vec<u8>, style: &MetaStyle, command: &Command<'_>, repl
                 let text = applied.value.to_text();
                 if flags.want_value {
                     out.extend_from_slice(b"VA ");
-                    out.extend_from_slice(text.len().to_string().as_bytes());
+                    push_u64(out, text.len() as u64);
                     write_key_and_opaque(out, flags, command);
                     out.extend_from_slice(b"\r\n");
                     out.extend_from_slice(text.as_bytes());
@@ -469,9 +470,9 @@ fn encode_meta(out: &mut Vec<u8>, style: &MetaStyle, command: &Command<'_>, repl
                 out.extend_from_slice(b"ME ");
                 out.extend_from_slice(command_key(command).unwrap_or(b""));
                 out.extend_from_slice(b" cas=");
-                out.extend_from_slice(value.cas.to_string().as_bytes());
+                push_u64(out, value.cas);
                 out.extend_from_slice(b" size=");
-                out.extend_from_slice(value.data.len().to_string().as_bytes());
+                push_u64(out, value.data.len() as u64);
                 out.extend_from_slice(b" fetch=yes\r\n");
             }
             _ => out.extend_from_slice(b"EN\r\n"),
@@ -494,7 +495,7 @@ pub fn encode_meta_get_hit(
 ) {
     if flags.want_value {
         out.extend_from_slice(b"VA ");
-        out.extend_from_slice(value.data.len().to_string().as_bytes());
+        push_u64(out, value.data.len() as u64);
     } else {
         out.extend_from_slice(b"HD");
     }
@@ -516,15 +517,15 @@ fn write_return_flags(
     if let Some(value) = value {
         if flags.want_client_flags {
             out.extend_from_slice(b" f");
-            out.extend_from_slice(value.mc_flags.to_string().as_bytes());
+            push_u64(out, u64::from(value.mc_flags));
         }
         if flags.want_size {
             out.extend_from_slice(b" s");
-            out.extend_from_slice(value.data.len().to_string().as_bytes());
+            push_u64(out, value.data.len() as u64);
         }
         if flags.want_cas {
             out.extend_from_slice(b" c");
-            out.extend_from_slice(value.cas.to_string().as_bytes());
+            push_u64(out, value.cas);
         }
         if flags.want_ttl {
             let now_ms = std::time::SystemTime::now()
@@ -535,7 +536,7 @@ fn write_return_flags(
             // answer if the value arrived without an expiry.
             let remaining = value.remaining_ttl_secs(now_ms).unwrap_or(-1);
             out.extend_from_slice(b" t");
-            out.extend_from_slice(remaining.to_string().as_bytes());
+            push_i64(out, remaining);
         }
     }
     write_key_and_opaque(out, flags, command);

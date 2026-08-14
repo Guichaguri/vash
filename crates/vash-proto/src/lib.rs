@@ -12,6 +12,7 @@
 //! string commands do not map one-to-one onto storage operations — see that
 //! module and `vash_server::resp`.
 
+mod digits;
 pub mod memcached;
 pub mod resp;
 pub mod vcp;

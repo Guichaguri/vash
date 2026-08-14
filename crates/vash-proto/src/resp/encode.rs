@@ -76,13 +76,13 @@ pub fn protocol_error(out: &mut Vec<u8>, detail: &str) {
 
 pub fn integer(out: &mut Vec<u8>, value: i64) {
     out.push(b':');
-    out.extend_from_slice(itoa(value).as_bytes());
+    itoa(out, value);
     out.extend_from_slice(b"\r\n");
 }
 
 pub fn bulk(out: &mut Vec<u8>, bytes: &[u8]) {
     out.push(b'$');
-    out.extend_from_slice(itoa(bytes.len() as i64).as_bytes());
+    itoa(out, bytes.len() as i64);
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(bytes);
     out.extend_from_slice(b"\r\n");
@@ -102,7 +102,7 @@ pub fn null(out: &mut Vec<u8>, version: Version) {
 
 pub fn array(out: &mut Vec<u8>, len: usize) {
     out.push(b'*');
-    out.extend_from_slice(itoa(len as i64).as_bytes());
+    itoa(out, len as i64);
     out.extend_from_slice(b"\r\n");
 }
 
@@ -132,7 +132,7 @@ pub fn hello(out: &mut Vec<u8>, version: Version) {
         Version::Resp2 => array(out, FIELDS * 2),
         Version::Resp3 => {
             out.push(b'%');
-            out.extend_from_slice(itoa(FIELDS as i64).as_bytes());
+            itoa(out, FIELDS as i64);
             out.extend_from_slice(b"\r\n");
         }
     }
@@ -173,7 +173,7 @@ pub fn verbatim(out: &mut Vec<u8>, text: &str, version: Version) {
         Version::Resp2 => bulk(out, text.as_bytes()),
         Version::Resp3 => {
             out.push(b'=');
-            out.extend_from_slice(itoa((text.len() + 4) as i64).as_bytes());
+            itoa(out, (text.len() + 4) as i64);
             out.extend_from_slice(b"\r\ntxt:");
             out.extend_from_slice(text.as_bytes());
             out.extend_from_slice(b"\r\n");
@@ -562,8 +562,10 @@ fn escape(out: &mut Vec<u8>, name: &[u8]) {
     }
 }
 
-fn itoa(value: i64) -> String {
-    value.to_string()
+/// Appends a decimal integer. Named for what it does; it used to be
+/// `value.to_string()`, which allocated on every reply that carried a length.
+fn itoa(out: &mut Vec<u8>, value: i64) {
+    crate::digits::push_i64(out, value);
 }
 
 #[cfg(test)]

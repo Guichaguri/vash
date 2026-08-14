@@ -210,6 +210,47 @@ fn memcached_encode_value_reply(bencher: divan::Bencher) {
     });
 }
 
+/// The same memcached hit rendered into a buffer that already exists, which is
+/// what actually happens — `conn::handle` keeps one write buffer per connection
+/// and clears it between reads.
+///
+/// The two arms above allocate their output afresh every iteration, so the
+/// allocator dominates them and small changes inside the encoder hide in the
+/// noise. This one holds the buffer still and measures the rendering, which is
+/// the only way to see what the decimal writers cost: a `VALUE` line spells
+/// three integers, and each was a `String` allocation until `digits` replaced
+/// them.
+#[divan::bench]
+fn memcached_encode_value_reply_reusing_the_buffer(bencher: divan::Bencher) {
+    let reply = vash_core::Reply::Values(vec![Some(vash_core::Value {
+        data: bytes::Bytes::from_static(VALUE),
+        mc_flags: 0,
+        cas: 42,
+        expires_at_ms: Some(0),
+    })]);
+    let command = Command::GetMany(vec![vash_core::Key::from_stored(b"user:1234:profile")]);
+    let style = memcached::encode::ResponseStyle::Retrieval { with_cas: true };
+
+    let mut out = Vec::with_capacity(VALUE.len() + 64);
+    bencher.bench_local(|| {
+        out.clear();
+        memcached::encode::encode(&mut out, &style, &command, divan::black_box(&reply));
+        divan::black_box(out.len())
+    });
+}
+
+/// The RESP equivalent: a bulk string, whose length prefix is the one integer
+/// every Redis `GET` hit has to spell.
+#[divan::bench]
+fn resp_encode_bulk_reusing_the_buffer(bencher: divan::Bencher) {
+    let mut out = Vec::with_capacity(VALUE.len() + 64);
+    bencher.bench_local(|| {
+        out.clear();
+        vash_proto::resp::encode::bulk(&mut out, divan::black_box(VALUE));
+        divan::black_box(out.len())
+    });
+}
+
 // ---- the copy on the read path ---------------------------------------------
 //
 // M6 recorded that a value is copied twice on the way out — once out of the map
