@@ -18,7 +18,14 @@ max_blocking_threads = 128
 path = "data"
 
 # Independent LMDB environments, and therefore the ceiling on concurrent
-# writers. 0 picks min(num_cpus, 8).
+# writers. 0 picks min(num_cpus, 4).
+#
+# Capped at four rather than at the core count, because sharding buys concurrent
+# writers and nothing else — reads are already lock-free and concurrent within
+# one environment. When commits are disk-bound, which the default `relaxed`
+# durability makes likely, splitting one device between more environments
+# fragments its I/O and throughput *falls*. See the benchmark in the README
+# before raising it.
 #
 # Fixed once a database exists: changing it would route every key to a different
 # environment, so startup refuses to open a store built for a different count

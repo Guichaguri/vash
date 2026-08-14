@@ -42,7 +42,8 @@ pub struct ServerConfig {
 pub struct StoreConfig {
     pub path: PathBuf,
     /// Independent LMDB environments, and therefore the ceiling on concurrent
-    /// writers. `0` picks `min(num_cpus, 8)`.
+    /// writers. `0` picks `min(num_cpus, 4)` — see [`Config::shard_count`] for
+    /// why it is capped there.
     ///
     /// Fixed once a database exists: changing it would route every key to a
     /// different environment, so startup refuses to open a mismatched store
