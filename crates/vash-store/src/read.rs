@@ -14,6 +14,7 @@ use heed::{AnyTls, RoTxn};
 use vash_core::{Key, RecordRef, Value};
 
 use crate::engine::LmdbEngine;
+use crate::env::TrackedTxn;
 use crate::error::{Result, StoreError};
 use crate::tags::TagLookup;
 
@@ -67,7 +68,8 @@ impl LmdbEngine {
     pub fn get(&self, key: Key<'_>) -> Result<Option<Value>> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
-        self.read_record(&rtxn, &lookup, self.snapshot(), key.as_bytes())
+        let at = self.snapshot(&rtxn);
+        self.read_record(&rtxn, &lookup, at, key.as_bytes())
     }
 
     /// Resolves a whole batch inside one read transaction, so every key in a
@@ -76,7 +78,7 @@ impl LmdbEngine {
     pub fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
-        let at = self.snapshot();
+        let at = self.snapshot(&rtxn);
         keys.iter()
             .map(|key| self.read_record(&rtxn, &lookup, at, key.as_bytes()))
             .collect()
@@ -88,20 +90,15 @@ impl LmdbEngine {
     pub fn deadline(&self, key: Key<'_>) -> Result<Option<u64>> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
-        self.read_alive(
-            &rtxn,
-            &lookup,
-            self.snapshot(),
-            key.as_bytes(),
-            RecordRef::expires_at_ms,
-        )
+        let at = self.snapshot(&rtxn);
+        self.read_alive(&rtxn, &lookup, at, key.as_bytes(), RecordRef::expires_at_ms)
     }
 
     /// [`Engine::deadline`] over a batch, against one snapshot.
     pub fn deadlines(&self, keys: &[Key<'_>]) -> Result<Vec<Option<u64>>> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
-        let at = self.snapshot();
+        let at = self.snapshot(&rtxn);
         keys.iter()
             .map(|key| {
                 self.read_alive(&rtxn, &lookup, at, key.as_bytes(), RecordRef::expires_at_ms)
@@ -110,6 +107,10 @@ impl LmdbEngine {
     }
 
     /// The RAM-resident half of the liveness check, read once per call.
+    ///
+    /// The clock comes off the transaction rather than being read here: it was
+    /// taken when the transaction opened, which is the instant this snapshot
+    /// describes. See [`TrackedTxn::opened_at_ms`].
     ///
     /// Both halves are already fixed for the length of a call — the read
     /// transaction pins its own view of the data, and a batch is documented to
@@ -122,9 +123,9 @@ impl LmdbEngine {
     /// clock read per key, a batch spanning a millisecond boundary could count
     /// one key live and the next one expired against the *same* deadline.
     #[inline]
-    fn snapshot(&self) -> Snapshot {
+    fn snapshot(&self, txn: &TrackedTxn<'_>) -> Snapshot {
         Snapshot {
-            now_ms: self.now_ms(),
+            now_ms: txn.opened_at_ms(),
             epoch: self.epoch(),
         }
     }

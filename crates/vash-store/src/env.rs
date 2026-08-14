@@ -249,10 +249,19 @@ impl LmdbEngine {
     /// The recording is one relaxed store here and another when the returned
     /// guard drops — see [`crate::readers`] for why it is a slot per thread
     /// rather than a registry, and why LMDB cannot answer the question itself.
+    ///
+    /// The instant it opened is kept on the transaction, because the reads that
+    /// follow need the same number for their liveness check and were each
+    /// reading the clock a second time to get it.
     pub fn read_txn(&self) -> Result<TrackedTxn<'_>> {
-        let guard = self.reader_ages.open(self.now_ms());
+        let opened_at_ms = self.now_ms();
+        let guard = self.reader_ages.open(opened_at_ms);
         let txn = self.env.read_txn().map_err(StoreError::from_heed)?;
-        Ok(TrackedTxn { txn, _guard: guard })
+        Ok(TrackedTxn {
+            txn,
+            _guard: guard,
+            opened_at_ms,
+        })
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -279,6 +288,28 @@ impl LmdbEngine {
 pub struct TrackedTxn<'e> {
     txn: RoTxn<'e, WithTls>,
     _guard: crate::readers::ReaderGuard<'e>,
+    opened_at_ms: u64,
+}
+
+impl TrackedTxn<'_> {
+    /// Unix milliseconds at which this transaction opened.
+    ///
+    /// **This is the "now" a read judges expiry against**, rather than the
+    /// clock as it stands when each record is examined. The two differ by the
+    /// microseconds between opening the transaction and reaching the record,
+    /// against deadlines stored to the millisecond — so the only records the
+    /// distinction can reach are ones expiring inside that window, and they are
+    /// served for a moment longer instead of a moment less.
+    ///
+    /// That is the direction this design already accepts everywhere else:
+    /// expiry is lazy, and an expired record is served by nothing but is
+    /// removed by the sweeper whenever it gets there. Reading the clock again
+    /// per record bought no guarantee it did not already have — and it cost a
+    /// `SystemTime::now` on the most executed path in the server.
+    #[inline]
+    pub fn opened_at_ms(&self) -> u64 {
+        self.opened_at_ms
+    }
 }
 
 impl<'e> std::ops::Deref for TrackedTxn<'e> {

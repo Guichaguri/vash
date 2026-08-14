@@ -119,7 +119,11 @@ impl LmdbEngine {
     ) -> Result<ShardScan> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
-        let now_ms = self.now_ms();
+        // Off the transaction rather than the clock: it was taken as this
+        // opened, and a scan is the longest-lived read there is, so judging its
+        // whole page against one instant is the more coherent reading as well
+        // as the cheaper one.
+        let now_ms = rtxn.opened_at_ms();
         let epoch = self.epoch();
 
         let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match after {

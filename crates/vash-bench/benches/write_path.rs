@@ -193,6 +193,46 @@ fn delete_miss(bencher: divan::Bencher) {
     });
 }
 
+// ---- single-key reads ------------------------------------------------------
+
+/// The clock call itself, which is the whole of what a removed one saves and
+/// therefore the ceiling on any of the reads below. Worth having as a number
+/// rather than an assumption: it is a vDSO read on Linux and a rather different
+/// thing on Windows, and the case for hoisting it rests on which.
+#[divan::bench]
+fn clock_now_ms(bencher: divan::Bencher) {
+    let clock = vash_core::Clock::new();
+    bencher.bench(|| divan::black_box(divan::black_box(&clock).now_ms()));
+}
+
+/// A single `GET` that hits — the most executed operation in the server.
+#[divan::bench]
+fn get_hit(bencher: divan::Bencher) {
+    let fixture = Fixture::new();
+    fixture.write(b"user:1234:profile", &vec![b'x'; 64]);
+    let key = Key::new(b"user:1234:profile").expect("valid");
+
+    bencher.bench(|| divan::black_box(fixture.store().get(divan::black_box(key)).expect("read")));
+}
+
+/// The same lookup through the header-only projection, so the value copy is out
+/// of the way and a removed clock call is a larger share of what is left.
+#[divan::bench]
+fn deadline_hit(bencher: divan::Bencher) {
+    let fixture = Fixture::new();
+    fixture.write(b"user:1234:profile", &vec![b'x'; 64]);
+    let key = Key::new(b"user:1234:profile").expect("valid");
+
+    bencher.bench(|| {
+        divan::black_box(
+            fixture
+                .store()
+                .deadline(divan::black_box(key))
+                .expect("read"),
+        )
+    });
+}
+
 // ---- batch reads -----------------------------------------------------------
 
 /// A multi-get over keys that are all present.
