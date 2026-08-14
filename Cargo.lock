@@ -1330,6 +1330,7 @@ dependencies = [
  "vash-core",
  "vash-proto",
  "vash-server",
+ "vash-store",
  "xxhash-rust",
 ]
 

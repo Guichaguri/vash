@@ -18,10 +18,15 @@ tokio.workspace = true
 
 [dev-dependencies]
 divan = "0.1"
+vash-store.workspace = true
 xxhash-rust.workspace = true
 
 [[bench]]
 name = "hot_path"
+harness = false
+
+[[bench]]
+name = "write_path"
 harness = false
 
 [[bin]]
