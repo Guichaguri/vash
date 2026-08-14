@@ -979,19 +979,47 @@ a loopback run on this box has ±25% between identical runs, which is wider than
 | Render a `GET` hit straight out of the store, inside the read transaction (`Store::get_with`) | ~200ns at 1 KiB, ~400ns at 4 KiB, plus the allocation every hit made |
 | Spell reply integers into a stack buffer instead of a `String` each | memcached `VALUE` line with cas 174–187ns → 43–47ns; RESP bulk 75–82ns → 22–26ns |
 | Fuse the single-key plain memcached `get`, the one every client library sends | 384ns → 230ns at 1 KiB, of which ~75ns is the batch reply's vector and is flat in value size |
+| Take the tag registry's lock only when a record carries tags | ~15–25ns, single-threaded. The contention it was meant to remove did not measure at all — see below |
 
 **The second one is the correction to M6's finding 2.** The text encoders looked expensive because
 they were measured as framing, and roughly 45ns of each integer they wrote was a malloc and a free
 rather than any part of the format. A `VALUE` line spells three. What is left after removing them is
 the framing cost §3 actually predicted, and it is a good deal smaller than 452ns.
 
-**A note on measuring any of this here.** Divan's default sampling cannot see these: an LMDB read
-transaction throws an occasional 20µs outlier, which collapses the auto-tuned sample size to one
-iteration, and the 100ns timer then quantises every arm to the same figure. The read-path arms pin
-`sample_size = 500` for that reason. Independently, this box interleaves whole rounds where every
-arm — including ones the change under test does not touch — is six times slower; a round where an
-untouched control moved is a round to discard, which is the same lesson as the note below arrived at
-from the other direction.
+**The fourth one is a recorded non-win**, in the sense §13's finding 4 already uses. The tag
+registry's lock is shared across every reader on a shard, so acquiring it per read should have been
+a contended cache line, and `read_bench` scaling only 1.14x from four threads to eight looked
+exactly like one. It is not: interleaved A/B over four pairs shows no difference at any thread
+count. The single-threaded saving is real and is just the uncontended acquire. Whatever bounds
+concurrent reads on this box, it is not that lock, and finding out what does is open.
+
+### Measuring on this box, which took three tries to get right
+
+Every one of these changes is 20–150ns on a path that costs a few hundred, which is below what any
+end-to-end run here can resolve. Three separate ways of getting that wrong turned up in one session,
+and all three produced *plausible* numbers rather than obviously broken ones.
+
+**Divan's default sampling cannot see them.** An LMDB read transaction throws an occasional 20µs
+outlier, which collapses the auto-tuned sample size to a single iteration; the 100ns timer then
+quantises every arm to the same figure and small differences vanish into rounding. The read-path
+arms pin `sample_size = 500` for that reason.
+
+**Sequential A/B manufactures results.** Running every round of B and then every round of A reported
+the tag-lock change as +65% at eight threads and +130% at one. Interleaving the same two binaries
+pair by pair reported no difference — and the *unchanged* arm's own throughput moved 2.6x between
+the first run of the session and the fourth, which is the whole of the effect. Anything compared
+here has to alternate, and an untouched control has to be one of the things measured.
+
+**A benchmark can be too coarse for the thing it is pointed at.** `read_bench` builds its key with
+`format!` inside the measured loop, so a per-operation cost in microseconds sits on top of every
+figure it reports. It answers what it was written to answer — whether reads scale with threads — and
+cannot answer whether a 20ns change helped.
+
+**And the disk filled again.** `read_bench` refused to populate with `os error 112`: the system
+drive had 4.7 MB free, and `TEMP` is on it, so every store-backed benchmark in this session had been
+running against a full disk. The pure-memory encoder measurements were unaffected and the read-path
+ones re-measured the same on a drive with room, so nothing above rests on it — but that is luck,
+established afterwards, and the note below is now something that has happened twice.
 
 **A methodological note, because it nearly produced wrong numbers.** An earlier campaign measured
 `inline_reads` as a 30% win and GET at 648k. Both were artifacts of a disk that had silently filled
