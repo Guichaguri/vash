@@ -253,13 +253,10 @@ fn read_encode_in_txn(bencher: divan::Bencher, value_len: usize) {
     let mut out = Vec::with_capacity(value_len + 64);
     bencher.bench_local(|| {
         out.clear();
-        store
-            .store
-            .get_with(divan::black_box(key), |value| {
-                out.extend_from_slice(value.data)
-            })
-            .unwrap()
-            .unwrap();
+        vash_store::Store::get_with(&store.store, divan::black_box(key), &mut |value| {
+            out.extend_from_slice(value.data)
+        })
+        .unwrap();
         divan::black_box(out.len())
     });
 }

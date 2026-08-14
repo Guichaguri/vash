@@ -1,4 +1,4 @@
-use vash_core::{Reply, ServerInfo};
+use vash_core::{Reply, ServerInfo, ValueRef};
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32};
 
@@ -238,18 +238,24 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
         | Reply::Deadline(_)
         | Reply::Deadlines(_) => encode_response(out, opcode, request_id, Status::Unsupported, &[]),
 
-        Reply::Value(value) => {
-            // Written as one frame without an intermediate buffer: header, then
-            // the value metadata, then the payload straight out of the store.
-            let body_len = (VALUE_PREFIX_LEN + value.data.len()) as u32;
-            let header = FrameHeader::response(opcode, request_id, Status::Ok, body_len);
-            out.reserve(super::frame::HEADER_LEN + body_len as usize);
-            out.extend_from_slice(header.as_bytes());
-            out.extend_from_slice(&value.mc_flags.to_le_bytes());
-            out.extend_from_slice(&value.cas.to_le_bytes());
-            out.extend_from_slice(&value.data);
-        }
+        Reply::Value(value) => encode_value(out, opcode, request_id, value.borrowed()),
     }
+}
+
+/// Renders a `GET` hit as one frame: header, value metadata, payload.
+///
+/// Takes a borrowed value so the same rendering serves a value copied out of
+/// the store and one still sitting in the memory map — see
+/// [`vash_core::ValueRef`]. Written without an intermediate buffer, so the
+/// payload goes straight from wherever it lives into the write buffer.
+pub fn encode_value(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, value: ValueRef<'_>) {
+    let body_len = (VALUE_PREFIX_LEN + value.data.len()) as u32;
+    let header = FrameHeader::response(opcode, request_id, Status::Ok, body_len);
+    out.reserve(super::frame::HEADER_LEN + body_len as usize);
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(&value.mc_flags.to_le_bytes());
+    out.extend_from_slice(&value.cas.to_le_bytes());
+    out.extend_from_slice(value.data);
 }
 
 /// `protocol_version u16 | shards u16 | max_key_len u32 | max_value_len u32 |

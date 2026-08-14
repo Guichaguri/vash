@@ -136,6 +136,28 @@ pub fn execute_memcached(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // The fused read path, which in this dialect is `mg` alone: plain `get` is
+    // a multi-key retrieval even when it names one key, and stays on the
+    // `Reply` path. A `T` flag turns `mg` into a get-and-touch, which writes —
+    // the parser renders that as `GetAndTouch`, so matching the command rather
+    // than the style is what keeps this off the write path.
+    if let vash_proto::memcached::encode::ResponseStyle::Meta(
+        vash_proto::memcached::encode::MetaStyle::Get(flags),
+    ) = &parsed.style
+        && let Command::Get { key } = parsed.command
+        && !parsed.noreply
+    {
+        let rendered = execute_get_into(state, key, Dialect::Memcached, &mut |value| {
+            mc::encode_meta_get_hit(out, flags, &parsed.command, value)
+        });
+        match rendered {
+            Ok(true) => {}
+            Ok(false) => out.extend_from_slice(b"EN\r\n"),
+            Err(failed) => mc::encode_error(out, memcached_error(failed.status)),
+        }
+        return Closing::No;
+    }
+
     let result = execute(state, &parsed.command, Dialect::Memcached);
     let closing = matches!(result, Ok(Reply::Closing));
 
@@ -517,6 +539,27 @@ pub fn execute_frame_into(
 
         Ok(Decoded::Request { mut request, .. }) => {
             offsets_to_store_ttls(&mut request.command);
+
+            // The fused read path. A `NO_REPLY` `GET` is excluded on purpose:
+            // it has nowhere to render into, and sending it round the ordinary
+            // path keeps that case answering exactly as it did.
+            if let Command::Get { key } = request.command
+                && !request.no_reply
+            {
+                let (opcode, request_id) = (request.opcode, request.request_id);
+                let rendered = execute_get_into(state, key, Dialect::Vcp, &mut |value| {
+                    vash_proto::vcp::encode::encode_value(out, opcode, request_id, value)
+                });
+                match rendered {
+                    Ok(true) => {}
+                    // Through `encode_reply` rather than writing the status
+                    // here, so a miss keeps whatever that mapping says it is.
+                    Ok(false) => encode_reply(out, opcode, request_id, &Reply::NotFound),
+                    Err(failed) => encode_error(out, opcode as u8, request_id, failed.status),
+                }
+                return;
+            }
+
             let result = execute(state, &request.command, Dialect::Vcp);
 
             if request.no_reply {
@@ -705,6 +748,45 @@ fn offset_to_store_ttl(
         }
         TtlChange::Keep => TtlChange::Keep,
     }
+}
+
+/// Executes a single-key `GET`, rendering a hit **while the store still has the
+/// value in hand** — inside the read transaction, straight into the write
+/// buffer — instead of copying it into a [`Reply`] on the way past. Returns
+/// whether the key was live; the caller renders the miss in its own dialect.
+///
+/// This is the one command that steps around the `Reply` boundary, and it earns
+/// it: `hot_path.rs` measures the copy it removes at ~200ns per read at 1 KiB
+/// and ~400ns at 4 KiB, plus the allocation that building a `Value` needs on
+/// every single hit.
+///
+/// The cost of stepping around that boundary is that the counting `execute`
+/// does has to be reproduced here. For a `GET` that is exactly two things — the
+/// command histogram and the hit/miss split — because [`Outcomes::observe`] has
+/// no `Command::Get` arm. That is load-bearing rather than lucky, so
+/// `metrics::tests::observe_has_nothing_to_say_about_a_get` fails if anyone
+/// adds one.
+///
+/// [`Outcomes::observe`]: crate::metrics::Outcomes::observe
+pub fn execute_get_into(
+    state: &ServerState,
+    key: vash_core::Key<'_>,
+    dialect: Dialect,
+    render: &mut dyn FnMut(vash_core::ValueRef<'_>),
+) -> Result<bool, Failed> {
+    // Timed and counted exactly as `execute` does it, including observing the
+    // histogram before the error is propagated: a read that failed still took
+    // the time it took.
+    let started = std::time::Instant::now();
+    let outcome = state.store.get_with(key, render);
+    state
+        .metrics
+        .commands
+        .observe(CommandKind::Get, dialect, started.elapsed());
+
+    let hit = outcome.map_err(to_failed)?;
+    state.metrics.read(u64::from(hit), u64::from(!hit));
+    Ok(hit)
 }
 
 pub fn execute(

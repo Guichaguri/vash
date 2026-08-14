@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use bytes::Bytes;
 use vash_core::{
     Applied, Arithmetic, BatchGuard, Clock, ExpireGuard, Key, ListEntry, ListRequest, Listing,
-    NEVER, Set, SetMode, Stored, TagGeneration, TtlChange, Value, arith,
+    NEVER, Set, SetMode, Stored, TagGeneration, TtlChange, Value, ValueRef, arith,
 };
 
 use crate::apply::Written;
@@ -200,6 +200,29 @@ impl Store for MemoryStore {
         let now = self.clock.now_ms();
         let inner = self.lock()?;
         Ok(inner.live(key.as_bytes(), now).map(Inner::value_of))
+    }
+
+    /// The borrowing read, which for this store borrows out of the map it holds
+    /// under its own lock.
+    ///
+    /// The lock is held across `render` for the same reason LMDB holds its read
+    /// transaction: that is what makes the borrow valid. It is also why the
+    /// trait forbids `render` from calling back into the store — here that would
+    /// deadlock rather than merely pin a snapshot, which makes the fake a
+    /// stricter check of the contract than the real thing.
+    fn get_with(&self, key: Key<'_>, render: &mut dyn FnMut(ValueRef<'_>)) -> Result<bool> {
+        let now = self.clock.now_ms();
+        let inner = self.lock()?;
+        let Some(entry) = inner.live(key.as_bytes(), now) else {
+            return Ok(false);
+        };
+        render(ValueRef {
+            data: &entry.value,
+            mc_flags: entry.mc_flags,
+            cas: entry.cas,
+            expires_at_ms: Some(entry.expires_at_ms),
+        });
+        Ok(true)
     }
 
     fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {

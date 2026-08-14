@@ -11,20 +11,7 @@
 
 use bytes::Bytes;
 use heed::{AnyTls, RoTxn};
-use vash_core::{Key, RecordRef, Value};
-
-/// A live record, borrowed straight from the memory map.
-///
-/// The borrowing counterpart to [`Value`]: same fields, except that `data`
-/// points into the map and is therefore only valid while the read transaction
-/// that produced it is open. See [`LmdbEngine::get_with`].
-#[derive(Debug, Clone, Copy)]
-pub struct ValueRef<'a> {
-    pub data: &'a [u8],
-    pub mc_flags: u32,
-    pub cas: u64,
-    pub expires_at_ms: u64,
-}
+use vash_core::{Key, RecordRef, Value, ValueRef};
 
 use crate::engine::LmdbEngine;
 use crate::env::TrackedTxn;
@@ -106,7 +93,7 @@ impl LmdbEngine {
                 data: record.value,
                 mc_flags: record.mc_flags(),
                 cas: record.cas(),
-                expires_at_ms: record.expires_at_ms(),
+                expires_at_ms: Some(record.expires_at_ms()),
             })
         })
     }

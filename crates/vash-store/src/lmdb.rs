@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use vash_core::{Key, Listing, Set, Value};
+use vash_core::{Key, Listing, Set, Value, ValueRef};
 
 use crate::config::StoreConfig;
 use crate::engine::{LmdbEngine, Pressure};
@@ -156,24 +156,6 @@ impl LmdbStore {
             .filter_map(|shard| shard.engine.tags().generation_of(name))
             .max()
     }
-
-    /// Runs `project` against a live record inside its read transaction, so the
-    /// value can be encoded straight out of the memory map.
-    ///
-    /// Inherent rather than on [`Store`] until there is a reason to put it
-    /// there: adding it to the trait obliges every implementation to offer a
-    /// borrowing read, and what that would buy is exactly what `hot_path.rs`
-    /// measures. See [`crate::engine::LmdbEngine::get_with`].
-    pub fn get_with<R>(
-        &self,
-        key: Key<'_>,
-        project: impl FnOnce(crate::ValueRef<'_>) -> R,
-    ) -> Result<Option<R>> {
-        self.shards
-            .for_key(key.as_bytes())
-            .engine
-            .get_with(key, project)
-    }
 }
 
 impl Store for LmdbStore {
@@ -183,6 +165,15 @@ impl Store for LmdbStore {
 
     fn get(&self, key: Key<'_>) -> Result<Option<Value>> {
         self.shards.for_key(key.as_bytes()).engine.get(key)
+    }
+
+    fn get_with(&self, key: Key<'_>, render: &mut dyn FnMut(ValueRef<'_>)) -> Result<bool> {
+        Ok(self
+            .shards
+            .for_key(key.as_bytes())
+            .engine
+            .get_with(key, render)?
+            .is_some())
     }
 
     fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {

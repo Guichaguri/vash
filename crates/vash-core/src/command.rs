@@ -415,13 +415,55 @@ pub struct Value {
     pub expires_at_ms: Option<u64>,
 }
 
+/// A value borrowed where it lies, rather than copied out.
+///
+/// The exact fields of [`Value`], except that `data` points at storage owned by
+/// someone else — for a read that means the memory map, valid only while the
+/// transaction that produced it is open. Encoders take this rather than
+/// `&Value` so that one rendering serves both a value that was copied out and
+/// one that never was; see [`Value::borrowed`] for the conversion that keeps
+/// the owned paths working unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct ValueRef<'a> {
+    pub data: &'a [u8],
+    pub mc_flags: u32,
+    pub cas: u64,
+    /// As [`Value::expires_at_ms`], including its `None`: a borrowed value must
+    /// not invent an expiry that the owned one would have declined to report.
+    pub expires_at_ms: Option<u64>,
+}
+
+impl ValueRef<'_> {
+    /// As [`Value::remaining_ttl_secs`].
+    pub fn remaining_ttl_secs(&self, now_ms: u64) -> Option<i64> {
+        Value::remaining_ttl_from(self.expires_at_ms, now_ms)
+    }
+}
+
 impl Value {
+    /// This value, borrowed, so an owned value can be rendered by the same code
+    /// that renders one still sitting in the map.
+    pub fn borrowed(&self) -> ValueRef<'_> {
+        ValueRef {
+            data: &self.data,
+            mc_flags: self.mc_flags,
+            cas: self.cas,
+            expires_at_ms: self.expires_at_ms,
+        }
+    }
+
     /// Remaining lifetime in seconds, in the form memcached's `t` flag uses:
     /// `-1` for an item that never expires, never negative otherwise (an
     /// expired item would not have been returned), and `None` when the
     /// transport did not report an expiry at all.
     pub fn remaining_ttl_secs(&self, now_ms: u64) -> Option<i64> {
-        match self.expires_at_ms {
+        Self::remaining_ttl_from(self.expires_at_ms, now_ms)
+    }
+
+    /// The rule itself, shared with [`ValueRef`] so the borrowed and owned forms
+    /// cannot answer differently.
+    fn remaining_ttl_from(expires_at_ms: Option<u64>, now_ms: u64) -> Option<i64> {
+        match expires_at_ms {
             None => None,
             Some(crate::record::NEVER) => Some(-1),
             Some(at) => Some(at.saturating_sub(now_ms).div_ceil(1000) as i64),

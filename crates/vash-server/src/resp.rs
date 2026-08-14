@@ -411,6 +411,25 @@ fn run(
         // helper is bypassed.
         Command::Scan(scan) => run_scan(state, scan, *version, out),
 
+        // The one command that touches storage without building a `Reply`: a
+        // `GET` hit is written straight out of the store into the buffer, so
+        // the value is copied once rather than twice. The boundary it steps
+        // around is the `Reply`, not the counting — `execute_get_into` counts
+        // exactly what `dispatch::execute` counts for a `GET`.
+        Command::Get { key } => {
+            let hit = crate::dispatch::execute_get_into(
+                state,
+                key_of(key)?,
+                crate::metrics::Dialect::Resp,
+                &mut |value| encode::bulk(out, value.data),
+            )
+            .map_err(resp_error)?;
+            if !hit {
+                encode::null(out, *version);
+            }
+            Ok(())
+        }
+
         // Everything past this point touches storage, so it goes through the
         // shared boundary: translated into a `vash_core::Command`, executed by
         // `dispatch::execute` — which is where it gets counted and where its

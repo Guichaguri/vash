@@ -40,7 +40,6 @@ pub mod memory;
 mod prefault;
 mod queue;
 mod read;
-pub use read::ValueRef;
 mod readers;
 pub mod reclaim;
 pub mod schema;
@@ -48,7 +47,7 @@ mod shard;
 pub mod tags;
 mod writer;
 
-use vash_core::{BatchGuard, ExpireGuard, Key, Listing, Set, Value};
+use vash_core::{BatchGuard, ExpireGuard, Key, Listing, Set, Value, ValueRef};
 
 pub use apply::Written;
 pub use config::{Durability, EvictionConfig, StoreConfig, WriteConfig};
@@ -190,6 +189,25 @@ pub trait Store: Send + Sync + 'static {
     /// Returns the value if the key is present **and live**. Expired, flushed
     /// and tag-invalidated records read as absent without being rewritten.
     fn get(&self, key: Key<'_>) -> Result<Option<Value>>;
+
+    /// Hands a live value to `render` **without copying it out of storage
+    /// first**, returning whether the key was live.
+    ///
+    /// The whole point is that `render` runs while the read is still in
+    /// progress — for LMDB, inside the read transaction, with `data` pointing
+    /// straight at the memory map — so a `GET` goes from the map to the write
+    /// buffer once instead of twice. Measured at `hot_path.rs`: ~200ns saved at
+    /// 1 KiB and ~400ns at 4 KiB, and it also drops the per-read allocation
+    /// that building a [`Value`] requires.
+    ///
+    /// **`render` must not block or call back into the store.** It runs with a
+    /// read transaction open, and holding one open is the LMDB footgun this
+    /// crate is otherwise careful to avoid (plan §9). Encoding bytes into a
+    /// buffer is what it is for.
+    ///
+    /// Takes `&mut dyn FnMut` rather than a generic so the trait stays
+    /// object-safe: the server holds an `Arc<dyn Store>`.
+    fn get_with(&self, key: Key<'_>, render: &mut dyn FnMut(ValueRef<'_>)) -> Result<bool>;
 
     /// Resolves many keys against a single consistent snapshot.
     fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>>;

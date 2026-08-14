@@ -966,6 +966,55 @@ pub fn render_prometheus(
 mod tests {
     use super::*;
 
+    /// **The invariant the fused `GET` path stands on.**
+    ///
+    /// [`crate::dispatch::execute_get_into`] renders a `GET` hit straight out
+    /// of the store, so it never builds a [`Reply`] and never reaches
+    /// [`OutcomeMetrics::observe`]. That is only safe because `observe` has
+    /// nothing to say about a `Command::Get`: the hit and miss counts come from
+    /// [`ServerMetrics::read`], which the fused path does call.
+    ///
+    /// Adding a `Get` arm to `observe` would therefore silently stop counting
+    /// whatever it counted, on every `GET` the server serves. This fails first
+    /// instead.
+    #[test]
+    fn observe_has_nothing_to_say_about_a_get() {
+        let rendered = |metrics: &ServerMetrics| {
+            render_prometheus(
+                metrics,
+                &StoreStats::default(),
+                &ClusterMetrics::default(),
+                0,
+            )
+        };
+
+        let metrics = ServerMetrics::default();
+        let before = rendered(&metrics);
+
+        let key = vash_core::Key::from_stored(b"k");
+        let value = vash_core::Value {
+            data: bytes::Bytes::from_static(b"v"),
+            mc_flags: 0,
+            cas: 1,
+            expires_at_ms: Some(0),
+        };
+        metrics
+            .outcomes
+            .observe(&Command::Get { key }, &Reply::Value(value));
+        metrics
+            .outcomes
+            .observe(&Command::Get { key }, &Reply::NotFound);
+
+        assert_eq!(
+            before,
+            rendered(&metrics),
+            "observe now counts something for a GET, which the fused read path \
+             in dispatch::execute_get_into bypasses -- that counting would be \
+             silently lost. Either count it in execute_get_into too, or take \
+             GET off the fused path."
+        );
+    }
+
     #[test]
     fn every_series_is_typed_and_documented() {
         let metrics = ServerMetrics::default();

@@ -6,7 +6,7 @@
 //! renders against that. Keeping the choice in the parser means the storage
 //! layer never learns that two dialects exist.
 
-use vash_core::{Command, Reply, Stored};
+use vash_core::{Command, Reply, Stored, Value, ValueRef};
 
 use super::ErrorKind;
 use super::meta::MetaFlags;
@@ -403,8 +403,10 @@ fn encode_meta(out: &mut Vec<u8>, style: &MetaStyle, command: &Command<'_>, repl
             // `mg` addresses one key, but a `T` flag turns it into a
             // get-and-touch, whose reply is a batch of one.
             let value = match reply {
-                Reply::Value(value) => Some(value),
-                Reply::Values(values) => values.first().and_then(|v| v.as_ref()),
+                Reply::Value(value) => Some(value.borrowed()),
+                Reply::Values(values) => {
+                    values.first().and_then(|v| v.as_ref()).map(Value::borrowed)
+                }
                 _ => None,
             };
 
@@ -412,20 +414,7 @@ fn encode_meta(out: &mut Vec<u8>, style: &MetaStyle, command: &Command<'_>, repl
                 out.extend_from_slice(b"EN\r\n");
                 return;
             };
-
-            if flags.want_value {
-                out.extend_from_slice(b"VA ");
-                out.extend_from_slice(value.data.len().to_string().as_bytes());
-            } else {
-                out.extend_from_slice(b"HD");
-            }
-            write_return_flags(out, flags, command, Some(value));
-            out.extend_from_slice(b"\r\n");
-
-            if flags.want_value {
-                out.extend_from_slice(&value.data);
-                out.extend_from_slice(b"\r\n");
-            }
+            encode_meta_get_hit(out, flags, command, value);
         }
 
         MetaStyle::Set(flags) => {
@@ -491,11 +480,38 @@ fn encode_meta(out: &mut Vec<u8>, style: &MetaStyle, command: &Command<'_>, repl
 }
 
 /// Appends the return flags a meta request asked for, in a stable order.
+/// Renders an `mg` hit: the `VA <size>`/`HD` line, its return flags, and the
+/// payload when one was asked for.
+///
+/// Split out and taking a borrowed value so the fused read path can call it
+/// with a value that is still in the memory map, while the owned path above
+/// reaches it through [`vash_core::Value::borrowed`]. One rendering either way.
+pub fn encode_meta_get_hit(
+    out: &mut Vec<u8>,
+    flags: &MetaFlags,
+    command: &Command<'_>,
+    value: ValueRef<'_>,
+) {
+    if flags.want_value {
+        out.extend_from_slice(b"VA ");
+        out.extend_from_slice(value.data.len().to_string().as_bytes());
+    } else {
+        out.extend_from_slice(b"HD");
+    }
+    write_return_flags(out, flags, command, Some(value));
+    out.extend_from_slice(b"\r\n");
+
+    if flags.want_value {
+        out.extend_from_slice(value.data);
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
 fn write_return_flags(
     out: &mut Vec<u8>,
     flags: &MetaFlags,
     command: &Command<'_>,
-    value: Option<&vash_core::Value>,
+    value: Option<ValueRef<'_>>,
 ) {
     if let Some(value) = value {
         if flags.want_client_flags {
