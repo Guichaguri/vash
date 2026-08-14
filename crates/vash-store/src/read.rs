@@ -30,7 +30,7 @@ impl LmdbEngine {
     fn read_alive<'txn, T>(
         &self,
         txn: &'txn RoTxn<'_, AnyTls>,
-        lookup: &TagLookup<'_>,
+        tags: &mut LazyTags<'_>,
         at: Snapshot,
         key: &[u8],
         project: impl FnOnce(&RecordRef<'txn>) -> T,
@@ -40,7 +40,16 @@ impl LmdbEngine {
         };
 
         let record = RecordRef::parse(blob)?;
-        if !record.is_alive(at.now_ms, at.epoch, |id| lookup.generation(id)) {
+
+        // Taken only when this record actually carries tags — see
+        // [`RecordRef::needs_tag_registry`]. `None` here means `is_alive` will
+        // not call the closure at all, so what it would have returned cannot
+        // matter; answering `None` from it keeps that total rather than
+        // resting on an `expect` that is unreachable by construction.
+        let lookup = record.needs_tag_registry().then(|| tags.lookup());
+        if !record.is_alive(at.now_ms, at.epoch, |id| {
+            lookup.and_then(|held| held.generation(id))
+        }) {
             // Expired, flushed or tag-invalidated: logically absent. Reclaiming
             // the space belongs to the sweeper and the reclaimer; a read never
             // writes.
@@ -53,11 +62,11 @@ impl LmdbEngine {
     fn read_record(
         &self,
         txn: &RoTxn<'_, AnyTls>,
-        lookup: &TagLookup<'_>,
+        tags: &mut LazyTags<'_>,
         at: Snapshot,
         key: &[u8],
     ) -> Result<Option<Value>> {
-        self.read_alive(txn, lookup, at, key, |record| Value {
+        self.read_alive(txn, tags, at, key, |record| Value {
             data: Bytes::copy_from_slice(record.value),
             mc_flags: record.mc_flags(),
             cas: record.cas(),
@@ -67,9 +76,9 @@ impl LmdbEngine {
 
     pub fn get(&self, key: Key<'_>) -> Result<Option<Value>> {
         let rtxn = self.read_txn()?;
-        let lookup = self.tags.lookup();
+        let mut tags = LazyTags::new(&self.tags);
         let at = self.snapshot(&rtxn);
-        self.read_record(&rtxn, &lookup, at, key.as_bytes())
+        self.read_record(&rtxn, &mut tags, at, key.as_bytes())
     }
 
     /// Runs `project` against a live record **while the read transaction is
@@ -86,9 +95,9 @@ impl LmdbEngine {
         project: impl FnOnce(ValueRef<'_>) -> R,
     ) -> Result<Option<R>> {
         let rtxn = self.read_txn()?;
-        let lookup = self.tags.lookup();
+        let mut tags = LazyTags::new(&self.tags);
         let at = self.snapshot(&rtxn);
-        self.read_alive(&rtxn, &lookup, at, key.as_bytes(), |record| {
+        self.read_alive(&rtxn, &mut tags, at, key.as_bytes(), |record| {
             project(ValueRef {
                 data: record.value,
                 mc_flags: record.mc_flags(),
@@ -99,14 +108,15 @@ impl LmdbEngine {
     }
 
     /// Resolves a whole batch inside one read transaction, so every key in a
-    /// `GET_MANY` sees the same consistent snapshot â€” and under a single tag
-    /// registry lock rather than one per key.
+    /// `GET_MANY` sees the same consistent snapshot â€” and under at most one tag
+    /// registry lock rather than one per key. At most, because a batch in which
+    /// no key carries tags takes none at all: see [`LazyTags`].
     pub fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {
         let rtxn = self.read_txn()?;
-        let lookup = self.tags.lookup();
+        let mut tags = LazyTags::new(&self.tags);
         let at = self.snapshot(&rtxn);
         keys.iter()
-            .map(|key| self.read_record(&rtxn, &lookup, at, key.as_bytes()))
+            .map(|key| self.read_record(&rtxn, &mut tags, at, key.as_bytes()))
             .collect()
     }
 
@@ -115,19 +125,19 @@ impl LmdbEngine {
     /// `None` means not live; `Some(NEVER)` means live with no expiry.
     pub fn deadline(&self, key: Key<'_>) -> Result<Option<u64>> {
         let rtxn = self.read_txn()?;
-        let lookup = self.tags.lookup();
+        let mut tags = LazyTags::new(&self.tags);
         let at = self.snapshot(&rtxn);
-        self.read_alive(&rtxn, &lookup, at, key.as_bytes(), RecordRef::expires_at_ms)
+        self.read_alive(&rtxn, &mut tags, at, key.as_bytes(), RecordRef::expires_at_ms)
     }
 
     /// [`Engine::deadline`] over a batch, against one snapshot.
     pub fn deadlines(&self, keys: &[Key<'_>]) -> Result<Vec<Option<u64>>> {
         let rtxn = self.read_txn()?;
-        let lookup = self.tags.lookup();
+        let mut tags = LazyTags::new(&self.tags);
         let at = self.snapshot(&rtxn);
         keys.iter()
             .map(|key| {
-                self.read_alive(&rtxn, &lookup, at, key.as_bytes(), RecordRef::expires_at_ms)
+                self.read_alive(&rtxn, &mut tags, at, key.as_bytes(), RecordRef::expires_at_ms)
             })
             .collect()
     }
@@ -162,4 +172,39 @@ impl LmdbEngine {
 struct Snapshot {
     now_ms: u64,
     epoch: u32,
+}
+
+/// The tag registry's read lock, taken at most once per call and only if some
+/// record in it actually carries tags.
+///
+/// **Why it is worth deferring.** The lock is shared across every reader on the
+/// shard, and acquiring it for reading is still a read-modify-write on one
+/// word — so taking it per read puts a contended cache line in front of every
+/// `GET` the server serves, whether or not the workload uses tags at all. A
+/// cache that never invalidates by tag stores no tags on any record and so
+/// never needed it once.
+///
+/// **Why it is still hoisted.** A batch keeps the property the eager version
+/// had — one acquisition for the whole call rather than one per key — because
+/// the same holder is threaded through every key. What changes is only that the
+/// first key carrying tags takes it, instead of the call taking it up front.
+/// Zero acquisitions when no key has tags, one when any does; never more.
+struct LazyTags<'a> {
+    registry: &'a crate::tags::TagRegistry,
+    held: Option<TagLookup<'a>>,
+}
+
+impl<'a> LazyTags<'a> {
+    fn new(registry: &'a crate::tags::TagRegistry) -> Self {
+        Self {
+            registry,
+            held: None,
+        }
+    }
+
+    #[inline]
+    fn lookup(&mut self) -> &TagLookup<'a> {
+        let registry = self.registry;
+        self.held.get_or_insert_with(|| registry.lookup())
+    }
 }

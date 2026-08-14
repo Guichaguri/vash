@@ -178,6 +178,31 @@ impl<'a> RecordRef<'a> {
         })
     }
 
+    /// Whether [`is_alive`] will consult `current_generation` at all.
+    ///
+    /// **The precondition for deferring the tag registry's lock.** `is_alive`
+    /// reaches the registry only through [`tags_alive`], which is a fold over
+    /// this record's tags — so a record carrying none never calls the closure,
+    /// and a reader that has not yet taken the lock does not need to. Most
+    /// records carry none, and the lock is shared across every reader on the
+    /// shard, so that is the difference between an atomic read-modify-write on
+    /// one contended cache line per read and none at all. See
+    /// `vash_store::read`.
+    ///
+    /// It lives here, beside `is_alive`, rather than being spelled
+    /// `!record.tags.is_empty()` at the call site: it is a statement about what
+    /// `is_alive` needs, and if that ever grows a second reason to consult the
+    /// registry, this is the line that has to change with it. A reader that
+    /// skipped the lock on a stale answer would serve invalidated data, which
+    /// is the one failure this whole check exists to prevent.
+    ///
+    /// [`is_alive`]: Self::is_alive
+    /// [`tags_alive`]: Self::tags_alive
+    #[inline]
+    pub fn needs_tag_registry(&self) -> bool {
+        !self.tags.is_empty()
+    }
+
     /// The full liveness check. All three conditions read RAM-resident state
     /// only — no additional disk I/O.
     #[inline]
