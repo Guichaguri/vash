@@ -3,6 +3,9 @@
 A cache server built on LMDB, with TTLs, tag-based invalidation, and memcached
 and Redis protocol compatibility.
 
+Start here: [docs/guide.md](docs/guide.md) — the features, how to run the
+server, and how to use it from a client.
+
 Wire protocols: [docs/protocol.md](docs/protocol.md) — enough detail to write a
 client against. Per-opcode implementation contract:
 [docs/opcodes.md](docs/opcodes.md). Design and rationale:
