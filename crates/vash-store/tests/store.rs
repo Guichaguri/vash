@@ -1721,6 +1721,67 @@ fn a_tag_registered_mid_walk_does_not_shift_the_page_after_it() {
 /// after the invalidation it was tagged for — a stale hit, which is the failure
 /// direction a cache must never take.
 #[test]
+fn writing_over_an_expired_record_clears_the_rows_it_left() {
+    // A record that has expired but not been swept is invisible to a client and
+    // still entirely present on disk, index rows and all. A write over it counts
+    // as creating the key — there is nothing live to build on — but it must
+    // still clear what the dead record owned, or the expiry entry and the tag
+    // rows outlive the record they describe and the reclaimer keeps finding
+    // work that no longer exists.
+    //
+    // The distinction is invisible through the liveness check alone, which is
+    // exactly what makes it worth pinning: an implementation that decides "was
+    // anything here?" by asking "would a client see it?" passes every other
+    // test in this file and leaks a row on every one of these.
+    let h = Harness::with(|c| c.write.sweep_interval_ms = 10_000);
+
+    h.set_tagged(b"n", b"1", 1, &[b"news"]);
+    assert_eq!(h.expiry_entries(), 1);
+    assert_eq!(h.tag_index_entries(), 1);
+
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert!(
+        h.get(b"n").is_none(),
+        "expired, though still on disk: the sweeper has not run"
+    );
+
+    // Redis's arithmetic, not memcached's: this one creates the key at zero when
+    // nothing live is there, which is what makes it a *write* over the dead
+    // record rather than the `NOT_FOUND` that memcached's counter would answer.
+    h.arithmetic(&vash_core::Arithmetic::redis(
+        Key::new(b"n").unwrap(),
+        vash_core::Delta::Int {
+            delta: 5,
+            lower: i64::MIN,
+            upper: i64::MAX,
+        },
+    ));
+
+    assert_eq!(
+        h.expiry_entries(),
+        1,
+        "the dead record's expiry row must go with it, not accumulate beside the new one"
+    );
+    assert_eq!(
+        h.tag_index_entries(),
+        0,
+        "the new record carries no tags, so the dead one's tag row must not survive it"
+    );
+
+    // The same for a concatenation, which takes the other branch.
+    h.set_tagged(b"a", b"x", 1, &[b"news"]);
+    std::thread::sleep(Duration::from_millis(1_200));
+    h.store().append(Key::new(b"a").unwrap(), b"y").unwrap();
+
+    assert_eq!(
+        h.expiry_entries(),
+        2,
+        "one row for the counter and one for the appended key, and no leftovers"
+    );
+    assert_eq!(h.tag_index_entries(), 0);
+}
+
+#[test]
 fn arithmetic_keeps_the_tag_table() {
     let h = Harness::new();
     h.set_tagged(b"n", b"1", 0, &[b"news"]);

@@ -193,6 +193,306 @@ fn delete_miss(bencher: divan::Bencher) {
     });
 }
 
+// ---- read-modify-write, below the commit -----------------------------------
+//
+// These go straight to the engine rather than through the store, and recycle
+// one write transaction across many operations rather than committing per call.
+// Through the store a commit is tens of microseconds and swamps everything —
+// which is what made the delete and tag-scan changes unmeasurable when this
+// file only had store-level benchmarks. The commit is the part group commit
+// exists to amortise, so taking it out leaves the per-operation work that does
+// *not* amortise, which is the part worth counting.
+//
+// # What they were built to answer, and did
+//
+// Each of these operations reads its record and then used to read it again on
+// the way to storing the replacement, and the obvious fix is to carry the first
+// read forward. Measured here — including against `..._large`, a keyspace big
+// enough for a descent to cost real memory traffic — that fix came to under a
+// microsecond and never cleared the noise floor, while `rmw_plain_set`, the
+// control on the path that always read once, moved as much in both directions.
+//
+// The reason is worth keeping even though the change was not: **the second
+// lookup is always warm**. It is the same key in the same transaction
+// microseconds after the first, so its pages are in cache by construction, it
+// can never be a page fault, and the value's size does not enter into it
+// because parsing is a pointer into the map. There is no working set that makes
+// that redundant descent expensive, which is why no benchmark here could show
+// one. Anyone tempted to try again should start by disproving that.
+
+/// An engine to run write operations against directly.
+struct Rmw {
+    engine: Option<std::sync::Arc<vash_store::engine::LmdbEngine>>,
+    _dir: TempDir,
+}
+
+impl Rmw {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = StoreConfig {
+            path: dir.path().join("db"),
+            map_size: 1024 * 1024 * 1024,
+            durability: vash_store::Durability::Ephemeral,
+            ..StoreConfig::default()
+        };
+        let engine = vash_store::engine::LmdbEngine::open(&config, 0, 1).expect("open");
+        Self {
+            engine: Some(std::sync::Arc::new(engine)),
+            _dir: dir,
+        }
+    }
+
+    fn engine(&self) -> &vash_store::engine::LmdbEngine {
+        self.engine.as_ref().expect("open")
+    }
+}
+
+impl Drop for Rmw {
+    fn drop(&mut self) {
+        if let Some(engine) = self.engine.take()
+            && let Ok(engine) = std::sync::Arc::try_unwrap(engine)
+        {
+            engine.close();
+        }
+    }
+}
+
+/// Operations per transaction.
+///
+/// A transaction that is never committed is not a cheap transaction: LMDB
+/// tracks every dirty page in it, and a benchmark's worth of writes into one
+/// degrades until the page bookkeeping is all that is being measured — 40µs an
+/// operation, against roughly 2µs when the transaction is kept to a sane size.
+/// Recycling it is also the shape the server actually runs in, since group
+/// commit puts a batch in each transaction rather than everything.
+const OPS_PER_TXN: u32 = 256;
+
+/// `INCR` over a key that exists: read the counter, write it back.
+#[divan::bench]
+fn rmw_arithmetic(bencher: divan::Bencher) {
+    let fixture = Rmw::new();
+    let engine = fixture.engine();
+    let mut wtxn = Some(engine.write_txn().expect("txn"));
+
+    let key = Key::new(b"counter").expect("valid");
+    let op = vash_core::Arithmetic::redis(
+        key,
+        vash_core::Delta::Int {
+            delta: 1,
+            lower: i64::MIN,
+            upper: i64::MAX,
+        },
+    );
+
+    let mut n = 0u32;
+    bencher.bench_local(|| {
+        n += 1;
+        if n.is_multiple_of(OPS_PER_TXN) {
+            wtxn.take().expect("open").commit().expect("commit");
+            wtxn = Some(engine.write_txn().expect("txn"));
+        }
+        let txn = wtxn.as_mut().expect("open");
+        divan::black_box(
+            engine
+                .apply_arithmetic(txn, divan::black_box(&op))
+                .expect("applied"),
+        )
+    });
+    wtxn.take().expect("open").commit().expect("commit");
+}
+
+/// `APPEND` onto a key that exists. The value is reset periodically, or it
+/// grows without bound and the memcpy rather than the lookups is what is
+/// being measured.
+#[divan::bench]
+fn rmw_append(bencher: divan::Bencher) {
+    let fixture = Rmw::new();
+    let engine = fixture.engine();
+    let mut wtxn = Some(engine.write_txn().expect("txn"));
+
+    let mut n = 0u32;
+    bencher.bench_local(|| {
+        n += 1;
+        if n.is_multiple_of(OPS_PER_TXN) {
+            wtxn.take().expect("open").commit().expect("commit");
+            wtxn = Some(engine.write_txn().expect("txn"));
+        }
+        let txn = wtxn.as_mut().expect("open");
+        if n.is_multiple_of(64) {
+            engine.apply_delete(txn, b"log").expect("reset");
+        }
+        divan::black_box(
+            engine
+                .apply_append(txn, b"log", divan::black_box(b"x"))
+                .expect("appended"),
+        )
+    });
+    wtxn.take().expect("open").commit().expect("commit");
+}
+
+/// `TOUCH`: re-stamp the deadline, which rewrites the record.
+#[divan::bench]
+fn rmw_touch(bencher: divan::Bencher) {
+    let fixture = Rmw::new();
+    let engine = fixture.engine();
+    let mut wtxn = Some(engine.write_txn().expect("txn"));
+
+    {
+        let txn = wtxn.as_mut().expect("open");
+        let mut prepared = engine
+            .prepare_set(
+                &set_of(b"session", &vec![b'x'; 64], SetMode::Set),
+                Vec::new(),
+            )
+            .expect("prepared");
+        engine.apply_set(txn, &mut prepared).expect("seed");
+    }
+
+    let mut n = 0u32;
+    bencher.bench_local(|| {
+        n += 1;
+        if n.is_multiple_of(OPS_PER_TXN) {
+            wtxn.take().expect("open").commit().expect("commit");
+            wtxn = Some(engine.write_txn().expect("txn"));
+        }
+        let txn = wtxn.as_mut().expect("open");
+        divan::black_box(engine.apply_touch(txn, b"session", 300).expect("touched"))
+    });
+    wtxn.take().expect("open").commit().expect("commit");
+}
+
+/// Keys seeded into the large-tree fixtures below.
+///
+/// The point of the number is that the B-tree is several levels deep and far
+/// larger than the CPU's caches, so a descent costs real memory traffic. On the
+/// handful of keys the benchmarks above use, a lookup is nearly free and a
+/// removed one is worth almost nothing — which flatters the code and tells you
+/// nothing about a cache holding a working set.
+const SEEDED_KEYS: u64 = 200_000;
+
+/// The seeded value.
+///
+/// A decimal integer, because the counter benchmark increments these keys and a
+/// value it cannot parse would fail before doing any work at all — a benchmark
+/// measuring an error path and reporting it as an operation.
+const SEEDED_VALUE: &[u8] = b"1000000";
+
+fn seed(engine: &vash_store::engine::LmdbEngine, count: u64) {
+    let value = SEEDED_VALUE.to_vec();
+    let mut wtxn = Some(engine.write_txn().expect("txn"));
+    for i in 0..count {
+        if i.is_multiple_of(2000) {
+            wtxn.take().expect("open").commit().expect("commit");
+            wtxn = Some(engine.write_txn().expect("txn"));
+        }
+        let key = format!("user:{i:08}:profile").into_bytes();
+        let mut prepared = engine
+            .prepare_set(&set_of(&key, &value, SetMode::Set), Vec::new())
+            .expect("prepared");
+        engine
+            .apply_set(wtxn.as_mut().expect("open"), &mut prepared)
+            .expect("seeded");
+    }
+    wtxn.take().expect("open").commit().expect("commit");
+}
+
+/// A cheap deterministic walk over the seeded keyspace, so successive
+/// operations land on unrelated pages instead of re-hitting one hot leaf.
+fn scatter(n: u64) -> u64 {
+    (n.wrapping_mul(2_654_435_761)) % SEEDED_KEYS
+}
+
+/// `INCR` across a large keyspace — the same operation as `rmw_arithmetic`, on a
+/// tree deep enough for a descent to cost something.
+#[divan::bench]
+fn rmw_arithmetic_large(bencher: divan::Bencher) {
+    let fixture = Rmw::new();
+    let engine = fixture.engine();
+    seed(engine, SEEDED_KEYS);
+
+    let mut wtxn = Some(engine.write_txn().expect("txn"));
+    let mut n = 0u64;
+    bencher.bench_local(|| {
+        n += 1;
+        if n.is_multiple_of(OPS_PER_TXN as u64) {
+            wtxn.take().expect("open").commit().expect("commit");
+            wtxn = Some(engine.write_txn().expect("txn"));
+        }
+        let key = format!("user:{:08}:profile", scatter(n)).into_bytes();
+        let op = vash_core::Arithmetic::redis(
+            Key::new(&key).expect("valid"),
+            vash_core::Delta::Int {
+                delta: 1,
+                lower: i64::MIN,
+                upper: i64::MAX,
+            },
+        );
+        divan::black_box(
+            engine
+                .apply_arithmetic(wtxn.as_mut().expect("open"), &op)
+                .expect("applied")
+                .expect("the key is there and its value is a number"),
+        )
+    });
+    wtxn.take().expect("open").commit().expect("commit");
+}
+
+/// The control for the above: a plain `SET` across the same keyspace, on the
+/// path that reads the record once and always did.
+#[divan::bench]
+fn rmw_plain_set_large(bencher: divan::Bencher) {
+    let fixture = Rmw::new();
+    let engine = fixture.engine();
+    seed(engine, SEEDED_KEYS);
+
+    let value = SEEDED_VALUE.to_vec();
+    let mut wtxn = Some(engine.write_txn().expect("txn"));
+    let mut n = 0u64;
+    bencher.bench_local(|| {
+        n += 1;
+        if n.is_multiple_of(OPS_PER_TXN as u64) {
+            wtxn.take().expect("open").commit().expect("commit");
+            wtxn = Some(engine.write_txn().expect("txn"));
+        }
+        let key = format!("user:{:08}:profile", scatter(n)).into_bytes();
+        let mut prepared = engine
+            .prepare_set(&set_of(&key, &value, SetMode::Set), Vec::new())
+            .expect("prepared");
+        divan::black_box(
+            engine
+                .apply_set(wtxn.as_mut().expect("open"), &mut prepared)
+                .expect("stored"),
+        )
+    });
+    wtxn.take().expect("open").commit().expect("commit");
+}
+
+/// A plain `SET` over an existing key, which reads the record once and always
+/// did. The control: nothing about this path changed, so a difference here
+/// would mean the differences above are drift rather than the saved lookup.
+#[divan::bench]
+fn rmw_plain_set(bencher: divan::Bencher) {
+    let fixture = Rmw::new();
+    let engine = fixture.engine();
+    let mut wtxn = Some(engine.write_txn().expect("txn"));
+    let value = vec![b'x'; 64];
+
+    let mut n = 0u32;
+    bencher.bench_local(|| {
+        n += 1;
+        if n.is_multiple_of(OPS_PER_TXN) {
+            wtxn.take().expect("open").commit().expect("commit");
+            wtxn = Some(engine.write_txn().expect("txn"));
+        }
+        let txn = wtxn.as_mut().expect("open");
+        let mut prepared = engine
+            .prepare_set(&set_of(b"plain", &value, SetMode::Set), Vec::new())
+            .expect("prepared");
+        divan::black_box(engine.apply_set(txn, &mut prepared).expect("stored"))
+    });
+    wtxn.take().expect("open").commit().expect("commit");
+}
+
 // ---- single-key reads ------------------------------------------------------
 
 /// The clock call itself, which is the whole of what a removed one saves and
