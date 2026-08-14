@@ -296,12 +296,23 @@ async fn run_block<S: Copy + Send + 'static>(
     let mut authenticating = conn_auth.clone();
     let mut negotiating = *dialect;
 
+    // The connection's own buffer makes the trip rather than a fresh one, and
+    // comes back with the replies appended. It used to be an allocation per
+    // batch plus a copy of every reply byte back out of it — on a `GET` that is
+    // the whole value moved a third time, after the copy out of the memory map
+    // and the copy into the reply. Moving it costs three words each way and
+    // keeps the capacity, so a connection stops reallocating once it has seen
+    // its largest response.
+    //
+    // Appending rather than replacing, so this holds whether or not the caller
+    // handed over an empty buffer.
+    let mut out = std::mem::take(write_buf);
+
     // Store operations can page-fault or wait on the writer queue, neither of
     // which may happen on a runtime worker. The block is re-parsed on the
     // blocking thread so the borrowed key and value slices never cross a task
     // boundary.
-    let (response, closing, authenticated, negotiated) = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::with_capacity(64);
+    let joined = tokio::task::spawn_blocking(move || {
         let closing = run(
             &state,
             &mut authenticating,
@@ -311,12 +322,17 @@ async fn run_block<S: Copy + Send + 'static>(
         );
         (out, closing, authenticating, negotiating)
     })
-    .await
-    .map_err(std::io::Error::other)?;
+    .await;
+
+    // Only a panic in the block gets here, and it takes the connection with it —
+    // so the buffer this leaves empty is about to be dropped along with
+    // everything else. There is nothing to restore it from: it went into the
+    // task that panicked.
+    let (response, closing, authenticated, negotiated) = joined.map_err(std::io::Error::other)?;
 
     *conn_auth = authenticated;
     *dialect = negotiated;
-    write_buf.extend_from_slice(&response);
+    *write_buf = response;
     Ok(closing)
 }
 

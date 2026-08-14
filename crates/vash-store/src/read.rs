@@ -24,10 +24,13 @@ impl LmdbEngine {
     /// Generic over the projection so the reads that want only the header —
     /// `EXISTS`, `TYPE`, `TTL`, `PERSIST`, `EXPIRE` — share one definition of
     /// "live" with `GET` without also paying for `GET`'s copy of the value.
+    /// `at` is the snapshot every key in one call is judged against — see
+    /// [`Snapshot`].
     fn read_alive<'txn, T>(
         &self,
         txn: &'txn RoTxn<'_, AnyTls>,
         lookup: &TagLookup<'_>,
+        at: Snapshot,
         key: &[u8],
         project: impl FnOnce(&RecordRef<'txn>) -> T,
     ) -> Result<Option<T>> {
@@ -36,7 +39,7 @@ impl LmdbEngine {
         };
 
         let record = RecordRef::parse(blob)?;
-        if !record.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id)) {
+        if !record.is_alive(at.now_ms, at.epoch, |id| lookup.generation(id)) {
             // Expired, flushed or tag-invalidated: logically absent. Reclaiming
             // the space belongs to the sweeper and the reclaimer; a read never
             // writes.
@@ -50,9 +53,10 @@ impl LmdbEngine {
         &self,
         txn: &RoTxn<'_, AnyTls>,
         lookup: &TagLookup<'_>,
+        at: Snapshot,
         key: &[u8],
     ) -> Result<Option<Value>> {
-        self.read_alive(txn, lookup, key, |record| Value {
+        self.read_alive(txn, lookup, at, key, |record| Value {
             data: Bytes::copy_from_slice(record.value),
             mc_flags: record.mc_flags(),
             cas: record.cas(),
@@ -63,7 +67,7 @@ impl LmdbEngine {
     pub fn get(&self, key: Key<'_>) -> Result<Option<Value>> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
-        self.read_record(&rtxn, &lookup, key.as_bytes())
+        self.read_record(&rtxn, &lookup, self.snapshot(), key.as_bytes())
     }
 
     /// Resolves a whole batch inside one read transaction, so every key in a
@@ -72,8 +76,9 @@ impl LmdbEngine {
     pub fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
+        let at = self.snapshot();
         keys.iter()
-            .map(|key| self.read_record(&rtxn, &lookup, key.as_bytes()))
+            .map(|key| self.read_record(&rtxn, &lookup, at, key.as_bytes()))
             .collect()
     }
 
@@ -83,15 +88,51 @@ impl LmdbEngine {
     pub fn deadline(&self, key: Key<'_>) -> Result<Option<u64>> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
-        self.read_alive(&rtxn, &lookup, key.as_bytes(), RecordRef::expires_at_ms)
+        self.read_alive(
+            &rtxn,
+            &lookup,
+            self.snapshot(),
+            key.as_bytes(),
+            RecordRef::expires_at_ms,
+        )
     }
 
     /// [`Engine::deadline`] over a batch, against one snapshot.
     pub fn deadlines(&self, keys: &[Key<'_>]) -> Result<Vec<Option<u64>>> {
         let rtxn = self.read_txn()?;
         let lookup = self.tags.lookup();
+        let at = self.snapshot();
         keys.iter()
-            .map(|key| self.read_alive(&rtxn, &lookup, key.as_bytes(), RecordRef::expires_at_ms))
+            .map(|key| {
+                self.read_alive(&rtxn, &lookup, at, key.as_bytes(), RecordRef::expires_at_ms)
+            })
             .collect()
     }
+
+    /// The RAM-resident half of the liveness check, read once per call.
+    ///
+    /// Both halves are already fixed for the length of a call — the read
+    /// transaction pins its own view of the data, and a batch is documented to
+    /// see one consistent snapshot — so reading them per key bought nothing and
+    /// cost a `SystemTime::now` and an acquire load each time round. On a
+    /// hundred-key `GET_MANY` that was a hundred clock calls to answer a
+    /// question whose answer had not moved.
+    ///
+    /// It also makes the guarantee load-bearing rather than incidental: with the
+    /// clock read per key, a batch spanning a millisecond boundary could count
+    /// one key live and the next one expired against the *same* deadline.
+    #[inline]
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            now_ms: self.now_ms(),
+            epoch: self.epoch(),
+        }
+    }
+}
+
+/// The clock and flush epoch a batch of keys is judged against.
+#[derive(Clone, Copy)]
+struct Snapshot {
+    now_ms: u64,
+    epoch: u32,
 }

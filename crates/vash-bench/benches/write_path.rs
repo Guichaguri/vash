@@ -193,6 +193,129 @@ fn delete_miss(bencher: divan::Bencher) {
     });
 }
 
+// ---- batch reads -----------------------------------------------------------
+
+/// A multi-get over keys that are all present.
+///
+/// The values are deliberately small, because what is under examination is the
+/// per-key overhead rather than the copy: at 64 bytes a clock call is a visible
+/// fraction of what a key costs, and at 64 KiB it would be lost in the memcpy.
+/// The one-key case is the control — nothing about a batch of one changes when
+/// per-key work moves out of the loop, so a difference there would mean the
+/// difference elsewhere is drift.
+#[divan::bench(args = [1, 16, 128])]
+fn get_many_hits(bencher: divan::Bencher, key_count: usize) {
+    let fixture = Fixture::new();
+    let value = vec![b'x'; 64];
+    let names: Vec<Vec<u8>> = (0..key_count)
+        .map(|i| format!("user:{i}:profile").into_bytes())
+        .collect();
+    for name in &names {
+        fixture.write(name, &value);
+    }
+    let keys: Vec<Key<'_>> = names.iter().map(|n| Key::new(n).expect("valid")).collect();
+
+    bencher.bench(|| {
+        divan::black_box(
+            fixture
+                .store()
+                .get_many(divan::black_box(&keys))
+                .expect("read"),
+        )
+    });
+}
+
+/// The same batch through the header-only projection, which copies no values at
+/// all — so the per-key overhead is nearly all of what is left.
+#[divan::bench(args = [1, 16, 128])]
+fn deadlines_hits(bencher: divan::Bencher, key_count: usize) {
+    let fixture = Fixture::new();
+    let value = vec![b'x'; 64];
+    let names: Vec<Vec<u8>> = (0..key_count)
+        .map(|i| format!("user:{i}:profile").into_bytes())
+        .collect();
+    for name in &names {
+        fixture.write(name, &value);
+    }
+    let keys: Vec<Key<'_>> = names.iter().map(|n| Key::new(n).expect("valid")).collect();
+
+    bencher.bench(|| {
+        divan::black_box(
+            fixture
+                .store()
+                .deadlines(divan::black_box(&keys))
+                .expect("read"),
+        )
+    });
+}
+
+// ---- the reply buffer across the blocking hop ------------------------------
+//
+// Every command goes through a `spawn_blocking` hop, because `inline_reads`
+// defaults to off. The hop itself is unchanged and identical in both arms
+// below, so it is measured on its own and left out of them: at roughly a
+// microsecond with millisecond outliers it is far larger and far noisier than
+// the buffer handling, and including it only buries what is under test.
+//
+// What changed is what crosses the hop. It used to be a buffer allocated per
+// batch, whose bytes were then copied back into the connection's own; it is now
+// the connection's buffer itself, moved each way.
+
+/// The hop alone, carrying nothing. The floor both arms below sit on, and the
+/// figure their difference should be read against.
+#[divan::bench]
+fn blocking_hop_roundtrip(bencher: divan::Bencher) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    bencher.bench(|| {
+        rt.block_on(async {
+            divan::black_box(
+                tokio::task::spawn_blocking(|| divan::black_box(0u8))
+                    .await
+                    .expect("joined"),
+            )
+        })
+    });
+}
+
+/// What the buffer handling used to cost: a fresh allocation per batch, and
+/// every reply byte copied back out of it.
+#[divan::bench(args = [64, 1024, 16384])]
+fn reply_buffer_via_copy(bencher: divan::Bencher, reply_len: usize) {
+    let payload = vec![b'r'; reply_len];
+    let mut write_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    bencher.bench_local(|| {
+        // The task's own buffer, as it was.
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(divan::black_box(&payload));
+        write_buf.extend_from_slice(&out);
+        let len = write_buf.len();
+        write_buf.clear();
+        divan::black_box(len)
+    });
+}
+
+/// What it costs now: the connection's buffer moved out and back.
+#[divan::bench(args = [64, 1024, 16384])]
+fn reply_buffer_via_move(bencher: divan::Bencher, reply_len: usize) {
+    let payload = vec![b'r'; reply_len];
+    let mut write_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    bencher.bench_local(|| {
+        let mut out = std::mem::take(&mut write_buf);
+        out.extend_from_slice(divan::black_box(&payload));
+        write_buf = out;
+        let len = write_buf.len();
+        write_buf.clear();
+        divan::black_box(len)
+    });
+}
+
 // ---- the per-command authentication gate -----------------------------------
 //
 // Both forms below are compiled from the same tree, so this is a straight
