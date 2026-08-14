@@ -97,7 +97,8 @@ Closed-loop latency, one request in flight per connection, 1 KiB values:
 These are vash measured against itself. For vash measured **beside Redis and
 memcached** — one client, one box, the same workload pointed at all three — see
 [docs/benchmarks.md](docs/benchmarks.md), which also records a read-path knob
-worth 4–9× in a container and one bug the comparison turned up.
+worth 3–10× in a container, and the retraction of a bug that document reported
+on one sample and could not reproduce on the next eleven.
 
 Against the goals set in [plan.md](docs/plan.md) §13 before any of it was built:
 
