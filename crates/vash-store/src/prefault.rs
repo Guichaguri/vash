@@ -36,6 +36,35 @@
 //! not the mechanism: the sequential read is what removes the stall, and it
 //! works everywhere.
 //!
+//! # Why not huge pages
+//!
+//! A 4 GiB map walked at random is a TLB-miss machine, so `MADV_HUGEPAGE` was
+//! the obvious next thing to reach for. It was measured rather than assumed,
+//! and there is nothing to take: on LMDB's mapping the call **returns success
+//! and does nothing**. That is worse than failing — a knob that reports having
+//! worked invites an operator to believe TLB pressure has been dealt with.
+//!
+//! The kernel says so directly. Probed with a 256 MiB mapping of each shape,
+//! every page touched, reading `THPeligible` and the huge-page counters back
+//! out of `/proc/self/smaps`:
+//!
+//! | mapping | `madvise` | `THPeligible` | huge pages |
+//! |---|---|---|---|
+//! | anonymous — control | `0` | 1 | 168 MiB |
+//! | file-backed `MAP_SHARED`, ext4 — **what LMDB does** | `0` | 0 | none |
+//! | file-backed `MAP_SHARED`, tmpfs | `0` | 0 | none |
+//!
+//! Transparent huge pages cover anonymous memory and shmem. A shared mapping of
+//! a file on an ordinary filesystem is not eligible however it is advised, and
+//! the control line is what makes that a fact about the mapping rather than
+//! about the probe.
+//!
+//! Two paths remain, and neither is this crate's to take. tmpfs becomes
+//! eligible once `/sys/kernel/mm/transparent_hugepage/shmem_enabled` is moved
+//! off its `never` default — root, system-wide, the operator's call, and only
+//! relevant to an `ephemeral` store placed on tmpfs. `hugetlbfs` would need the
+//! mapping to come from a hugetlbfs file, and LMDB opens and maps its own.
+//!
 //! # What it buys, measured
 //!
 //! `examples/prefault_bench` is the measurement, and it is the only honest way

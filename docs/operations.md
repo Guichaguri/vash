@@ -155,6 +155,24 @@ Note that **`MAP_POPULATE` itself is not available**: it is a flag on `mmap`,
 LMDB owns that call, and it exposes neither the flag nor the mapping's address.
 `src/prefault.rs` records the detail.
 
+### Huge pages — there is no knob, and that is deliberate
+
+Worth knowing if you were about to go looking for one. `MADV_HUGEPAGE` on
+LMDB's mapping **returns success and has no effect**, so vash does not offer it:
+a setting that reports having worked while changing nothing is worse than its
+absence.
+
+Measured with a 256 MiB mapping of each shape, reading `THPeligible` back out
+of `/proc/self/smaps` — an anonymous mapping reports eligible and gets 168 MiB
+of huge pages, while a shared file mapping on ext4, which is exactly what LMDB
+creates, reports **not eligible** and gets none. Transparent huge pages cover
+anonymous memory and shmem, not shared mappings of ordinary files.
+
+If you want huge pages behind a cache, the only route is an `ephemeral` store on
+tmpfs with `/sys/kernel/mm/transparent_hugepage/shmem_enabled` moved off its
+`never` default. That is a root-level, machine-wide kernel setting and therefore
+yours to make, not something the server can or should do on your behalf.
+
 ### Durability
 
 | Mode | Use when |
