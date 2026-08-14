@@ -1425,3 +1425,240 @@ async fn info_is_a_verbatim_string_under_resp3() {
     )
     .await;
 }
+
+// ---- tags ------------------------------------------------------------------
+//
+// The tag surface this dialect gained: `SETTAGS` and `MSETTAGS` attach names at
+// write time, `DELBYTAG` invalidates every record carrying one. Designed in
+// `docs/resp-tags.md`, and these pin the wire behaviour a client sees.
+
+#[tokio::test]
+async fn settags_attaches_tags_and_delbytag_invalidates_them() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.call(&["SETTAGS", "article:1", "one", "1", "news"], "+OK\r\n")
+        .await;
+    c.call(
+        &["SETTAGS", "article:2", "two", "2", "news", "author:7"],
+        "+OK\r\n",
+    )
+    .await;
+    // Untagged, and therefore not the tag's business.
+    c.call(&["SET", "unrelated", "keep"], "+OK\r\n").await;
+
+    c.call(&["GET", "article:1"], "$3\r\none\r\n").await;
+    c.call(&["DELBYTAG", "news"], ":1\r\n").await;
+
+    // Both records carried the tag, so both are gone — in one constant-time
+    // operation, whatever the count.
+    c.call(&["GET", "article:1"], "$-1\r\n").await;
+    c.call(&["GET", "article:2"], "$-1\r\n").await;
+    c.call(&["GET", "unrelated"], "$4\r\nkeep\r\n").await;
+
+    // The second tag the invalidated record carried is still a live name: the
+    // registry keeps it, and nothing that carried it is left.
+    c.call(&["DELBYTAG", "author:7"], ":1\r\n").await;
+}
+
+/// A record written *after* an invalidation carries the tag's new generation,
+/// so it survives — including one written immediately afterwards, which is the
+/// case a framework hits when it invalidates and then repopulates.
+#[tokio::test]
+async fn a_write_after_the_invalidation_survives_it() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.call(&["SETTAGS", "k", "old", "1", "news"], "+OK\r\n")
+        .await;
+    c.call(&["DELBYTAG", "news"], ":1\r\n").await;
+    c.call(&["SETTAGS", "k", "new", "1", "news"], "+OK\r\n")
+        .await;
+    c.call(&["GET", "k"], "$3\r\nnew\r\n").await;
+
+    // And the tag still works on it.
+    c.call(&["DELBYTAG", "news"], ":1\r\n").await;
+    c.call(&["GET", "k"], "$-1\r\n").await;
+}
+
+#[tokio::test]
+async fn delbytag_counts_the_names_it_knew() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.call(&["SETTAGS", "k", "v", "2", "a", "b"], "+OK\r\n")
+        .await;
+
+    // Two of the three are registered; `never-used` was never seen, so nothing
+    // could have carried it. Counted the way `DEL` counts absent keys.
+    c.call(&["DELBYTAG", "a", "b", "never-used"], ":2\r\n")
+        .await;
+    c.call(&["DELBYTAG", "never-used"], ":0\r\n").await;
+    c.call(&["GET", "k"], "$-1\r\n").await;
+}
+
+#[tokio::test]
+async fn msettags_tags_every_pair_in_the_batch() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.call(
+        &[
+            "MSETTAGS", "2", "a", "1", "b", "2", "1", "batch", "EX", "1000",
+        ],
+        ":1\r\n",
+    )
+    .await;
+    c.call(&["GET", "a"], "$1\r\n1\r\n").await;
+    let ttl = c.line(&["TTL", "b"]).await;
+    assert!(ttl == ":1000\r\n" || ttl == ":999\r\n", "got {ttl:?}");
+
+    // The guard still governs the batch, and a skipped batch tags nothing.
+    c.call(&["MSETTAGS", "1", "a", "9", "1", "other", "NX"], ":0\r\n")
+        .await;
+    c.call(&["DELBYTAG", "other"], ":0\r\n").await;
+    c.call(&["GET", "a"], "$1\r\n1\r\n").await;
+
+    c.call(&["DELBYTAG", "batch"], ":1\r\n").await;
+    c.call(&["GET", "a"], "$-1\r\n").await;
+    c.call(&["GET", "b"], "$-1\r\n").await;
+}
+
+/// `SETTAGS` is `SET` with a tag list, and the options have to keep behaving
+/// exactly as they do on `SET` — including the ones that decide whether the
+/// write happens at all.
+#[tokio::test]
+async fn settags_keeps_every_set_option() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.call(
+        &["SETTAGS", "k", "first", "1", "t", "EX", "1000"],
+        "+OK\r\n",
+    )
+    .await;
+    let ttl = c.line(&["TTL", "k"]).await;
+    assert!(ttl == ":1000\r\n" || ttl == ":999\r\n", "got {ttl:?}");
+
+    // NX on a key that exists: skipped, and reported as a null.
+    c.call(&["SETTAGS", "k", "second", "1", "t", "NX"], "$-1\r\n")
+        .await;
+    c.call(&["GET", "k"], "$5\r\nfirst\r\n").await;
+
+    // GET reports what was displaced, and KEEPTTL leaves the deadline alone.
+    c.call(
+        &["SETTAGS", "k", "second", "1", "t", "GET", "KEEPTTL"],
+        "$5\r\nfirst\r\n",
+    )
+    .await;
+    let ttl = c.line(&["TTL", "k"]).await;
+    assert!(ttl == ":1000\r\n" || ttl == ":999\r\n", "got {ttl:?}");
+
+    // A tagless `SETTAGS` is a plain write, not an error.
+    c.call(&["SETTAGS", "k", "third", "0"], "+OK\r\n").await;
+    c.call(&["GET", "k"], "$5\r\nthird\r\n").await;
+    c.call(&["DELBYTAG", "t"], ":1\r\n").await;
+    // Which is why it survived: the last write carried no tag at all.
+    c.call(&["GET", "k"], "$5\r\nthird\r\n").await;
+}
+
+/// Every refusal lands before the write, so a rejected command leaves the key
+/// exactly as it was — and the connection carries on.
+#[tokio::test]
+async fn a_bad_tag_list_is_refused_without_writing() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.call(&["SETTAGS", "k", "v", "1", ""], "-ERR invalid tag\r\n")
+        .await;
+    c.call(&["EXISTS", "k"], ":0\r\n").await;
+
+    let long = "x".repeat(256);
+    c.call(&["SETTAGS", "k", "v", "1", &long], "-ERR invalid tag\r\n")
+        .await;
+
+    // Past the record format's ceiling: refused by the parser.
+    c.call(&["SETTAGS", "k", "v", "256", "t"], "-ERR too many tags\r\n")
+        .await;
+
+    // Past the *configured* per-record limit, which only the store knows. The
+    // parser lets these through and the store names the refusal.
+    let mut over: Vec<String> = vec!["SETTAGS".into(), "k".into(), "v".into(), "33".into()];
+    over.extend((0..33).map(|i| format!("t{i}")));
+    let over: Vec<&str> = over.iter().map(String::as_str).collect();
+    c.call(&over, "-ERR too many tags\r\n").await;
+
+    c.call(
+        &["SETTAGS", "k", "v", "3", "a"],
+        "-ERR wrong number of arguments for 'settags' command\r\n",
+    )
+    .await;
+    c.call(
+        &["DELBYTAG"],
+        "-ERR wrong number of arguments for 'delbytag' command\r\n",
+    )
+    .await;
+
+    c.call(&["EXISTS", "k"], ":0\r\n").await;
+    c.call(&["SETTAGS", "k", "v", "1", "t"], "+OK\r\n").await;
+}
+
+/// The expiry error names the verb the client actually sent, which is what
+/// Redis does and what makes the message actionable.
+#[tokio::test]
+async fn the_tagged_writes_name_themselves_in_an_expiry_error() {
+    const MAX: &str = "9223372036854775807";
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    c.call(
+        &["SETTAGS", "k", "v", "1", "t", "PX", MAX],
+        "-ERR invalid expire time in 'settags' command\r\n",
+    )
+    .await;
+    c.call(
+        &["MSETTAGS", "1", "a", "1", "1", "t", "PX", MAX],
+        "-ERR invalid expire time in 'msettags' command\r\n",
+    )
+    .await;
+    c.call(&["EXISTS", "k"], ":0\r\n").await;
+}
+
+/// One tag space, three dialects. A tag attached over RESP is the same
+/// registered name a memcached client invalidates, and the record it kills is
+/// the same record — which is the whole point of the tag surface being a
+/// property of the store rather than of a protocol.
+#[tokio::test]
+async fn a_tag_attached_over_resp_is_invalidated_over_memcached() {
+    let server = TestServer::start().await;
+
+    let mut redis = server.connect().await;
+    redis
+        .call(&["SETTAGS", "shared", "hello", "1", "news"], "+OK\r\n")
+        .await;
+
+    let mut memcached = server.connect().await;
+    memcached.send(b"delete_by_tag news\r\n").await;
+    let expected = "DELETED\r\n";
+    memcached.fill(expected.len()).await;
+    assert_eq!(
+        String::from_utf8_lossy(&memcached.buf[..expected.len()]),
+        expected,
+        "the tag was registered by the RESP write"
+    );
+
+    redis.call(&["GET", "shared"], "$-1\r\n").await;
+
+    // And the reverse: a tag the memcached dialect registered is one `DELBYTAG`
+    // knows about.
+    memcached.buf.clear();
+    memcached.send(b"ms tagged 5 Gsport\r\nvalue\r\n").await;
+    let stored = "HD\r\n";
+    memcached.fill(stored.len()).await;
+    assert_eq!(
+        String::from_utf8_lossy(&memcached.buf[..stored.len()]),
+        stored
+    );
+    redis.call(&["DELBYTAG", "sport"], ":1\r\n").await;
+    redis.call(&["GET", "tagged"], "$-1\r\n").await;
+}

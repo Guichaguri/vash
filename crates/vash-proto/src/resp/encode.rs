@@ -448,9 +448,15 @@ pub fn info(out: &mut Vec<u8>, sections: Sections, stats: &[(String, String)], v
         // under it.
         let mut body = String::new();
         if section == Section::Vash {
-            // Rendered by prefix rather than from a table: these are already
-            // named for this server, and a second list of them would be a
-            // second thing to keep in step with `stats::collect`.
+            // Stated, not counted: what a client wants to know here is whether
+            // this dialect answers `SETTAGS`/`MSETTAGS`/`DELBYTAG` at all, and
+            // sending one to find out is a write. It lives here rather than in
+            // `stats::collect` because it is a fact about *this* dialect, and
+            // the memcached `stats` payload should not carry it.
+            let _ = writeln!(body, "vash_resp_tags:1\r");
+            // The rest are rendered by prefix rather than from a table: they are
+            // already named for this server, and a second list of them would be
+            // a second thing to keep in step with `stats::collect`.
             for (name, value) in stats.iter().filter(|(name, _)| name.starts_with("vash_")) {
                 let _ = writeln!(body, "{name}:{value}\r");
             }
@@ -741,6 +747,9 @@ mod tests {
         let all = rendered_info(Sections::ALL, &counters());
         assert!(all.contains("# Vash\r\n"));
         assert!(all.contains("vash_shards:4\r\n"));
+        // How a client learns this dialect has tags without writing to find out.
+        assert!(all.contains("vash_resp_tags:1\r\n"));
+        assert!(!rendered_info(Sections::DEFAULT, &counters()).contains("vash_resp_tags"));
     }
 
     #[test]

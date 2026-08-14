@@ -58,6 +58,11 @@ pub enum Command<'a> {
         pairs: Vec<(&'a [u8], &'a [u8])>,
         condition: Condition,
         expiry: Expiry,
+        /// `MSETTAGS`: one tag list, carried by every pair in the batch. Empty
+        /// for `MSETEX`.
+        tags: Vec<&'a [u8]>,
+        /// Whether the client sent `MSETTAGS`. See [`Set::tagged`].
+        tagged: bool,
     },
     Exists {
         keys: Vec<&'a [u8]>,
@@ -72,6 +77,20 @@ pub enum Command<'a> {
     Append {
         key: &'a [u8],
         value: &'a [u8],
+    },
+
+    // ---- tags ------------------------------------------------------------
+    /// `DELBYTAG tag [tag …]`: invalidate every record carrying each named tag.
+    ///
+    /// The other half of the tag surface — attaching them — is not a command of
+    /// its own: `SETTAGS` and `MSETTAGS` are [`Set`] and [`Command::MSetEx`]
+    /// carrying a tag list, because they are the same write with the same
+    /// options and the same reply.
+    ///
+    /// Named for what it does to *records*, selected by tag. Nothing here
+    /// deletes the tag itself: the registry keeps a name once it has seen it.
+    DelByTag {
+        tags: Vec<&'a [u8]>,
     },
 
     // ---- expiry ----------------------------------------------------------
@@ -145,6 +164,15 @@ pub struct Set<'a> {
     pub expiry: Expiry,
     /// `GET`: reply with the value the key held beforehand rather than `OK`.
     pub return_previous: bool,
+    /// Tag names to attach, in the order the client listed them. Empty for
+    /// `SET`, which costs no allocation.
+    pub tags: Vec<&'a [u8]>,
+    /// Whether the client sent `SETTAGS` rather than `SET`.
+    ///
+    /// Not derivable from `tags` — `SETTAGS key value 0` is a legal tagless
+    /// write — and needed because Redis names the command in its expiry error,
+    /// which the executor raises after the parser is done.
+    pub tagged: bool,
 }
 
 /// `INCREX`, which is every other arithmetic command plus bounds and an
@@ -314,7 +342,8 @@ pub fn parse_command<'a>(
             key: exactly(args, 2, "get", consumed)?[1],
         },
 
-        b"SET" => parse_set(args, consumed)?,
+        b"SET" => parse_set(args, consumed, Tagged::No)?,
+        b"SETTAGS" => parse_set(args, consumed, Tagged::Yes)?,
 
         b"DEL" => Command::Delete {
             keys: at_least(args, 2, "del", consumed)?[1..].to_vec(),
@@ -337,7 +366,19 @@ pub fn parse_command<'a>(
             }
         }
 
-        b"MSETEX" => parse_msetex(args, consumed)?,
+        b"MSETEX" => parse_msetex(args, consumed, Tagged::No)?,
+        b"MSETTAGS" => parse_msetex(args, consumed, Tagged::Yes)?,
+
+        // One command per tag would do the same work; taking a list saves the
+        // round trips a framework spends invalidating several at once.
+        b"DELBYTAG" => {
+            let args = at_least(args, 2, "delbytag", consumed)?;
+            let mut tags = Vec::with_capacity(args.len() - 1);
+            for tag in &args[1..] {
+                tags.push(check_tag(tag).map_err(fail)?);
+            }
+            Command::DelByTag { tags }
+        }
 
         b"EXISTS" => Command::Exists {
             keys: at_least(args, 2, "exists", consumed)?[1..].to_vec(),
@@ -510,10 +551,22 @@ fn has_unescaped_class(pattern: &[u8]) -> bool {
     false
 }
 
-/// `SET key value [NX | XX] [GET] [EX s | PX ms | EXAT ts | PXAT ms | KEEPTTL]`
-fn parse_set<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, ProtocolError<'a>> {
-    let args = at_least(args, 3, "set", consumed)?;
+/// `SET key value [NX | XX] [GET] [EX s | PX ms | EXAT ts | PXAT ms | KEEPTTL]`,
+/// and `SETTAGS key value numtags tag [tag …] [the same options]`.
+///
+/// One parser for both: the tag list is the only difference, and routing
+/// `SETTAGS` through a parser of its own would mean maintaining two copies of
+/// an option grammar that has to stay identical.
+fn parse_set<'a>(
+    args: &[&'a [u8]],
+    consumed: usize,
+    tagged: Tagged,
+) -> Result<Command<'a>, ProtocolError<'a>> {
+    let name = tagged.pick("set", "settags");
+    let args = at_least(args, if tagged.yes() { 4 } else { 3 }, name, consumed)?;
     let fail = |reply: ErrorReply<'a>| ProtocolError::Recoverable { reply, consumed };
+
+    let (tags, options_at) = tag_list(args, 3, tagged, name, consumed)?;
 
     let mut set = Set {
         key: args[1],
@@ -521,9 +574,11 @@ fn parse_set<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, Prot
         condition: Condition::Always,
         expiry: Expiry::Unset,
         return_previous: false,
+        tags,
+        tagged: tagged.yes(),
     };
 
-    let mut cursor = Options::new(&args[3..], "set", consumed);
+    let mut cursor = Options::new(&args[options_at..], name, consumed);
     while let Some(token) = cursor.next() {
         if eq(token, b"NX") {
             cursor.set_condition(&mut set.condition, Condition::IfAbsent)?;
@@ -551,9 +606,22 @@ fn parse_set<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, Prot
     Ok(Command::Set(set))
 }
 
-/// `MSETEX numkeys key value [key value ...] [NX | XX] [EX … | KEEPTTL]`
-fn parse_msetex<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, ProtocolError<'a>> {
-    let args = at_least(args, 4, "msetex", consumed)?;
+/// `MSETEX numkeys key value [key value ...] [NX | XX] [EX … | KEEPTTL]`, and
+/// `MSETTAGS numkeys key value [key value …] numtags tag [tag …] [the same
+/// options]`.
+///
+/// The batch shares one tag list rather than carrying one per pair. The
+/// boundary would take per-pair lists — `SetMany` holds a `Vec<Set>`, each with
+/// its own tags — but the wire form for that is a second counted list per pair,
+/// and a batch written together is a batch invalidated together in every use
+/// this is for.
+fn parse_msetex<'a>(
+    args: &[&'a [u8]],
+    consumed: usize,
+    tagged: Tagged,
+) -> Result<Command<'a>, ProtocolError<'a>> {
+    let name = tagged.pick("msetex", "msettags");
+    let args = at_least(args, if tagged.yes() { 5 } else { 4 }, name, consumed)?;
     let fail = |reply: ErrorReply<'a>| ProtocolError::Recoverable { reply, consumed };
 
     let count = parse_int(args[1]).ok_or_else(|| fail(ErrorReply::NOT_AN_INTEGER))?;
@@ -568,13 +636,15 @@ fn parse_msetex<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, P
 
     let body = 2 + (count as usize) * 2;
     if args.len() < body {
-        return Err(fail(ErrorReply::WrongArity("msetex")));
+        return Err(fail(ErrorReply::WrongArity(name)));
     }
+
+    let (tags, options_at) = tag_list(args, body, tagged, name, consumed)?;
 
     let mut condition = Condition::Always;
     let mut expiry = Expiry::Unset;
 
-    let mut cursor = Options::new(&args[body..], "msetex", consumed);
+    let mut cursor = Options::new(&args[options_at..], name, consumed);
     while let Some(token) = cursor.next() {
         if eq(token, b"NX") {
             cursor.set_condition(&mut condition, Condition::IfAbsent)?;
@@ -591,7 +661,91 @@ fn parse_msetex<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, P
         pairs: pairs(&args[2..body]),
         condition,
         expiry,
+        tags,
+        tagged: tagged.yes(),
     })
+}
+
+/// Whether the verb being parsed carries a tag list.
+///
+/// A named type rather than a bare `bool` because it also picks the command
+/// name every error in these two parsers is worded with, and a call site
+/// reading `Tagged::Yes` cannot get the sense backwards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tagged {
+    No,
+    Yes,
+}
+
+impl Tagged {
+    fn yes(self) -> bool {
+        self == Self::Yes
+    }
+
+    fn pick(self, plain: &'static str, tagged: &'static str) -> &'static str {
+        if self.yes() { tagged } else { plain }
+    }
+}
+
+/// Reads `numtags tag [tag …]` at `at`, and reports where the options begin.
+///
+/// Counted rather than delimited, because tag names are binary-safe: a
+/// comma-separated list — which is what the memcached extension has to use,
+/// having nowhere else to put them — cannot express a name containing a comma.
+///
+/// `numtags 0` is accepted, unlike `MSETEX`'s `numkeys`. A batch of no keys is a
+/// meaningless write; a write with no tags is an ordinary one, and a client
+/// building a command from a possibly-empty list should not have to switch
+/// verbs to send it.
+fn tag_list<'t, 'a>(
+    args: &'t [&'a [u8]],
+    at: usize,
+    tagged: Tagged,
+    name: &'static str,
+    consumed: usize,
+) -> Result<(Vec<&'a [u8]>, usize), ProtocolError<'a>> {
+    let fail = |reply: ErrorReply<'a>| ProtocolError::Recoverable { reply, consumed };
+    if !tagged.yes() {
+        return Ok((Vec::new(), at));
+    }
+
+    let count = parse_int(args[at]).ok_or_else(|| fail(ErrorReply::NOT_AN_INTEGER))?;
+    if count < 0 {
+        return Err(fail(ErrorReply::Err(
+            "numtags should be greater than or equal to 0",
+        )));
+    }
+    // The record format's ceiling, not the configured limit: `tag_count` is a
+    // `u8`, so a longer list cannot be written down at all. Checking it before
+    // the names are collected means an enormous `numtags` costs nothing. The
+    // store still applies `store.tags.max_per_record`, which is lower.
+    if count as u64 > vash_core::ABSOLUTE_MAX_TAGS as u64 {
+        return Err(fail(ErrorReply::Err("too many tags")));
+    }
+
+    let first = at + 1;
+    let end = first + count as usize;
+    if args.len() < end {
+        return Err(fail(ErrorReply::WrongArity(name)));
+    }
+
+    let mut tags = Vec::with_capacity(count as usize);
+    for tag in &args[first..end] {
+        tags.push(check_tag(tag).map_err(fail)?);
+    }
+    Ok((tags, end))
+}
+
+/// Checks one tag name against the format's limits.
+///
+/// The same two rules the memcached extension applies, in this dialect's
+/// wording: a name is 1–255 bytes and otherwise binary-safe. Rejected here so a
+/// batch that cannot be written never reaches the writer queue.
+fn check_tag<'a>(tag: &'a [u8]) -> Result<&'a [u8], ErrorReply<'a>> {
+    if tag.is_empty() || tag.len() > vash_core::MAX_TAG_LEN {
+        return Err(ErrorReply::Err("invalid tag"));
+    }
+    Ok(tag)
 }
 
 /// `EXPIRE key seconds [NX | XX | GT | LT]` and its `EXPIREAT` twin.
@@ -1045,6 +1199,8 @@ mod tests {
             pairs,
             condition,
             expiry,
+            tags,
+            tagged,
         } = command(&[b"MSETEX", b"2", b"a", b"1", b"b", b"2", b"NX", b"EX", b"30"])
         else {
             panic!("expected an msetex")
@@ -1052,6 +1208,8 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(condition, Condition::IfAbsent);
         assert_eq!(expiry, Expiry::After(30_000));
+        assert!(tags.is_empty());
+        assert!(!tagged);
     }
 
     #[test]
@@ -1066,6 +1224,177 @@ mod tests {
             rejected(&[b"MSETEX", b"0", b"a", b"1"]),
             ErrorReply::Err("numkeys should be greater than 0")
         );
+    }
+
+    #[test]
+    fn parses_settags() {
+        let Command::Set(set) = command(&[
+            b"SETTAGS",
+            b"k",
+            b"v",
+            b"2",
+            b"news",
+            b"author:7",
+            b"EX",
+            b"60",
+            b"NX",
+        ]) else {
+            panic!("expected a set")
+        };
+        assert_eq!(set.key, b"k");
+        assert_eq!(set.value, b"v");
+        assert_eq!(set.tags, vec![&b"news"[..], &b"author:7"[..]]);
+        assert!(set.tagged);
+        // The tag list changes nothing about the options that follow it.
+        assert_eq!(set.expiry, Expiry::After(60_000));
+        assert_eq!(set.condition, Condition::IfAbsent);
+    }
+
+    /// A tagless write is an ordinary thing to ask for, and a client building a
+    /// command from a list that turned out empty should not have to switch
+    /// verbs. `tagged` is what remembers which verb was sent.
+    #[test]
+    fn settags_accepts_no_tags() {
+        let Command::Set(set) = command(&[b"SETTAGS", b"k", b"v", b"0", b"KEEPTTL"]) else {
+            panic!("expected a set")
+        };
+        assert!(set.tags.is_empty());
+        assert!(set.tagged);
+        assert_eq!(set.expiry, Expiry::Keep);
+    }
+
+    #[test]
+    fn set_carries_no_tags_and_settags_needs_a_count() {
+        let Command::Set(set) = command(&[b"SET", b"k", b"v"]) else {
+            panic!("expected a set")
+        };
+        assert!(set.tags.is_empty());
+        assert!(!set.tagged);
+
+        // Without the count there is nothing to say where the tags stop.
+        assert_eq!(
+            rejected(&[b"SETTAGS", b"k", b"v"]),
+            ErrorReply::WrongArity("settags")
+        );
+    }
+
+    #[test]
+    fn settags_checks_numtags_against_the_arguments() {
+        assert_eq!(
+            rejected(&[b"SETTAGS", b"k", b"v", b"3", b"news"]),
+            ErrorReply::WrongArity("settags")
+        );
+        assert_eq!(
+            rejected(&[b"SETTAGS", b"k", b"v", b"-1", b"news"]),
+            ErrorReply::Err("numtags should be greater than or equal to 0")
+        );
+        assert_eq!(
+            rejected(&[b"SETTAGS", b"k", b"v", b"two", b"news"]),
+            ErrorReply::NOT_AN_INTEGER
+        );
+        // Past the record format's own ceiling, and refused before a list that
+        // long is collected.
+        assert_eq!(
+            rejected(&[b"SETTAGS", b"k", b"v", b"256", b"news"]),
+            ErrorReply::Err("too many tags")
+        );
+    }
+
+    #[test]
+    fn a_tag_name_is_one_to_255_bytes() {
+        let long = vec![b'x'; vash_core::MAX_TAG_LEN + 1];
+        assert_eq!(
+            rejected(&[b"SETTAGS", b"k", b"v", b"1", &long]),
+            ErrorReply::Err("invalid tag")
+        );
+        assert_eq!(
+            rejected(&[b"SETTAGS", b"k", b"v", b"1", b""]),
+            ErrorReply::Err("invalid tag")
+        );
+        assert_eq!(
+            rejected(&[b"DELBYTAG", b"news", b""]),
+            ErrorReply::Err("invalid tag")
+        );
+
+        // The limit itself is allowed, on both verbs.
+        let edge = vec![b'x'; vash_core::MAX_TAG_LEN];
+        assert!(matches!(
+            command(&[b"SETTAGS", b"k", b"v", b"1", &edge]),
+            Command::Set(_)
+        ));
+        assert!(matches!(
+            command(&[b"DELBYTAG", &edge]),
+            Command::DelByTag { .. }
+        ));
+    }
+
+    /// A tag name is binary-safe, which is why the list is counted rather than
+    /// comma-separated: the memcached extension cannot express this at all.
+    #[test]
+    fn a_tag_name_may_contain_a_comma() {
+        let Command::Set(set) = command(&[b"SETTAGS", b"k", b"v", b"1", b"a,b"]) else {
+            panic!("expected a set")
+        };
+        assert_eq!(set.tags, vec![&b"a,b"[..]]);
+    }
+
+    #[test]
+    fn parses_msettags() {
+        let Command::MSetEx {
+            pairs,
+            condition,
+            expiry,
+            tags,
+            tagged,
+        } = command(&[
+            b"MSETTAGS",
+            b"2",
+            b"a",
+            b"1",
+            b"b",
+            b"2",
+            b"1",
+            b"news",
+            b"XX",
+            b"EX",
+            b"30",
+        ])
+        else {
+            panic!("expected an msetex")
+        };
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(tags, vec![&b"news"[..]]);
+        assert!(tagged);
+        assert_eq!(condition, Condition::IfPresent);
+        assert_eq!(expiry, Expiry::After(30_000));
+    }
+
+    #[test]
+    fn msettags_counts_the_tags_after_the_pairs() {
+        // `numkeys` says where the pairs stop; `numtags` says where the tags do.
+        // Getting either wrong is an arity error, not a guess.
+        assert_eq!(
+            rejected(&[b"MSETTAGS", b"2", b"a", b"1", b"b", b"2", b"2", b"news"]),
+            ErrorReply::WrongArity("msettags")
+        );
+        assert_eq!(
+            rejected(&[b"MSETTAGS", b"1", b"a", b"1"]),
+            ErrorReply::WrongArity("msettags")
+        );
+        assert_eq!(
+            rejected(&[b"MSETTAGS", b"0", b"a", b"1", b"0"]),
+            ErrorReply::Err("numkeys should be greater than 0")
+        );
+    }
+
+    #[test]
+    fn parses_delbytag() {
+        let Command::DelByTag { tags } = command(&[b"DELBYTAG", b"news", b"author:7"]) else {
+            panic!("expected a tag invalidation")
+        };
+        assert_eq!(tags, vec![&b"news"[..], &b"author:7"[..]]);
+
+        assert_eq!(rejected(&[b"DELBYTAG"]), ErrorReply::WrongArity("delbytag"));
     }
 
     #[test]

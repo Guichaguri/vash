@@ -36,7 +36,7 @@ records are evicted when that fills. Nothing here is a system of record.
 |---|---|
 | **Protocol compatibility** | memcached text and meta, Redis RESP2 and RESP3, and the native VCP, all on the same port. The dialect is settled by the connection's first byte. |
 | **TTLs** | Per-record, enforced on read, and reclaimed in the background so expired data does not keep occupying space. |
-| **Tag invalidation** | Attach tags at write time; `DELETE_BY_TAG` invalidates all of them at once, in constant time, and propagates across a cluster. |
+| **Tag invalidation** | Attach tags at write time; `DELETE_BY_TAG` invalidates all of them at once, in constant time, and propagates across a cluster. Reachable from all three dialects. |
 | **Batches** | `GET_MANY` / `SET_MANY` / `DELETE_MANY`, and memcached / Redis multi-key commands. One transaction per batch, one round trip. |
 | **Atomic counters** | Read-modify-write inside one transaction, with optional bounds, saturation and TTL. Counters are decimal text, so all three dialects move the same counter. |
 | **CAS** | Every record carries a CAS token; memcached `gets`/`cas` work as upstream, and tokens never go backwards across a restart. |
@@ -243,7 +243,21 @@ EN
 ```
 
 `delete_by_tag <tag>` does the same in the classic dialect, and `DELETE_BY_TAG`
-in VCP. A tag is 1–255 bytes; a record carries up to 32 by default
+in VCP. Redis clients have three commands of their own, which any library can
+send through its raw-command escape hatch:
+
+```
+SETTAGS article:1 value 2 news sport
++OK
+MSETTAGS 2 a 1 b 2 1 news EX 60
+:1
+DELBYTAG news
+:1
+```
+
+`SETTAGS` is `SET` and `MSETTAGS` is `MSETEX`, each with a counted tag list
+before the usual options; `DELBYTAG` takes one or more tag names and answers how
+many of them the server had registered. A tag is 1–255 bytes; a record carries up to 32 by default
 (`store.tags.max_per_record`), and the server registers up to 100,000 distinct
 names (`store.tags.max_tags`).
 

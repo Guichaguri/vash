@@ -45,7 +45,7 @@ Run with `--ephemeral` to start from an empty database and skip syncing, or
 | Tags, `DELETE_BY_TAG`, `FLUSH` | Working — invalidation is constant time, see [benchmark](#tag-invalidation) |
 | Memcached text protocol | Working — `get`/`gets`/`set`/`add`/`replace`/`append`/`prepend`/`cas`/`delete`/`touch`/`gat`/`gats`/`incr`/`decr`/`stats`/`version`/`flush_all`/`quit` |
 | Memcached meta protocol | Working — `mg`/`ms`/`md`/`ma`/`mn`/`me`, core flag set |
-| Redis protocol (RESP2 + RESP3) | Working — string and expiry commands, all [atomic](docs/protocol.md#atomicity) except `MSETEX NX/XX` across shards |
+| Redis protocol (RESP2 + RESP3) | Working — string and expiry commands plus the tag extensions, all [atomic](docs/protocol.md#atomicity) except `MSETEX NX/XX` across shards |
 | Sharding | Working — independent environments, one writer each |
 | Capacity watermarks and eviction | Working — TTL-ordered, never LRU |
 | Metrics and admin endpoints | Working — `/metrics`, `/health`, `/stats` |
@@ -445,7 +445,8 @@ redis-cli -p 11311 SET key value
 redis-cli -3 -p 11311 INCREX ratelimit:42 BYINT 1 UBOUND 100 EX 60 ENX
 ```
 
-Supported: `GET` `SET` `DEL` `UNLINK` `MSET` `MGET` `MSETEX` `EXISTS` `TYPE`
+Supported: `GET` `SET` `DEL` `UNLINK` `MSET` `MGET` `MSETEX` `SETTAGS`
+`MSETTAGS` `DELBYTAG` `EXISTS` `TYPE`
 `EXPIRE` `EXPIREAT` `PERSIST` `TTL` `APPEND` `INCR` `INCRBY` `DECR` `DECRBY`
 `INCRBYFLOAT` `INCREX` `SCAN` `INFO`, plus `HELLO`, `PING` and `QUIT` to
 negotiate and keep a connection. `TYPE` answers `string` or `none` — every value
@@ -453,6 +454,21 @@ here is a string. `SET` takes `NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`;
 `EXPIRE` and `EXPIREAT` take `NX`/`XX`/`GT`/`LT`; `INCREX` takes its full option
 set. Anything else answers `unknown command`, which is how a client library
 discovers a feature is missing.
+
+The last three are **tags**, which Redis has no equivalent of: `SETTAGS` is
+`SET` and `MSETTAGS` is `MSETEX`, each with a counted tag list before the usual
+options, and `DELBYTAG` invalidates every record carrying a name — in constant
+time, whether that is ten keys or a million.
+
+```bash
+redis-cli -p 11311 SETTAGS article:1 body 2 news author:7
+redis-cli -p 11311 DELBYTAG news
+```
+
+New verbs rather than options on `SET`, so Redis's own commands stay byte-exact
+and a server without the feature says `unknown command` rather than
+`syntax error`. The reasoning, and the eleven other shapes this could have
+taken, are in [docs/resp-tags.md](docs/resp-tags.md).
 
 `INFO` reports the counters this server actually measures — nothing is filled in
 with a plausible zero — and `cluster_enabled:0`, so a cluster-aware client does

@@ -1426,12 +1426,12 @@ A subset of the Redis string and expiry commands, enough for a cache, plus
 sets, streams, transactions, scripting, pub/sub, `SELECT` or replication
 commands, and there never will be — see [plan.md](plan.md) §16.
 
-**There is no tag surface in this dialect.** A RESP client can neither attach a
-tag nor invalidate one, where VCP has [`DELETE_BY_TAG`](#delete_by_tag-0x30) and
-memcached has the [extensions](#extensions). A proposed surface —
-`SETTAGS`/`MSETTAGS`/`DELBYTAG`, and what was rejected on the way there — is
-designed in [resp-tags.md](resp-tags.md). It is not built, and nothing in this
-section anticipates it.
+**Tags reach this dialect through three commands that Redis does not have** —
+`SETTAGS`, `MSETTAGS` and `DELBYTAG`, described [below](#tag-commands). They are
+extensions, exactly as `ms … G<tag>` and `mdt` are in the memcached dialect, and
+a client that never sends them is unaffected. Why they are new verbs rather than
+options on `SET`, and what was rejected on the way there, is in
+[resp-tags.md](resp-tags.md).
 
 Served by default, and turned off with `protocol.resp_enabled = false` or
 `--disable-resp`, in which case a connection opening with a RESP array is closed
@@ -1496,6 +1496,9 @@ together rather than last-one-wins.
 | `MGET` | `MGET key [key …]` |
 | `MSET` | `MSET key value [key value …]` |
 | `MSETEX` | `MSETEX numkeys key value [key value …] [NX \| XX] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` |
+| `SETTAGS` | **Extension.** `SETTAGS key value numtags tag [tag …]`, then any option `SET` takes — see [Tags](#tag-commands) |
+| `MSETTAGS` | **Extension.** `MSETTAGS numkeys key value [key value …] numtags tag [tag …]`, then any option `MSETEX` takes |
+| `DELBYTAG` | **Extension.** `DELBYTAG tag [tag …]` |
 | `EXISTS` | `EXISTS key [key …]` — counts a key once per mention |
 | `TYPE` | `TYPE key` — `+string` or `+none`; every value here is a string |
 | `EXPIRE` | `EXPIRE key seconds [NX \| XX \| GT \| LT]` |
@@ -1598,6 +1601,55 @@ because that is Redis's own value for "not computed".
 `vash_version` reports what this actually is; `redis_version` is a
 compatibility claim, since client libraries gate features on it.
 
+`vash_resp_tags:1` is in the `vash` section — a statement, not a counter, and
+the way to learn this dialect has tags without sending a write to find out.
+
+## Tag commands
+
+Three commands Redis does not have. They are the only tag surface in this
+dialect, and every rule about tags themselves — the limits, the generation
+semantics, the ordering guarantee, the cluster behaviour — is the shared one in
+[Tags](#tags), unchanged.
+
+| Command | Reply |
+|---|---|
+| `SETTAGS key value numtags tag [tag …] [NX \| XX] [GET] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` | Whatever `SET` would answer: `+OK`, a null when the condition skipped the write, the displaced value with `GET`. |
+| `MSETTAGS numkeys key value [key value …] numtags tag [tag …] [NX \| XX] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` | Whatever `MSETEX` would answer: `:1`, or `:0` when the guard skipped the batch. |
+| `DELBYTAG tag [tag …]` | Integer: how many of the named tags were registered. A name this server has never seen counts zero, exactly as `DEL` counts a key that was not there. |
+
+**`SETTAGS` is `SET` and `MSETTAGS` is `MSETEX`**, each with a counted tag list
+between the body and the options. Every option behaves identically, the replies
+are identical, and the writes are as atomic as their untagged twins — the tags
+are part of the record the shard writer commits, not a second step.
+
+**The tag list is counted, not delimited.** Tag names are binary-safe, so a
+comma-separated list — which is what the memcached extension has to use, having
+nowhere else to put them — cannot express a name containing a comma. `numtags`
+says where the list ends and the options begin, exactly as `MSETEX`'s `numkeys`
+says where the pairs do.
+
+- **`numtags 0` is accepted**, unlike `numkeys 0`, and means a write with no
+  tags. A batch of no keys is meaningless; a write with no tags is ordinary, and
+  a client building a command from a list that turned out empty should not have
+  to switch verbs to send it.
+- A `numtags` that disagrees with the arguments given is an **arity error**,
+  since the count is what says where the list stops.
+- The parser refuses a list longer than **255** — the record format's own
+  ceiling — before collecting it. `store.tags.max_per_record` is lower and is
+  enforced by the store, which answers `-ERR too many tags` either way.
+
+**`DELBYTAG` deletes records, not tags.** The registry keeps a name once it has
+seen it, so a tag that has just been invalidated is still a registered name and
+`DELBYTAG` on it answers `:1` again. Several names in one command are several
+invalidations: each is a constant-time generation bump, they are counted
+individually, and a failure part-way through leaves the earlier ones applied.
+Retrying is safe — a generation bump is idempotent, which is the same property
+that lets a cluster replay them freely.
+
+There is no command to attach a tag to a record that already exists, and none to
+read a record's tags. Both are designed in
+[resp-tags.md](resp-tags.md#2-decision) and neither is built.
+
 ## Errors
 
 | Reply | When |
@@ -1613,6 +1665,9 @@ compatibility claim, since client libraries gate features on it.
 | `-ERR invalid key` | Empty, or past this server's 511-byte key limit. |
 | `-ERR string exceeds maximum allowed size` | A value past `store.max_value_bytes`. |
 | `-ERR numkeys should be greater than 0` / `-ERR too many keys` | `MSETEX` with a non-positive `numkeys`, or more than 4096 pairs. |
+| `-ERR numtags should be greater than or equal to 0` | A negative `numtags`. Zero is legal; see [Tags](#tag-commands). |
+| `-ERR invalid tag` | A tag name that is empty or longer than 255 bytes. |
+| `-ERR too many tags` | More tags on one record than `store.tags.max_per_record`, or more than the format's 255. |
 | `-ERR LBOUND must be less than or equal to UBOUND` | `INCREX` with an empty range. |
 | `-ERR command disabled by configuration` | A command gated off server-side — `SCAN` with `listing_enabled` clear. |
 | `-ERR invalid cursor` | A `SCAN` cursor that is not a non-negative integer. Redis's own wording. |
@@ -1620,7 +1675,7 @@ compatibility claim, since client libraries gate features on it.
 | `-ERR character classes are not supported in MATCH` | An unescaped `[` in a `SCAN` pattern. |
 | `-ERR unsupported operation` / `-ERR invalid argument` / `-ERR internal error` | The remaining status codes, rendered in Redis's shape. |
 | `-ERR server is overloaded, try again` | Write queue full or shutting down. Retryable. |
-| `-OOM command not allowed when used memory > 'maxmemory'` | The map is full. Clients treat `OOM` as "back off", which is right. |
+| `-OOM command not allowed when used memory > 'maxmemory'` | The map is full, or the tag registry is (`store.tags.max_tags`) — both are `CAPACITY_FULL` and this dialect does not tell them apart. Clients treat `OOM` as "back off", which is right for the first; for the second nothing frees a name, so it needs an operator. |
 | `-NOPROTO unsupported protocol version` | `HELLO` with anything but 2 or 3. |
 | `-NOAUTH Authentication required.` | Any command before authenticating. |
 | `-NOAUTH HELLO must be called with the client already authenticated, …` | A bare `HELLO` while unauthenticated. Redis's own wording, which explains the combined form. |

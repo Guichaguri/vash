@@ -123,6 +123,10 @@ pub fn inline_safe(command: &Command<'_>) -> bool {
     // `SCAN` is missing and must stay missing: it is bounded by
     // `listing_max_scan` records, not by anything a runtime worker should be
     // blocked for. `Command::ListKeys` — what it becomes — answers the same.
+    //
+    // `DELBYTAG` is missing for the ordinary reason: it writes. Neither is
+    // covered by `the_shortcut_agrees_with_the_domain`, because neither reaches
+    // `translate`, so `the_multi_step_commands_are_not_inline_safe` pins them.
 }
 
 fn execute(
@@ -339,7 +343,9 @@ const INVALID_KEY: &str = "invalid key";
 /// Redis names the command in this one, so there is a constant per command that
 /// can produce it rather than a formatted string.
 const INVALID_EXPIRE_SET: &str = "invalid expire time in 'set' command";
+const INVALID_EXPIRE_SETTAGS: &str = "invalid expire time in 'settags' command";
 const INVALID_EXPIRE_MSETEX: &str = "invalid expire time in 'msetex' command";
+const INVALID_EXPIRE_MSETTAGS: &str = "invalid expire time in 'msettags' command";
 const INVALID_EXPIRE_INCREX: &str = "invalid expire time in 'increx' command";
 
 type Answered = Result<(), Failure>;
@@ -410,6 +416,10 @@ fn run(
         // The boundary is still `dispatch::execute` — only the pure-function
         // helper is bypassed.
         Command::Scan(scan) => run_scan(state, scan, *version, out),
+
+        // Also more than one step, for a different reason: the boundary
+        // invalidates one tag at a time and this command names several.
+        Command::DelByTag { tags } => run_del_by_tag(state, tags, out),
 
         // The one command that touches storage without building a `Reply`: a
         // `GET` hit is written straight out of the store into the buffer, so
@@ -504,6 +514,45 @@ fn run_scan(
         None => crate::scan::START,
     };
     answer_scan(out, next, &page.entries, version)
+}
+
+/// Answers `DELBYTAG`.
+///
+/// One `DELETE_BY_TAG` per name, because that is the shape of the operation the
+/// boundary and the store have: each is a constant-time generation bump on one
+/// tag, independent of the others, and there is no batch form to reach for.
+/// Every one is counted and classified by `dispatch::execute` like any other
+/// write, so a three-tag command is three invalidations in the metrics —
+/// which is what it is.
+///
+/// **A failure part-way through leaves the earlier tags invalidated**, and the
+/// reply is the error rather than a count. That is safe to retry: a generation
+/// bump is idempotent, invalidating an already-invalidated tag costs one more
+/// bump and changes nothing a client can observe, which is the same property
+/// that lets the cluster replay these freely.
+fn run_del_by_tag(state: &ServerState, tags: &[&[u8]], out: &mut Vec<u8>) -> Answered {
+    let mut registered = 0i64;
+    for tag in tags {
+        let reply = crate::dispatch::execute(
+            state,
+            &vash_core::Command::DeleteByTag { tag },
+            crate::metrics::Dialect::Resp,
+        )
+        .map_err(resp_error)?;
+
+        match reply {
+            // `false` is a tag this server has never registered: nothing could
+            // have carried it, so nothing was invalidated. Counted the way
+            // `DEL` counts keys that were not there — silently, as a zero.
+            Reply::Invalidated(hit) => registered += i64::from(hit),
+            other => {
+                error!(?other, "DELBYTAG produced a reply it cannot render");
+                return Err(Failure::internal());
+            }
+        }
+    }
+    encode::integer(out, registered);
+    Ok(())
 }
 
 /// `[cursor, [key …]]`, with the cursor as decimal text — which is what every
@@ -660,6 +709,15 @@ fn resp_error(failed: crate::dispatch::Failed) -> Failure {
         Some(CoreError::NotFinite) => Some(NOT_FINITE),
         Some(CoreError::EmptyKey | CoreError::KeyTooLong { .. }) => Some(INVALID_KEY),
         Some(CoreError::ValueTooLarge { .. }) => Some("string exceeds maximum allowed size"),
+        // The parser enforces the format's ceiling on a tag list; this is the
+        // configured `store.tags.max_per_record`, which is lower and which only
+        // the store knows. Named rather than left as `invalid argument`,
+        // because the client can act on it — send fewer tags.
+        Some(CoreError::TooManyTags { .. }) => Some("too many tags"),
+        // Unreachable from this dialect, whose parser rejects both before the
+        // command is built. Mapped anyway so a future caller that skips the
+        // parser cannot land on `invalid argument` for a named condition.
+        Some(CoreError::EmptyTag | CoreError::TagTooLong { .. }) => Some("invalid tag"),
         _ => None,
     };
     if let Some(message) = message {
@@ -716,9 +774,18 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
         Command::Set(set) => Domain::Set(vash_core::Set {
             key: key_of(set.key)?,
             value: set.value,
-            ttl: ttl_change_for(set.expiry, now_ms() as i64, INVALID_EXPIRE_SET)?,
+            ttl: ttl_change_for(
+                set.expiry,
+                now_ms() as i64,
+                if set.tagged {
+                    INVALID_EXPIRE_SETTAGS
+                } else {
+                    INVALID_EXPIRE_SET
+                },
+            )?,
             mc_flags: 0,
-            tags: Vec::new(),
+            // Empty for `SET`, where cloning allocates nothing.
+            tags: set.tags.clone(),
             mode: match set.condition {
                 Condition::Always => SetMode::Set,
                 Condition::IfAbsent => SetMode::Add,
@@ -739,14 +806,31 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
             pairs,
             condition,
             expiry,
+            tags,
+            tagged,
         } => {
             // Resolved once for the whole batch, so every key in it is stamped
             // against one instant.
-            let ttl = ttl_change_for(*expiry, now_ms() as i64, INVALID_EXPIRE_MSETEX)?;
+            let ttl = ttl_change_for(
+                *expiry,
+                now_ms() as i64,
+                if *tagged {
+                    INVALID_EXPIRE_MSETTAGS
+                } else {
+                    INVALID_EXPIRE_MSETEX
+                },
+            )?;
             Domain::SetMany {
                 sets: pairs
                     .iter()
-                    .map(|(key, value)| Ok(vash_core::Set::with_ttl(key_of(key)?, value, ttl)))
+                    .map(|(key, value)| {
+                        let mut set = vash_core::Set::with_ttl(key_of(key)?, value, ttl);
+                        // One list, copied per record: the store attaches tags
+                        // to each record separately, and the batch's list is
+                        // what every record in it carries.
+                        set.tags.clone_from(tags);
+                        Ok(set)
+                    })
                     .collect::<Result<_, Failure>>()?,
                 guard: match condition {
                     Condition::Always => vash_core::BatchGuard::Always,
@@ -805,9 +889,15 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
         Command::Info { .. } => Domain::Stats,
 
         // Answered before translation is reached — `Scan` because its cursor
-        // has to be resolved against server state first, the rest because they
-        // are properties of this socket rather than operations on the cache.
-        Command::Quit | Command::Auth(_) | Command::Hello { .. } | Command::Scan(_) => {
+        // has to be resolved against server state first, `DelByTag` because one
+        // command carries several invalidations and the boundary takes one at a
+        // time, the rest because they are properties of this socket rather than
+        // operations on the cache.
+        Command::Quit
+        | Command::Auth(_)
+        | Command::Hello { .. }
+        | Command::Scan(_)
+        | Command::DelByTag { .. } => {
             error!("a connection command reached the storage boundary");
             return Err(Failure::internal());
         }
@@ -1044,13 +1134,15 @@ mod tests {
     /// *translation*, and a match would let a new variant be added to both
     /// without ever being compared.
     fn storage_commands() -> Vec<Command<'static>> {
-        let set = |condition, expiry, return_previous| {
+        let set = |condition, expiry, return_previous, tags: Vec<&'static [u8]>| {
             Command::Set(RespSet {
                 key: b"k",
                 value: b"v",
                 condition,
                 expiry,
                 return_previous,
+                tagged: !tags.is_empty(),
+                tags,
             })
         };
         vec![
@@ -1061,8 +1153,10 @@ mod tests {
             Command::Type { key: b"k" },
             Command::Ttl { key: b"k" },
             Command::Delete { keys: vec![b"k"] },
-            set(Condition::Always, Expiry::Unset, false),
-            set(Condition::IfAbsent, Expiry::Keep, true),
+            set(Condition::Always, Expiry::Unset, false, vec![]),
+            set(Condition::IfAbsent, Expiry::Keep, true, vec![]),
+            // `SETTAGS`, which is the same write carrying a tag list.
+            set(Condition::Always, Expiry::After(1000), false, vec![b"news"]),
             Command::MSet {
                 pairs: vec![(b"k".as_slice(), b"v".as_slice())],
             },
@@ -1070,6 +1164,15 @@ mod tests {
                 pairs: vec![(b"k".as_slice(), b"v".as_slice())],
                 condition: Condition::IfAbsent,
                 expiry: Expiry::After(1000),
+                tags: vec![],
+                tagged: false,
+            },
+            Command::MSetEx {
+                pairs: vec![(b"k".as_slice(), b"v".as_slice())],
+                condition: Condition::Always,
+                expiry: Expiry::Keep,
+                tags: vec![b"news"],
+                tagged: true,
             },
             Command::Append {
                 key: b"k",
@@ -1112,6 +1215,30 @@ mod tests {
                 inline_safe(&command),
                 translated.inline_safe(),
                 "{command:?} is classified differently by the shortcut and by the domain"
+            );
+        }
+    }
+
+    /// The two commands answered in several steps do not reach `translate`, so
+    /// the agreement test cannot see them — and both must be kept off the
+    /// runtime's workers: `SCAN` walks records, `DELBYTAG` writes.
+    #[test]
+    fn the_multi_step_commands_are_not_inline_safe() {
+        for command in [
+            Command::Scan(vash_proto::resp::command::Scan {
+                token: 0,
+                pattern: b"",
+                count: 10,
+                only_strings: true,
+            }),
+            Command::DelByTag {
+                tags: vec![b"news"],
+            },
+        ] {
+            assert!(!inline_safe(&command), "{command:?} must not run inline");
+            assert!(
+                translate(&command).is_err(),
+                "{command:?} is answered before translation"
             );
         }
     }

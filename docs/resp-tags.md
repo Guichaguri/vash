@@ -1,21 +1,25 @@
 # Tags over RESP — design
 
-Status: **proposed, not built.** Same house style as the rest of the docs:
-decision first, then the reasoning, then the rejected alternatives.
+Status: **phase 1 built** — `SETTAGS`, `MSETTAGS` and `DELBYTAG` are on the
+wire and specified in [protocol.md](protocol.md#tag-commands); phase 2 (`ADDTAGS`,
+`REMTAGS`) and phase 3 (the reserved key prefix) are not. Same house style as
+the rest of the docs: decision first, then the reasoning, then the rejected
+alternatives. Sections marked *as built* record where implementing it changed
+the design.
 
-Tags are a first-class feature of the store ([plan.md](plan.md) §5) and reach
+Tags are a first-class feature of the store ([plan.md](plan.md) §5) and reached
 two of the three dialects. VCP carries a tag list in the `SET` body and has
 [`DELETE_BY_TAG`](protocol.md#delete_by_tag-0x30); memcached gets them through
 the two documented [extensions](protocol.md#extensions), `ms … G<tag>` and
-`mdt`/`delete_by_tag`. **The Redis dialect has no tag surface at all** — a
-client speaking RESP can neither attach a tag nor invalidate one, and since the
-dialect answers no `FLUSHALL` or `FLUSHDB` either, it has *no* way to invalidate
-more than one named key at a time.
+`mdt`/`delete_by_tag`. **The Redis dialect had no tag surface at all** — a
+client speaking RESP could neither attach a tag nor invalidate one, and since
+the dialect answers no `FLUSHALL` or `FLUSHDB` either, it had *no* way to
+invalidate more than one named key at a time.
 
-That is the largest remaining hole in the RESP subset, and it is the one that
-matters most in practice: the Redis dialect is what a framework cache backend
-speaks, and tag-based invalidation is the feature those backends want. This
-document proposes the surface.
+That was the largest remaining hole in the RESP subset, and the one that matters
+most in practice: the Redis dialect is what a framework cache backend speaks,
+and tag-based invalidation is the feature those backends want. This document is
+how the surface was chosen.
 
 ---
 
@@ -216,9 +220,24 @@ uses:
 | Reply | When |
 |---|---|
 | `-ERR invalid tag` | Empty, or over 255 bytes. Mirrors `-ERR invalid key`. |
-| `-ERR too many tags` | Past `store.tags.max_per_record`, named rather than reported as a bare `-ERR invalid argument`. |
-| `-ERR tag registry is full` | `store.tags.max_tags` reached. Retryable only after something frees a name — and today nothing does. |
-| `-ERR numtags is greater than the arguments given` | The count and the argument list disagree, as `MSETEX` checks `numkeys`. |
+| `-ERR too many tags` | Past `store.tags.max_per_record`, or past the format's 255. Named rather than reported as a bare `-ERR invalid argument`. |
+| `-ERR numtags should be greater than or equal to 0` | A negative count. |
+| `-ERR wrong number of arguments for '…' command` | The count and the argument list disagree, as `MSETEX` checks `numkeys`. |
+
+*As built:* two of these moved. A `numtags` that does not match the arguments is
+an **arity error** rather than a message of its own, because that is what
+`MSETEX` already answers for the same mistake about `numkeys`, and one wording
+for one class of error is worth more than a bespoke sentence.
+
+The registry-full case does **not** get `-ERR tag registry is full`. The store
+reports it as `CapacityFull` with no cause attached — the same status a full map
+produces — and this dialect renders that as `-OOM`, which client libraries treat
+as "back off". Telling the two apart would mean plumbing a new distinction
+through `dispatch::to_failed` for all three dialects to serve a wording in one,
+so the honest thing was to document the collision rather than build for it:
+[protocol.md's error table](protocol.md#errors-1) now names both causes on the
+`-OOM` row, and notes that backing off does not help the second one because
+nothing frees a name.
 
 ### The warning this surface needs more than the others
 
@@ -235,21 +254,37 @@ they have to say this first: **tag vocabularies are small and bounded, one per
 
 ## 5. What it costs to build
 
-| Phase | Work | Where |
-|---|---|---|
-| 1 | `SETTAGS`, `MSETTAGS`, `DELBYTAG` | Parser only |
-| 2 | `ADDTAGS`, `REMTAGS` | A new storage primitive |
-| 3 (optional) | Reserved-prefix `DEL` routing | Executor |
+| Phase | Work | Where | Status |
+|---|---|---|---|
+| 1 | `SETTAGS`, `MSETTAGS`, `DELBYTAG` | Parser only | **built** |
+| 2 | `ADDTAGS`, `REMTAGS` | A new storage primitive | not built |
+| 3 (optional) | Reserved-prefix `DEL` routing | Executor | not built |
 
-**Phase 1 needs no storage change and no boundary change.** `Set` already
-carries `pub tags: Vec<&'a [u8]>`
-([command.rs:231](../crates/vash-core/src/command.rs)), `SetMany` is a `Vec<Set>`
-so each pair could even carry its own list, and `Store::delete_by_tag` is
-already on the trait ([lib.rs:309](../crates/vash-store/src/lib.rs)). The three
-commands are a parser addition in
-[resp/command.rs](../crates/vash-proto/src/resp/command.rs) and three arms in
-the executor — which is what M10 phase 2 bought by routing RESP through the
-shared `Command` boundary instead of composing `Store` calls directly.
+**Phase 1 needed no storage change and no boundary change**, which is what M10
+phase 2 bought by routing RESP through the shared `Command` boundary instead of
+composing `Store` calls directly. `Set` already carried
+`pub tags: Vec<&'a [u8]>` ([command.rs](../crates/vash-core/src/command.rs)),
+`SetMany` is a `Vec<Set>`, and `Store::delete_by_tag` was already on the trait
+([lib.rs](../crates/vash-store/src/lib.rs)).
+
+*As built*, the shape of the change was:
+
+- **`SETTAGS` and `MSETTAGS` are not new commands to the executor.** They are
+  `Command::Set` and `Command::MSetEx` carrying a tag list and a `tagged` flag,
+  so `translate` and `render` gained a field each rather than arms of their own.
+  The flag is not redundant with an empty list: `SETTAGS key value 0` is a legal
+  tagless write, and the flag is what names the right command in an expiry
+  error.
+- **One parser for both spellings.** `parse_set` and `parse_msetex` take a
+  `Tagged` flag that decides whether a counted tag list is read and which
+  command name every error is worded with. The option grammar exists once, which
+  was §3's promise.
+- **`DELBYTAG` is answered outside `translate`**, beside `SCAN`, because the
+  boundary invalidates one tag at a time and the command names several. Each is
+  a separate `dispatch::execute`, so a three-tag command is three invalidations
+  in the metrics — which is what it is. A failure part-way leaves the earlier
+  bumps applied; that is safe because a bump is idempotent, the same property
+  the cluster already relies on.
 
 **Phase 2 is where the real work is.** The tag table lives *inside* the record,
 between the header and the value, 12 bytes per tag
@@ -272,8 +307,8 @@ equivalent workaround, which is the one thing that might pull phase 2 forward.
 
 | # | Mechanism | Rung | Store work | `SET` stays Redis-exact | Against a real Redis | Verdict |
 |---|---|---|---|---|---|---|
-| 1 | `SETTAGS` / `MSETTAGS` | B | none | yes | `unknown command` | **chosen** |
-| 2 | `DELBYTAG` | B | none | yes | `unknown command` | **chosen** |
+| 1 | `SETTAGS` / `MSETTAGS` | B | none | yes | `unknown command` | **built** |
+| 2 | `DELBYTAG` | B | none | yes | `unknown command` | **built** |
 | 3 | `ADDTAGS` / `REMTAGS` post-hoc | B | new primitive, O(value) | yes | `unknown command` | deferred to phase 2 |
 | 4 | `SET … TAGS n t…` option | B | none | **no** | `syntax error` | rejected — §3 |
 | 5 | `GETTAGS key` introspection | B | none (registry read) | yes | `unknown command` | deferred — §6.5 |
@@ -418,18 +453,22 @@ A client finds out whether the server supports this the way
 command and read the error. `-ERR unknown command 'DELBYTAG'` is unambiguous and
 needs no handshake.
 
-For code that would rather ask than probe, `INFO` gains one line in the vash
+For code that would rather ask than probe, `INFO` carries one line in the vash
 section beside the existing `vash_tags` counter:
 
 ```text
 vash_resp_tags:1
-vash_tag_prefix:vash:tag:
 ```
 
-The second is present only when §6.6 is configured. Both mirror how the
-memcached dialect announces its tag extensions through `stats`, so all three
-dialects state their tag support in the place a client of that dialect already
-looks.
+*As built*, it is emitted by the RESP `INFO` renderer rather than collected as a
+counter, because it is a fact about *this dialect* and the memcached `stats`
+payload — which shares the counter list — should not carry it. Like every vash
+field it is out of the default `INFO` and reached by `INFO all` or `INFO vash`.
+A second line, `vash_tag_prefix`, belongs with §6.6 if that is ever built.
+
+This mirrors how the memcached dialect announces its tag extensions through
+`stats`, so each dialect states its tag support where a client of that dialect
+already looks.
 
 ---
 
