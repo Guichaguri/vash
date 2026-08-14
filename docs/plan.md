@@ -981,6 +981,7 @@ a loopback run on this box has ±25% between identical runs, which is wider than
 | Fuse the single-key plain memcached `get`, the one every client library sends | 384ns → 230ns at 1 KiB, of which ~75ns is the batch reply's vector and is flat in value size |
 | Take the tag registry's lock only when a record carries tags | ~15–25ns, single-threaded. The contention it was meant to remove did not measure at all — see below |
 | Hold a one-key retrieval's key inline instead of in a `Vec` (`KeyList`) | memcached `get` parse 93–116ns → 48–49ns, against an unchanged control at 46–50ns. ~100ns per command, because the parse happens twice |
+| Hold a RESP command's arguments inline instead of in a `Vec` (`Args`) | `GET` 102–105ns → 66–75ns, `SET` 181–186ns → 145–163ns, interleaved. ~35ns and ~20ns per parse, doubled per command. Approximate: see the control note |
 
 **The second one is the correction to M6's finding 2.** The text encoders looked expensive because
 they were measured as framing, and roughly 45ns of each integer they wrote was a malloc and a free
@@ -1029,6 +1030,16 @@ here has to alternate, and an untouched control has to be one of the things meas
 `format!` inside the measured loop, so a per-operation cost in microseconds sits on top of every
 figure it reports. It answers what it was written to answer — whether reads scale with threads — and
 cannot answer whether a 20ns change helped.
+
+**An untouched control still moves, and the amount is worth knowing.** `memcached_parse_delete` sits
+in both binaries of the RESP argument change and is not on any path it touches; across three
+interleaved pairs it moved from ~42.7ns to ~38.9ns, consistently and in the same direction. Nothing
+in that parser changed, so it is code layout shifting under a smaller binary. **Roughly 4ns, or
+about 9%, is the resolution floor here** — a measured difference of that order is not a result no
+matter how many times it repeats, and every figure in the table above should be read as carrying it.
+This is also the argument for a control that is *in the same process* rather than a second run: the
+memcached/`KeyList` measurement is the strongest of the set precisely because its control sat beside
+it in one binary and did not move.
 
 **And the disk filled again.** `read_bench` refused to populate with `os error 112`: the system
 drive had 4.7 MB free, and `TEMP` is on it, so every store-backed benchmark in this session had been
