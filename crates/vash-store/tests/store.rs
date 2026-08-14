@@ -1967,3 +1967,69 @@ fn append_preserves_the_deadline_and_the_flags() {
     let value = h.store().get(Key::new(b"k").unwrap()).unwrap().unwrap();
     assert_eq!(value.mc_flags, 0xbeef);
 }
+
+// ---- prefault --------------------------------------------------------------
+
+#[test]
+fn a_prefaulted_store_opens_and_serves_every_shard() {
+    // The warming pass runs once per environment, inside `LmdbEngine::open`,
+    // and reaches for a `data.mdb` that LMDB has just created. A shard whose
+    // file was missing or held open exclusively would fail here rather than in
+    // the unit tests, which supply their own file.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StoreConfig {
+        path: dir.path().join("db"),
+        map_size: 32 * 1024 * 1024,
+        shards: 4,
+        ..StoreConfig::default()
+    };
+
+    {
+        let store = LmdbStore::open(&config).unwrap();
+        for i in 0..64u32 {
+            store
+                .set(&Set {
+                    key: Key::new(format!("k{i}").as_bytes()).unwrap(),
+                    value: b"v",
+                    ttl: vash_core::TtlChange::Set(3600),
+                    return_previous: false,
+                    mc_flags: 0,
+                    tags: Vec::new(),
+                    mode: vash_core::SetMode::Set,
+                })
+                .unwrap();
+        }
+        store.close();
+    }
+
+    config.prefault = true;
+    let store = LmdbStore::open(&config).unwrap();
+    for i in 0..64u32 {
+        let key = format!("k{i}");
+        assert!(
+            store
+                .get(Key::new(key.as_bytes()).unwrap())
+                .unwrap()
+                .is_some(),
+            "{key} must survive a prefaulted open"
+        );
+    }
+    store.close();
+}
+
+#[test]
+fn prefaulting_an_empty_database_is_not_an_error() {
+    // Nothing has been written, so the file is whatever LMDB creates for an
+    // empty environment. Warming it must be a no-op, not a startup failure.
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("db"),
+        map_size: 32 * 1024 * 1024,
+        prefault: true,
+        ..StoreConfig::default()
+    };
+
+    let store = LmdbStore::open(&config).unwrap();
+    assert_eq!(store.stats().unwrap().entries, 0);
+    store.close();
+}

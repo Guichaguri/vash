@@ -43,6 +43,13 @@ pub struct StoreConfig {
     pub max_value_len: usize,
     /// Wipe any existing database on startup.
     pub wipe_on_start: bool,
+    /// Read the whole data file at startup, so the map is resident before the
+    /// first request rather than after it.
+    ///
+    /// Trades startup time — sequential-read bandwidth over the data file —
+    /// for the page faults it removes from the read path. `src/prefault.rs`
+    /// carries the detail, including why this is not `MAP_POPULATE`.
+    pub prefault: bool,
     /// Granularity that expiry-index buckets are rounded up to. Coarser means
     /// fewer distinct index keys and less write amplification; it never delays
     /// a read from seeing the key as expired, because the read path checks the
@@ -145,6 +152,7 @@ impl Default for StoreConfig {
             durability: Durability::default(),
             max_value_len: vash_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
+            prefault: false,
             bucket_granularity_ms: 1000,
             max_tags: 100_000,
             max_tags_per_record: vash_core::DEFAULT_MAX_TAGS,

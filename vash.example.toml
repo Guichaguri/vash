@@ -51,6 +51,19 @@ durability = "relaxed"
 max_value_bytes = 1048576
 wipe_on_start = false
 
+# Read every shard's data file at startup, so the map is resident before the
+# first request rather than faulting in underneath it.
+#
+# This is the other half of inline_reads below. That knob asks you to assert a
+# resident working set and removes the protection against its not being one;
+# this makes the assertion true at the moment the server starts serving.
+#
+# The cost is startup time proportional to the data, at sequential-read
+# bandwidth — seconds for a large database, against a cold start that is
+# otherwise near-instant because nothing is loaded. Off by default for that
+# reason.
+prefault = false
+
 # Run read-only requests on the network worker instead of handing them to the
 # storage threads.
 #

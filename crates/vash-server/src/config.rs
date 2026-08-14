@@ -55,6 +55,15 @@ pub struct StoreConfig {
     pub durability: Durability,
     pub max_value_bytes: usize,
     pub wipe_on_start: bool,
+    /// Read every shard's data file at startup, so the map is resident before
+    /// the first request instead of faulting in under one.
+    ///
+    /// This is the other half of `inline_reads`. That flag asks the operator to
+    /// assert a resident working set and then removes the protection against
+    /// its not being one; this makes the assertion true at the moment the
+    /// server starts serving. The cost is startup time proportional to the
+    /// data, at sequential-read bandwidth.
+    pub prefault: bool,
     /// Run read-only requests on the network worker instead of handing them to
     /// the storage tier.
     ///
@@ -470,6 +479,7 @@ impl Default for StoreConfig {
             durability: Durability::default(),
             max_value_bytes: vash_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
+            prefault: false,
             inline_reads: false,
             shards: 0,
             write: WriteConfig::default(),
@@ -699,6 +709,7 @@ impl Config {
             durability: self.store.durability.into(),
             max_value_len: self.store.max_value_bytes,
             wipe_on_start: self.store.wipe_on_start,
+            prefault: self.store.prefault,
             bucket_granularity_ms: self.store.ttl.bucket_granularity_ms,
             max_tags: self.store.tags.max_tags,
             max_tags_per_record: self.store.tags.max_per_record,

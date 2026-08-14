@@ -37,6 +37,7 @@ pub mod lmdb;
 /// An in-memory implementation, for tests. See [`memory::MemoryStore`].
 #[cfg(feature = "testing")]
 pub mod memory;
+mod prefault;
 mod queue;
 mod read;
 mod readers;

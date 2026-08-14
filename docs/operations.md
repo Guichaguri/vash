@@ -84,6 +84,7 @@ real server over a real socket.
 | Setting | Raise it when | Costs |
 |---|---|---|
 | `store.inline_reads` | The working set is resident and reads dominate | A cold read stalls every connection on that worker |
+| `store.prefault` | You want the map resident before the first request, not after it | Startup time proportional to the data |
 | `store.write.max_batch` | Writes are the bottleneck and commits are small | Longer write transactions |
 | `store.write.queue_depth` | `OVERLOADED` under bursts that would drain | Memory, and a longer queue to wait behind |
 | `store.ttl.sweep_interval_ms` (lower) | Expired data lingers | Maintenance competes with traffic |
@@ -109,6 +110,33 @@ this code does.
 If you do turn it on, turn it on because the working set is resident. When it is
 not, a cold read blocks a worker and every connection assigned to it — which is
 exactly what the default exists to prevent.
+
+### `prefault`
+
+The companion to `inline_reads`, and the way to stop that knob being a guess.
+`prefault = true` reads each shard's `data.mdb` end to end before the server
+accepts anything, so the pages are in the OS page cache and a read that would
+have waited ~100 µs on the device takes a minor fault instead — page-table work
+against memory that is already there, well under a microsecond, and never a
+block on I/O.
+
+It is off by default because it trades the one thing a memory-mapped store is
+unusually good at: a cold start that serves immediately because nothing is
+loaded. **Measured at ~260 ms per GiB** with the file already cached — a 1 GiB
+shard took a 4 ms open to 264 ms — and a genuinely cold file adds whatever the
+device charges on top. That is a good trade for a long-lived node whose tail
+latency matters and a bad one for anything that restarts often.
+
+On Linux the warmed mapping is additionally handed to `madvise` — `MADV_POPULATE_READ`
+on 5.14 and later — which builds the page tables too and removes even the minor
+fault. It is a hint, not the mechanism: on older kernels it degrades to
+`MADV_WILLNEED`, which is advisory and mostly declines, and the sequential read
+has already done the part that matters. Nothing about the flag's behaviour
+depends on the platform beyond that.
+
+Note that **`MAP_POPULATE` itself is not available**: it is a flag on `mmap`,
+LMDB owns that call, and it exposes neither the flag nor the mapping's address.
+`src/prefault.rs` records the detail.
 
 ### Durability
 

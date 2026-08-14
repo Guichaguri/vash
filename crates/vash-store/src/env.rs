@@ -206,6 +206,22 @@ impl LmdbEngine {
 
         wtxn.commit().map_err(StoreError::from_heed)?;
 
+        // After the commit above, so the file is at its final length and
+        // nothing warmed here is about to be rewritten.
+        //
+        // Failure is logged and ignored on purpose: a map that could not be
+        // warmed serves every request correctly and merely faults on the way,
+        // which is exactly what every deployment before this flag existed did.
+        // Refusing to start over a performance measure would be the worse
+        // trade.
+        let mut prefaulted = 0;
+        if config.prefault {
+            match crate::prefault::prefault(&config.path) {
+                Ok(bytes) => prefaulted = bytes,
+                Err(err) => warn!(%err, "could not prefault the map; serving without it"),
+            }
+        }
+
         info!(
             path = %config.path.display(),
             durability = ?config.durability,
@@ -213,6 +229,7 @@ impl LmdbEngine {
             epoch,
             cas_start,
             tag_count,
+            prefaulted,
             "opened store"
         );
 

@@ -15,6 +15,12 @@ thiserror.workspace = true
 tracing.workspace = true
 xxhash-rust.workspace = true
 
+# `madvise` on LMDB's mapping, for `store.prefault`. Linux only: it is the one
+# platform that both exposes the mapping table and has an advice that means
+# "prefault this". See `src/prefault.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [features]
 # A second `Store` implementation, held in memory. Off by default: it is a test
 # double, not a cache, and nothing in a release build should be able to reach it.

@@ -38,6 +38,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam-channel = "0.5"
 memchr = "2"
 proptest = "1"
+# Linux-only, and only for `madvise` on the LMDB map. Already in the tree via
+# `lmdb-master-sys`, so this adds no new crate to the build.
+libc = "0.2"
 # Authentication only, and off the request path: one hash and one compare per
 # connection. `subtle` is what keeps the compare from leaking a timing oracle
 # over the shared prefix, which is the one attack a naive `==` hands over free.
