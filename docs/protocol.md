@@ -1429,7 +1429,7 @@ commands, and there never will be — see [plan.md](plan.md) §16.
 **There is no tag surface in this dialect.** A RESP client can neither attach a
 tag nor invalidate one, where VCP has [`DELETE_BY_TAG`](#delete_by_tag-0x30) and
 memcached has the [extensions](#extensions). A proposed surface —
-`SETTAG`/`MSETTAG`/`DELTAG`, and what was rejected on the way there — is
+`SETTAGS`/`MSETTAGS`/`DELBYTAG`, and what was rejected on the way there — is
 designed in [resp-tags.md](resp-tags.md). It is not built, and nothing in this
 section anticipates it.
 

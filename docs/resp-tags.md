@@ -8,9 +8,9 @@ two of the three dialects. VCP carries a tag list in the `SET` body and has
 [`DELETE_BY_TAG`](protocol.md#delete_by_tag-0x30); memcached gets them through
 the two documented [extensions](protocol.md#extensions), `ms … G<tag>` and
 `mdt`/`delete_by_tag`. **The Redis dialect has no tag surface at all** — a
-client speaking RESP can neither attach a tag nor invalidate one, and the only
-bulk invalidation available to it is `FLUSH`, which is off by default and takes
-the whole cache.
+client speaking RESP can neither attach a tag nor invalidate one, and since the
+dialect answers no `FLUSHALL` or `FLUSHDB` either, it has *no* way to invalidate
+more than one named key at a time.
 
 That is the largest remaining hole in the RESP subset, and it is the one that
 matters most in practice: the Redis dialect is what a framework cache backend
@@ -50,11 +50,11 @@ which map onto the `Command` boundary as it already exists.**
 
 | Command | Form | Reply |
 |---|---|---|
-| `SETTAG` | `SETTAG key value numtags tag [tag …] [NX \| XX] [GET] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` | As `SET`: `+OK`, null when the guard skips it, the previous value with `GET` |
-| `MSETTAG` | `MSETTAG numkeys key value [key value …] numtags tag [tag …] [NX \| XX] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` | As `MSETEX`: `+OK`, or null when the guard skips the batch |
-| `DELTAG` | `DELTAG tag [tag …]` | Integer — how many of the named tags were registered, as `DEL` counts keys |
+| `SETTAGS` | `SETTAGS key value numtags tag [tag …] [NX \| XX] [GET] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` | As `SET`: `+OK`, null when the guard skips it, the previous value with `GET` |
+| `MSETTAGS` | `MSETTAGS numkeys key value [key value …] numtags tag [tag …] [NX \| XX] [EX s \| PX ms \| EXAT ts \| PXAT ms \| KEEPTTL]` | As `MSETEX`: `+OK`, or null when the guard skips the batch |
+| `DELBYTAG` | `DELBYTAG tag [tag …]` | Integer — how many of the named tags were registered, as `DEL` counts keys |
 
-`SETTAG` is `SET` plus a counted tag list; `MSETTAG` is `MSETEX` plus one tag
+`SETTAGS` is `SET` plus a counted tag list; `MSETTAGS` is `MSETEX` plus one tag
 list shared by every pair in the batch. The tags are attached at write time,
 which is the only moment the store attaches them cheaply (§5).
 
@@ -62,15 +62,65 @@ which is the only moment the store attaches them cheaply (§5).
 
 | Command | Form | Reply |
 |---|---|---|
-| `TAG` | `TAG key numtags tag [tag …]` | Integer — tags newly attached |
-| `UNTAG` | `UNTAG key numtags tag [tag …]` | Integer — tags actually removed |
+| `ADDTAGS` | `ADDTAGS key numtags tag [tag …]` | Integer — tags newly attached |
+| `REMTAGS` | `REMTAGS key numtags tag [tag …]` | Integer — tags actually removed |
 
 These attach to a record that already exists. They need a storage primitive that
 does not exist and cost a full record rewrite; §5 says why they are phase 2
 rather than phase 1.
 
 **Optionally, and off by default:** a reserved key prefix that routes `DEL` to
-`DELTAG`, so a caller with no raw escape hatch can still invalidate (§6.6).
+`DELBYTAG`, so a caller with no raw escape hatch can still invalidate (§6.6).
+
+### The naming rule
+
+An earlier draft called these `SETTAG`, `MSETTAG` and `DELTAG`, and the shared
+`…TAG` suffix was a bug in the design. `SETTAG` and `DELTAG` look like a matched
+pair operating on the same thing, and they are not: two of them write an
+**entry** that carries tags, and the third selects entries **by** a tag and
+kills them. Read as a pair, `DELTAG` says "remove a tag from the entry
+`SETTAG` put it on" — which is a real operation, and not that one.
+
+So the two spaces are spelled differently, and the rule is one line:
+
+> **A command whose name ends in plural `…TAGS` takes a key and is about that
+> one entry's tags. The command that says `BY TAG` takes tag names and is about
+> every entry carrying them.**
+
+| Space | Commands | First argument |
+|---|---|---|
+| One entry's tags | `SETTAGS`, `MSETTAGS`, `ADDTAGS`, `REMTAGS`, `GETTAGS` | a key |
+| Selection by tag | `DELBYTAG` | a tag |
+
+`DELBYTAG` also carries the name the feature already has everywhere else: VCP's
+[`DELETE_BY_TAG`](protocol.md#delete_by_tag-0x30) opcode, memcached's
+`delete_by_tag`, and `vash-client`'s `delete_by_tag()`. One concept, one name,
+four surfaces — a reader who knows any dialect recognises it in the others.
+
+**And it is the only name that is honest about what happens.** `DELTAG` and
+`TAGDEL` both say the tag is deleted. The tag is not deleted: the registry keeps
+the name forever, since [nothing removes a tag today](protocol.md#recommendations)
+— not a flush, not deleting every record that carried it. `DELBYTAG` promises
+only what it does, which is delete records *by* tag and bump a generation.
+
+The phase-2 pair is `ADDTAGS`/`REMTAGS` rather than `ADDTAGS`/`DELTAGS` for the
+same reason in miniature: `REM` removes a name from one entry's list, `DEL`
+destroys something, and Redis already uses `SREM` for exactly this distinction.
+
+### Names considered and rejected
+
+| Name | Why not |
+|---|---|
+| `SETTAG` / `MSETTAG` (singular) | Reads as "set the tags **of** a key", which is `ADDTAGS`'s job, not this one's. The plural pairs the name with the option family it adds, as `MSETEX` pairs with `EX`. |
+| `DELTAG` | The suffix collision above, plus it claims to delete the tag. |
+| `TAGDEL`, `TAGADD` | Redis's own convention is type-first (`HDEL`, `SREM`, `ZADD`), so this is the most Redis-shaped option. Rejected because a tag is not a type living at a key — `TAGDEL` takes no key at all — and the prefix would put `TAGADD key …` (an entry command) in the same family as `TAGDEL tag` (a tag command), recreating the confusion one letter further along. |
+| `FLUSHTAG` | Reads well beside `FLUSHDB`/`FLUSHALL` and is unmistakably bulk. Rejected because it implies kinship with `FLUSH` that does not exist: `FLUSH` bumps the global epoch, takes the whole cache, and is gated by `protocol.flush_enabled`. Tag invalidation is none of those, and an operator who turned flushing off would reasonably expect a `FLUSHTAG` to be off with it. |
+| `INVALIDATE` | Accurate about the mechanism — records die lazily on their next read — but silent about what is being invalidated, and no other dialect calls it that. |
+| `TSET` / `MTSET` | Short, and nobody writing a client would guess it. |
+| `SETX` | One letter from Redis's real `SETEX`, with a different argument order. A typo that silently means something else is the worst outcome on this list. |
+
+None of `SETTAGS`, `MSETTAGS`, `ADDTAGS`, `REMTAGS`, `GETTAGS` or `DELBYTAG`
+collides with a Redis command name, present or historical.
 
 ### Why the count and not a comma list
 
@@ -99,11 +149,11 @@ It is rejected, for four reasons that all point the same way.
 because vash wanted `MSET` and `INCR` with extras and would not modify the
 originals. [protocol.md](protocol.md#command-reference-1) states the rule
 outright: options follow the Redis documentation exactly unless noted. A `TAGS`
-token on `SET` breaks that rule for the first time; `SETTAG` extends the pattern
+token on `SET` breaks that rule for the first time; `SETTAGS` extends the pattern
 that is already there.
 
 **An unknown verb fails loudly, and in the right place.** `-ERR unknown command
-'SETTAG'` is how [protocol.md:1510](protocol.md#command-reference-1) already says a
+'SETTAGS'` is how [protocol.md:1510](protocol.md#command-reference-1) already says a
 client discovers a missing feature, and it is unambiguous: the server does not
 have tags. An unknown *option* on a known command comes back as `-ERR syntax
 error`, which every client and every operator will first read as their own bug.
@@ -111,11 +161,11 @@ error`, which every client and every operator will first read as their own bug.
 **Mirroring and migration.** A `SET` that a real Redis rejects is a trap for
 dual-write migrations, proxies, and anything that records commands and replays
 them elsewhere — the command looks like a `SET` those tools understand, and it
-is not one. A `SETTAG` is visibly not a Redis command anywhere it is seen.
+is not one. A `SETTAGS` is visibly not a Redis command anywhere it is seen.
 
 **Two verbs need not mean two parsers.** `parse_set` and `parse_msetex` in
 [command.rs](../crates/vash-proto/src/resp/command.rs) already share the
-`Options` cursor; `SETTAG` is `parse_set` with a tag list parsed between the
+`Options` cursor; `SETTAGS` is `parse_set` with a tag list parsed between the
 value and the options, and the option grammar stays in exactly one place. The
 duplication the option form avoids is duplication that does not have to exist.
 
@@ -130,26 +180,26 @@ the only thing that will read it.
 
 ## 4. Semantics, limits, errors
 
-**Atomicity.** `SETTAG` is one storage primitive, evaluated inside the shard
+**Atomicity.** `SETTAGS` is one storage primitive, evaluated inside the shard
 writer's transaction, so it is atomic exactly as `SET` is — the tags land with
-the value or neither does. `MSETTAG` inherits `MSETEX`'s guard behaviour
+the value or neither does. `MSETTAGS` inherits `MSETEX`'s guard behaviour
 verbatim, including the standing caveat that `NX`/`XX` across shards can be
 stale (plan §16).
 
 **Generations.** A tag reference stores the tag's generation at the moment of
-the write ([record.rs](../crates/vash-core/src/record.rs)). A `DELTAG` bumps the
+the write ([record.rs](../crates/vash-core/src/record.rs)). A `DELBYTAG` bumps the
 generation, so records written *before* it die and records written *after* it
 live — including a record written microseconds later with the same tag. This is
 the same [read-your-writes caveat](protocol.md#tags) the other dialects carry,
 and it is worth restating in the RESP docs because the Redis audience is the
 one most likely to write-then-invalidate in the same request.
 
-**Cluster.** `DELTAG` is `DELETE_BY_TAG` under another name, so fan-out and
+**Cluster.** `DELBYTAG` is `DELETE_BY_TAG` under another name, so fan-out and
 anti-entropy gossip apply unchanged, governed by `cluster.delete_by_tag`. No new
 cluster surface.
 
 **Auth.** Unchanged: any authenticated client can already invalidate any tag
-([auth.md](auth.md) §9), and `DELTAG` adds no new authority — only a new spelling
+([auth.md](auth.md) §9), and `DELBYTAG` adds no new authority — only a new spelling
 of an existing one.
 
 **Limits**, all of them already enforced by the store and merely surfaced here:
@@ -187,8 +237,8 @@ they have to say this first: **tag vocabularies are small and bounded, one per
 
 | Phase | Work | Where |
 |---|---|---|
-| 1 | `SETTAG`, `MSETTAG`, `DELTAG` | Parser only |
-| 2 | `TAG`, `UNTAG` | A new storage primitive |
+| 1 | `SETTAGS`, `MSETTAGS`, `DELBYTAG` | Parser only |
+| 2 | `ADDTAGS`, `REMTAGS` | A new storage primitive |
 | 3 (optional) | Reserved-prefix `DEL` routing | Executor |
 
 **Phase 1 needs no storage change and no boundary change.** `Set` already
@@ -208,12 +258,12 @@ record therefore means rewriting the record: re-encode the header with the new
 `tag_count`, write the widened tag table, and copy the value across. Done inside
 the writer's transaction it copies from a borrowed mmap slice and never
 materialises the value in the network tier — the same shape `apply_append`
-took in M10 phase 1 — but it is still O(value) where a `SETTAG` is O(1) extra.
+took in M10 phase 1 — but it is still O(value) where a `SETTAGS` is O(1) extra.
 Plus one `tagidx` row per newly attached tag.
 
 That asymmetry is the argument for shipping phase 1 alone and seeing whether
 anyone asks for phase 2. A client that knows the tags when it writes never needs
-`TAG`; a client that does not can re-`SETTAG` the record. `UNTAG` has no
+`ADDTAGS`; a client that does not can re-`SETTAGS` the record. `REMTAGS` has no
 equivalent workaround, which is the one thing that might pull phase 2 forward.
 
 ---
@@ -222,11 +272,11 @@ equivalent workaround, which is the one thing that might pull phase 2 forward.
 
 | # | Mechanism | Rung | Store work | `SET` stays Redis-exact | Against a real Redis | Verdict |
 |---|---|---|---|---|---|---|
-| 1 | `SETTAG` / `MSETTAG` | B | none | yes | `unknown command` | **chosen** |
-| 2 | `DELTAG` | B | none | yes | `unknown command` | **chosen** |
-| 3 | `TAG` / `UNTAG` post-hoc | B | new primitive, O(value) | yes | `unknown command` | deferred to phase 2 |
+| 1 | `SETTAGS` / `MSETTAGS` | B | none | yes | `unknown command` | **chosen** |
+| 2 | `DELBYTAG` | B | none | yes | `unknown command` | **chosen** |
+| 3 | `ADDTAGS` / `REMTAGS` post-hoc | B | new primitive, O(value) | yes | `unknown command` | deferred to phase 2 |
 | 4 | `SET … TAGS n t…` option | B | none | **no** | `syntax error` | rejected — §3 |
-| 5 | `TAGS key` introspection | B | none (registry read) | yes | `unknown command` | deferred — §6.5 |
+| 5 | `GETTAGS key` introspection | B | none (registry read) | yes | `unknown command` | deferred — §6.5 |
 | 6 | Reserved key prefix, `DEL` only | **A** | none | yes | deletes a real key | optional, off by default — §6.6 |
 | 7 | Tags as virtual sets (`SADD`/`SMEMBERS`) | **A** | phase-2 primitive | yes | operates on a real set | rejected — §6.7 |
 | 8 | Ambient tags via a connection name | **C** | none | yes | name is stored and ignored | rejected — §6.8 |
@@ -236,7 +286,7 @@ equivalent workaround, which is the one thing that might pull phase 2 forward.
 | 12 | Tags in a value prefix | A | none | yes | corrupt value | rejected — §6.12 |
 | 13 | Key-name convention + `SCAN`/`DEL` | A | none | yes | works, slowly | the status quo — §6.13 |
 
-### 6.5 `TAGS key` — reading a record's tags
+### 6.5 `GETTAGS key` — reading a record's tags
 
 Cheap to implement and genuinely useful for debugging, but it is a deliberate
 omission elsewhere: `LIST_KEYS` leaves tag names out of its reply on purpose
@@ -245,7 +295,7 @@ per-key tag reader to the *most* accessible dialect while the native one
 withholds it is the wrong order to do things in. If it lands, it lands in VCP
 first and behind `listing_enabled`.
 
-### 6.6 A reserved key prefix, routing `DEL` to `DELTAG`
+### 6.6 A reserved key prefix, routing `DEL` to `DELBYTAG`
 
 The only rung-A mechanism worth having. With `store.tags.resp_prefix` set — say
 `vash:tag:`, empty by default, which disables the whole thing — the keyspace
@@ -253,7 +303,7 @@ under that prefix becomes a view of the tag registry:
 
 | Command | Behaviour under the prefix |
 |---|---|
-| `DEL` / `UNLINK` | Invalidates the tag. Counts as `DELTAG` does. |
+| `DEL` / `UNLINK` | Invalidates the tag. Counts as `DELBYTAG` does. |
 | `EXISTS` | 1 if the tag is registered. |
 | `GET` / `TTL` / `TYPE` | Null, `-2`, `+none`. A tag is not a value. |
 | `SET`, `APPEND`, arithmetic | `-ERR key namespace reserved for tags` |
@@ -365,7 +415,7 @@ client reach it.
 
 A client finds out whether the server supports this the way
 [protocol.md](protocol.md#command-reference-1) already prescribes: send the
-command and read the error. `-ERR unknown command 'DELTAG'` is unambiguous and
+command and read the error. `-ERR unknown command 'DELBYTAG'` is unambiguous and
 needs no handshake.
 
 For code that would rather ask than probe, `INFO` gains one line in the vash
@@ -388,9 +438,9 @@ looks.
 - **A client library that cannot send an unknown verb.** None of the major ones
   qualifies today; if a significant one does, §6.6 grows from optional to
   necessary and phase 1 alone stops being enough.
-- **`UNTAG` turning out to be load-bearing.** Re-`SETTAG` covers attach; nothing
+- **`REMTAGS` turning out to be load-bearing.** Re-`SETTAGS` covers attach; nothing
   covers detach. A real use case pulls phase 2 forward.
-- **Per-key tag lists in `MSETTAG`.** The `Command` boundary already supports
+- **Per-key tag lists in `MSETTAGS`.** The `Command` boundary already supports
   them — `SetMany` holds a `Vec<Set>`, each with its own tags — and only the
   wire grammar shares one list. If batches with differing tags turn out common,
   the grammar can grow a per-pair form without the boundary moving.
