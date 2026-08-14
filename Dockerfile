@@ -41,11 +41,20 @@ RUN find crates -name "*.rs" -exec touch {} + \
     && cargo build --release --bin vash-server \
     && strip target/release/vash-server
 
+# The data directory has to exist *in the image*, owned by the user the server
+# runs as. Docker initialises a fresh named volume from the image's directory —
+# content and ownership both — and a `VOLUME` declared over a path that is not
+# in the image gets one owned by root, which an unprivileged process cannot
+# write. Without this, the `docker run` at the top of this file fails on a clean
+# machine with "opening store: Permission denied".
+RUN mkdir -p /data && chown 65534:65534 /data
+
 # scratch, not alpine: nothing in the image but the binary means nothing in the
 # image to have a CVE. There is no shell to exec into, which is the point.
 FROM scratch
 
 COPY --from=build --chown=65534:65534 /src/target/release/vash-server /vash-server
+COPY --from=build --chown=65534:65534 /data /var/lib/vash
 
 # 11311 is the cache port for all three protocols. 9090 is the conventional
 # admin port, declared here for an operator who wants it — nothing listens on it
