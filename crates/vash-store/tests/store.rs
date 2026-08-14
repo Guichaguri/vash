@@ -103,6 +103,14 @@ impl Harness {
         self.store().stats().unwrap().pending_reclaims
     }
 
+    /// Records the expiry sweeper has actually reclaimed, cumulative.
+    ///
+    /// Unlike [`Harness::entries`] this only ever rises, which is what makes it
+    /// safe to assert against while the sweeper is running.
+    fn reclaimed(&self) -> u64 {
+        self.store().stats().unwrap().reclaimed
+    }
+
     /// One atomic counter step, for the arithmetic tests below.
     fn arithmetic(&self, op: &vash_core::Arithmetic<'_>) -> Option<vash_core::Applied> {
         self.store().arithmetic(op).unwrap()
@@ -264,10 +272,30 @@ fn the_sweeper_catches_up_across_several_passes() {
     for i in 0..200u32 {
         h.set(format!("k{i}").as_bytes(), b"v", 1);
     }
-    assert_eq!(h.entries(), 200);
 
     h.wait_for("the backlog to drain", |h| h.entries() == 0);
     assert_eq!(h.expiry_entries(), 0);
+
+    // **This is the assertion the test is named for**, and it replaces a
+    // `assert_eq!(h.entries(), 200)` taken before the wait.
+    //
+    // That earlier check was a race against the very thing under test. The
+    // sweeper runs throughout — every 5ms — and the TTL is one second, so on a
+    // machine slow enough for 200 writes to outlast a second, the earliest keys
+    // fall due and are reclaimed before the last one is written. Observed under
+    // load: 186 of 200. Widening the TTL would only move the threshold.
+    //
+    // Counting the work the sweeper actually did is immune to that, and says
+    // more: 200 records reclaimed against a budget of 8 per pass cannot have
+    // happened in fewer than 25 passes, which is precisely the catching-up this
+    // test exists to prove. The counter only rises, so nothing can move it back
+    // under the assertion.
+    assert!(
+        h.reclaimed() >= 200,
+        "the sweeper reclaimed {} records; all 200 had to go through it, and at \
+         a budget of 8 a pass that is at least 25 passes",
+        h.reclaimed()
+    );
 }
 
 #[test]
