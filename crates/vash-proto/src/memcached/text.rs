@@ -10,7 +10,7 @@
 //! flush_all [delay] [noreply]\r\n
 //! ```
 
-use vash_core::{Command, Key, Set, SetMode, TtlChange};
+use vash_core::{Command, Key, KeyList, Set, SetMode, TtlChange};
 
 use super::encode::ResponseStyle;
 use super::{ErrorKind, MAX_KEY_LEN, Outcome, Parsed, ProtocolError};
@@ -503,12 +503,38 @@ fn parse_key(token: Option<&[u8]>, consumed: usize) -> Result<Key<'_>, ProtocolE
     Key::new(token).map_err(|_| fail(BAD_LINE))
 }
 
+/// Reads a retrieval's key list.
+///
+/// **The one-key case never allocates**, which is the case that matters: `get k`
+/// is what every memcached client sends for a single-key read, and the
+/// connection parses each command twice — once to find where it ends, once to
+/// run it. Both parses used to allocate a vector for one borrowed key. The
+/// second key is what forces the heap, so the vector is not built until one
+/// turns up. See [`KeyList`].
 fn parse_keys<'a>(
     tokens: impl Iterator<Item = &'a [u8]>,
     consumed: usize,
-) -> Result<Vec<Key<'a>>, ProtocolError> {
-    let mut keys = Vec::new();
+) -> Result<KeyList<'a>, ProtocolError> {
+    let bad_line = || ProtocolError::Recoverable {
+        response: ErrorKind::Client(BAD_LINE),
+        consumed,
+    };
+
+    let mut tokens = tokens;
+    let Some(first) = tokens.next() else {
+        // A retrieval naming no key at all.
+        return Err(bad_line());
+    };
+    let first = parse_key(Some(first), consumed)?;
+
+    let Some(second) = tokens.next() else {
+        return Ok(KeyList::from(first));
+    };
+
+    let mut keys = vec![first, parse_key(Some(second), consumed)?];
     for token in tokens {
+        // Checked before the push, so the limit is the number accepted rather
+        // than the number after which one more is refused.
         if keys.len() >= vash_core::MAX_BATCH_ITEMS {
             return Err(ProtocolError::Recoverable {
                 response: ErrorKind::Client("too many keys"),
@@ -517,13 +543,7 @@ fn parse_keys<'a>(
         }
         keys.push(parse_key(Some(token), consumed)?);
     }
-    if keys.is_empty() {
-        return Err(ProtocolError::Recoverable {
-            response: ErrorKind::Client(BAD_LINE),
-            consumed,
-        });
-    }
-    Ok(keys)
+    Ok(KeyList::Many(keys))
 }
 
 /// Converts memcached's `exptime` to a relative TTL in seconds.
@@ -714,6 +734,56 @@ mod tests {
         };
         assert_eq!(keys.len(), 3);
         assert_eq!(keys[2].as_bytes(), b"ccc");
+    }
+
+    /// A one-key `get` must not build a vector for its single key — that is the
+    /// whole point of [`KeyList`], and it is the shape every client library
+    /// sends. Asserting the variant rather than the length is what makes this
+    /// fail if someone routes the common case back through the heap.
+    #[test]
+    fn a_single_key_get_holds_its_key_inline() {
+        let Command::GetMany(keys) = command(b"get solo\r\n").command else {
+            panic!("expected a retrieval")
+        };
+        assert!(
+            matches!(keys, KeyList::One(_)),
+            "a one-key get allocated a vector: {keys:?}"
+        );
+        assert_eq!(keys[0].as_bytes(), b"solo");
+    }
+
+    /// The bound a client could otherwise use to demand unbounded work, checked
+    /// at the exact edge. `parse_keys` pushes the first two keys before it
+    /// starts checking, so an off-by-one here would not show up on any smaller
+    /// input.
+    #[test]
+    fn the_key_count_is_bounded_at_exactly_the_batch_limit() {
+        let line = |count: usize| {
+            let mut line = b"get".to_vec();
+            for i in 0..count {
+                line.extend_from_slice(format!(" k{i}").as_bytes());
+            }
+            line.extend_from_slice(b"\r\n");
+            line
+        };
+
+        let at_limit = line(vash_core::MAX_BATCH_ITEMS);
+        let Command::GetMany(keys) = command(&at_limit).command else {
+            panic!("the limit itself must be accepted")
+        };
+        assert_eq!(keys.len(), vash_core::MAX_BATCH_ITEMS);
+
+        let over = line(vash_core::MAX_BATCH_ITEMS + 1);
+        assert!(
+            matches!(
+                super::parse(b"get", &over[..over.len() - 2], over.len(), &over),
+                Err(ProtocolError::Recoverable {
+                    response: ErrorKind::Client("too many keys"),
+                    ..
+                })
+            ),
+            "one key past the limit must be refused"
+        );
     }
 
     #[test]

@@ -1012,7 +1012,7 @@ mod tests {
             .observe(&Command::Get { key }, &Reply::NotFound);
 
         // The single-key `get` the memcached path fuses, in both outcomes.
-        let one = Command::GetMany(vec![key]);
+        let one = Command::GetMany(vash_core::KeyList::from(key));
         metrics
             .outcomes
             .observe(&one, &Reply::Values(vec![Some(value)]));

@@ -43,7 +43,7 @@ fn command_for(opcode: Opcode) -> Option<Command<'static>> {
         Opcode::Stats => Command::Stats,
         Opcode::Cluster => Command::Cluster,
         Opcode::Get => Command::Get { key: key() },
-        Opcode::GetMany => Command::GetMany(vec![key()]),
+        Opcode::GetMany => Command::GetMany(vec![key()].into()),
         Opcode::Set => Command::Set(vash_core::Set::plain(key(), b"v", 0)),
         Opcode::SetMany => Command::SetMany {
             sets: vec![vash_core::Set::plain(key(), b"v", 0)],

@@ -404,7 +404,8 @@ pub fn encode_value_line(out: &mut Vec<u8>, with_cas: bool, key: &[u8], value: V
 
 fn encode_retrieval(out: &mut Vec<u8>, with_cas: bool, command: &Command<'_>, reply: &Reply) {
     let keys = match command {
-        Command::GetMany(keys) | Command::GetAndTouch { keys, .. } => keys.as_slice(),
+        Command::GetMany(keys) => keys.as_slice(),
+        Command::GetAndTouch { keys, .. } => keys.as_slice(),
         _ => &[],
     };
 
@@ -585,9 +586,8 @@ fn command_key<'a>(command: &'a Command<'a>) -> Option<&'a [u8]> {
         }
         Command::Arithmetic(op) => Some(op.key.as_bytes()),
         Command::Set(set) => Some(set.key.as_bytes()),
-        Command::GetAndTouch { keys, .. } | Command::GetMany(keys) => {
-            keys.first().map(|k| k.as_bytes())
-        }
+        Command::GetAndTouch { keys, .. } => keys.first().map(|k| k.as_bytes()),
+        Command::GetMany(keys) => keys.first().map(|k| k.as_bytes()),
         _ => None,
     }
 }
@@ -646,7 +646,7 @@ mod tests {
         assert_eq!(
             rendered(
                 ResponseStyle::Retrieval { with_cas: false },
-                Command::GetMany(keys),
+                Command::GetMany(keys.into()),
                 reply
             ),
             "VALUE a 7 1\r\n1\r\nVALUE c 0 3\r\n333\r\nEND\r\n"
@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(
             rendered(
                 ResponseStyle::Retrieval { with_cas: true },
-                Command::GetMany(vec![Key::from_stored(b"k")]),
+                Command::GetMany(vec![Key::from_stored(b"k")].into()),
                 reply
             ),
             "VALUE k 0 1 42\r\nx\r\nEND\r\n"
@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(
             rendered(
                 ResponseStyle::Retrieval { with_cas: false },
-                Command::GetMany(vec![Key::from_stored(b"k")]),
+                Command::GetMany(vec![Key::from_stored(b"k")].into()),
                 Reply::Values(vec![None])
             ),
             "END\r\n"

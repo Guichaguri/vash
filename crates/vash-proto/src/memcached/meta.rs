@@ -88,7 +88,9 @@ pub fn parse<'a>(
             // `T` on a get makes it a get-and-touch.
             let command = match flags.ttl {
                 Some(ttl_secs) => Command::GetAndTouch {
-                    keys: vec![key],
+                    // `mg` addresses one key, so this is the inline form and
+                    // allocates nothing — see [`KeyList`].
+                    keys: key.into(),
                     ttl_secs,
                 },
                 None => Command::Get { key },

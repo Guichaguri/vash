@@ -704,7 +704,7 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
     Ok(match command {
         Command::Ping { .. } => Domain::Ping,
         Command::Get { key } => Domain::Get { key: key_of(key)? },
-        Command::MGet { keys } => Domain::GetMany(keys_of(keys.iter().copied())?),
+        Command::MGet { keys } => Domain::GetMany(keys_of(keys.iter().copied())?.into()),
 
         // Redis counts a key once per time it is named, so duplicates are not
         // folded together.

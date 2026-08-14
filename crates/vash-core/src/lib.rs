@@ -29,8 +29,8 @@ pub use arith::{
 pub use clock::{Clock, MAX_TTL_SECS};
 pub use cluster::{ClusterInfo, ClusterMode, MAX_TAG_SYNC_ENTRIES, PeerInfo, TagGeneration};
 pub use command::{
-    BatchGuard, Command, ExpireGuard, MAX_BATCH_ITEMS, PROTOCOL_VERSION, Reply, ServerInfo, Set,
-    SetMode, Stored, Value, ValueRef, capability,
+    BatchGuard, Command, ExpireGuard, KeyList, MAX_BATCH_ITEMS, PROTOCOL_VERSION, Reply, ServerInfo,
+    Set, SetMode, Stored, Value, ValueRef, capability,
 };
 pub use error::{CoreError, Result};
 pub use key::{Key, MAX_KEY_LEN};

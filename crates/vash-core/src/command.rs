@@ -61,6 +61,69 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// with one enormous `SET_MANY`.
 pub const MAX_BATCH_ITEMS: usize = 4096;
 
+/// The keys of a multi-key retrieval, with room for one of them inline.
+///
+/// **Why this is not a `Vec`.** `get k` is a multi-key retrieval that names one
+/// key, and it is what every memcached client library sends for a single-key
+/// read — so the most executed command the server has was allocating a vector
+/// to hold exactly one borrowed key. Worse, it paid for it *twice*: the
+/// connection parses a block once in `conn::measure_memcached` to find where
+/// each command ends, and again in `dispatch` to execute it. Measured at
+/// ~50ns per parse, which is the malloc and the free.
+///
+/// Both retrievals use it — `GET_MANY` and `GET_AND_TOUCH` — because they share
+/// a parser and a client sends either with one key. `SET_MANY`, `DELETE_MANY`
+/// and the deadline batches keep their `Vec`: nothing sends those with one item
+/// as a matter of course, since the single-item form of each has a command of
+/// its own and clients use it.
+///
+/// Derefs to `[Key]`, so everything that reads the list — iterating, indexing,
+/// handing it to the store — is unchanged from when it was a vector.
+#[derive(Debug, Clone)]
+pub enum KeyList<'a> {
+    /// One key, held inline. No allocation.
+    One([Key<'a>; 1]),
+    Many(Vec<Key<'a>>),
+}
+
+impl<'a> KeyList<'a> {
+    #[inline]
+    pub fn as_slice(&self) -> &[Key<'a>] {
+        self
+    }
+}
+
+impl<'a> std::ops::Deref for KeyList<'a> {
+    type Target = [Key<'a>];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::One(one) => one,
+            Self::Many(many) => many,
+        }
+    }
+}
+
+impl<'a> From<Key<'a>> for KeyList<'a> {
+    #[inline]
+    fn from(key: Key<'a>) -> Self {
+        Self::One([key])
+    }
+}
+
+impl<'a> From<Vec<Key<'a>>> for KeyList<'a> {
+    /// Kept for the decoders that genuinely produce a vector — VCP's
+    /// `GET_MANY` and Redis's `MGET` both read a counted list. It does not
+    /// collapse a one-element vector into [`KeyList::One`]: by then the
+    /// allocation has already happened, so there would be nothing to save and
+    /// a copy to pay.
+    #[inline]
+    fn from(keys: Vec<Key<'a>>) -> Self {
+        Self::Many(keys)
+    }
+}
+
 /// A decoded request, borrowing from the connection's read buffer.
 #[derive(Debug, Clone)]
 pub enum Command<'a> {
@@ -71,7 +134,7 @@ pub enum Command<'a> {
     Get {
         key: Key<'a>,
     },
-    GetMany(Vec<Key<'a>>),
+    GetMany(KeyList<'a>),
     Set(Set<'a>),
     SetMany {
         sets: Vec<Set<'a>>,
@@ -123,7 +186,7 @@ pub enum Command<'a> {
 
     /// Fetch several keys and re-stamp their TTL in one pass (memcached `gat`).
     GetAndTouch {
-        keys: Vec<Key<'a>>,
+        keys: KeyList<'a>,
         ttl_secs: u32,
     },
     /// Atomic read-modify-write on a counter.

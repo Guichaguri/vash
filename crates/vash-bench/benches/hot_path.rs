@@ -68,7 +68,7 @@ fn vcp_decode_set(bencher: divan::Bencher, value_len: usize) {
 }
 
 /// A 64-key multi-get, which is one frame's worth of work for 64 requests.
-#[divan::bench]
+#[divan::bench(sample_size = 500)]
 fn vcp_decode_get_many(bencher: divan::Bencher) {
     let keys: Vec<String> = (0..64).map(|i| format!("user:{i}:profile")).collect();
     let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
@@ -86,13 +86,29 @@ fn vcp_decode_get_many(bencher: divan::Bencher) {
 /// The same request over the memcached text protocol. The gap between this and
 /// `vcp_decode_get` is what the native protocol buys per request, and is the
 /// concrete form of plan §3's "text framing costs".
-#[divan::bench]
+#[divan::bench(sample_size = 500)]
 fn memcached_parse_get(bencher: divan::Bencher) {
     let line = b"get user:1234:profile\r\n";
     bencher.bench(|| divan::black_box(memcached::parse(divan::black_box(line)).is_ok()));
 }
 
-#[divan::bench]
+/// `delete` is the same shape as `get` — one verb, one key, one line — and it
+/// has never allocated, because `Command::Delete { key }` holds the key
+/// directly.
+///
+/// It is here as the control for [`memcached_parse_get`]. `get` decodes into
+/// `Command::GetMany`, which used to be a `Vec<Key>` and so allocated for one
+/// borrowed key; the gap between the two arms was ~50ns, paid **twice** per
+/// command because the connection parses each block once to find where its
+/// commands end and again to run them. `KeyList` closed it. The two arms
+/// should now sit close together, and this one is what says so.
+#[divan::bench(sample_size = 500)]
+fn memcached_parse_delete(bencher: divan::Bencher) {
+    let line = b"delete user:1234:profile\r\n";
+    bencher.bench(|| divan::black_box(memcached::parse(divan::black_box(line)).is_ok()));
+}
+
+#[divan::bench(sample_size = 500)]
 fn memcached_parse_set(bencher: divan::Bencher) {
     let mut input = b"set user:1234:profile 0 300 1024\r\n".to_vec();
     input.extend_from_slice(VALUE);
@@ -102,7 +118,7 @@ fn memcached_parse_set(bencher: divan::Bencher) {
 }
 
 /// The meta dialect, whose flags are parsed one character at a time.
-#[divan::bench]
+#[divan::bench(sample_size = 500)]
 fn memcached_parse_meta_get(bencher: divan::Bencher) {
     let line = b"mg user:1234:profile v f s c t k Oopaque\r\n";
     bencher.bench(|| divan::black_box(memcached::parse(divan::black_box(line)).is_ok()));
@@ -200,7 +216,7 @@ fn memcached_encode_value_reply(bencher: divan::Bencher) {
         cas: 42,
         expires_at_ms: Some(0),
     })]);
-    let command = Command::GetMany(vec![vash_core::Key::from_stored(b"user:1234:profile")]);
+    let command = Command::GetMany(vash_core::Key::from_stored(b"user:1234:profile").into());
     let style = memcached::encode::ResponseStyle::Retrieval { with_cas: false };
 
     bencher.bench(|| {
@@ -228,7 +244,7 @@ fn memcached_encode_value_reply_reusing_the_buffer(bencher: divan::Bencher) {
         cas: 42,
         expires_at_ms: Some(0),
     })]);
-    let command = Command::GetMany(vec![vash_core::Key::from_stored(b"user:1234:profile")]);
+    let command = Command::GetMany(vash_core::Key::from_stored(b"user:1234:profile").into());
     let style = memcached::encode::ResponseStyle::Retrieval { with_cas: true };
 
     let mut out = Vec::with_capacity(VALUE.len() + 64);
