@@ -156,6 +156,24 @@ impl LmdbStore {
             .filter_map(|shard| shard.engine.tags().generation_of(name))
             .max()
     }
+
+    /// Runs `project` against a live record inside its read transaction, so the
+    /// value can be encoded straight out of the memory map.
+    ///
+    /// Inherent rather than on [`Store`] until there is a reason to put it
+    /// there: adding it to the trait obliges every implementation to offer a
+    /// borrowing read, and what that would buy is exactly what `hot_path.rs`
+    /// measures. See [`crate::engine::LmdbEngine::get_with`].
+    pub fn get_with<R>(
+        &self,
+        key: Key<'_>,
+        project: impl FnOnce(crate::ValueRef<'_>) -> R,
+    ) -> Result<Option<R>> {
+        self.shards
+            .for_key(key.as_bytes())
+            .engine
+            .get_with(key, project)
+    }
 }
 
 impl Store for LmdbStore {

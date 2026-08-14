@@ -13,6 +13,19 @@ use bytes::Bytes;
 use heed::{AnyTls, RoTxn};
 use vash_core::{Key, RecordRef, Value};
 
+/// A live record, borrowed straight from the memory map.
+///
+/// The borrowing counterpart to [`Value`]: same fields, except that `data`
+/// points into the map and is therefore only valid while the read transaction
+/// that produced it is open. See [`LmdbEngine::get_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct ValueRef<'a> {
+    pub data: &'a [u8],
+    pub mc_flags: u32,
+    pub cas: u64,
+    pub expires_at_ms: u64,
+}
+
 use crate::engine::LmdbEngine;
 use crate::env::TrackedTxn;
 use crate::error::{Result, StoreError};
@@ -70,6 +83,32 @@ impl LmdbEngine {
         let lookup = self.tags.lookup();
         let at = self.snapshot(&rtxn);
         self.read_record(&rtxn, &lookup, at, key.as_bytes())
+    }
+
+    /// Runs `project` against a live record **while the read transaction is
+    /// still open**, so the value can be encoded straight out of the map
+    /// instead of being copied into a [`Value`] first.
+    ///
+    /// This is the shape plan §8 wanted and M6 recorded as not taken. It is
+    /// here to be measured before it is adopted: the copy it removes is not
+    /// free to remove, because it is also what pulls the value into cache for
+    /// whatever copies it next. See `hot_path.rs`.
+    pub fn get_with<R>(
+        &self,
+        key: Key<'_>,
+        project: impl FnOnce(ValueRef<'_>) -> R,
+    ) -> Result<Option<R>> {
+        let rtxn = self.read_txn()?;
+        let lookup = self.tags.lookup();
+        let at = self.snapshot(&rtxn);
+        self.read_alive(&rtxn, &lookup, at, key.as_bytes(), |record| {
+            project(ValueRef {
+                data: record.value,
+                mc_flags: record.mc_flags(),
+                cas: record.cas(),
+                expires_at_ms: record.expires_at_ms(),
+            })
+        })
     }
 
     /// Resolves a whole batch inside one read transaction, so every key in a

@@ -209,3 +209,92 @@ fn memcached_encode_value_reply(bencher: divan::Bencher) {
         divan::black_box(out.len())
     });
 }
+
+// ---- the copy on the read path ---------------------------------------------
+//
+// M6 recorded that a value is copied twice on the way out — once out of the map
+// into a `Value`, once out of that into the write buffer — where plan §8 wanted
+// one, and that removing the first means encoding while the read transaction is
+// still open. That trade costs the `Store`/`Reply` boundary, so it is worth
+// knowing what it buys before paying for it.
+//
+// **Both arms end in the same place: bytes appended to a write buffer.** That
+// is the only fair comparison, and it is why the answer is smaller than "one
+// copy in three". The first copy is also what pulls the value into cache; take
+// it away and the remaining copy pays the misses the other one was absorbing.
+
+/// Today's path: `get` copies the value out of the map, then the encoder copies
+/// it into the write buffer.
+#[divan::bench(args = [64, 1024, 4096, 16384])]
+fn read_copy_then_encode(bencher: divan::Bencher, value_len: usize) {
+    let store = ReadFixture::new(value_len);
+    let key = vash_core::Key::from_stored(ReadFixture::KEY);
+
+    // Reused across iterations, exactly as the connection's write buffer is —
+    // measuring the read, not the allocator.
+    let mut out = Vec::with_capacity(value_len + 64);
+    bencher.bench_local(|| {
+        out.clear();
+        let value = vash_store::Store::get(&store.store, divan::black_box(key))
+            .unwrap()
+            .unwrap();
+        out.extend_from_slice(&value.data);
+        divan::black_box(out.len())
+    });
+}
+
+/// The proposed path: the value is appended straight out of the map, inside the
+/// read transaction, and never lands in a `Value` at all.
+#[divan::bench(args = [64, 1024, 4096, 16384])]
+fn read_encode_in_txn(bencher: divan::Bencher, value_len: usize) {
+    let store = ReadFixture::new(value_len);
+    let key = vash_core::Key::from_stored(ReadFixture::KEY);
+
+    let mut out = Vec::with_capacity(value_len + 64);
+    bencher.bench_local(|| {
+        out.clear();
+        store
+            .store
+            .get_with(divan::black_box(key), |value| {
+                out.extend_from_slice(value.data)
+            })
+            .unwrap()
+            .unwrap();
+        divan::black_box(out.len())
+    });
+}
+
+/// One populated single-shard environment, kept alive with its directory.
+struct ReadFixture {
+    store: vash_store::LmdbStore,
+    _dir: tempfile::TempDir,
+}
+
+impl ReadFixture {
+    const KEY: &'static [u8] = b"user:1234:profile";
+
+    fn new(value_len: usize) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config = vash_store::StoreConfig {
+            path: dir.path().join("db"),
+            map_size: 256 * 1024 * 1024,
+            shards: 1,
+            ..vash_store::StoreConfig::default()
+        };
+        let store = vash_store::LmdbStore::open(&config).unwrap();
+        vash_store::Store::set(
+            &store,
+            &vash_core::Set {
+                key: vash_core::Key::new(Self::KEY).unwrap(),
+                value: &vec![b'x'; value_len],
+                ttl: vash_core::TtlChange::Set(0),
+                return_previous: false,
+                mc_flags: 0,
+                tags: Vec::new(),
+                mode: vash_core::SetMode::Set,
+            },
+        )
+        .unwrap();
+        Self { store, _dir: dir }
+    }
+}

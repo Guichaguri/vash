@@ -40,6 +40,7 @@ pub mod memory;
 mod prefault;
 mod queue;
 mod read;
+pub use read::ValueRef;
 mod readers;
 pub mod reclaim;
 pub mod schema;
