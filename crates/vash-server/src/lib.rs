@@ -222,7 +222,7 @@ impl Server {
             pre_auth,
             lmdb,
         } = self;
-        let enforcing = state.auth.current().required();
+        let enforcing = state.auth.required();
 
         // Signalled once the listener is gone, so connections sitting idle
         // between requests let go instead of holding the drain open until it

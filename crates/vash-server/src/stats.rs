@@ -302,7 +302,7 @@ fn settings(state: &ServerState) -> Vec<(String, String)> {
         ("auth_enabled_sasl".into(), "no".into()),
         (
             "auth_enabled_ascii".into(),
-            yes_no(state.auth.current().required()),
+            yes_no(state.auth.required()),
         ),
         // Over the limit a connection is refused rather than accepted and
         // starved, which is what `maxconns_fast` names.

@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, bail, ensure};
@@ -263,11 +264,22 @@ impl Auth {
 
 /// The live table plus the pre-auth budget, shared by every connection.
 ///
-/// `RwLock<Arc<..>>` rather than a lock-free swap: it is read once per
-/// connection, never per request, so the lock is not on any path worth
-/// optimising and it saves a dependency.
+/// `RwLock<Arc<..>>` rather than a lock-free swap: the table itself is only
+/// reached for an actual verification, which happens once per connection, so
+/// the lock is not on any path worth optimising and it saves a dependency.
+///
+/// Whether authentication is *enforced* is a different question, and one every
+/// command asks — the gates in `dispatch` and `resp` check it before each one.
+/// It is mirrored into an atomic beside the lock so that asking costs a relaxed
+/// load rather than a lock acquisition and an `Arc` refcount round trip on a
+/// cacheline every connection thread shares. With enforcement off the
+/// `is_authenticated()` short-circuit in front of those gates never fires, so
+/// the mirror is what keeps the default configuration off the lock entirely.
 pub struct AuthState {
     current: RwLock<Arc<Auth>>,
+    /// Mirrors `current.required()`. Written only under the write lock, so it
+    /// cannot disagree with the table for longer than a reload takes.
+    required: AtomicBool,
     pub limits: Limits,
 }
 
@@ -291,9 +303,19 @@ pub struct Limits {
 impl AuthState {
     pub fn new(auth: Auth, limits: Limits) -> Self {
         Self {
+            required: AtomicBool::new(auth.required()),
             current: RwLock::new(Arc::new(auth)),
             limits,
         }
+    }
+
+    /// Whether this server enforces authentication.
+    ///
+    /// The per-command gate, and the reason it does not go through
+    /// [`Self::current`] — see the note on the struct.
+    #[inline]
+    pub fn required(&self) -> bool {
+        self.required.load(Ordering::Relaxed)
     }
 
     /// The table as it stands. Cloned out so a reload cannot swap underneath a
@@ -309,7 +331,14 @@ impl AuthState {
     /// whole of the rotation story — add the new credential, roll the clients,
     /// remove the old one — and it is why there is no runtime mutation command.
     pub fn replace(&self, auth: Auth) {
-        *self.current.write().expect("auth table lock poisoned") = Arc::new(auth);
+        let mut current = self.current.write().expect("auth table lock poisoned");
+        // Both under the write lock, so the mirror and the table it describes
+        // are swapped together. A gate reading the mirror without the lock can
+        // still catch the instant between them, which is the same window a
+        // reload already has between one `current()` and the next — a command
+        // in flight is judged by one side or the other, never by half of each.
+        self.required.store(auth.required(), Ordering::Relaxed);
+        *current = Arc::new(auth);
     }
 }
 

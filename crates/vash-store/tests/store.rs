@@ -342,6 +342,35 @@ fn touch_misses_on_absent_and_expired_keys() {
 }
 
 #[test]
+fn delete_misses_on_an_expired_record_the_sweeper_has_not_reached() {
+    // The row is still on disk, so the delete frees real space — but a client
+    // could no longer read the key, so removing it is a miss and not a hit. The
+    // sweep interval is pushed out to keep the sweeper from reaching it first,
+    // which would make this pass for the wrong reason.
+    let h = Harness::with(|c| c.write.sweep_interval_ms = 10_000);
+
+    h.set(b"expired", b"v", 1);
+    assert_eq!(h.expiry_entries(), 1, "still indexed, so still on disk");
+    std::thread::sleep(Duration::from_millis(1_200));
+
+    assert!(
+        !h.store().delete(Key::new(b"expired").unwrap()).unwrap(),
+        "an expired record is already invisible, so deleting it is a miss"
+    );
+    assert!(
+        !h.store().delete(Key::new(b"absent").unwrap()).unwrap(),
+        "and a key that was never written is the same miss"
+    );
+
+    let live = h.set(b"live", b"v", 60);
+    assert!(live > 0);
+    assert!(
+        h.store().delete(Key::new(b"live").unwrap()).unwrap(),
+        "a record a client could still read is a hit"
+    );
+}
+
+#[test]
 fn batch_writes_apply_atomically_and_return_ordered_cas() {
     let h = Harness::new();
     let sets: Vec<Set<'_>> = (0..64u32)

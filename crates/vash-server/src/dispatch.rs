@@ -50,7 +50,7 @@ pub fn execute_memcached_block(
                 // recognition; this is that rule for the text dialect. The byte
                 // count is the parser's either way, so a refused storage
                 // command still steps over its data block.
-                if !conn.is_authenticated() && state.auth.current().required() {
+                if !conn.is_authenticated() && state.auth.required() {
                     state.metrics.auth_refused();
                     vash_proto::memcached::encode::encode_error(
                         out,
@@ -84,7 +84,7 @@ pub fn execute_memcached(
 ) -> Closing {
     use vash_proto::memcached::encode as mc;
 
-    if !conn.is_authenticated() && state.auth.current().required() {
+    if !conn.is_authenticated() && state.auth.required() {
         return execute_memcached_unauthenticated(state, conn, parsed, out);
     }
 
@@ -579,7 +579,7 @@ struct Refused {
 /// unauthenticated party `HELLO` already told them, and `/health` on the admin
 /// port is the liveness check an operator should be using.
 fn header_refusal(state: &ServerState, conn: &ConnAuth, frame: &[u8]) -> Option<Refused> {
-    if conn.is_authenticated() || !state.auth.current().required() {
+    if conn.is_authenticated() || !state.auth.required() {
         return None;
     }
     // Short of a header there is nothing to refuse *with* — no request id to

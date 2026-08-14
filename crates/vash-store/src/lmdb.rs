@@ -75,6 +75,15 @@ impl LmdbStore {
     fn ensure_tags_registered(&self, sets: &[Set<'_>]) -> Result<()> {
         self.check_tag_counts(sets)?;
 
+        // The overwhelmingly common write carries no tags at all, and has
+        // nothing here to register. Answering it from this scan rather than
+        // from the grouping below is what keeps it off the allocation the
+        // grouping makes — one `Vec` per shard — and off the per-shard walk
+        // that would then find every group empty of tags.
+        if sets.iter().all(|set| set.tags.is_empty()) {
+            return Ok(());
+        }
+
         for shard_items in self.shards.group(sets, |set| set.key.as_bytes()) {
             let mut missing: Vec<(Box<[u8]>, u64)> = Vec::new();
             let mut shard = None;

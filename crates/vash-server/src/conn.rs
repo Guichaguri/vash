@@ -55,7 +55,7 @@ pub async fn handle(
     let mut conn_auth = ConnAuth::default();
 
     let limits = state.auth.limits;
-    let enforcing = state.auth.current().required();
+    let enforcing = state.auth.required();
     // An unauthenticated connection is the one thing here a stranger can
     // create, so it gets a deadline rather than the ordinary idle treatment. It
     // is folded into the `select!` that already handles shutdown, so it costs
@@ -144,7 +144,7 @@ pub async fn handle(
         let keep_going = match protocol.expect("set above") {
             Protocol::Vcp => {
                 // Ordered so an authenticated connection never touches the lock.
-                let gated = !conn_auth.is_authenticated() && state.auth.current().required();
+                let gated = !conn_auth.is_authenticated() && state.auth.required();
                 drain(
                     &state,
                     &mut conn_auth,

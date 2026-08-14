@@ -59,6 +59,12 @@ pub struct Written {
 /// What the record an overwrite replaced was holding.
 #[derive(Debug, Default)]
 struct Displaced {
+    /// Whether a record was there and a client would have been served it.
+    ///
+    /// Distinct from `deadline.is_some()`, which happens to carry the same
+    /// answer today only because every live record has a deadline field — a
+    /// coincidence, and not one a caller should have to know about.
+    live: bool,
     /// Its deadline, or `None` if there was no live record to take one from.
     deadline: Option<u64>,
     /// Its value, captured only when the caller asked for it.
@@ -166,6 +172,7 @@ impl LmdbEngine {
             let lookup = self.tags.lookup();
             let live = record.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id));
             Displaced {
+                live,
                 // A record that is not live is already invisible to clients, so
                 // it has no deadline worth keeping and no value worth reporting.
                 deadline: live.then_some(expires_at_ms),
@@ -222,9 +229,23 @@ impl LmdbEngine {
         prepared: &mut PreparedSet,
         mode: SetMode,
     ) -> Result<Written> {
-        let existing = self
-            .live_record(wtxn, &prepared.key)?
-            .map(|r| (r.cas(), r.mc_flags(), r.expires_at_ms(), r.value.to_vec()));
+        // Only two callers ever read the displaced value: `SET … GET`, which
+        // reports it, and the concatenating modes, which build on it. For
+        // everything else — every `set`, `add`, `replace` and `cas` — copying it
+        // out of the memory map would be a copy of the whole old value, taken on
+        // the shard's single writer thread and thrown away unread. The header
+        // fields below are what the guards actually judge, and they are three
+        // integers.
+        let wants_value =
+            prepared.return_previous || matches!(mode, SetMode::Append | SetMode::Prepend);
+        let existing = self.live_record(wtxn, &prepared.key)?.map(|r| {
+            (
+                r.cas(),
+                r.mc_flags(),
+                r.expires_at_ms(),
+                wants_value.then(|| r.value.to_vec()),
+            )
+        });
 
         // A guard that refuses the write still has to answer `SET … GET`, which
         // reports what the key holds whether or not the write applied — that is
@@ -232,8 +253,12 @@ impl LmdbEngine {
         let refused = |outcome: Stored| -> Result<Written> {
             Ok(Written {
                 outcome,
+                // The value is present exactly when `return_previous` asked for
+                // it, so matching on both rather than unwrapping keeps this
+                // total: there is no arm here that can panic if the two ever
+                // drift apart.
                 previous: match (&existing, prepared.return_previous) {
-                    (Some((cas, mc_flags, expires_at_ms, value)), true) => Some(Value {
+                    (Some((cas, mc_flags, expires_at_ms, Some(value))), true) => Some(Value {
                         data: Bytes::copy_from_slice(value),
                         mc_flags: *mc_flags,
                         cas: *cas,
@@ -262,8 +287,15 @@ impl LmdbEngine {
         // Concatenation keeps the stored value's TTL and client flags, matching
         // memcached: append/prepend carry no metadata of their own.
         if matches!(mode, SetMode::Append | SetMode::Prepend) {
-            let (_, mc_flags, expires_at_ms, current) =
-                existing.expect("guarded above: concatenation requires an existing record");
+            // The value is captured for exactly these two modes, so it is
+            // present by the same construction the match above relies on.
+            let (_, mc_flags, expires_at_ms, Some(current)) =
+                existing.expect("guarded above: concatenation requires an existing record")
+            else {
+                return Err(StoreError::Corrupt(
+                    "concatenation reached the writer without the value it builds on".into(),
+                ));
+            };
 
             let addition = RecordRef::parse(&prepared.record)?.value.to_vec();
             let mut combined = Vec::with_capacity(current.len() + addition.len());
@@ -598,20 +630,13 @@ impl LmdbEngine {
     /// expired but not yet been swept is already invisible to clients, so
     /// removing it counts as a miss even though it frees a row.
     pub fn apply_delete(&self, wtxn: &mut RwTxn, key: &[u8]) -> Result<bool> {
-        let was_live = match self.main.get(wtxn, key).map_err(StoreError::from_heed)? {
-            Some(blob) => {
-                let lookup = self.tags.lookup();
-                RecordRef::parse(blob)
-                    .map(|r| r.is_alive(self.now_ms(), self.epoch(), |id| lookup.generation(id)))
-                    .unwrap_or(false)
-            }
-            None => false,
-        };
-
-        self.displace(wtxn, key, false)?;
+        // `displace` already reads the record and judges its liveness, on the
+        // way to clearing its index rows. Asking it rather than repeating the
+        // lookup halves the B-tree descents a delete costs.
+        let displaced = self.displace(wtxn, key, false)?;
         self.main.delete(wtxn, key).map_err(StoreError::from_heed)?;
 
-        Ok(was_live)
+        Ok(displaced.live)
     }
 
     /// Re-stamps a record's expiry without the client resending the value.

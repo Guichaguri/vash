@@ -170,7 +170,7 @@ fn execute(
 /// Redis's own long message, which exists precisely to tell a client how to
 /// authenticate and negotiate at once.
 fn refusal(state: &ServerState, conn: &ConnAuth, command: &Command<'_>) -> Option<Failure> {
-    if conn.is_authenticated() || !state.auth.current().required() {
+    if conn.is_authenticated() || !state.auth.required() {
         return None;
     }
 
