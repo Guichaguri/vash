@@ -32,19 +32,22 @@ fn env_flags(durability: Durability, write_map: bool) -> EnvFlags {
 
     // Separate from the durability mode because it is not a durability
     // decision: it trades LMDB's dirty-page copies for a lower memory
-    // footprint, and it was measured *slower* here twice — no gain under
-    // `relaxed`, and a `lazy` store without it beating the old `ephemeral`
-    // mode, which was `lazy` plus this flag, by nearly 2×. An operator who
-    // wants the memory profile can still have it, and `store.write_map`
-    // documents that it costs `lazy` its integrity guarantee.
+    // footprint. **Whether it is also faster depends on the platform, and the
+    // measurements disagree by more than the flag's own effect.** On Linux it
+    // is worth nothing — 1.04x, 0.96x and 1.01x under `lazy` on the same NVMe
+    // the Windows numbers below were taken on — which is the result §6 and §9
+    // of `docs/performance-proposals.md` were written against. Natively on
+    // Windows the same build under `lazy` measures 1.08x closed loop, 1.26x
+    // pipelined and 1.17x mixed, winning all fifteen paired runs. The device
+    // was identical in both, so this is an mmap-and-filesystem difference, not
+    // a storage one.
     //
-    // Unix only: on Windows `mdb_env_open` fails with OS error 6 at every map
-    // size tested.
+    // No longer Unix-gated: the `mdb_env_open` failure that gate was written
+    // for does not reproduce, at 4, 16 or 64 GiB map sizes, and while it stood
+    // it made `store.write_map` a silent no-op on the one platform where the
+    // flag pays. `store.write_map` documents what it costs `lazy` in exchange.
     if write_map {
-        #[cfg(unix)]
-        {
-            flags |= EnvFlags::WRITE_MAP;
-        }
+        flags |= EnvFlags::WRITE_MAP;
     }
     flags
 }

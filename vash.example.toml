@@ -89,17 +89,28 @@ max_value_bytes = 1048576
 # Start from an empty database. What --ephemeral sets, alongside `lazy`.
 wipe_on_start = false
 
-# Let LMDB write dirty pages straight into the map (MDB_WRITEMAP; Unix only,
-# ignored on Windows where env-open fails with it at every map size tested).
+# Let LMDB write dirty pages straight into the map (MDB_WRITEMAP).
 #
-# Not a speed setting on the evidence here — no gain under `relaxed`, a worse
-# tail when the device stalls, and a `lazy` store without it beat the old
-# `ephemeral` mode, which was `lazy` plus this flag, by nearly 2x on pipelined
-# writes. What it buys is memory: LMDB stops allocating a copy of every dirty
+# What it buys everywhere is memory: LMDB stops allocating a copy of every dirty
 # page, so a large transaction has a lower peak footprint.
 #
+# Whether it also buys speed depends on the platform, and by more than the flag
+# itself is worth:
+#
+#   - On Linux, nothing. Measured three times — no gain under `relaxed`, a worse
+#     tail when the device stalls, and 1.04x / 0.96x / 1.01x under `lazy`.
+#   - Natively on Windows, 1.08x closed-loop and 1.26x pipelined writes under
+#     `lazy`, on the same NVMe as the Linux run and winning every paired round.
+#
+# So measure it on your own platform rather than inheriting either answer. It is
+# off by default because the platform where it pays is not the one most servers
+# run on, and because of the next paragraph.
+#
 # It removes `lazy`'s integrity guarantee — LMDB keeps a NOSYNC database
-# consistent only if WRITEMAP is not used — so pair it with wipe_on_start.
+# consistent only if WRITEMAP is not used, since pages are written in place with
+# no ordering. A crash can then leave the database corrupt rather than merely
+# missing its last second of writes. Pair it with wipe_on_start, or run it under
+# `durable`, or be willing to rebuild the cache after a crash.
 write_map = false
 
 # Read every shard's data file at startup, so the map is resident before the

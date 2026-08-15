@@ -57,12 +57,17 @@ pub struct StoreConfig {
     /// Start from an empty database. What `--ephemeral` sets, together with
     /// `lazy` durability.
     pub wipe_on_start: bool,
-    /// Let LMDB write dirty pages straight into the map (`MDB_WRITEMAP`, Unix
-    /// only).
+    /// Let LMDB write dirty pages straight into the map (`MDB_WRITEMAP`).
     ///
-    /// Lower peak memory in a large transaction, and **measured slower here
-    /// twice** — see `docs/performance-proposals.md` §6 and §9. It also removes
-    /// `lazy`'s integrity guarantee, so pair it with `wipe_on_start`.
+    /// Lower peak memory in a large transaction. **Whether it is faster is a
+    /// platform question**: on Linux it measured nothing three times, and
+    /// natively on Windows it measured 1.08–1.26× under `lazy` on the same
+    /// disk — see `docs/performance-proposals.md` §6.
+    ///
+    /// It also removes `lazy`'s integrity guarantee, because pages are written
+    /// in place with no ordering: a crash can leave the database corrupt rather
+    /// than merely stale. Pair it with `wipe_on_start`, or run it under
+    /// `durable`, or accept rebuilding the cache after a crash.
     pub write_map: bool,
     /// Read every shard's data file at startup, so the map is resident before
     /// the first request instead of faulting in under one.

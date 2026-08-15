@@ -529,6 +529,56 @@ Worth re-testing on a real device rather than a virtualised one, where the
 `msync`-versus-`pwrite` difference should be smaller and the stalls should not
 exist. Nothing here generalises past the hardware described at the top.
 
+### Re-tested off the VM, and the answer changed — but not for the reason expected
+
+**Status: still off by default, no longer Unix-gated.**
+
+The re-test above was run under `lazy` rather than `relaxed`, since `lazy` is now
+the default, and natively on Windows against the NVMe directly — no WSL2, no
+container, no VHDX. Server and load generator were both native, over vash's own
+VCP loopback, five alternating rounds:
+
+| Workload | `write_map` off | on | |
+|---|---:|---:|---:|
+| `SET`, closed loop | 19,309 | **20,918** | 1.08× |
+| `SET`, pipeline 16 | 101,844 | **128,448** | 1.26× |
+| mixed, pipeline 16 | 196,941 | **229,442** | 1.17× |
+
+`on` won **all fifteen paired runs**, so unlike the original this is not a
+question of medians.
+
+**The obvious explanation is wrong.** If the gain came from the device, then the
+same physical NVMe under Linux should show it too. It does not — same binaries,
+same load generator, same protocol, same disk, in a container instead:
+
+| Workload | `write_map` off | on | |
+|---|---:|---:|---:|
+| `SET`, closed loop | 9,821 | 10,252 | 1.04× |
+| `SET`, pipeline 16 | 79,094 | 76,302 | 0.96× |
+| mixed, pipeline 16 | 123,990 | 124,771 | 1.01× |
+
+Flat, which agrees with the original rejection and with §9. (The absolute
+numbers are not comparable across the two tables — the container was capped at
+four cores and the native run was not. Only the within-table ratios mean
+anything.)
+
+So the variable is not the storage device. What differs between the two tables is
+the operating system, the filesystem, and the virtualisation layer, all at once,
+and this pair of runs cannot separate them. What it does establish is the shape
+of the answer: **`WRITE_MAP` is a platform-dependent setting, not a
+storage-dependent one**, and an operator should measure it where they run rather
+than inherit either row.
+
+Two changes fell out. The `#[cfg(unix)]` gate is gone: the `mdb_env_open`
+failure it was written for does not reproduce at 4, 16 or 64 GiB map sizes, and
+while it stood it silently ignored `store.write_map` on the one platform where
+the flag pays — the worst of both, an option that reads as supported and does
+nothing. And the default stays `false`, for the reason in the previous section
+plus a sharper one now that `lazy` is the default: under `NOSYNC`, `WRITEMAP`
+writes pages in place with no ordering, so a crash can leave the database
+**corrupt** rather than merely a second stale. That is a much larger promise to
+trade than 1.26× on one platform, and it should be the operator's trade to make.
+
 ---
 
 ## 7. A RAM-resident write-back tier — **not the bottleneck**
