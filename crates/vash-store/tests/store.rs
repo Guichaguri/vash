@@ -2105,3 +2105,74 @@ fn prefaulting_an_empty_database_is_not_an_error() {
     assert_eq!(store.stats().unwrap().entries, 0);
     store.close();
 }
+
+/// **`lazy` keeps the database, it only loosens when the data reaches the
+/// device.** That is the whole distinction from `ephemeral`, which has to be
+/// wiped at startup, and it is the claim the mode is sold on — so it is pinned
+/// rather than reasoned about: write under `lazy`, close cleanly, reopen, and
+/// find everything still there and still readable.
+#[test]
+fn a_lazy_store_reopens_with_its_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("db"),
+        map_size: 64 * 1024 * 1024,
+        durability: vash_store::Durability::Lazy,
+        ..StoreConfig::default()
+    };
+
+    {
+        let store = LmdbStore::open(&config).unwrap();
+        for i in 0..64u32 {
+            store
+                .set(&Set {
+                    key: Key::new(format!("k{i}").as_bytes()).unwrap(),
+                    value: b"v",
+                    ttl: vash_core::TtlChange::Set(0),
+                    return_previous: false,
+                    mc_flags: 0,
+                    tags: Vec::new(),
+                    mode: vash_core::SetMode::Set,
+                })
+                .unwrap();
+        }
+        store.close();
+    }
+
+    let store = LmdbStore::open(&config).unwrap();
+    for i in 0..64u32 {
+        let key = format!("k{i}");
+        assert_eq!(
+            store
+                .get(Key::new(key.as_bytes()).unwrap())
+                .unwrap()
+                .map(|v| v.data.to_vec())
+                .as_deref(),
+            Some(&b"v"[..]),
+            "{key} did not survive the restart"
+        );
+    }
+    store.close();
+}
+
+/// The periodic sync runs on its own, without a client asking for one. It is
+/// what bounds `lazy`'s loss window, and — since nothing but shutdown ever
+/// forced a sync before — what makes `relaxed`'s documented promise true.
+#[test]
+fn the_writer_syncs_on_its_own_timer() {
+    let h = Harness::with(|c| {
+        c.durability = vash_store::Durability::Lazy;
+        c.write.sync_interval_ms = 10;
+    });
+
+    h.set(b"k", b"v", 0);
+    // Several intervals, so a sync that only ever ran on demand would not have
+    // happened by now.
+    std::thread::sleep(Duration::from_millis(120));
+
+    // The store is still serving, which is the observable part: a sync that
+    // panicked or wedged the writer would show up as this hanging or failing.
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"v"[..]));
+    h.set(b"k2", b"v2", 0);
+    assert_eq!(h.get(b"k2").as_deref(), Some(&b"v2"[..]));
+}

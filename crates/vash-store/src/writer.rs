@@ -326,12 +326,17 @@ fn writer_loop(
 ) {
     let sweep_interval = Duration::from_millis(config.sweep_interval_ms);
     let mut last_sweep = Instant::now();
+    // The timer that bounds `lazy`'s loss window, and that finally does what
+    // `relaxed` has always claimed. Zero disables it.
+    let sync_interval = Duration::from_millis(config.sync_interval_ms);
+    let mut last_sync = Instant::now();
     let mut batch: Vec<WriteJob> = Vec::with_capacity(config.max_batch);
 
     info!(
         max_batch = config.max_batch,
         queue_depth = config.queue_depth,
         sweep_interval_ms = config.sweep_interval_ms,
+        sync_interval_ms = config.sync_interval_ms,
         sweep_batch = config.sweep_batch,
         "writer thread started"
     );
@@ -344,8 +349,12 @@ fn writer_loop(
     loop {
         let idle_timeout = if reclaim_pending {
             Duration::ZERO
-        } else {
+        } else if sync_interval.is_zero() {
             sweep_interval
+        } else {
+            // So an idle server still flushes what it last wrote, rather than
+            // holding it until something else happens to arrive.
+            sweep_interval.min(sync_interval)
         };
 
         // Block until there is work, but wake up on the sweep interval so the
@@ -372,6 +381,23 @@ fn writer_loop(
         // Maintenance shares the batch's transaction, so it costs no extra
         // commit. Under sustained write load the interval check is what keeps
         // it from starving.
+        // **The periodic flush.** Taken before the batch below rather than
+        // after, so it covers transactions that have already committed rather
+        // than racing the one about to. It is the whole of what bounds `lazy`'s
+        // loss window, and under `relaxed` it is what pushes the meta page out
+        // — the sync that mode's documentation has always promised and that,
+        // until now, only ran at shutdown.
+        //
+        // A failure is logged and the timer reset anyway: retrying a failing
+        // device every wake-up turns one problem into a log flood, and the next
+        // interval will try again.
+        if !sync_interval.is_zero() && last_sync.elapsed() >= sync_interval {
+            if let Err(e) = engine.sync() {
+                warn!(error = %e, "periodic sync failed");
+            }
+            last_sync = Instant::now();
+        }
+
         let due_for_maintenance = reclaim_pending || last_sweep.elapsed() >= sweep_interval;
         if batch.is_empty() && !due_for_maintenance {
             continue;

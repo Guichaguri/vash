@@ -23,11 +23,32 @@ pub enum Durability {
     /// `fsync` on every commit. Slowest, strongest.
     Durable,
     /// Skips only the meta-page sync. An OS crash loses at most the last few
-    /// transactions and **cannot corrupt the database**. Periodically forced.
+    /// transactions and **cannot corrupt the database**.
     #[default]
     Relaxed,
-    /// No syncing at all. Fastest. An OS crash or power loss can corrupt the
-    /// file, which is handled by wiping it at startup and beginning empty.
+    /// **Syncs on a timer rather than on every commit.**
+    ///
+    /// The per-commit `fsync` is what a write actually waits for: measured on a
+    /// four-core container, `relaxed` spends 0.43 ms per record inside commit
+    /// against `ephemeral`'s 0.033 ms, so **92% of it is the sync** — and the
+    /// backlog that builds behind it is the writer queue wait that dominates a
+    /// write's latency. See `docs/performance-proposals.md` §9.
+    ///
+    /// What it gives up is **durability only, and boundedly**: an OS crash loses
+    /// writes newer than the last periodic sync, `write.sync_interval_ms`. What
+    /// it keeps is integrity — the database is still consistent and still
+    /// openable, unlike [`Self::Ephemeral`], which has to be wiped.
+    ///
+    /// **That guarantee has a condition**, and it is LMDB's rather than this
+    /// crate's: `MDB_NOSYNC` preserves atomicity, consistency and isolation
+    /// *"if the filesystem preserves write order and the `MDB_WRITEMAP` flag is
+    /// not used"*. So this mode never sets `WRITE_MAP` — which costs nothing,
+    /// since it measured as no gain — and an operator on a filesystem that
+    /// reorders writes gets the `ephemeral` risk without the `ephemeral` label.
+    Lazy,
+    /// No syncing at all, and a writable map. Fastest. An OS crash or power loss
+    /// can corrupt the file, which is handled by wiping it at startup and
+    /// beginning empty.
     Ephemeral,
 }
 
@@ -106,6 +127,15 @@ pub struct WriteConfig {
     /// How often the sweeper runs. Also how long the writer waits for work
     /// before waking to sweep, so idle sweeps cost nothing.
     pub sweep_interval_ms: u64,
+    /// How often the writer forces everything committed since the last one onto
+    /// the device. `0` never does.
+    ///
+    /// This is what bounds the loss window of [`Durability::Lazy`], and it is
+    /// also what finally makes [`Durability::Relaxed`]'s promise true: that mode
+    /// has always been documented as "periodically forced" and nothing forced
+    /// it — the only `force_sync` in the tree was at shutdown, so a killed
+    /// process left the meta page wherever the OS had got to.
+    pub sync_interval_ms: u64,
     /// Most expiry-index entries examined per sweep, bounding how long
     /// reclamation can hold the write transaction.
     pub sweep_batch: usize,
@@ -151,6 +181,10 @@ impl Default for WriteConfig {
             queue_depth: 4096,
             linger_us: 0,
             sweep_interval_ms: 100,
+            // Frequent enough that the loss window is a blink, rare enough that
+            // the sync amortises across thousands of commits at any real write
+            // rate.
+            sync_interval_ms: 1000,
             sweep_batch: 512,
             reclaim_batch: 512,
             eviction: EvictionConfig::default(),

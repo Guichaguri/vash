@@ -185,6 +185,14 @@ pub struct WriteConfig {
     /// whatever queued during the previous commit, which adds no latency when
     /// idle and still forms large batches under load.
     pub linger_us: u64,
+    /// How often the writer forces committed data onto the device. `0` never
+    /// does.
+    ///
+    /// Under `lazy` this is the loss window: an OS crash costs the writes newer
+    /// than the last one. Under `relaxed` and `durable` the data is already on
+    /// the device and this only pushes the meta page, which is what those modes
+    /// have always documented and nothing was doing.
+    pub sync_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -208,6 +216,7 @@ impl Default for WriteConfig {
             max_batch: defaults.max_batch,
             queue_depth: defaults.queue_depth,
             linger_us: defaults.linger_us,
+            sync_interval_ms: defaults.sync_interval_ms,
         }
     }
 }
@@ -231,6 +240,7 @@ pub enum Durability {
     Durable,
     #[default]
     Relaxed,
+    Lazy,
     Ephemeral,
 }
 
@@ -239,6 +249,7 @@ impl From<Durability> for vash_store::Durability {
         match d {
             Durability::Durable => Self::Durable,
             Durability::Relaxed => Self::Relaxed,
+            Durability::Lazy => Self::Lazy,
             Durability::Ephemeral => Self::Ephemeral,
         }
     }
@@ -755,6 +766,7 @@ impl Config {
                 max_batch: self.store.write.max_batch,
                 queue_depth: self.store.write.queue_depth,
                 linger_us: self.store.write.linger_us,
+                sync_interval_ms: self.store.write.sync_interval_ms,
                 sweep_interval_ms: self.store.ttl.sweep_interval_ms,
                 sweep_batch: self.store.ttl.sweep_batch,
                 reclaim_batch: self.store.tags.reclaim_batch,

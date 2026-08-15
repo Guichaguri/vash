@@ -30,6 +30,12 @@ fn env_flags(durability: Durability) -> EnvFlags {
         // place: no throughput gain under `relaxed`, and a far worse tail when
         // the device stalls. See `docs/performance-proposals.md` §6.
         Durability::Relaxed => flags |= EnvFlags::NO_META_SYNC,
+        // **Deliberately without `WRITE_MAP`**, and not for want of a platform:
+        // it is the flag LMDB names as the thing that turns `NO_SYNC` from
+        // "loses the last transactions" into "may corrupt the database". §6
+        // measured it as worth nothing anyway, so the integrity this mode
+        // promises costs no throughput to keep.
+        Durability::Lazy => flags |= EnvFlags::NO_SYNC,
         Durability::Ephemeral => {
             flags |= EnvFlags::NO_SYNC;
             // WRITE_MAP would add a further gain but fails at env-open on

@@ -45,7 +45,22 @@ max_readers = 256
 # durable   fsync on every commit
 # relaxed   skips the meta-page sync; loses at most the last few transactions
 #           on an OS crash and cannot corrupt the database
-# ephemeral no syncing; fastest, and a crash means starting empty
+# lazy      syncs on a timer instead of on every commit; loses writes newer than
+#           the last sync_interval_ms, and keeps the database intact
+# ephemeral no syncing and a writable map; fastest, and a crash means starting
+#           empty
+#
+# `lazy` is the one worth understanding, because the per-commit fsync is what a
+# write actually waits for: measured on a four-core container, `relaxed` spends
+# 0.43 ms per record inside commit against `ephemeral`'s 0.033 ms, so 92% of it
+# is the sync — and the backlog behind it is most of a write's latency.
+#
+# What `lazy` gives up is durability, and only back to the last periodic sync.
+# What it keeps is integrity: unlike `ephemeral` the database is still
+# consistent and still openable after a crash, so there is nothing to wipe.
+# LMDB's condition for that is that the filesystem preserves write order and
+# MDB_WRITEMAP is not used — this mode never sets it. On a filesystem that
+# reorders writes you have `ephemeral`'s risk without its name, so check.
 durability = "relaxed"
 
 max_value_bytes = 1048576
@@ -122,6 +137,16 @@ queue_depth = 4096
 # Artificial delay before sealing a batch. Zero adds no latency when idle and
 # still batches under load; raise it only to trade latency for throughput.
 linger_us = 0
+
+# How often the writer forces committed data onto the device. 0 never does.
+#
+# Under `lazy` this is the loss window — an OS crash costs the writes newer than
+# the last one — so it is the knob that mode is tuned with. Under `relaxed` and
+# `durable` the data is already down and this only pushes the meta page, which
+# is what those modes have always documented and, until this existed, nothing
+# actually did: the only forced sync in the server ran at shutdown, so a killed
+# process left the meta page wherever the OS had got to.
+sync_interval_ms = 1000
 
 [store.ttl]
 # Expiry-index buckets round up to this. Coarser means fewer distinct index keys

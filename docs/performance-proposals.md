@@ -21,8 +21,8 @@ it, because it comes from the writer's own counters rather than from the client.
 |---|---:|---:|---:|---:|
 | GET, closed loop | 17,443 | **173,659** ✅ | 50,484 | 130,922 |
 | GET, pipelined | 221,380 | **781,427** ✅ | 475,430 | 651,154 |
-| SET, closed loop | 5,774 | ~7,300 relaxed, **22,673** ephemeral | 55,401 | 148,314 |
-| SET, pipelined | 14,140 | ~30,000 relaxed, **69,305** ephemeral | 554,785 | 912,234 |
+| SET, closed loop | 5,774 | 15,110 relaxed, **24,902** lazy | 55,401 | 148,314 |
+| SET, pipelined | 14,140 | 24,675 relaxed, **109,839** lazy | 554,785 | 912,234 |
 
 The read rows are [§3](#3-implemented-resident_mode) and the write rows are
 [§4](#4-implemented-one-writer-submission-per-block-not-per-command), both since
@@ -39,7 +39,8 @@ not. §4 and §5 took the storage engine down to **8% of what a write costs** wi
 syncing off; the remaining 92% was the request path, and
 [§8](#8-implemented-writes-off-the-blocking-pool) took the hand-off out of it.
 That is why the write-back tier in §7 is measured *against* rather than built:
-it addresses the 8%.
+it addresses the 8%. §9 then took the `fsync` out of the commit, which is what
+the writer queue had been backed up behind all along.
 
 ---
 
@@ -735,7 +736,78 @@ magnitude. The server-side signal agrees with the direction: queue wait fell fro
 
 ---
 
-## 9. Explicitly rejected
+## 9. Implemented: stop syncing on every commit
+
+**Status: shipped as `store.durability = "lazy"`. 1.7–4.5× on writes, and it
+collapses the queue wait §8 left behind.**
+
+After §8 the dominant term in a write was the **writer queue wait** — 4.8 ms at
+pipeline 1 and 10.3 ms at 16. That is not an independent cost to attack: it is
+Little's law against a saturated writer, so it only falls if the writer gets
+faster or there are more of them. [plan.md](plan.md) §9 already measured more
+shards going backwards on a disk-bound workload, which leaves making the writer
+faster.
+
+The writer's own counters say what it is waiting for. Per record inside commit:
+**0.43 ms under `relaxed` against 0.033 ms under `ephemeral`** — so 92% of it is
+the `fsync`, and everything queued behind it is the queue wait.
+
+### The mode that was already documented and never existed
+
+`relaxed` is `MDB_NOMETASYNC`: the meta page is not synced, the data is, on every
+commit. Its documentation has always said *"periodically forced"* — and nothing
+forced it. The only `force_sync` in the tree ran at shutdown, so a killed process
+left the meta page wherever the OS had got to.
+
+So the writer now has a sync timer, `write.sync_interval_ms`, which does two
+things at once: it makes `relaxed`'s promise true, and it makes a new mode
+possible.
+
+`durability = "lazy"` is `MDB_NOSYNC` — no sync on commit at all — with that
+timer bounding the loss window. **It gives up durability, boundedly, and keeps
+integrity**: after a crash the database is still consistent and still openable,
+where `ephemeral` has to be wiped. LMDB's condition for that is exactly stated —
+`MDB_NOSYNC` preserves atomicity, consistency and isolation *"if the filesystem
+preserves write order and the `MDB_WRITEMAP` flag is not used"* — so this mode
+never sets `WRITE_MAP`, which [§6](#6-tried-and-rejected-write_map-under-relaxed)
+had already measured as worth nothing.
+
+### Measured
+
+Three modes, one build, alternating order, medians of four:
+
+| | ops/s | queue wait | commit/record |
+|---|---:|---:|---:|
+| **pipeline 1** | | | |
+| `relaxed` | 15,110 | 2.23 ms | 0.260 ms |
+| **`lazy`** | **24,902** | **1.17 ms** | **0.062 ms** |
+| `ephemeral` | 26,154 | 0.87 ms | 0.049 ms |
+| **pipeline 16** | | | |
+| `relaxed` | 24,675 | 3.98 ms | 0.159 ms |
+| **`lazy`** | **109,839** | **0.77 ms** | **0.021 ms** |
+| `ephemeral` | 56,233 | 1.34 ms | 0.028 ms |
+
+**1.65× and 4.45× over `relaxed`**, and the queue wait falls with it — 2.23 to
+1.17 ms and 3.98 to 0.77 ms — which is the point: the backlog was the sync, and
+removing the sync drained it.
+
+### The thing that fell out: `ephemeral` is leaving 2× on the floor
+
+`lazy` beats `ephemeral` at pipeline 16 by **109,839 against 56,233**, and the
+only difference between them is `WRITE_MAP`. That is the second independent
+measurement pointing the same way — §6 found it worth nothing under `relaxed`
+and far worse in the tail — so `ephemeral` is now the slowest way to run with
+syncing off *and* the only one that has to be wiped at startup.
+
+Dropping `WRITE_MAP` from `ephemeral` is one line, but it is not only a
+performance change: without that flag `MDB_NOSYNC` preserves integrity, so
+`ephemeral` would stop needing its wipe and would become `lazy` with the timer
+off. That is a question about what the two modes are *for*, not a tuning knob,
+and it is left open rather than answered in passing.
+
+---
+
+## 10. Explicitly rejected
 
 Recorded so they do not get proposed again:
 
@@ -763,7 +835,7 @@ Recorded so they do not get proposed again:
 
 ---
 
-## 10. Sequencing
+## 11. Sequencing
 
 | Order | Proposal | Effort | Outcome | Confidence |
 |---|---|---|---|---|
@@ -772,7 +844,8 @@ Recorded so they do not get proposed again:
 | ~~3~~ | §6 `WRITE_MAP` under `relaxed` | done | **no effect, reverted** — 6% the wrong way, worse stall tail | **measured** |
 | ~~4~~ | §5 expiry-index relocation | done | **41–53× less B-tree work**; no measurable end-to-end change on this box | **measured**, and the two regimes disagree — see §5 |
 | ~~5~~ | §8 writes off the blocking pool | done | **1.2–2.5× on writes** | **measured**, and it needed a semaphore the pool had been standing in for |
-| 6 | §7 RAM write-back tier | a milestone | **not the bottleneck**; revisit only if §8 makes the device the limit again | measured against, see §7 |
+| ~~6~~ | §9 `lazy` durability | done | **1.7–4.5× on writes**, and the queue wait with it | **measured** |
+| 7 | §7 RAM write-back tier | a milestone | **not the bottleneck**; revisit only if the device becomes the limit again | measured against, see §7 |
 
 **Where that leaves the objective.** Reads are done: vash is ahead of both
 servers on both read workloads. Writes moved from 39–65× behind to roughly
@@ -783,7 +856,7 @@ believed, because the first version of it was wrong in the direction of despair.
 
 ---
 
-## 11. How to know it worked
+## 12. How to know it worked
 
 The last two rounds of benchmarking made the methodology a first-class concern,
 and any of this work should inherit it:
