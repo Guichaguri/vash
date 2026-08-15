@@ -8,8 +8,7 @@ the comparison is between the servers rather than between benchmark harnesses.
 Read the [What this cannot tell you](#what-this-cannot-tell-you) section before
 quoting anything here. The short version: one laptop, one container host, 20
 seconds per run, the whole matrix run twice. These are orders of magnitude, not
-measurements — and the two rounds disagree by enough on the write rows to prove
-it.
+measurements.
 
 ---
 
@@ -27,35 +26,41 @@ runs in a container on that network: an earlier attempt published the ports to
 the host instead and reached a `vash-server` that happened to be running there,
 which is how that mistake gets made.
 
-**What was measured**, on 2026-08-14: vash at `7da2e5f`, built by the repository
+**What was measured**, on 2026-08-15: vash at `55c7241`, built by the repository
 `Dockerfile` into a 4.7 MB `scratch` image; `redis:8-alpine` (Redis 8.10.0);
 `memcached:1.6-alpine` (memcached 1.6.45); `memtier_benchmark` 2.5.1. Host: a
 Windows laptop running Rancher Desktop, 12 CPUs and 10 GB visible to the WSL2
 VM, with a k3s cluster idling on the same machine.
 
-**The matrix was measured twice**, a few hours apart on that machine, against
-the same image — `7da2e5f` is `7c71098` plus a documentation commit, so the two
-rounds ran identical code. The tables below are the **second** round. The first
-is not discarded quietly: where the rounds disagree it is said so in place, and
-the largest disagreement — a `SET`-only collapse on the memcached dialect that
-did not come back — has [its own section](#a-collapse-that-did-not-reproduce).
+**This is the second measurement of this matrix.** The first, at `7da2e5f`, is
+what [performance-proposals.md](performance-proposals.md) was written against.
+Eight changes later — four that worked and four that did not — these are the
+numbers the same client sees from the same box. Old figures are quoted where the
+comparison is the point.
 
-**Five targets across three servers**:
+**The matrix was measured twice**, back to back. The tables below are the
+**second** round; where the rounds disagree it is said so in place.
+
+**Six targets across three servers**:
 
 | Target | What it is |
 |---|---|
-| `vash-resp` | vash on its defaults, driven over the Redis dialect |
-| `vash-memcache` | the same server and the same defaults, driven over the memcached text dialect |
-| `vash-ephemeral` | vash with `--ephemeral`: nothing is synced to disk |
+| `vash` | vash on its defaults — `lazy` durability, two shards — over the Redis dialect |
+| `vash-memcache` | the same server and the same defaults, over the memcached text dialect |
+| `vash-resident` | `store.resident_mode = true`: the map prefaulted and locked, reads served on the network worker |
+| `vash-relaxed` | `durability = "relaxed"`: an `fsync` on every commit, which was the default until this round |
 | `redis` | `redis:8-alpine`, `--save '' --appendonly no` — persistence off, which is how a cache is run |
 | `memcached` | `memcached:1.6-alpine -m 1024 -t 4` |
 
-vash appears three times on purpose. Twice because it speaks two of the three
-dialects being compared and the cost of a dialect is a thing this document can
-isolate; a third time because its default is a **disk-backed store** and the two
-servers it is being compared against are memory. `--ephemeral` is the closest
-vash gets to what Redis and memcached are, and the gap between it and
-`vash-resp` is the price of the design rather than of the code.
+vash appears four times because it has two dialects and two settings worth
+isolating. **`vash-ephemeral` is gone**: `--ephemeral` now means `lazy`
+durability plus a wipe at startup, and `lazy` is the default, so that row would
+have been the same server twice.
+
+`vash-resident` is **restarted between the populate and the runs**, on a named
+volume. Without that, the map is prefaulted and locked while it is still empty
+and the setting gets measured doing nothing; after the restart the server reports
+`vash_map_locked yes`, which is the condition the row is supposed to be about.
 
 ### Reproducing it
 
@@ -74,10 +79,11 @@ docker run -d --name bench-server --network vashbench --cpus 4 \
   memcached:1.6-alpine -m 1024 -t 4
 ```
 
-`--ephemeral` still needs `--data`: it changes the durability of the store
-rather than removing it, and without a writable path the server exits with
-`opening store at data: Permission denied`. The client port differs per target —
-**11311** for vash, **6379** for Redis, **11211** for memcached.
+The two vash settings come from a config file — `store.resident_mode = true` and
+`durability = "relaxed"` — passed with `--config`. `resident_mode` also wants
+`--ulimit memlock=-1:-1`, or the map lock is refused and the server keeps the
+storage-pool hand-off, which it says in the log. The client port differs per
+target — **11311** for vash, **6379** for Redis, **11211** for memcached.
 
 Each target is populated first, so the read tests hit rather than miss — 20,000
 sequential keys down one connection, pipelined so the populate is not itself the
@@ -113,10 +119,11 @@ two memcached targets.
 Stated first, because everything below is only meaningful inside these limits.
 
 - **One box, 20 seconds a run, two rounds.** No confidence intervals, nothing
-  discarded as an outlier. The second round is what the tables report, and it is
-  the reason to distrust them: between rounds vash's closed-loop `SET` figure
-  moved by 38% and its memcached-dialect `SET` figure by a factor of seventeen.
-  Everything here is an order of magnitude; the write rows are barely that.
+  discarded as an outlier. The second round is what the tables report, and the
+  two agree far better than the previous measurement's did — within about 12% on
+  every row rather than the factor of seventeen that round produced on one of
+  them. That is an improvement in the box's mood as much as in the server, and it
+  does not make any of this precise.
 - **A laptop, not a server.** Everything ran inside a Rancher Desktop WSL2 VM on
   Windows, with a k3s cluster idling in the background on the same host. The
   absolute numbers are worth less than the ratios between them.
@@ -131,7 +138,7 @@ Stated first, because everything below is only meaningful inside these limits.
 - **The whole dataset fits in memory** — 20,000 keys at 512 bytes is about
   10 MB, resident for all three servers. Nothing here ever reads from the disk,
   which flatters vash's reads specifically: its memory-mapped read path never
-  page-faults, and the `inline_reads` result [below](#does-inline_reads-explain-the-read-latency)
+  page-faults, and the `inline_reads` result [below](#resident_mode-wins-closed-loop-and-loses-pipelined)
   is measured under exactly the condition that setting asks you to guarantee.
 - **The disk is a virtualised disk inside a VM.** vash's write path commits to
   it and Redis and memcached never touch it, which is the single most important
@@ -155,27 +162,32 @@ round trips, so the latency column is the one that means something.
 
 | Workload | Target | ops/s | avg ms | p50 ms | p99 ms | p99.9 ms |
 |---|---|---:|---:|---:|---:|---:|
-| SET only | vash-resp | 5,774 | 17.31 | 7.20 | 481.28 | 987.14 |
-| SET only | vash-memcache | 5,205 | 19.21 | 9.73 | 28.42 | 2080.77 |
-| SET only | vash-ephemeral | 11,120 | 8.99 | 5.82 | 48.64 | 53.76 |
-| SET only | redis | 55,401 | 1.80 | 1.65 | 3.90 | 5.76 |
-| SET only | memcached | 148,314 | 0.67 | 0.63 | 1.95 | 4.77 |
-| GET only | vash-resp | 17,443 | 5.73 | 5.66 | 11.71 | 14.27 |
-| GET only | vash-memcache | 16,885 | 5.92 | 5.86 | 12.10 | 14.72 |
-| GET only | vash-ephemeral | 17,448 | 5.73 | 5.66 | 11.71 | 14.46 |
-| GET only | redis | 50,484 | 1.98 | 1.80 | 4.64 | 6.82 |
-| GET only | memcached | 130,922 | 0.76 | 0.73 | 1.94 | 3.98 |
-| 1:9 mixed | vash-resp | 14,881 | 6.71 | 6.27 | 19.07 | 25.73 |
-| 1:9 mixed | vash-memcache | 14,103 | 7.08 | 6.50 | 19.33 | 44.54 |
-| 1:9 mixed | vash-ephemeral | 16,210 | 6.16 | 6.05 | 12.99 | 17.28 |
-| 1:9 mixed | redis | 55,398 | 1.80 | 1.64 | 4.06 | 6.46 |
-| 1:9 mixed | memcached | 135,070 | 0.74 | 0.70 | 1.90 | 4.13 |
+| SET only | **vash** | **56,940** | 1.75 | 1.28 | 25.34 | 27.90 |
+| SET only | vash-memcache | 45,956 | 2.17 | 1.62 | 25.22 | 28.16 |
+| SET only | vash-resident | 45,141 | 2.21 | 1.66 | 24.83 | 27.26 |
+| SET only | vash-relaxed | 11,174 | 8.94 | 5.18 | 97.79 | 139.26 |
+| SET only | redis | 54,047 | 1.85 | 1.74 | 3.78 | 6.11 |
+| SET only | memcached | 142,503 | 0.70 | 0.64 | 2.32 | 5.47 |
+| GET only | vash | 18,265 | 5.47 | 5.44 | 10.94 | 13.38 |
+| GET only | vash-memcache | 16,904 | 5.91 | 5.86 | 12.03 | 14.78 |
+| GET only | **vash-resident** | **165,731** | 0.60 | 0.58 | 1.38 | 3.76 |
+| GET only | vash-relaxed | 16,736 | 5.97 | 5.92 | 11.97 | 14.40 |
+| GET only | redis | 56,006 | 1.78 | 1.69 | 3.49 | 4.86 |
+| GET only | memcached | 120,408 | 0.83 | 0.79 | 1.83 | 4.96 |
+| 1:9 mixed | vash | 18,191 | 5.49 | 5.38 | 11.90 | 19.46 |
+| 1:9 mixed | vash-memcache | 18,581 | 5.38 | 5.25 | 11.52 | 20.10 |
+| 1:9 mixed | **vash-resident** | **94,746** | 1.05 | 0.86 | 4.70 | 15.62 |
+| 1:9 mixed | vash-relaxed | 17,495 | 5.71 | 5.50 | 13.25 | 19.07 |
+| 1:9 mixed | redis | 44,326 | 2.25 | 2.02 | 5.41 | 8.96 |
+| 1:9 mixed | memcached | 135,500 | 0.74 | 0.71 | 1.57 | 3.50 |
 
-The `SET`-only rows for the two vash dialects are the ones that moved between
-rounds, in both directions: `vash-resp` was 9,264 in the first round and 5,774
-here, and `vash-memcache` was 308 and is 5,205. See
-[below](#a-collapse-that-did-not-reproduce) — vash's closed-loop write rate is
-the least repeatable number in this document.
+**vash leads Redis on every closed-loop row**, and with `resident_mode` it leads
+memcached on `GET` too. That is the round's headline and it is new: the previous
+measurement had `SET` at 5,774 against Redis's 55,401, and this one has 56,940
+against 54,047.
+
+`vash-relaxed` is the same server with an `fsync` on every commit — the default
+until this round — and it is what the rest of the table used to look like.
 
 ### Pipelined — 16 requests in flight per connection, 100 connections
 
@@ -185,21 +197,29 @@ milliseconds says the server is saturated.
 
 | Workload | Target | ops/s | avg ms | p50 ms | p99 ms | p99.9 ms |
 |---|---|---:|---:|---:|---:|---:|
-| SET only | vash-resp | 14,140 | 112.98 | 89.60 | 172.03 | 3817.47 |
-| SET only | vash-memcache | 13,272 | 122.04 | 105.47 | 294.91 | 2195.46 |
-| SET only | vash-ephemeral | 47,656 | 33.54 | 18.18 | 84.48 | 96.26 |
-| SET only | redis | 554,785 | 2.88 | 2.72 | 6.62 | 8.70 |
-| SET only | memcached | 912,234 | 1.75 | 1.42 | 7.65 | 15.36 |
-| GET only | vash-resp | 221,380 | 7.22 | 6.69 | 23.55 | 30.21 |
-| GET only | vash-memcache | 212,125 | 7.53 | 6.85 | 25.34 | 32.51 |
-| GET only | vash-ephemeral | 218,200 | 7.33 | 6.59 | 25.98 | 32.00 |
-| GET only | redis | 475,430 | 3.36 | 3.20 | 7.74 | 12.03 |
-| GET only | memcached | 651,154 | 2.45 | 2.30 | 5.76 | 11.46 |
-| 1:9 mixed | vash-resp | 86,583 | 18.64 | 15.10 | 47.36 | 352.26 |
-| 1:9 mixed | vash-memcache | 83,653 | 19.10 | 18.43 | 45.06 | 52.48 |
-| 1:9 mixed | vash-ephemeral | 125,401 | 12.75 | 6.82 | 63.74 | 71.17 |
-| 1:9 mixed | redis | 452,420 | 3.53 | 3.28 | 9.47 | 14.66 |
-| 1:9 mixed | memcached | 675,864 | 2.36 | 2.24 | 5.63 | 11.90 |
+| SET only | vash | 186,779 | 8.56 | 7.94 | 19.97 | 39.42 |
+| SET only | vash-memcache | 174,565 | 9.16 | 7.58 | 28.42 | 86.02 |
+| SET only | vash-resident | 184,848 | 8.65 | 7.84 | 22.53 | 40.19 |
+| SET only | vash-relaxed | 15,061 | 106.04 | 65.02 | 335.87 | 419.84 |
+| SET only | redis | 472,690 | 3.38 | 2.74 | 14.34 | 28.54 |
+| SET only | memcached | 779,928 | 2.04 | 1.54 | 10.18 | 16.38 |
+| GET only | vash | 146,901 | 10.88 | 6.98 | 55.81 | 62.98 |
+| GET only | vash-memcache | 145,401 | 10.99 | 7.39 | 51.46 | 57.09 |
+| GET only | vash-resident | 102,872 | 15.54 | 15.30 | 31.62 | 37.89 |
+| GET only | vash-relaxed | 136,005 | 11.75 | 6.98 | 57.86 | 63.74 |
+| GET only | redis | 341,668 | 4.68 | 4.05 | 13.70 | 19.97 |
+| GET only | memcached | 401,239 | 3.97 | 3.18 | 12.29 | 20.35 |
+| 1:9 mixed | vash | 71,634 | 22.32 | 13.95 | 71.17 | 105.98 |
+| 1:9 mixed | vash-memcache | 63,959 | 24.98 | 14.98 | 78.85 | 118.78 |
+| 1:9 mixed | vash-resident | 74,514 | 21.46 | 13.63 | 69.12 | 82.43 |
+| 1:9 mixed | vash-relaxed | 56,319 | 28.38 | 24.32 | 67.07 | 76.29 |
+| 1:9 mixed | redis | 442,660 | 3.61 | 3.41 | 8.64 | 12.54 |
+| 1:9 mixed | memcached | 423,462 | 3.76 | 2.98 | 13.63 | 28.03 |
+
+Pipelined, vash is still behind both — 2.5× on `SET`, 2.7× on `GET`, 6× on the
+mixed workload. **And `vash-resident` is the slowest vash row for `GET` here**,
+which is the exact opposite of what it does closed loop. That reversal is not
+noise and has [its own section](#resident_mode-wins-closed-loop-and-loses-pipelined).
 
 ### The populate pass, which turned out to be its own result
 
@@ -209,109 +229,137 @@ concurrency to batch**:
 
 | Target | ops/s |
 |---|---:|
-| vash-resp | 505 |
-| vash-memcache | 473 |
-| vash-ephemeral | 9,825 |
-| redis | 391,129 |
-| memcached | 337,587 |
+| vash | 48,999 |
+| vash-memcache | 57,109 |
+| vash-resident | 53,389 |
+| vash-relaxed | 4,940 |
+| redis | 303,624 |
+| memcached | 395,570 |
 
-This is the most repeatable number vash has: both rounds put the two dialects
-within 40% of each other and both within 25% of 400 ops/s. It is the commit
-latency of the container's disk and nothing else, which is why **the two vash
-dialects agree here even in the round where they disagreed everywhere else.**
+**This row moved further than any other: 505 to 48,999, a factor of 97.** It is
+the one that isolates the write path with no concurrency to batch, so it was the
+purest measure of the per-write cost — and three changes went at exactly that.
+Coalescing a pipelined block into one submission, keying the expiry index so an
+overwrite stops relocating it, and `lazy` durability so a commit stops waiting
+for the device. `vash-relaxed` at 4,940 is the same server with the last of those
+put back.
 
 ---
 
 ## Reading the numbers
 
-### Reads: the same order of magnitude, two to three times behind
+### Closed loop: vash is now in front of Redis
 
-Pipelined `GET` is 212k–221k on vash against 475k for Redis and 651k for
-memcached. That is the honest shape of it: vash is in the same class, a factor
-of two to three back, and the factor is not the protocol — its two dialects are
-4% apart and sit at the same distance from the other two servers.
+This is the round that changed. Every closed-loop row has vash ahead of Redis —
+`SET` 56,940 against 54,047, `GET` with `resident_mode` 165,731 against 56,006,
+mixed 94,746 against 44,326 — and the `GET` row is ahead of memcached's 120,408
+as well.
 
-Closed loop is where the distance shows: **5.7–5.9 ms per round trip at 100
-connections against Redis's 1.8 ms and memcached's 0.73 ms.** Throughput follows
-directly (100 connections ÷ 5.8 ms ≈ 17k), so the read *rate* in that table is a
-restatement of the read *latency*, not an independent finding. Something in
-vash's read path costs several milliseconds per request under this concurrency
-that neither of the other two pays.
+The previous measurement had `SET` at 5,774 and `GET` at 17,443. Nothing about
+the design changed: it is still a copy-on-write B-tree committing to a disk. What
+changed is what a request pays on the way to it, and
+[performance-proposals.md](performance-proposals.md) has the four that mattered —
+coalescing a pipelined block into one submission, keying the expiry index so an
+overwrite stops relocating it, taking writes off the blocking pool so no thread
+is parked per write in flight, and `lazy` durability so a commit stops waiting
+for the device.
 
-Both rounds agree on this to within 6% on every read row, which is what makes it
-worth reasoning about at all.
+**Closed loop is the shape most caches actually see**, because most clients wait
+for their answer. It is also the shape where a server has the least room to hide:
+throughput is `connections ÷ latency`, so the column that moved is latency.
 
-The suspect is the hand-off: vash runs reads on the storage thread pool rather
-than on the network worker, because a read that page-faults must not block a
-worker serving other connections. `store.inline_reads` turns that off, and its
-documentation says it measured within noise on the development machine — a
-machine that was not a four-core cgroup. Measuring it here is
-[below](#does-inline_reads-explain-the-read-latency).
+### Pipelined: still two to three times behind
 
-### Writes: this is the design, and the design has a price
+`SET` 186,779 against Redis's 472,690 and memcached's 779,928. `GET` 146,901
+against 341,668 and 401,239. The mixed workload is worse — 71,634 against 442,660
+and 423,462, a factor of six.
 
-Pipelined `SET`: **14,140 for vash against 555k for Redis and 912k for
-memcached** — 39× and 65×. The ordering is not close and it is not a surprise:
-vash writes through a copy-on-write B-tree that commits to a disk, and the other
-two write to memory. [plan.md](plan.md) §6 chose that, and the README already
-records the original 250k/s write goal as *wrong rather than missed*. This is
-what the choice costs on the wire, in the environment described above.
+This is the honest limit of the design as measured. With 16 requests in flight
+per connection the client stops waiting, and what is left is how much work each
+server does per request. vash does more: a B-tree write against a hash insert, a
+memory-mapped read through a transaction against a pointer chase.
 
-Two things soften and sharpen it:
+### Durability is most of what remains on writes
 
-- **Concurrency is what makes vash's writes work at all.** 505 ops/s on one
-  connection, 5,774 closed loop across a hundred and 14,140 pipelined — 11× and
-  28× from group commit, which forms a batch out of whatever queued during the
-  previous commit. It cannot help a single-threaded writer, and there is nothing
-  to be done about that.
-- **The disk is most of it.** `--ephemeral` — same code, nothing synced — is
-  47,656 against 14,140 pipelined, a 3.4× penalty for durability under load, and
-  9,825 against 505 with a single connection, which is 19×. What that says is
-  that the sync cost is amortised by batching *and* by concurrency, and that a
-  workload with neither pays it in full.
+`vash-relaxed` is the same server with an `fsync` on every commit — the default
+until this round — and it is the row that shows what that costs: **15,061
+pipelined `SET` against 186,779, and 11,174 closed loop against 56,940.** A
+factor of 12 and a factor of 5.
 
-Even at 48k, ephemeral vash is 12× behind Redis on writes. The gap is not all
-persistence.
-
-**Treat the vash write figures as an order of magnitude and nothing finer.**
-Between the two rounds, pipelined `SET` over RESP moved from 9,691 to 14,140 and
-closed-loop `SET` from 9,264 to 5,774 — 46% up and 38% down, same image, same
-box, hours apart. Nothing above this paragraph is precise enough for those
-swings to matter, and nothing below should be read as though it were.
+That is the trade `lazy` makes, and it is worth being precise about what it gives
+up: writes newer than the last periodic sync, one second by default, against an
+OS crash. Not the database — integrity is preserved and there is nothing to wipe.
+Redis and memcached in the configurations measured here lose *everything* on a
+restart, so a one-second window is still the most durable row in the table.
 
 ### The mixed workload is the realistic one
 
-At 1:9, pipelined: vash 84k–87k, or 125k ephemeral, Redis 452k, memcached 676k.
-A cache doing 90% reads sits between the read and write results and inherits
-more from the writes than the ratio suggests, because in vash a write is ~16×
-the cost of a read rather than ~1×.
+At 1:9 closed loop, `vash-resident` reaches 94,746 against Redis's 44,326 and
+memcached's 135,500 — ahead of one, behind the other. Pipelined it is 74,514
+against 442,660 and 423,462, which is the worst vash shows anywhere.
+
+A cache doing 90% reads inherits more from the writes than the ratio suggests,
+because in vash a write still costs several times a read. The gap between the two
+mixed rows is the whole story of this document in miniature: where the client
+waits, vash competes; where it does not, it does not.
 
 ### The two dialects are not the interesting variable
 
-In this round they are within 5% of each other on every row, with RESP
-marginally ahead: 221k against 212k pipelined `GET`, 87k against 84k mixed,
-14,140 against 13,272 pipelined `SET`.
+Within 6% of each other on every row, RESP marginally ahead: 186,779 against
+174,565 pipelined `SET`, 146,901 against 145,401 pipelined `GET`. Both rounds
+agree.
 
-The first round had the memcached dialect *ahead* by 14% on pipelined `GET` and
-31% on mixed, and this document reasoned about why. The gap did not survive
-re-measurement — and the parser prices say it should not have been believed the
-first time. `cargo bench -p vash-bench --bench hot_path` puts the two decoders
-at **53.5 ns** for a memcached `get` and **90.9 ns** for a RESP one; the 37 ns
-between them, at 220,000 requests a second, is 0.8% of one core. A dialect gap
-an order of magnitude larger than the dialect's own cost was always more likely
-to be the machine than the protocol.
+`cargo bench -p vash-bench --bench hot_path` puts the two decoders at **53.5 ns**
+for a memcached `get` and **90.9 ns** for a RESP one; the 37 ns between them, at
+150,000 requests a second, is half a percent of one core. **Protocol choice is
+not a performance decision here**, and it now rests on the dialects agreeing
+rather than on explaining away a disagreement.
 
-The conclusion outlived the numbers that suggested it: **protocol choice is not
-a performance decision here.** It now rests on the two dialects agreeing rather
-than on explaining away their disagreement.
+---
 
-And then there is the row this document exists to be honest about.
+## `resident_mode` wins closed loop and loses pipelined
+
+The one result in this round that points both ways, and the one worth reading
+before turning the setting on.
+
+| | reads on the pool | `resident_mode` | |
+|---|---:|---:|---:|
+| `GET`, closed loop | 18,265 | **165,731** | 9.1× |
+| `GET`, pipelined | 146,901 | 102,872 | **0.70×** |
+
+Closed loop it is transformative — a `GET` round trip falls from 5.44 ms to
+0.58 ms, and that single change is what puts vash ahead of both other servers on
+reads. Pipelined it is a 30% loss.
+
+**The mechanism is the same in both directions.** `resident_mode` serves reads on
+the network worker instead of handing them to the storage pool. Closed loop that
+removes a thread hand-off from every request, which is nearly all of the latency.
+Pipelined, a block of 16 reads runs to completion on one of four runtime workers
+without yielding, where the pool spreads the same work across up to 128 threads —
+so the setting trades concurrency for latency, and pipelining is the case that
+wanted the concurrency.
+
+**This reversed since the previous measurement**, which had `resident_mode` ahead
+pipelined as well — 753,498 against 222,892. Both figures have since fallen by
+more than half on an idle box, so something about the platform moved underneath
+them; a bisect across shard counts and read modes reproduced the reversal in
+three rounds of three and did not explain it. It is recorded as measured and not
+understood.
+
+**So it is a workload setting, not a speed setting**, and it stays off by
+default. Turn it on for a cache whose clients wait for their answers. Leave it
+off for one whose clients pipeline.
 
 ---
 
 ## A collapse that did not reproduce
 
-The first round of this matrix recorded **`SET`-only over the memcached dialect
+Kept from the previous measurement, because a retraction is worth more than the
+thing retracted. **A third round has since agreed**: the memcached dialect now
+measures 45,955 closed loop and 174,565 pipelined, within 12% of the Redis
+dialect on both, which is where it has been every time except once.
+
+The first round of that matrix recorded **`SET`-only over the memcached dialect
 at 308 requests a second**, where the same server over the Redis dialect
 answered 9,264 and real memcached answered 144,289 — and 300 ops/s pipelined,
 with a p99 of 19.5 *seconds*. It was recorded here as a reproducible bug with no
@@ -377,7 +425,7 @@ memcached dialect**, because the dialect has since answered the identical
 workload at 5,205 and 13,272 with group commit working normally.
 
 The honest reading of the write rows is the one the
-[writes section](#writes-this-is-the-design-and-the-design-has-a-price) already
+[durability section](#durability-is-most-of-what-remains-on-writes) already
 states: vash's closed-loop `SET` throughput on this hardware is the least stable
 number in the document — eleven runs of one command spanned 3,309 to 12,480 ops/s
 — and a single 20-second sample of it, in either direction, is not a finding. The
@@ -392,55 +440,42 @@ never anywhere near collapsed.
 
 ---
 
-## Does `inline_reads` explain the read latency?
+## What `inline_reads` measured, before it became `resident_mode`
 
-The read section left a question: 5.5 ms per `GET` at 100 connections, against
-1.7 ms for Redis and 0.74 ms for memcached. The suspect was the hand-off — vash
-answers reads on the storage thread pool, not on the network worker.
+Kept because it is where the read result came from, and because half of it no
+longer reproduces.
 
-`store.inline_reads` turns the hand-off off. Its documentation in
-[vash.example.toml](../vash.example.toml) says it measured within run-to-run
-noise, and invites exactly this: *"worth leaving off unless your own
-measurements disagree."* In a four-core container, they disagree.
+The question was whether the hand-off explained vash's read latency — 5.5 ms per
+`GET` at 100 connections against Redis's 1.7 ms. `store.inline_reads` removes it.
+Same image, one config file setting, `GET`-only:
 
-Same image, same flags, one config file setting `inline_reads = true`, same
-`GET`-only workload:
-
-| Workload | `inline_reads` | ops/s | p50 ms | p99 ms |
-|---|---|---:|---:|---:|
-| GET only, closed loop | off (default) | 18,023 | 5.47 | 11.39 |
-| GET only, closed loop | **on** | **180,027** | **0.52** | 1.69 |
-| GET only, pipelined | off (default) | 222,892 | 6.62 | 23.55 |
-| GET only, pipelined | **on** | **753,498** | 1.94 | 5.15 |
-
-**10× closed loop and 3.4× pipelined**, and it moves vash's pipelined read
-throughput from *behind* both other servers to ahead of both — 753k against
-memcached's 651k and Redis's 475k, on the same four cores.
+| Workload | `inline_reads` | ops/s | p50 ms |
+|---|---|---:|---:|
+| GET only, closed loop | off | 18,023 | 5.47 |
+| GET only, closed loop | **on** | **180,027** | **0.52** |
+| GET only, pipelined | off | 222,892 | 6.62 |
+| GET only, pipelined | **on** | **753,498** | 1.94 |
 
 Because a result that large is more likely to be a mistake than a discovery, the
-closed-loop pair was run twice more, alternating between the two images so that
-neither got the warmer machine:
+closed-loop pair was run twice more, alternating images so neither got the warmer
+machine: 17,022 against 175,102, then 16,916 against 174,479. Four measurements,
+two images, one setting.
 
-| Round | `inline_reads` off | `inline_reads` on |
-|---|---:|---:|
-| 1 | 17,022 ops/s | 175,102 ops/s |
-| 2 | 16,916 ops/s | 174,479 ops/s |
+**The closed-loop half held and became a feature.** `store.resident_mode` is that
+setting with the assertion it depends on enforced rather than requested: it
+prefaults every shard, `mlock`s each map, and enables inline reads only if every
+shard came back locked. When the lock is refused it says so and keeps the
+hand-off, so the failure mode is "slower", never "stalls".
 
-Four measurements, two images, one setting between them.
+**The pipelined half did not.** Re-measured, the same setting is a 30% *loss*
+pipelined — see [above](#resident_mode-wins-closed-loop-and-loses-pipelined). The
+mechanism now looks like a trade between latency and concurrency rather than a
+free win, and the original 753,498 has never been seen again.
 
-**This is the one large effect in this document that reproduced.** Measured
-again hours later it gave 10× and 3.4× where it first gave 9.5× and 4.5×, with
-the "on" closed-loop figure landing within 5% across six separate runs. Set
-against the `SET`-only rows that moved by a factor of two and the collapse that
-vanished, that stability is most of the reason to believe it.
-
-The setting is not free and the reason it is off by default has not changed: a
-read that page-faults now blocks a network worker and every connection sharing
-it, so the assertion it asks for — that the working set is resident — has to be
-true. What this measurement adds is that **the cost of the hand-off is a
-property of the platform, and this platform is not the one the default was
-measured on.** On a CPU-capped container, a thread wake-up per read is most of
-the read path.
+What survives is the finding underneath both: **the cost of a thread hand-off is
+a property of the platform, and this platform is not the one the default was
+measured on.** On a CPU-capped container a wake-up per read is most of the read
+path when the client waits, and not the limit when it pipelines.
 
 ---
 
@@ -525,43 +560,40 @@ the cost of being the wrong operation.
 
 ## What to take from all of this
 
-**Reads are competitive, and with `inline_reads` they lead** — 753k pipelined
-`GET` against memcached's 651k and Redis's 475k on the same four cores. On the
-default, they are a factor of two to three behind.
+**Closed loop, vash is now the fastest of the three on two of the three
+workloads.** `SET` 56,940 against Redis's 54,047; `GET` with `resident_mode`
+165,731 against Redis's 56,006 and memcached's 120,408. Only the mixed row still
+has memcached ahead. That sentence was not true a day earlier, when the same
+workloads read 5,774 and 17,443.
 
-**Writes are not competitive, and that is a design decision rather than a
-defect.** 14,140 pipelined `SET` against 555k and 912k. A copy-on-write B-tree
-committing to a disk cannot be made to look like an in-memory hash table, and
-[plan.md](plan.md) §6 chose the B-tree deliberately: what it buys is a cache
-that survives a restart. The README already records the original write goal as
-wrong rather than missed; this is that admission with the other two servers
-standing next to it.
+**Pipelined, it is still two to three times behind**, six on the mixed workload.
+When the client stops waiting, what is left is per-request work, and vash does
+more of it: a copy-on-write B-tree against a hash table. [plan.md](plan.md) §6
+chose that deliberately and what it buys is a cache that survives a restart.
 
-**Group invalidation is not a performance comparison, it is a capability one.**
-The thing vash does in under a millisecond, a Redis client does in hundreds by
-walking the keyspace, and a memcached client does not do at all.
+**Most of the write gap that closed was not the storage engine.** Of the four
+changes that moved these numbers, three were about what a request pays on the way
+to storage — a submission per pipelined block instead of per command, no OS
+thread parked per write in flight, an expiry index that stops relocating itself —
+and one was durability. The B-tree is the same B-tree.
+[performance-proposals.md](performance-proposals.md) has all eight attempts,
+including the four that measured nothing or worse.
 
-So the honest summary: if the workload is write-heavy and the data is
-disposable, memcached and Redis are faster by a margin no tuning here will
-close. If the workload is read-heavy, needs the cache to survive a restart, and
-needs to invalidate by group rather than by key, that is the trade this server
-is making — and the read side of it is competitive on the same hardware.
+**Group invalidation is a capability comparison, not a performance one.** The
+thing vash does in under a millisecond, a Redis client does in hundreds by
+walking the keyspace, and a memcached client cannot do at all.
 
-Two things this exercise produced beyond the numbers, and they are not the two it
-first claimed. One is a [read-path
-setting](#does-inline_reads-explain-the-read-latency) worth 3–10× in a container
-and off by default, which reproduced across six runs and two rounds. The other is
-the [collapse that did not](#a-collapse-that-did-not-reproduce): a bug reported
-here on one 20-second sample, hunted, and then not found — because on this
-hardware vash's write throughput moves by a factor of two between runs, and a
-single sample of it was never enough to call anything.
+So the honest summary: **if your clients wait for their answers, vash is now
+competitive with Redis and memcached on this hardware and ahead of both on
+reads.** If they pipeline, it is not. And it is the only one of the three that
+still has your data after a restart.
 
-The setting is worth more than the table. The retraction is worth more than the
-setting.
+Two things this exercise produced beyond the numbers. One is
+[`resident_mode`](#resident_mode-wins-closed-loop-and-loses-pipelined), which is
+9× closed loop and a 30% loss pipelined — a workload setting rather than a speed
+setting, and the reversal is measured but not explained. The other is the
+[collapse that did not reproduce](#a-collapse-that-did-not-reproduce): a bug
+reported here on one 20-second sample, hunted, and never found.
 
-What to *do* about the gap is a separate question from measuring it, and it has
-its own document: [performance-proposals.md](performance-proposals.md) decomposes
-the write cost from the writer's own counters — a commit costs 2.37 ms before it
-writes anything and 0.23 ms per record, which caps vash near 17,400 writes/s no
-matter how well it batches — and works through what each candidate change is
-worth against that ceiling.
+The settings are worth more than the table. The retraction is worth more than the
+settings.

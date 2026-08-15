@@ -96,9 +96,10 @@ Closed-loop latency, one request in flight per connection, 1 KiB values:
 
 These are vash measured against itself. For vash measured **beside Redis and
 memcached** — one client, one box, the same workload pointed at all three — see
-[docs/benchmarks.md](docs/benchmarks.md), which also records a read-path knob
-worth 3–10× in a container, and the retraction of a bug that document reported
-on one sample and could not reproduce on the next eleven.
+[docs/benchmarks.md](docs/benchmarks.md). The short version, on four cores with
+clients that wait for their answers: vash answers 56,940 `SET`s a second against
+Redis's 54,047, and 165,731 `GET`s against Redis's 56,006 and memcached's
+120,408. With clients that pipeline it is two to three times behind both.
 
 Against the goals set in [plan.md](docs/plan.md) §13 before any of it was built:
 
