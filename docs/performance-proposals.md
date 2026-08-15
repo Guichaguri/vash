@@ -34,10 +34,12 @@ on both read workloads with a setting that existed, shipped, and was off by
 default. Everything the read section of `benchmarks.md` agonises over was one
 flag and the safety argument behind it — now `store.resident_mode`, §3.
 
-**Writes are a research problem**, and the rest of this document is mostly about
-why, and what it would actually take. §4 shortened the gap by 5–6× without
-touching the storage engine; closing it still means not touching the storage
-engine on the request path at all, which is §7.
+**Writes were assumed to be a storage problem**, and three changes later they are
+not. §4, §5 and §6 between them took the storage engine down to **8% of what a
+write costs** with syncing off. The remaining 92% is the request path — the
+hand-off that puts every in-flight write on its own OS thread — which is
+[§8](#8-what-the-measurement-points-at-instead), and which is why the
+write-back tier in §7 is *not* the next thing to build.
 
 ---
 
@@ -100,11 +102,15 @@ So the write gap decomposes as:
 | Redis, measured | — | 554,785/s |
 | memcached, measured | — | 912,234/s |
 
-**Durability is 2.7× of the gap. The storage engine is the other 12–19×.** Even
-with every sync disabled and the file allowed to corrupt on power loss, an LMDB
-write costs 84 µs where Redis needs one to cost about 2 µs. That is the finding
-this document is built on, and it is the one that decides which proposals are
-worth anything.
+**Durability is 2.7× of the gap. The storage engine is the other 12–19×.**
+
+> **Also corrected — see [§7](#7-a-ram-resident-write-back-tier--not-the-bottleneck).**
+> The 84 µs was derived from container throughput the same way the 0.23 ms was,
+> so it carried the same per-queue-hop and per-hand-off cost that §4 later
+> removed. Decomposed directly against the writer's counters, the storage terms
+> of an `--ephemeral` write are 0.94 ms of queue wait and 0.05 ms of commit
+> against an 12.5 ms round trip. **The storage engine is not the other 12–19×;
+> the request path is.**
 
 ### Why an LMDB write costs 84 µs
 
@@ -524,17 +530,50 @@ exist. Nothing here generalises past the hardware described at the top.
 
 ---
 
-## 7. Proposal 5 — a RAM-resident write-back tier
+## 7. A RAM-resident write-back tier — **not the bottleneck**
 
-**Status: the only proposal that can meet the objective. An M11-sized milestone.**
+**Status: costed, and the measurement says do not build it. §8 replaces it.**
 
-§2 establishes that the request path cannot both touch LMDB and be fast. Every
-proposal above moves vash toward the ~17,400/s ceiling or lifts it to maybe
-35,000/s. The objective is 554,785/s. **The gap is not a tuning gap and no
-combination of §4–§6 closes it.**
+This section was written when §2's arithmetic said the storage engine was the
+wall. §4 corrected that arithmetic, §5 removed most of the B-tree work, and the
+premise below no longer holds — so before building a milestone, the write path
+was decomposed again. **Storage is now a small minority of what a write costs.**
 
-The only architecture that does is one where a write does not reach the B-tree
-before it is acknowledged:
+Measured on the current build, 100 connections, one request in flight each, so a
+round trip is exactly `100 / throughput`. The writer's own counters give the two
+storage terms and the remainder is everything else — socket, parse, dispatch,
+and the hand-off to the storage pool:
+
+| | round trip | queue wait | commit | **everything else** |
+|---|---:|---:|---:|---:|
+| `--ephemeral` | 12.52 ms | 0.94 ms | 0.05 ms | **11.54 ms — 92%** |
+| `relaxed` (default) | 16.57 ms | 4.84 ms | 0.60 ms | **11.15 ms — 67%** |
+
+**With syncing switched off entirely, the storage engine accounts for 8% of a
+write.** A tier that makes storage free therefore buys at most that 8%, and the
+same shape shows in throughput: `--ephemeral` reaches 53,177 pipelined `SET`
+against `relaxed`'s 29,506 — 1.8×, not the order of magnitude this section
+assumed — and it gets there with its writers *idle*, mean batch collapsing from
+88 to 13 because the queue drains faster than it fills.
+
+The 11 ms is not mysterious. It is the same hand-off §3 measured for reads: a
+`GET` costs 5.47 ms with it and 0.54 ms without. Writes cannot take §3's
+shortcut — a write must not run on a runtime worker, because it blocks on the
+writer queue — so every in-flight write parks an OS thread for its whole
+duration, and a hundred of them contend for four cores. That is the cost, and a
+RAM tier does not remove it: the write would still cross the same hand-off to
+reach the RAM tier.
+
+**So this is the wrong change**, and [§8](#8-what-the-measurement-points-at-instead)
+is what the numbers actually point at. The design is kept below because it
+remains correct, and because if the hand-off is fixed and the device becomes the
+limit again, this is what comes next.
+
+<details>
+<summary>The design, kept for when it is the bottleneck</summary>
+
+The architecture is one where a write does not reach the B-tree before it is
+acknowledged:
 
 - An **in-memory index** (key → value) is the authority for reads and writes.
 - A **write** applies to RAM, acks immediately, and joins a per-shard dirty
@@ -594,13 +633,56 @@ It should not be built in one step, and each step is independently useful:
 **Honest expectation**: memcached's 912,234 pipelined `SET` is about 4.4 µs per
 operation end to end including the network, on four cores. That is close to what
 a lean server can do at all, so the realistic target for stage 3 is **parity
-with memcached and a clear lead over Redis**, not a rout. Combined with §3's
-read result, that would make vash faster than both across the matrix — which is
-the objective, and it is reachable, and it costs a milestone.
+with memcached and a clear lead over Redis**, not a rout.
+
+</details>
 
 ---
 
-## 8. Explicitly rejected
+## 8. What the measurement points at instead
+
+**Status: proposed, and the first thing to build. It is what §7's decomposition
+actually indicts.**
+
+A write is handed to `tokio::task::spawn_blocking`, and that thread then
+**blocks on a channel** waiting for the shard writer to commit it. The blocking
+is not the storage work — the thread is asleep for almost all of it, since the
+writer does the work on its own thread. The pool exists so a call that *may*
+block does not stall a runtime worker; what it costs here is one OS thread
+parked per in-flight write, a hundred of them on four cores, and two thread
+wake-ups per request.
+
+§7 measures that at **11 ms of an ephemeral write's 12.5 ms round trip**, and §3
+measures the same hand-off independently at 4.9 ms for a `GET` (5.47 ms with it,
+0.54 ms without).
+
+**Awaiting a channel is what async is for.** The work the blocking thread does
+is: prepare the record, hand it to the shard queue, sleep, wake, render the
+reply. Only the sleep needs the thread, and only because the reply arrives on a
+`crossbeam` channel that cannot be awaited. Swapping the reply channel for a
+`tokio::sync::oneshot` lets the connection task submit and `.await`, holding no
+thread at all while the writer works.
+
+- `prepare_set` stays on the caller — it is bounded CPU work with no I/O, and
+  running it on the runtime worker is what already happens for `inline_reads`.
+- The submit is already non-blocking: `Writer::send` is a `try_send` that fails
+  fast with `Overloaded` rather than waiting.
+- Reads keep both paths: inline under `resident_mode`, the pool otherwise, since
+  a read genuinely can fault.
+
+**Expected**: the 11 ms is thread contention, so removing the threads should take
+a write's round trip toward a read's. It will not reach it — the writer queue
+wait and commit are real, 0.99 ms in ephemeral and 5.4 ms in `relaxed` — but
+those are the terms the storage work actually costs, and everything above them
+is overhead this removes.
+
+**Measure it the way §6 was measured**: alternating rounds, medians, and the
+writer's own counters, because a change that moves throughput without moving
+`queue wait` or `commit` has done what it says.
+
+---
+
+## 9. Explicitly rejected
 
 Recorded so they do not get proposed again:
 
@@ -628,7 +710,7 @@ Recorded so they do not get proposed again:
 
 ---
 
-## 9. Sequencing
+## 10. Sequencing
 
 | Order | Proposal | Effort | Outcome | Confidence |
 |---|---|---|---|---|
@@ -636,7 +718,8 @@ Recorded so they do not get proposed again:
 | ~~2~~ | §4 one submission per block, shards in parallel | done | **5.4–6.4× on pipelined writes** | **measured** |
 | ~~3~~ | §6 `WRITE_MAP` under `relaxed` | done | **no effect, reverted** — 6% the wrong way, worse stall tail | **measured** |
 | ~~4~~ | §5 expiry-index relocation | done | **41–53× less B-tree work**; no measurable end-to-end change on this box | **measured**, and the two regimes disagree — see §5 |
-| 5 | §7 RAM write-back tier | a milestone | writes competitive with memcached | design-level only |
+| 5 | §8 writes off the blocking pool | ~1 week | the 11 ms of a 12.5 ms write that is not storage | **measured** — the decomposition in §7 |
+| 6 | §7 RAM write-back tier | a milestone | **not the bottleneck**; revisit only if §8 makes the device the limit again | measured against, see §7 |
 
 **Where that leaves the objective.** Reads are done: vash is ahead of both
 servers on both read workloads. Writes moved from 39–65× behind to roughly
@@ -647,7 +730,7 @@ believed, because the first version of it was wrong in the direction of despair.
 
 ---
 
-## 10. How to know it worked
+## 11. How to know it worked
 
 The last two rounds of benchmarking made the methodology a first-class concern,
 and any of this work should inherit it:
