@@ -149,13 +149,33 @@ impl Server {
             .await
             .with_context(|| format!("binding {}", config.server.listen))?;
 
+        // `resident_mode` is a request, not a setting: it earns inline reads
+        // only by having locked every shard's map. Reported either way, because
+        // "I asked for this and did not get it" is exactly the thing an
+        // operator must not have to infer from a throughput graph.
+        let inline_reads = if config.store.resident_mode && !config.store.inline_reads {
+            let locked = store.map_locked();
+            if locked {
+                info!("resident mode: every shard's map is locked; serving reads inline");
+            } else {
+                warn!(
+                    "resident mode: the map could not be locked, so reads keep the \
+                     storage-pool hand-off. Raise RLIMIT_MEMLOCK above the store's \
+                     size, or set store.inline_reads to assert residency yourself"
+                );
+            }
+            locked
+        } else {
+            config.store.inline_reads
+        };
+
         let state = ServerState::new(
             Arc::clone(&store),
             info,
             config.protocol,
             auth_state,
             cluster,
-            config.store.inline_reads,
+            inline_reads,
             state::Binding {
                 addr: listener.local_addr()?,
                 max_connections: config.server.max_connections as u64,

@@ -17,20 +17,27 @@ it, because it comes from the writer's own counters rather than from the client.
 
 ## 1. The gap is two different problems
 
-| Workload | vash today | Redis | memcached | To lead, vash needs |
-|---|---:|---:|---:|---|
-| GET, closed loop | 17,443 | 50,484 | 130,922 | **already done** — 180,027 with `inline_reads` |
-| GET, pipelined | 221,380 | 475,430 | 651,154 | **already done** — 753,498 with `inline_reads` |
-| SET, closed loop | 5,774 | 55,401 | 148,314 | 26× |
-| SET, pipelined | 14,140 | 554,785 | 912,234 | 65× |
+| Workload | when this was written | **now** | Redis | memcached |
+|---|---:|---:|---:|---:|
+| GET, closed loop | 17,443 | **173,659** ✅ | 50,484 | 130,922 |
+| GET, pipelined | 221,380 | **781,427** ✅ | 475,430 | 651,154 |
+| SET, closed loop | 5,774 | 8,754 | 55,401 | 148,314 |
+| SET, pipelined | 14,140 | 22,754 – 52,237 | 554,785 | 912,234 |
 
-**Reads are not a research problem.** vash is already faster than both servers
-on both read workloads with a setting that exists, ships, and is off by default.
-Everything the read section of `benchmarks.md` agonises over is one flag and the
-safety argument behind it. That is §3.
+The read rows are [§3](#3-implemented-resident_mode) and the write rows are
+[§4](#4-implemented-one-writer-submission-per-block-not-per-command), both since
+implemented. The two conclusions below survived them, and one piece of arithmetic
+did not — see the correction in §2.
+
+**Reads were not a research problem.** vash was already faster than both servers
+on both read workloads with a setting that existed, shipped, and was off by
+default. Everything the read section of `benchmarks.md` agonises over was one
+flag and the safety argument behind it — now `store.resident_mode`, §3.
 
 **Writes are a research problem**, and the rest of this document is mostly about
-why, and what it would actually take.
+why, and what it would actually take. §4 shortened the gap by 5–6× without
+touching the storage engine; closing it still means not touching the storage
+engine on the request path at all, which is §7.
 
 ---
 
@@ -60,17 +67,22 @@ it carries.** Both halves matter, and they fail in opposite directions:
 - The **2.37 ms fixed cost** is what group commit exists to amortise, and group
   commit works — mean batch reaches 13–17 under concurrent load, which drops the
   per-record share of it from 2.32 ms to under 0.2 ms. This half is solved.
-- The **0.23 ms marginal cost** is not amortised by anything, and it sets a
-  ceiling that no amount of batching can lift:
+- The **0.23 ms marginal cost** is not amortised by anything in the data above,
+  and appeared to set a ceiling near `4,350 × 4 ≈ 17,400 writes/s`.
 
-```
-per-shard ceiling = 1 / 0.23 ms  ≈  4,350 writes/s
-four shards       ≈ 17,400 writes/s
-```
+> **Corrected by measurement — see [§4](#4-implemented-one-writer-submission-per-block-not-per-command).**
+> That ceiling was an artefact of the fit. Every point above was taken when a
+> job carried exactly **one** record, so "per record" and "per job" were the same
+> column and the fit could not tell them apart. With writes coalesced, a batch of
+> 89 records costs 0.174 ms each rather than the 0.37 ms the two-term model
+> predicted, and pipelined `SET` measures well past 17,400. **The fixed cost is
+> per commit, and a large part of what looked marginal was per queue hop.** The
+> genuinely per-record component is far smaller — near the 0.084 ms the
+> syncing-off floor below implies.
 
-Measured best on that host: 14,140. **The ceiling is real and vash is already
-against it.** Perfect batching, infinite pipelining and a client that never
-sleeps would buy roughly 20% more, and then stop.
+What survives the correction is the shape of the problem rather than the number:
+a commit has a large fixed cost, group commit is what pays it down, and before
+§4 the server could only form a batch out of *separate connections*.
 
 ### The floor is not durability
 
@@ -112,9 +124,9 @@ Two things, both structural:
 
 ---
 
-## 3. Proposal 1 — turn `inline_reads` on, and make it safe
+## 3. Implemented: `resident_mode`
 
-**Status: measured, uncontroversial, blocked only on a safety argument.**
+**Status: shipped as `store.resident_mode`.**
 
 | | ops/s | p50 |
 |---|---:|---:|
@@ -145,19 +157,46 @@ to close that, in increasing order of strength:
   to the pool on a fault-rate threshold with hysteresis. Costs a clock read per
   request and adds a mode that is hard to test.
 
-**Recommendation: (b) over (a), never (c).** Ship a single `store.resident_mode`
-that turns on prefault, locks the map, and enables inline reads only if the lock
-succeeded — turning a promise the operator makes into one the server keeps. Keep
-the raw `inline_reads` flag for anyone who knows better.
+**(b) was taken, with (a) implied and (c) rejected.** `store.resident_mode`
+prefaults every shard, `mlock`s each map — raising `RLIMIT_MEMLOCK`'s soft limit
+to the hard one first, since the common container default is a modest soft limit
+against an unlimited hard one — and enables inline reads **only if every shard
+came back locked**. `store.inline_reads` still works and still skips the check,
+for an operator who knows their deployment better than the check does.
 
-**Expected: vash leads both servers on reads.** This is the only proposal here
-that is already proven rather than projected.
+The mapping is found the way `prefault` already found it, by inode in
+`/proc/self/maps`, which is also why locking is Linux-only: everywhere else the
+mapping cannot be located, `map_locked` answers `false`, and reads keep the
+hand-off. `stats settings` reports both `vash_map_locked` and
+`vash_inline_reads`, because "I asked for this and did not get it" must not have
+to be inferred from a throughput graph.
+
+### Measured
+
+A four-core container with `--ulimit memlock=-1:-1`, all four shards locked:
+
+| Workload | before | **resident_mode** | Redis | memcached |
+|---|---:|---:|---:|---:|
+| GET, closed loop | 18,023 | **173,659** | 50,484 | 130,922 |
+| GET, pipelined | 222,892 | **781,427** | 475,430 | 651,154 |
+
+**vash now leads both servers on both read workloads**, with the assertion
+enforced rather than requested. Closed-loop p50 falls from 5.47 ms to 0.54 ms.
+
+The fallback was measured too, because a safety valve that has never been seen
+to close is not one:
+
+| `--ulimit memlock` | outcome |
+|---|---|
+| `-1:-1` | all shards locked, reads inline |
+| `8192:8192` | `mlock` refused with `ENOMEM`, logged, **reads keep the hand-off** |
+| `8192:-1` | soft limit raised to the hard one, locked, reads inline |
 
 ---
 
-## 4. Proposal 2 — one writer submission per block, not per command
+## 4. Implemented: one writer submission per block, not per command
 
-**Status: bounded work, the largest non-architectural write win available.**
+**Status: shipped, in all three dialects.**
 
 The block executors — `execute_memcached_block`, `resp::execute_block`,
 `execute_vcp_block` — walk a pipelined block command by command, and every
@@ -212,25 +251,55 @@ the four commits overlap, and needs nothing new: the queue is already
 whether or not the block coalescing above lands, because `MSET` and `SET_MANY`
 take the same path today.
 
-**Expected**: by the model in §2, a 128-deep block spread over four shards gives
-a per-shard batch near 32, so `2.37 + 0.23 × 32 = 9.7 ms` per shard commit.
-Against today's measured 505 ops/s on that workload:
+### Measured
 
-| | time for 128 records | ops/s | vs today |
-|---|---:|---:|---:|
-| Today — one commit per command | 253 ms | 505 | — |
-| Coalesced, shards still sequential | 39 ms | 3,290 | **6.5×** |
-| Coalesced, shards overlapping | 9.7 ms | 13,155 | **26×** |
+Both halves landed together. A/B on the same box, same image pair:
 
-The second row is what the block coalescing alone buys; the third is why the
-parallel submission is worth doing in the same change rather than later. Both
-remove 127 queue hops and 127 thread wake-ups per block.
+| Workload | before | **after** | | mean batch |
+|---|---:|---:|---:|---|
+| Populate — 1 conn, pipeline 128, RESP | 511 | **3,143** | 6.2× | 1.00 → 7.2 |
+| Populate — 1 conn, pipeline 128, memcached | 519 | **3,310** | 6.4× | 1.00 → 7.5 |
+| `SET` — 100 conns, pipeline 16, RESP | 9,760 | **52,237** | 5.4× | 16.8 → 75.6 |
+| `SET` — 100 conns, pipeline 16, memcached | 8,625 | **50,328** | 5.8× | 17.1 → 77.7 |
 
-Neither raises the §2 ceiling — 13,155 ops/s from one connection is still under
-the ~17,400/s aggregate, which is the consistency check that says this model is
-not promising something the device cannot do. What they change is that a *single*
-pipelined client can reach that ceiling, where today it needs a hundred
-connections to get anywhere near it.
+The concurrent rows are the surprise. The model only predicted the
+single-connection case; concurrency was supposed to be the one thing group commit
+already handled. It was not — each of a hundred connections was still submitting
+sixteen separate jobs, so the writer saw 1,600 queue hops where it now sees 100,
+and its mean batch went from 17 to 76.
+
+That is also what corrects §2. On the sustained random-key workload the writer
+counters read **0.174 ms of commit per record at a mean batch of 89**, against
+0.37 ms at a batch of 17 before. A cost that falls when batches grow was never
+the per-record cost the two-term fit called it; most of it was per queue hop, and
+queue hops are exactly what this removes.
+
+**Read the multipliers as workload-dependent, not as a single number.** The rows
+above use sequential keys; the same change on uniformly random keys over the
+20,000-key space measures 14,140 → 22,754, because random writes scatter across
+the B-tree and pay more page churn per commit. The direction is the same
+everywhere and the size is not.
+
+### What it cost in semantics — nothing, and there are tests
+
+The risk in deferring a write is that a pipelined client sees something a
+sequential one would not. Pinned by tests in `tests/memcached.rs` and
+`tests/redis.rs`:
+
+- a `get`/`GET` later in the same block sees the writes before it;
+- a guarded write (`add`, `SET … NX`) is judged against them too;
+- a repeated key keeps last-write-wins, and each write still gets its own reply;
+- `noreply` suppresses its own response and nobody else's;
+- an error keeps its position in the reply stream;
+- **one refused write does not fail the run around it** — a batch is one
+  transaction per shard, so a record the store rejects fails the whole
+  submission, which then retries the run a command at a time through the ordinary
+  path. A client's verdict must not depend on whether it happened to pipeline.
+
+That last one was found by an existing test rather than by inspection: batching a
+`SETTAGS` carrying too many tags reported `invalid argument` where it had
+reported `too many tags`, because the batch was rendering from a status and
+throwing away the cause.
 
 ---
 
@@ -397,19 +466,20 @@ Recorded so they do not get proposed again:
 
 ## 9. Sequencing
 
-| Order | Proposal | Effort | Expected | Confidence |
+| Order | Proposal | Effort | Outcome | Confidence |
 |---|---|---|---|---|
-| 1 | §3 `resident_mode` | days | reads lead both servers | **measured** |
-| 2 | §4 one submission per block, shards in parallel | ~1 week | 6.5–26× pipelined single-connection writes | high — modelled from writer counters |
+| ~~1~~ | §3 `resident_mode` | done | **reads lead both servers** — 173,659 and 781,427 | **measured** |
+| ~~2~~ | §4 one submission per block, shards in parallel | done | **5.4–6.4× on pipelined writes** | **measured** |
 | 3 | §6 `WRITE_MAP` under `relaxed` | hours | 1.0–1.5× on writes | low, but nearly free to find out |
-| 4 | §5 expiry-index relocation | measure first, then ~1 week | up to 2× on writes | unknown until measured |
+| 4 | §5 expiry-index relocation | measure first, then ~1 week | unknown — and §2's correction means it should be re-costed against the new per-record figure first | unknown until measured |
 | 5 | §7 RAM write-back tier | a milestone | writes competitive with memcached | design-level only |
 
-Items 1–4 together plausibly reach 30–40k writes/s, which is **still 14× short
-of Redis**. They are worth doing because they are cheap, because they make the
-read result shippable, and because §7 needs the memory accounting that stage 1
-builds. They are not a path to the objective on their own, and this document
-should not be read as though they were.
+**Where that leaves the objective.** Reads are done: vash is ahead of both
+servers on both read workloads. Writes moved from 39–65× behind to roughly
+10–20× behind, on a change that turned out to be worth more than it was costed
+at. The remaining gap is still not a tuning gap — §7 is still what closes it —
+but §2's ceiling argument has to be rebuilt before the next write proposal is
+believed, because the first version of it was wrong in the direction of despair.
 
 ---
 

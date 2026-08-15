@@ -199,6 +199,14 @@ impl Store for LmdbStore {
 
         let mut results = vec![0u64; sets.len()];
         let grouped = self.shards.group(sets, |set| set.key.as_bytes());
+
+        // **Every shard is given its work before any of them is waited on.**
+        // One transaction per shard means one commit per shard, and a commit is
+        // milliseconds; waiting for each before submitting the next turned a
+        // batch across four shards into four commits end to end, which is most
+        // of why sharding did so little for batched writes. Sent here, awaited
+        // below, so the commits overlap.
+        let mut pending = Vec::with_capacity(self.shards.all().len());
         for (index, group) in grouped.runs() {
             let shard = &self.shards.all()[index];
 
@@ -218,13 +226,30 @@ impl Store for LmdbStore {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // One transaction per shard. A batch spanning shards is therefore
-            // atomic per shard, not overall — see the module note in `shard`.
-            for (placed, cas) in group.iter().zip(shard.writer.set_many(prepared)?) {
+            pending.push((group, shard.writer.send_set_many(prepared)?));
+        }
+
+        // A batch spanning shards is atomic per shard, not overall — see the
+        // module note in `shard`. Failing here therefore leaves the shards that
+        // did commit committed, which was already true when this was
+        // sequential; the `?` is in the same place it always was.
+        for (group, sent) in pending {
+            for (placed, cas) in group.iter().zip(sent.wait()?) {
                 results[placed.position] = cas;
             }
         }
         Ok(results)
+    }
+
+    fn map_locked(&self) -> bool {
+        // `all` over an empty shard list would be vacuously true, and a store
+        // with no shards cannot be serving reads safely either way.
+        !self.shards.all().is_empty()
+            && self
+                .shards
+                .all()
+                .iter()
+                .all(|shard| shard.engine.map_locked())
     }
 
     fn store(&self, set: &Set<'_>) -> Result<crate::Written> {

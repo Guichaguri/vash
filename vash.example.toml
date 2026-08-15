@@ -75,10 +75,42 @@ prefault = false
 # your own measurements disagree. What it removes is the cost of a thread
 # wake-up, which varies by platform far more than anything in this code.
 #
+# In a CPU-capped container the measurements disagree loudly: a four-core
+# container serves 18,000 closed-loop GETs a second with this off and 180,000
+# with it on. See docs/benchmarks.md. Prefer resident_mode below, which turns
+# this on only when it is safe to.
+#
 # If you turn it on, turn it on because the working set is resident: when it is
 # not, a cold read stalls every connection sharing that worker. Writes always
 # take the hand-off, because they wait on the writer queue by design.
 inline_reads = false
+
+# Make the working set resident, keep it resident, and serve reads inline only
+# if that worked.
+#
+# prefault and inline_reads are two halves of a bargain nothing was enforcing:
+# the first makes the map resident at startup, the second bets that it still is
+# on every later read. Losing that bet does not look like a slow read — it looks
+# like every connection on that worker stalling at once.
+#
+# This does all three steps and refuses the last one unless the first two held:
+#
+#   1. prefault every shard
+#   2. lock each map into memory, so the kernel cannot reclaim it
+#   3. serve reads inline only if every shard came back locked
+#
+# When the lock is refused — no RLIMIT_MEMLOCK headroom, or a platform where
+# LMDB's mapping cannot be found, which today is everything but Linux — the
+# server says so in the log and keeps the hand-off. The failure mode is the
+# default behaviour, never a stall. `stats settings` reports what happened as
+# vash_map_locked.
+#
+# It covers what exists at startup. A database that grows while serving has
+# unlocked pages above the mark this locked, so this is for a working set loaded
+# before traffic arrives rather than one that doubles at runtime.
+#
+# Implies prefault, and inherits its startup cost.
+resident_mode = false
 
 [store.write]
 # LMDB permits one writer, so writes scale only by sharing transactions. A batch

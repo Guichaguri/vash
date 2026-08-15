@@ -1,7 +1,7 @@
 //! Command execution: the only place that maps domain outcomes onto wire status
 //! codes.
 
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use vash_core::{Command, Reply, ServerInfo};
 use vash_proto::vcp::{
     AuthRequest, DecodeError, Decoded, Opcode, Status, decode, encode_error, encode_reply,
@@ -12,6 +12,194 @@ use vash_store::StoreError;
 use crate::auth::{ConnAuth, DEFAULT_NAME, Mechanism};
 use crate::metrics::{CommandKind, Dialect, ErrorClass};
 use crate::state::ServerState;
+
+/// A run of consecutive unconditional writes from one pipelined block, held
+/// back so that they cross the writer queue **together**.
+///
+/// # Why this exists
+///
+/// A block executor used to call [`execute`] per command, and every write in it
+/// blocked on its own commit before the next command was even parsed. Group
+/// commit therefore only ever saw the concurrency *between* connections and
+/// never the concurrency *within* one: measured, a 128-deep pipeline down a
+/// single connection produced a mean batch of **1.13** and 505 writes a second,
+/// against Redis's 391,129 on the identical command. The pipeline depth bought
+/// nothing at all.
+///
+/// Buffering the run and submitting it as one [`Store::set_many`] turns those
+/// 128 round trips into one per shard. It does not make a commit faster; it
+/// stops a client having to open a hundred connections before the server will
+/// batch anything.
+///
+/// # What may go in
+///
+/// Only writes whose reply cannot depend on what the store finds — `SetMode::Set`
+/// with no `return_previous`. A guarded write (`add`, `replace`, `cas`,
+/// `SET NX`) answers with a verdict, and `SET … GET` answers with the displaced
+/// value; both have to be executed where they can be reported, so they flush
+/// the run and go the ordinary way.
+///
+/// # When it must be flushed
+///
+/// The caller owns this, because only the caller knows what the next command
+/// is. A run must be flushed before:
+///
+/// - **any read**, so a `get` after a `set` in the same block sees it;
+/// - **any other storage command**, for the same reason;
+/// - **a second write to a key already in the run** — see [`Self::holds`];
+/// - **the end of the block**, which is the one every caller must not forget.
+///
+/// `T` is whatever the dialect needs to render one reply — a `noreply` flag for
+/// memcached, a request id for VCP — kept here rather than in three parallel
+/// vectors so an entry cannot lose its context.
+pub struct SetBatch<'a, T> {
+    sets: Vec<vash_core::Set<'a>>,
+    notes: Vec<T>,
+}
+
+impl<'a, T> Default for SetBatch<'a, T> {
+    fn default() -> Self {
+        Self {
+            sets: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+}
+
+impl<'a, T> SetBatch<'a, T> {
+    pub fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+
+    /// Whether the run already writes `key`.
+    ///
+    /// Two writes to one key in a single batch would be applied in order inside
+    /// the transaction and would give the right final value — but each one owes
+    /// the client a CAS token describing a record that the next one replaces
+    /// before anybody sees it. Flushing instead keeps every reply describing the
+    /// state the client would have observed had the writes been sent one at a
+    /// time, which is what a pipeline promises.
+    pub fn holds(&self, key: vash_core::Key<'_>) -> bool {
+        self.sets
+            .iter()
+            .any(|set| set.key.as_bytes() == key.as_bytes())
+    }
+
+    pub fn push(&mut self, set: vash_core::Set<'a>, note: T) {
+        self.sets.push(set);
+        self.notes.push(note);
+    }
+
+    /// Executes the run and renders every reply in request order.
+    ///
+    /// `render` is handed each entry's note and either the CAS token the write
+    /// produced or the failure that stopped it — the whole [`Failed`], not just
+    /// its status, because a dialect words `too many tags` and `value too large`
+    /// from the cause and would otherwise report both as `invalid argument`.
+    ///
+    /// # A failed batch is retried one at a time
+    ///
+    /// The batch is one transaction per shard, so a single record the store
+    /// refuses — a value past the ceiling, too many tags — takes the whole run
+    /// down with it. That would make a client's verdict depend on whether it
+    /// happened to pipeline, which is exactly the kind of difference this is not
+    /// allowed to introduce. So a failure falls back to [`execute`] per command,
+    /// where each one gets the verdict it would have had on its own.
+    ///
+    /// The fallback is not free and does not need to be: it runs only after
+    /// something has already gone wrong, and a retried write is an unconditional
+    /// overwrite of the same bytes, so re-applying one that a shard did commit
+    /// before the batch failed leaves the same value with a fresher CAS.
+    ///
+    /// Counting matches [`execute`] exactly, per command rather than per batch,
+    /// so `cmd_set` and the write counters cannot drift depending on whether a
+    /// client happened to pipeline. The one thing it cannot reproduce is a
+    /// per-command latency, since the batch has a single duration: that is
+    /// divided across its members, which keeps the mean honest and makes the
+    /// distribution narrower than reality.
+    pub fn flush(
+        &mut self,
+        state: &ServerState,
+        dialect: Dialect,
+        out: &mut Vec<u8>,
+        mut render: impl FnMut(&mut Vec<u8>, &T, Result<u64, &Failed>),
+    ) {
+        if self.sets.is_empty() {
+            return;
+        }
+
+        let started = std::time::Instant::now();
+        match state.store.set_many(&self.sets) {
+            Ok(cas) => {
+                let each = started.elapsed() / self.sets.len() as u32;
+                for (index, note) in self.notes.iter().enumerate() {
+                    let token = cas.get(index).copied().unwrap_or_default();
+                    state
+                        .metrics
+                        .commands
+                        .observe(CommandKind::Set, dialect, each);
+                    // Through the same observer the single-command path uses,
+                    // against the command that was actually issued — an
+                    // unconditional `Set` answered by `Stored`, which is the one
+                    // arm this batch can produce.
+                    state.metrics.outcomes.observe(
+                        &Command::Set(self.sets[index].clone()),
+                        &Reply::Stored(vash_core::Stored::Stored(token)),
+                    );
+                    state.metrics.write();
+                    render(out, note, Ok(token));
+                }
+            }
+            Err(err) => {
+                debug!(
+                    error = %err,
+                    held = self.sets.len(),
+                    "a batched write failed; retrying the run one command at a time"
+                );
+                for (set, note) in self.sets.iter().zip(&self.notes) {
+                    // `execute` counts and classifies, so the retry is indistinguishable
+                    // from having never batched — which is the point of it.
+                    let outcome = execute(state, &Command::Set(set.clone()), dialect);
+                    match outcome {
+                        Ok(Reply::Stored(vash_core::Stored::Stored(cas))) => {
+                            render(out, note, Ok(cas))
+                        }
+                        // An unconditional write has no other verdict, so this
+                        // is a mismatch rather than an outcome to render.
+                        Ok(unexpected) => {
+                            error!(
+                                ?unexpected,
+                                "an unconditional write answered with a verdict"
+                            );
+                            render(out, note, Err(&Failed::status(Status::Internal)));
+                        }
+                        Err(failed) => render(out, note, Err(&failed)),
+                    }
+                }
+            }
+        }
+
+        self.sets.clear();
+        self.notes.clear();
+    }
+}
+
+/// Whether a command is an unconditional write that [`SetBatch`] may hold back.
+///
+/// Matching the *mode* rather than the dialect's verb is what keeps this honest
+/// across three grammars: memcached's `add`, Redis's `SET NX` and VCP's
+/// conditional opcode all arrive here as a guarded `SetMode`, and none of them
+/// may be deferred.
+pub fn batchable<'c, 'a>(command: &'c Command<'a>) -> Option<&'c vash_core::Set<'a>> {
+    match command {
+        Command::Set(set)
+            if matches!(set.mode, vash_core::SetMode::Set) && !set.return_previous =>
+        {
+            Some(set)
+        }
+        _ => None,
+    }
+}
 
 /// Executes every complete memcached command in `block`, appending the replies.
 ///
@@ -27,11 +215,36 @@ pub fn execute_memcached_block(
 ) -> Closing {
     use vash_proto::memcached::{Outcome, ProtocolError, parse};
 
+    // Consecutive plain `set`s are held here and submitted together — see
+    // [`SetBatch`]. Everything else in this loop flushes it first, so a command
+    // can never be answered from a state the writes before it have not reached.
+    let mut batch: SetBatch<'_, bool> = SetBatch::default();
+
     let mut rest = block;
     while !rest.is_empty() {
         match parse(rest) {
             Ok(Outcome::Command(parsed)) => {
                 let consumed = parsed.consumed;
+
+                // A plain `set` from the classic grammar, which is the command
+                // every memcached client sends to write. `add`/`replace`/`cas`
+                // answer with a verdict and `ms` renders through the meta
+                // encoder, so both fall through to the ordinary path below.
+                if matches!(
+                    parsed.style,
+                    vash_proto::memcached::encode::ResponseStyle::Storage
+                ) && let Some(set) = batchable(&parsed.command)
+                    && !(conn_gated(state, conn))
+                {
+                    if batch.holds(set.key) {
+                        flush_memcached(state, &mut batch, out);
+                    }
+                    batch.push(set.clone(), parsed.noreply);
+                    rest = &rest[consumed..];
+                    continue;
+                }
+
+                flush_memcached(state, &mut batch, out);
                 if execute_memcached(state, conn, &parsed, out) == Closing::Yes {
                     // `quit`: nothing after it on this connection matters.
                     return Closing::Yes;
@@ -39,6 +252,7 @@ pub fn execute_memcached_block(
                 rest = &rest[consumed..];
             }
             Err(ProtocolError::Recoverable { response, consumed }) => {
+                flush_memcached(state, &mut batch, out);
                 // An unparseable command from an unauthenticated connection is
                 // still an unauthenticated command, and upstream answers it as
                 // one — an unknown verb, a bad command line and outright
@@ -69,7 +283,36 @@ pub fn execute_memcached_block(
             }
         }
     }
+    // The flush every other caller in this loop is protected from forgetting,
+    // because forgetting it here would drop the writes silently.
+    flush_memcached(state, &mut batch, out);
     Closing::No
+}
+
+/// Whether this connection still has to authenticate before it may write.
+///
+/// A gated connection's `set` is refused rather than executed, and the refusal
+/// is [`execute_memcached_unauthenticated`]'s to render, so such a command must
+/// never reach the batch.
+fn conn_gated(state: &ServerState, conn: &ConnAuth) -> bool {
+    !conn.is_authenticated() && state.auth.required()
+}
+
+/// Submits a held run of `set`s and writes `STORED` — or the failure — for each.
+fn flush_memcached(state: &ServerState, batch: &mut SetBatch<'_, bool>, out: &mut Vec<u8>) {
+    batch.flush(state, Dialect::Memcached, out, |out, noreply, result| {
+        // `noreply` suppresses the response but never the work, exactly as it
+        // does on the unbatched path.
+        if *noreply {
+            return;
+        }
+        match result {
+            Ok(_) => out.extend_from_slice(b"STORED\r\n"),
+            Err(failed) => {
+                vash_proto::memcached::encode::encode_error(out, memcached_error(failed.status));
+            }
+        }
+    });
 }
 
 /// Executes one memcached command, rendering the reply in that dialect.
@@ -517,6 +760,8 @@ pub fn execute_vcp_block(
 ) -> Closing {
     use vash_proto::vcp::{FrameLen, peek_frame_len};
 
+    let mut batch: SetBatch<'_, VcpReply> = SetBatch::default();
+
     let mut rest = block;
     while !rest.is_empty() {
         let FrameLen::Complete(len) = peek_frame_len(rest) else {
@@ -525,10 +770,39 @@ pub fn execute_vcp_block(
             error!("a VCP block did not end on a frame boundary");
             break;
         };
-        execute_frame_into(state, conn, &rest[..len], out);
+        execute_frame_batched(state, conn, &rest[..len], out, &mut batch);
         rest = &rest[len..];
     }
+    flush_vcp(state, &mut batch, out);
     Closing::No
+}
+
+/// What a held VCP write needs in order to be answered later.
+struct VcpReply {
+    opcode: Opcode,
+    request_id: u32,
+    no_reply: bool,
+}
+
+/// Submits a held run of writes and encodes each response.
+fn flush_vcp(state: &ServerState, batch: &mut SetBatch<'_, VcpReply>, out: &mut Vec<u8>) {
+    batch.flush(state, Dialect::Vcp, out, |out, reply, result| {
+        if reply.no_reply {
+            if let Err(failed) = result {
+                warn!(status = ?failed.status, opcode = ?reply.opcode, "no-reply request failed");
+            }
+            return;
+        }
+        match result {
+            Ok(cas) => encode_reply(
+                out,
+                reply.opcode,
+                reply.request_id,
+                &Reply::Stored(vash_core::Stored::Stored(cas)),
+            ),
+            Err(failed) => encode_error(out, reply.opcode as u8, reply.request_id, failed.status),
+        }
+    });
 }
 
 /// Decodes and executes one complete frame, appending the encoded response.
@@ -545,6 +819,22 @@ pub fn execute_frame_into(
     frame: &[u8],
     out: &mut Vec<u8>,
 ) {
+    // A batch of one, flushed at once: a caller executing a lone frame has no
+    // run to coalesce, and this keeps that path answering exactly as it did.
+    let mut batch = SetBatch::default();
+    execute_frame_batched(state, conn, frame, out, &mut batch);
+    flush_vcp(state, &mut batch, out);
+}
+
+/// [`execute_frame_into`], with a run of unconditional writes that this frame
+/// may join instead of executing — see [`SetBatch`].
+fn execute_frame_batched<'a>(
+    state: &ServerState,
+    conn: &mut ConnAuth,
+    frame: &'a [u8],
+    out: &mut Vec<u8>,
+    batch: &mut SetBatch<'a, VcpReply>,
+) {
     // Refused from the **header alone**, before the body is parsed at all.
     //
     // Doing it here rather than after decoding is what shrinks the pre-auth
@@ -558,6 +848,7 @@ pub fn execute_frame_into(
     // build implements: an unknown or unimplemented one is `UNAUTHORIZED` like
     // everything else, rather than `UNSUPPORTED`.
     if let Some(refused) = header_refusal(state, conn, frame) {
+        flush_vcp(state, batch, out);
         state.metrics.auth_refused();
         if !refused.no_reply {
             encode_error(
@@ -573,10 +864,34 @@ pub fn execute_frame_into(
     match decode(frame) {
         Ok(Decoded::Auth {
             request_id, auth, ..
-        }) => execute_auth(state, conn, request_id, &auth, out),
+        }) => {
+            flush_vcp(state, batch, out);
+            execute_auth(state, conn, request_id, &auth, out)
+        }
 
         Ok(Decoded::Request { mut request, .. }) => {
             offsets_to_store_ttls(&mut request.command);
+
+            // An unconditional write joins the run rather than waiting for its
+            // own commit. Everything below this point flushes first, so no
+            // command is ever answered from a state the writes before it have
+            // not reached.
+            if let Some(set) = batchable(&request.command) {
+                if batch.holds(set.key) {
+                    flush_vcp(state, batch, out);
+                }
+                let set = set.clone();
+                batch.push(
+                    set,
+                    VcpReply {
+                        opcode: request.opcode,
+                        request_id: request.request_id,
+                        no_reply: request.no_reply,
+                    },
+                );
+                return;
+            }
+            flush_vcp(state, batch, out);
 
             // The fused read path. A `NO_REPLY` `GET` is excluded on purpose:
             // it has nowhere to render into, and sending it round the ordinary
@@ -623,6 +938,9 @@ pub fn execute_frame_into(
             detail,
             ..
         }) => {
+            // Before the error is written, so a refused frame's response still
+            // lands after the responses to everything that preceded it.
+            flush_vcp(state, batch, out);
             warn!(request_id, opcode, detail, "rejected malformed request");
             encode_error(out, opcode, request_id, status);
         }
@@ -631,6 +949,7 @@ pub fn execute_frame_into(
         // neither of these is reachable. Answering rather than panicking keeps a
         // logic slip from taking the process down.
         Ok(Decoded::Incomplete { .. }) | Err(DecodeError::Fatal { .. }) => {
+            flush_vcp(state, batch, out);
             error!("frame passed to execute_frame_into was not a complete, valid frame");
             encode_error(out, 0, 0, Status::Internal);
         }

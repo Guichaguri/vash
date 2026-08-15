@@ -287,6 +287,20 @@ pub trait Store: Send + Sync + 'static {
     /// Stores many values in one transaction: all of them apply, or none do.
     fn set_many(&self, sets: &[Set<'_>]) -> Result<Vec<u64>>;
 
+    /// Whether **every** shard's map is pinned in memory, so no read can fault
+    /// to disk.
+    ///
+    /// The question `store.resident_mode` asks before it takes reads off the
+    /// storage pool and runs them on a runtime worker, and the reason it is a
+    /// method rather than a configuration flag: locking is best-effort and
+    /// platform-dependent, so what matters is what actually happened, not what
+    /// was asked for. Every shard, because one unlocked shard is one that can
+    /// stall a worker.
+    ///
+    /// Implementations that cannot fault — anything holding its data in memory
+    /// already — answer `true`.
+    fn map_locked(&self) -> bool;
+
     /// Removes a key. Returns whether it was live beforehand, so callers can
     /// distinguish a real delete from a miss.
     fn delete(&self, key: Key<'_>) -> Result<bool>;

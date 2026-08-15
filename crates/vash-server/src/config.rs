@@ -80,7 +80,40 @@ pub struct StoreConfig {
     ///
     /// Turn it on when the working set is resident — when it is not, a cold
     /// read stalls every connection sharing that worker.
+    ///
+    /// Prefer `resident_mode`, which asks the server to *make* that true and
+    /// enables this only if it succeeded. This flag remains for an operator who
+    /// knows their deployment better than the check does.
     pub inline_reads: bool,
+    /// Make the working set resident, keep it resident, and serve reads inline
+    /// **only if that worked**.
+    ///
+    /// The two flags above are the halves of a bargain nobody was enforcing.
+    /// `prefault` makes the map resident at startup; `inline_reads` bets that it
+    /// still is on every subsequent read. Nothing connected them, so the bet was
+    /// the operator's to lose — and losing it does not look like a slow read, it
+    /// looks like every connection on that worker stalling together.
+    ///
+    /// This turns the bargain into one the server keeps:
+    ///
+    /// 1. Prefault every shard, as `prefault` does.
+    /// 2. Lock each map into memory, so the kernel cannot reclaim it again.
+    /// 3. Serve reads inline **only if every shard came back locked**.
+    ///
+    /// When the lock is refused — no `RLIMIT_MEMLOCK` headroom, or a platform
+    /// where LMDB's mapping cannot be located — the server logs why, leaves
+    /// reads on the storage pool, and carries on. The failure mode is the
+    /// current default, never a stall.
+    ///
+    /// **What it does not cover**: pages written after startup. The lock spans
+    /// the map's high-water mark at open, so a database that grows while
+    /// serving has unlocked pages above it. This is a read-mostly setting for a
+    /// working set that is loaded before traffic arrives, which is what a cache
+    /// in front of an origin usually is — it is not a promise about a store that
+    /// doubles in size at runtime.
+    ///
+    /// Setting `inline_reads` directly still works and still skips the check.
+    pub resident_mode: bool,
     pub write: WriteConfig,
     pub ttl: TtlConfig,
     pub tags: TagConfig,
@@ -481,6 +514,7 @@ impl Default for StoreConfig {
             wipe_on_start: false,
             prefault: false,
             inline_reads: false,
+            resident_mode: false,
             shards: 0,
             write: WriteConfig::default(),
             ttl: TtlConfig::default(),
@@ -709,7 +743,11 @@ impl Config {
             durability: self.store.durability.into(),
             max_value_len: self.store.max_value_bytes,
             wipe_on_start: self.store.wipe_on_start,
-            prefault: self.store.prefault,
+            // `resident_mode` implies prefaulting: locking pages that were
+            // never read in would pin an empty map and answer `true` to a
+            // question about data that is not there.
+            prefault: self.store.prefault || self.store.resident_mode,
+            lock_map: self.store.resident_mode,
             bucket_granularity_ms: self.store.ttl.bucket_granularity_ms,
             max_tags: self.store.tags.max_tags,
             max_tags_per_record: self.store.tags.max_per_record,

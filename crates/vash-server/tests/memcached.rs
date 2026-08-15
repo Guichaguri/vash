@@ -1708,3 +1708,175 @@ async fn a_dump_reports_the_deadline_each_record_holds() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Coalesced writes. A run of consecutive plain `set`s crosses the writer queue
+// as one submission (`dispatch::SetBatch`); these pin the semantics that must
+// not change because of it, which are all about a pipelined client seeing
+// exactly what it would have seen one command at a time.
+// ---------------------------------------------------------------------------
+
+/// The reply stream is one `STORED` per `set`, in request order, however many
+/// of them arrived in a single read.
+#[tokio::test]
+async fn a_pipelined_run_of_sets_answers_each_one() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    let mut block = String::new();
+    for i in 0..32 {
+        block.push_str(&format!("set k{i} 0 0 3\r\nv{i:02}\r\n"));
+    }
+    conn.send(block.as_bytes()).await;
+
+    let replies = conn.read_until("STORED\r\n").await;
+    assert_eq!(replies, "STORED\r\n".repeat(32));
+
+    // And every one of them actually landed.
+    for i in 0..32 {
+        assert_eq!(
+            conn.get(&format!("get k{i}\r\n")).await,
+            format!("VALUE k{i} 0 3\r\nv{i:02}\r\nEND\r\n")
+        );
+    }
+}
+
+/// **A `get` in the same block sees the `set` before it.** The run has to be
+/// submitted before the read is answered, or a pipelined client reads a value
+/// the server has already told it was stored.
+#[tokio::test]
+async fn a_read_in_the_same_block_sees_the_writes_before_it() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    conn.send(b"set a 0 0 1\r\nA\r\nset b 0 0 1\r\nB\r\nget a\r\n")
+        .await;
+
+    assert_eq!(
+        conn.read_until("END\r\n").await,
+        "STORED\r\nSTORED\r\nVALUE a 0 1\r\nA\r\nEND\r\n"
+    );
+}
+
+/// Two writes to one key in a single block keep last-write-wins, and each still
+/// gets its own `STORED`.
+#[tokio::test]
+async fn a_repeated_key_in_one_block_keeps_the_last_write() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    conn.send(b"set k 0 0 5\r\nfirst\r\nset k 0 0 6\r\nsecond\r\nget k\r\n")
+        .await;
+
+    assert_eq!(
+        conn.read_until("END\r\n").await,
+        "STORED\r\nSTORED\r\nVALUE k 0 6\r\nsecond\r\nEND\r\n"
+    );
+}
+
+/// A guarded write cannot be deferred — its reply is a verdict — so it flushes
+/// the run and is answered against what the run wrote.
+#[tokio::test]
+async fn a_guarded_write_sees_the_run_before_it() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    // `add k` must fail, because the `set k` ahead of it in the same block
+    // created the key.
+    conn.send(b"set k 0 0 1\r\nA\r\nadd k 0 0 1\r\nB\r\nget k\r\n")
+        .await;
+
+    assert_eq!(
+        conn.read_until("END\r\n").await,
+        "STORED\r\nNOT_STORED\r\nVALUE k 0 1\r\nA\r\nEND\r\n"
+    );
+}
+
+/// **One rejected write does not take its neighbours down with it.** A batch is
+/// one transaction per shard, so a record the store refuses fails the whole
+/// submission; the run is then retried one command at a time so each gets the
+/// verdict it would have had unbatched.
+#[tokio::test]
+async fn a_refused_write_does_not_fail_the_run_around_it() {
+    // Small enough that one value in the run is over it, and nothing else is.
+    let server = TestServer::start_with(|config| config.store.max_value_bytes = 1024).await;
+    let mut conn = server.connect().await;
+
+    let oversized = "x".repeat(4096);
+    let mut block = String::from("set before 0 0 1\r\nA\r\n");
+    block.push_str(&format!(
+        "set toobig 0 0 {}\r\n{oversized}\r\n",
+        oversized.len()
+    ));
+    block.push_str("set after 0 0 1\r\nB\r\n");
+    conn.send(block.as_bytes()).await;
+
+    let replies = conn.read_until("STORED\r\n").await;
+    assert_eq!(
+        replies,
+        "STORED\r\nSERVER_ERROR object too large for cache\r\nSTORED\r\n"
+    );
+
+    // The two good writes are there, and the refused one is not.
+    assert_eq!(
+        conn.get("get before\r\n").await,
+        "VALUE before 0 1\r\nA\r\nEND\r\n"
+    );
+    assert_eq!(
+        conn.get("get after\r\n").await,
+        "VALUE after 0 1\r\nB\r\nEND\r\n"
+    );
+    assert_eq!(conn.get("get toobig\r\n").await, "END\r\n");
+}
+
+/// `noreply` suppresses its own response and nothing else's, including inside a
+/// coalesced run.
+#[tokio::test]
+async fn noreply_inside_a_run_suppresses_only_itself() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    conn.send(
+        b"set a 0 0 1 noreply\r\nA\r\nset b 0 0 1\r\nB\r\nset c 0 0 1 noreply\r\nC\r\nget c\r\n",
+    )
+    .await;
+
+    assert_eq!(
+        conn.read_until("END\r\n").await,
+        "STORED\r\nVALUE c 0 1\r\nC\r\nEND\r\n"
+    );
+}
+
+/// **`resident_mode` earns inline reads; it does not assume them.** The whole
+/// point of the setting is that the unsafe half is conditional on the safe half
+/// having worked, so the two must agree however the lock went — locked
+/// everywhere it can be (Linux with memlock headroom), locked nowhere it cannot
+/// (every other platform, where LMDB's mapping cannot even be located).
+#[tokio::test]
+async fn resident_mode_serves_reads_inline_only_when_the_map_is_locked() {
+    let server = TestServer::start_with(|config| config.store.resident_mode = true).await;
+    let mut c = server.connect().await;
+    let fields = stat_fields(&mut c, "stats settings\r\n").await;
+
+    let locked = fields.get("vash_map_locked").expect("vash_map_locked");
+    let inline = fields.get("vash_inline_reads").expect("vash_inline_reads");
+    assert_eq!(
+        inline, locked,
+        "resident mode must serve reads inline exactly when it locked the map"
+    );
+}
+
+/// Asking for `inline_reads` directly still means it, whatever the lock did:
+/// the check is a service to an operator who wants one, not a veto on one who
+/// knows their deployment.
+#[tokio::test]
+async fn inline_reads_stays_an_explicit_choice() {
+    let server = TestServer::start_with(|config| config.store.inline_reads = true).await;
+    let mut c = server.connect().await;
+    let fields = stat_fields(&mut c, "stats settings\r\n").await;
+
+    assert_eq!(
+        fields.get("vash_inline_reads").map(String::as_str),
+        Some("yes")
+    );
+}

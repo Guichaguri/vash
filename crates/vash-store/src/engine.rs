@@ -83,6 +83,10 @@ pub struct LmdbEngine {
     pub(crate) shard_count: usize,
     /// See [`crate::readers`].
     pub(crate) reader_ages: crate::readers::ReaderAges,
+    /// Whether this shard's map was pinned in memory at open. Fixed for the
+    /// life of the environment: nothing here unlocks it, and nothing relocks a
+    /// map that has since grown past what was locked.
+    pub(crate) map_locked: bool,
 }
 
 impl LmdbEngine {

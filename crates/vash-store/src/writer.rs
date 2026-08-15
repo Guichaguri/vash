@@ -75,6 +75,21 @@ pub(crate) struct Writer {
     metrics: Arc<WriterMetrics>,
 }
 
+/// A `set_many` that has been handed to a shard writer and not yet waited on.
+///
+/// Exists so a cross-shard batch can be in flight on every shard at once. It is
+/// deliberately not `Drop`-safe in any clever way: dropping one without
+/// [`SetManyPending::wait`] simply abandons the reply, and the writer discovers
+/// that when its send fails.
+pub struct SetManyPending(Receiver<Result<WriteOutcome>>);
+
+impl SetManyPending {
+    /// Blocks until this shard's batch has committed.
+    pub fn wait(self) -> Result<Vec<u64>> {
+        Writer::set_many_reply(Writer::collect(self.0)?)
+    }
+}
+
 impl Writer {
     pub fn spawn(engine: Arc<LmdbEngine>, config: WriteConfig) -> Self {
         let (tx, rx) = bounded(config.queue_depth);
@@ -96,11 +111,18 @@ impl Writer {
         &self.metrics
     }
 
-    /// Submits an operation and blocks until it has been committed.
+    /// Hands an operation to the writer **without waiting for it**, returning
+    /// the channel its outcome will arrive on.
     ///
-    /// Callers are on a blocking thread pool, never on an async runtime worker,
-    /// so blocking here is the intended behaviour.
-    fn submit(&self, op: WriteOp) -> Result<WriteOutcome> {
+    /// Split out of [`Self::submit`] for one caller: a batch spanning shards
+    /// used to give each shard its work and wait for that shard to commit
+    /// before the next shard had been given anything at all, so N shards became
+    /// N commits back to back. Sending first and collecting afterwards lets them
+    /// overlap — which is the whole point of having more than one writer.
+    ///
+    /// The receiver must be drained, or the writer's reply send fails and the
+    /// job's work is discarded after it has already been applied.
+    fn send(&self, op: WriteOp) -> Result<Receiver<Result<WriteOutcome>>> {
         let (reply_tx, reply_rx) = bounded(1);
         let job = WriteJob {
             op,
@@ -117,12 +139,34 @@ impl Writer {
             Err(TrySendError::Full(_)) => return Err(StoreError::Overloaded),
             Err(TrySendError::Disconnected(_)) => return Err(StoreError::ShuttingDown),
         }
-
-        reply_rx.recv().map_err(|_| StoreError::ShuttingDown)?
+        Ok(reply_rx)
     }
 
-    pub fn set_many(&self, prepared: Vec<PreparedSet>) -> Result<Vec<u64>> {
-        match self.submit(WriteOp::Set(prepared))? {
+    /// Waits for an outcome sent by [`Self::send`].
+    fn collect(reply: Receiver<Result<WriteOutcome>>) -> Result<WriteOutcome> {
+        reply.recv().map_err(|_| StoreError::ShuttingDown)?
+    }
+
+    /// Submits an operation and blocks until it has been committed.
+    ///
+    /// Callers are on a blocking thread pool, never on an async runtime worker,
+    /// so blocking here is the intended behaviour.
+    fn submit(&self, op: WriteOp) -> Result<WriteOutcome> {
+        Self::collect(self.send(op)?)
+    }
+
+    /// Hands a batch of writes to this shard, to be waited on with
+    /// [`SetManyPending::wait`].
+    ///
+    /// There is no blocking variant on purpose: the only caller groups a batch
+    /// across shards, and a `set_many` that waited would reintroduce exactly the
+    /// serialisation this split exists to remove.
+    pub fn send_set_many(&self, prepared: Vec<PreparedSet>) -> Result<SetManyPending> {
+        Ok(SetManyPending(self.send(WriteOp::Set(prepared))?))
+    }
+
+    fn set_many_reply(outcome: WriteOutcome) -> Result<Vec<u64>> {
+        match outcome {
             WriteOutcome::Cas(cas) => Ok(cas),
             _ => Err(mismatched_reply()),
         }

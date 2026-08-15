@@ -255,6 +255,12 @@ impl Store for MemoryStore {
         Ok(inner.put(set, &self.clock, now).0)
     }
 
+    /// Nothing here is mapped from a file, so no read can fault to disk and the
+    /// residency question is already answered.
+    fn map_locked(&self) -> bool {
+        true
+    }
+
     fn set_many(&self, sets: &[Set<'_>]) -> Result<Vec<u64>> {
         let now = self.clock.now_ms();
         let mut inner = self.lock()?;

@@ -103,6 +103,9 @@
 use std::io::Read;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+use tracing::warn;
+
 /// LMDB's data file within an environment directory.
 ///
 /// Fixed rather than discovered: the environment is opened without
@@ -113,6 +116,25 @@ const DATA_FILE: &str = "data.mdb";
 /// Read size for the warming pass. Large enough that the per-call overhead
 /// disappears against the copy, small enough to stay out of the way.
 const CHUNK: usize = 1024 * 1024;
+
+/// What warming achieved for one environment.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Warmed {
+    /// Bytes of the data file pulled into the page cache.
+    pub bytes: u64,
+    /// Whether the mapping was **locked** into memory, so the kernel cannot
+    /// reclaim it again under pressure.
+    ///
+    /// This is the difference between "resident now" and "resident from here
+    /// on", and it is the whole reason `store.resident_mode` can enable inline
+    /// reads when `store.prefault` alone cannot: warming makes the promise true
+    /// at startup, and only the lock keeps it true.
+    ///
+    /// `false` whenever locking was not asked for, could not be applied, or is
+    /// not reachable on this platform — never optimistic, because a caller uses
+    /// it to decide whether to put reads on a runtime worker.
+    pub locked: bool,
+}
 
 /// Warms one environment's map. Returns the bytes made resident.
 ///
@@ -139,14 +161,53 @@ const CHUNK: usize = 1024 * 1024;
 /// Errors are the caller's to log and ignore: everything here is a performance
 /// measure, and a database that could not be warmed is still a database that
 /// serves correctly.
-pub(crate) fn prefault(dir: &Path, high_water: u64) -> std::io::Result<u64> {
+/// `lock` additionally asks for the mapping to be pinned — see
+/// [`Warmed::locked`], which reports whether it worked.
+pub(crate) fn prefault(dir: &Path, high_water: u64, lock: bool) -> std::io::Result<Warmed> {
     let path = dir.join(DATA_FILE);
     let bytes = warm_page_cache(&path, high_water)?;
 
     #[cfg(target_os = "linux")]
-    populate_page_tables(&path, bytes);
+    let locked = populate_page_tables(&path, bytes, lock);
 
-    Ok(bytes)
+    // Everywhere else the mapping cannot be located at all — the `/proc`
+    // walk below is what finds it — so there is nothing to lock and the
+    // answer is the safe one. A caller that wanted the lock gets `false` and
+    // keeps its hand-off, which is exactly the behaviour before any of this.
+    #[cfg(not(target_os = "linux"))]
+    let locked = {
+        let _ = lock;
+        false
+    };
+
+    Ok(Warmed { bytes, locked })
+}
+
+/// Raises this process's locked-memory ceiling to whatever the hard limit
+/// allows, so a modest soft default does not decide the question on its own.
+///
+/// The common container default is 64 MiB against an unlimited hard limit,
+/// which would refuse to lock any real cache while the operator's actual
+/// policy — the hard limit — permits it. Raising the soft limit to the hard one
+/// takes nothing the process was not already entitled to.
+///
+/// Failure is silent: the lock below reports what actually happened, and that
+/// is the answer that matters.
+#[cfg(target_os = "linux")]
+fn raise_memlock_limit() {
+    // SAFETY: both calls write only into the local `rlimit`, and `setrlimit`
+    // is passed a limit this process just read, with the soft value raised no
+    // higher than the hard one — the one constraint the kernel enforces.
+    unsafe {
+        let mut limit = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) != 0
+            || limit.rlim_cur >= limit.rlim_max
+        {
+            return;
+        }
+        limit.rlim_cur = limit.rlim_max;
+        libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit);
+    }
 }
 
 /// Reads the data file up to `limit`, so its pages are in the OS page cache.
@@ -186,8 +247,13 @@ fn warm_page_cache(path: &Path, limit: u64) -> std::io::Result<u64> {
 /// page cache: if the file is not found, the table cannot be read, the kernel is
 /// too old, or the range is refused, the caller has already got the part that
 /// mattered.
+///
+/// When `lock` is set, each range is also `mlock`ed, and the return value says
+/// whether **every** range that was found came back locked. Partial success is
+/// reported as failure: a caller uses this to decide whether a read may run on
+/// a runtime worker, and one unlocked shard is enough to make that unsafe.
 #[cfg(target_os = "linux")]
-fn populate_page_tables(path: &Path, warmed: u64) {
+fn populate_page_tables(path: &Path, warmed: u64, lock: bool) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     /// Prefault a range for reading — `MAP_POPULATE` after the fact, and the
@@ -197,14 +263,22 @@ fn populate_page_tables(path: &Path, warmed: u64) {
     const MADV_POPULATE_READ: libc::c_int = 22;
 
     if warmed == 0 {
-        return;
+        return false;
     }
     let Ok(inode) = std::fs::metadata(path).map(|meta| meta.ino()) else {
-        return;
+        return false;
     };
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
-        return;
+        return false;
     };
+    if lock {
+        raise_memlock_limit();
+    }
+    // Nothing found means nothing locked, which is why this starts at zero
+    // rather than at `true`: a walk that matched no range must not report
+    // success just because it failed nothing.
+    let mut ranges = 0usize;
+    let mut all_locked = true;
 
     for line in maps.lines() {
         // `7f3c1c000000-7f3c9c000000 r--s 00000000 08:03 1234   /data/data.mdb`
@@ -259,6 +333,30 @@ fn populate_page_tables(path: &Path, warmed: u64) {
         // kernel validates the range and returns an error rather than acting on
         // memory the process does not own.
         let addr = start as *mut libc::c_void;
+        ranges += 1;
+
+        if lock {
+            // SAFETY: same range as the advice below — this process's own
+            // mapping, clamped to the file behind it. `mlock` does not write to
+            // it, and the kernel refuses a range the process does not own
+            // rather than acting on it.
+            //
+            // Locking *before* the advice is deliberate: `mlock` populates the
+            // range itself as part of its contract, so when it succeeds the
+            // `madvise` below has nothing left to do and costs a syscall. When
+            // it fails, the advice is still the fallback it always was.
+            if unsafe { libc::mlock(addr, len) } != 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    %err,
+                    bytes = len,
+                    "could not lock the map into memory; \
+                     reads will keep the storage-pool hand-off"
+                );
+                all_locked = false;
+            }
+        }
+
         let populated = unsafe { libc::madvise(addr, len, MADV_POPULATE_READ) };
         if populated != 0 {
             // Pre-5.14, where `POPULATE_READ` is `EINVAL`. `WILLNEED` is
@@ -271,6 +369,8 @@ fn populate_page_tables(path: &Path, warmed: u64) {
             unsafe { libc::madvise(addr, len, libc::MADV_WILLNEED) };
         }
     }
+
+    lock && ranges > 0 && all_locked
 }
 
 #[cfg(test)]
@@ -290,7 +390,9 @@ mod tests {
         let len = CHUNK + 4096;
         let dir = with_data_file(len);
         assert_eq!(
-            prefault(dir.path(), len as u64).expect("prefault"),
+            prefault(dir.path(), len as u64, false)
+                .expect("prefault")
+                .bytes,
             len as u64
         );
     }
@@ -306,7 +408,9 @@ mod tests {
         let dir = with_data_file(8 * CHUNK);
         let high_water = CHUNK as u64;
         assert_eq!(
-            prefault(dir.path(), high_water).expect("prefault"),
+            prefault(dir.path(), high_water, false)
+                .expect("prefault")
+                .bytes,
             high_water
         );
     }
@@ -317,7 +421,9 @@ mod tests {
     fn stops_at_the_end_of_a_short_file() {
         let dir = with_data_file(4096);
         assert_eq!(
-            prefault(dir.path(), 8 * CHUNK as u64).expect("prefault"),
+            prefault(dir.path(), 8 * CHUNK as u64, false)
+                .expect("prefault")
+                .bytes,
             4096
         );
     }
@@ -327,6 +433,6 @@ mod tests {
     #[test]
     fn reports_a_missing_data_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(prefault(dir.path(), CHUNK as u64).is_err());
+        assert!(prefault(dir.path(), CHUNK as u64, false).is_err());
     }
 }

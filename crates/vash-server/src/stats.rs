@@ -372,6 +372,11 @@ fn settings(state: &ServerState) -> Vec<(String, String)> {
         ),
         ("vash_resp_enabled".into(), yes_no(protocol.resp_enabled)),
         ("vash_inline_reads".into(), yes_no(state.inline_reads)),
+        // What `resident_mode` actually achieved, as opposed to what it asked
+        // for. Reported separately from `vash_inline_reads` because the two
+        // answer different questions — whether reads skip the hand-off, and
+        // whether it is safe that they do.
+        ("vash_map_locked".into(), yes_no(state.store.map_locked())),
         (
             "vash_cluster_mode".into(),
             state.cluster.view().mode.as_str().to_string(),

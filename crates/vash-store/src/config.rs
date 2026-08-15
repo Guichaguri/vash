@@ -50,6 +50,21 @@ pub struct StoreConfig {
     /// for the page faults it removes from the read path. `src/prefault.rs`
     /// carries the detail, including why this is not `MAP_POPULATE`.
     pub prefault: bool,
+    /// Pin the map in memory after warming it, so the kernel cannot reclaim it.
+    ///
+    /// Only meaningful with [`Self::prefault`], which is what puts the pages
+    /// there in the first place. Warming makes the working set resident *now*;
+    /// this is what keeps it resident, and it is the difference between an
+    /// assertion the operator makes and one the server can check — see
+    /// `server.store.resident_mode`, which is the setting operators actually
+    /// reach for.
+    ///
+    /// Linux only, and best-effort even there: the result is reported by
+    /// [`Store::map_locked`] rather than assumed, because a caller uses it to
+    /// decide whether reads may run on a runtime worker.
+    ///
+    /// [`Store::map_locked`]: crate::Store::map_locked
+    pub lock_map: bool,
     /// Granularity that expiry-index buckets are rounded up to. Coarser means
     /// fewer distinct index keys and less write amplification; it never delays
     /// a read from seeing the key as expired, because the read path checks the
@@ -153,6 +168,7 @@ impl Default for StoreConfig {
             max_value_len: vash_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
             prefault: false,
+            lock_map: false,
             bucket_granularity_ms: 1000,
             max_tags: 100_000,
             max_tags_per_record: vash_core::DEFAULT_MAX_TAGS,

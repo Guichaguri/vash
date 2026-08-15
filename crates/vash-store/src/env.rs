@@ -214,14 +214,14 @@ impl LmdbEngine {
         // which is exactly what every deployment before this flag existed did.
         // Refusing to start over a performance measure would be the worse
         // trade.
-        let mut prefaulted = 0;
+        let mut warmed = crate::prefault::Warmed::default();
         if config.prefault {
             // How far LMDB has ever written, which on Linux is the only thing
             // separating the data from a sparse file the size of the whole map.
             // See `prefault` — getting this wrong is expensive and silent.
             let high_water = (env.info().last_page_number as u64 + 1) * env.stat().page_size as u64;
-            match crate::prefault::prefault(&config.path, high_water) {
-                Ok(bytes) => prefaulted = bytes,
+            match crate::prefault::prefault(&config.path, high_water, config.lock_map) {
+                Ok(result) => warmed = result,
                 Err(err) => warn!(%err, "could not prefault the map; serving without it"),
             }
         }
@@ -233,7 +233,8 @@ impl LmdbEngine {
             epoch,
             cas_start,
             tag_count,
-            prefaulted,
+            prefaulted = warmed.bytes,
+            map_locked = warmed.locked,
             "opened store"
         );
 
@@ -258,7 +259,15 @@ impl LmdbEngine {
             shard_index,
             shard_count: shard_count.max(1),
             reader_ages: crate::readers::ReaderAges::default(),
+            map_locked: warmed.locked,
         })
+    }
+
+    /// Whether this shard's map is pinned in memory, so a read cannot fault to
+    /// disk. What `store.resident_mode` checks before it puts reads on a
+    /// runtime worker; see [`crate::prefault::Warmed::locked`].
+    pub fn map_locked(&self) -> bool {
+        self.map_locked
     }
 
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {

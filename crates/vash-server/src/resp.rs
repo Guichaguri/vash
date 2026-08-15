@@ -73,17 +73,33 @@ pub fn execute_block(
     version: &mut Version,
     out: &mut Vec<u8>,
 ) -> Closing {
+    // Consecutive plain `SET`s cross the writer queue together; everything else
+    // flushes the run first. See `dispatch::SetBatch`.
+    let mut batch: crate::dispatch::SetBatch<'_, ()> = Default::default();
+
     let mut rest = block;
     while !rest.is_empty() {
         match vash_proto::resp::parse(rest) {
             Ok(Outcome::Command(parsed)) => {
                 let consumed = parsed.consumed;
+
+                if let Some(set) = batchable_set(state, conn, &parsed.command) {
+                    if batch.holds(set.key) {
+                        flush_sets(state, &mut batch, out);
+                    }
+                    batch.push(set, ());
+                    rest = &rest[consumed..];
+                    continue;
+                }
+
+                flush_sets(state, &mut batch, out);
                 if execute(state, conn, &parsed.command, version, out) == Closing::Yes {
                     return Closing::Yes;
                 }
                 rest = &rest[consumed..];
             }
             Err(ProtocolError::Recoverable { reply, consumed }) => {
+                flush_sets(state, &mut batch, out);
                 state.metrics.other();
                 state.metrics.error(ErrorClass::Client);
                 encode::error_reply(out, &reply);
@@ -97,7 +113,52 @@ pub fn execute_block(
             }
         }
     }
+    flush_sets(state, &mut batch, out);
     Closing::No
+}
+
+/// A plain `SET` this block may hold back, already translated.
+///
+/// Returns `None` for everything with a verdict to report — `NX`, `XX`, `GET` —
+/// and for a connection that has not authenticated, whose `SET` owes a `NOAUTH`
+/// that only [`execute`] knows how to render. Translation failures fall through
+/// the same way, so a bad expiry is still reported by the ordinary path with the
+/// message it has always had.
+fn batchable_set<'a>(
+    state: &ServerState,
+    conn: &ConnAuth,
+    command: &Command<'a>,
+) -> Option<vash_core::Set<'a>> {
+    if !matches!(command, Command::Set(_)) || refusal(state, conn, command).is_some() {
+        return None;
+    }
+    let translated = translate(command).ok()?;
+    crate::dispatch::batchable(&translated).cloned()
+}
+
+/// Submits a held run of `SET`s and writes `+OK` — or the error — for each.
+fn flush_sets(
+    state: &ServerState,
+    batch: &mut crate::dispatch::SetBatch<'_, ()>,
+    out: &mut Vec<u8>,
+) {
+    batch.flush(
+        state,
+        crate::metrics::Dialect::Resp,
+        out,
+        |out, (), result| match result {
+            Ok(_) => encode::ok(out),
+            // Through the same mapping `execute` uses for a storage failure, so
+            // a batched `SET` reports a full map exactly as an unbatched one
+            // does. Only the wire bytes are taken from it: `SetBatch::flush` has
+            // already counted the failure, which is what `Failure::counted`
+            // means on this path.
+            Err(failed) => {
+                let failure = resp_error_ref(failed);
+                encode::error(out, failure.code, failure.message);
+            }
+        },
+    );
 }
 
 /// Whether a command can be answered without any chance of writing.
@@ -700,9 +761,15 @@ fn render(command: &Command<'_>, reply: &Reply, version: Version, out: &mut Vec<
 /// do not: four arithmetic failures share `NotNumeric` and have four different
 /// messages.
 fn resp_error(failed: crate::dispatch::Failed) -> Failure {
+    resp_error_ref(&failed)
+}
+
+/// [`resp_error`] without taking ownership, for the batched write path, which
+/// renders a shared failure for several commands.
+fn resp_error_ref(failed: &crate::dispatch::Failed) -> Failure {
     use vash_proto::vcp::Status;
 
-    let message = match failed.cause {
+    let message = match &failed.cause {
         Some(CoreError::NotAnInteger) => Some(NOT_AN_INTEGER),
         Some(CoreError::NotAFloat) => Some(NOT_A_FLOAT),
         Some(CoreError::Overflow) => Some(OVERFLOW),

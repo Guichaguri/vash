@@ -1662,3 +1662,105 @@ async fn a_tag_attached_over_resp_is_invalidated_over_memcached() {
     redis.call(&["DELBYTAG", "sport"], ":1\r\n").await;
     redis.call(&["GET", "tagged"], "$-1\r\n").await;
 }
+
+// ---------------------------------------------------------------------------
+// Coalesced writes. A run of consecutive plain `SET`s crosses the writer queue
+// as one submission (`dispatch::SetBatch`); these pin what a pipelined client
+// must still observe.
+// ---------------------------------------------------------------------------
+
+/// Sends everything as one block and asserts on the whole reply stream, which
+/// is the only way to see that the replies came back in request order.
+async fn pipeline(conn: &mut Conn, commands: &[&[&str]], expected: &str) {
+    let mut block = Vec::new();
+    for args in commands {
+        block.extend_from_slice(&request(args));
+    }
+    conn.send(&block).await;
+    conn.fill(expected.len()).await;
+    let actual = String::from_utf8_lossy(&conn.buf[..expected.len()]).into_owned();
+    assert_eq!(actual, expected);
+    conn.buf.drain(..expected.len());
+}
+
+/// One `+OK` per `SET`, in order, however many arrived in a single read.
+#[tokio::test]
+async fn a_pipelined_run_of_sets_answers_each_one() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    let commands: Vec<Vec<&str>> = (0..16).map(|_| vec!["SET", "k", "v"]).collect::<Vec<_>>();
+    let refs: Vec<&[&str]> = commands.iter().map(|c| c.as_slice()).collect();
+    pipeline(&mut conn, &refs, &"+OK\r\n".repeat(16)).await;
+}
+
+/// **A `GET` in the same block sees the `SET` before it.**
+#[tokio::test]
+async fn a_read_in_the_same_block_sees_the_writes_before_it() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    pipeline(
+        &mut conn,
+        &[&["SET", "a", "A"], &["SET", "b", "B"], &["GET", "a"]],
+        "+OK\r\n+OK\r\n$1\r\nA\r\n",
+    )
+    .await;
+}
+
+/// A conditional write is answered against what the run ahead of it wrote, so
+/// `SET … NX` on a key the block just created must decline.
+#[tokio::test]
+async fn a_conditional_write_sees_the_run_before_it() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    pipeline(
+        &mut conn,
+        &[&["SET", "k", "A"], &["SET", "k", "B", "NX"], &["GET", "k"]],
+        "+OK\r\n$-1\r\n$1\r\nA\r\n",
+    )
+    .await;
+}
+
+/// An error in the middle of a block keeps its place in the reply stream: the
+/// held writes ahead of it must be answered before it, not after.
+#[tokio::test]
+async fn an_error_keeps_its_position_in_a_pipelined_block() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    pipeline(
+        &mut conn,
+        &[
+            &["SET", "a", "A"],
+            &["GET"],
+            &["SET", "c", "C"],
+            &["GET", "a"],
+        ],
+        "+OK\r\n-ERR wrong number of arguments for 'get' command\r\n+OK\r\n$1\r\nA\r\n",
+    )
+    .await;
+}
+
+/// One rejected write does not take its neighbours down with it: a failed batch
+/// is retried a command at a time so each gets its own verdict.
+#[tokio::test]
+async fn a_refused_write_does_not_fail_the_run_around_it() {
+    let server = TestServer::start_with(|config| config.store.max_value_bytes = 1024).await;
+    let mut conn = server.connect().await;
+
+    let oversized = "x".repeat(4096);
+    pipeline(
+        &mut conn,
+        &[
+            &["SET", "before", "A"],
+            &["SET", "toobig", &oversized],
+            &["SET", "after", "B"],
+            &["GET", "before"],
+            &["GET", "toobig"],
+        ],
+        "+OK\r\n-ERR string exceeds maximum allowed size\r\n+OK\r\n$1\r\nA\r\n$-1\r\n",
+    )
+    .await;
+}
