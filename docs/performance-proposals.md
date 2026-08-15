@@ -849,10 +849,10 @@ pairs it with `wipe_on_start`.
 
 ---
 
-## 10. Built and left off: the adaptive writer
+## 10. Tried and reverted: the adaptive writer
 
-**Status: implemented, measured, defaulted to off. The shard cap already fixed
-what it was for, and better.**
+**Status: implemented, measured, reverted. The shard cap already fixed what it
+was for, and better.**
 
 §9's shard sweep ended on a tension: pipeline 1 wants one shard and pipeline 16
 wants two, and a fixed cap serves neither perfectly. The idea was a writer that
@@ -904,9 +904,34 @@ four shards at pipeline 1, where a batch of 1.9 rises to 6.6, and **that is the
 shard count §9 moved the default away from for the same reason.** Fewer shards
 fixes batch fragmentation better than lingering does.
 
-It ships off (`write.adaptive_linger_batch = 0`), kept for a deployment that
-needs many writers for reasons of its own and takes the batching hit at low load.
-A knob that helps a configuration we recommend against is not a default.
+**So it was reverted rather than shipped off by default.** The argument for
+keeping it was a deployment that needs many writers for reasons of its own and
+takes the batching hit at low load — but that is a configuration this document
+recommends against, and code the default never runs is code nothing tests in
+anger. Two knobs, a moving average and a feedback governor are a lot of surface
+to carry for one row of one table.
+
+What survives is the measurement and the shape of the answer, which is what the
+next person needs:
+
+- **The wait has to be bounded by what a commit costs.** Waiting longer than the
+  thing you are amortising cannot pay, and that bound needs no tuning.
+- **It has to prove it is gathering something**, or a single sequential client
+  waits on every write for company that cannot arrive until the write in hand is
+  answered. That is not a subtle failure — it is a 7× slowdown, and it is what
+  the test suite found.
+- **The target matters more than the wait.** Above a batch of roughly 40 the
+  fixed cost is already amortised and lingering is pure latency; the whole effect
+  lives below about 8.
+- **A closed-loop client turns latency into lost throughput one for one**, which
+  is the ceiling on anything of this shape. It is why the honest version of this
+  idea is worth so little: the batch has to grow by more than the wait cost, and
+  by the time the batch is worth growing it is already big enough not to need it.
+
+`write.linger_us` remains as the unconditional version for anyone who wants to
+trade latency for throughput on every batch, and plan §9's "no artificial linger"
+survives as the default — now as a measured position rather than an assumed
+one.
 
 ---
 
@@ -948,7 +973,8 @@ Recorded so they do not get proposed again:
 | ~~4~~ | §5 expiry-index relocation | done | **41–53× less B-tree work**; no measurable end-to-end change on this box | **measured**, and the two regimes disagree — see §5 |
 | ~~5~~ | §8 writes off the blocking pool | done | **1.2–2.5× on writes** | **measured**, and it needed a semaphore the pool had been standing in for |
 | ~~6~~ | §9 `lazy` durability | done | **1.7–4.5× on writes**, and the queue wait with it | **measured** |
-| 7 | §7 RAM write-back tier | a milestone | **not the bottleneck**; revisit only if the device becomes the limit again | measured against, see §7 |
+| ~~7~~ | §10 adaptive group-commit wait | tried, reverted | neutral to negative; the shard cap fixes it better | **measured** |
+| 8 | §7 RAM write-back tier | a milestone | **not the bottleneck**; revisit only if the device becomes the limit again | measured against, see §7 |
 
 **Where that leaves the objective.** Reads are done: vash is ahead of both
 servers on both read workloads. Writes moved from 39–65× behind to roughly

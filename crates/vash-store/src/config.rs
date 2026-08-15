@@ -144,48 +144,7 @@ pub struct WriteConfig {
     /// Artificial delay before sealing a batch. Zero — the default — means a
     /// batch is whatever queued during the previous commit, which adds no
     /// latency when idle and still batches under load.
-    ///
-    /// Unconditional, and therefore blunt: it is paid on every batch, including
-    /// the ones that were already large. [`Self::adaptive_linger_batch`] is the
-    /// version that only waits when waiting could help.
     pub linger_us: u64,
-    /// Wait for company only when the batch is smaller than this. **`0` — the
-    /// default — disables the wait**, which is plan §9's "no artificial linger".
-    ///
-    /// **The problem it solves.** A commit has a large fixed cost, and group
-    /// commit exists to spread that across a batch. When the queue runs dry the
-    /// writer commits whatever it has, however small — and at pipeline 1 across
-    /// four shards that is a mean batch of **1.9**, the fixed cost paid almost
-    /// per record.
-    ///
-    /// **And it is off, because measured it does not pay.** A closed-loop client
-    /// converts added latency into lost throughput one for one, so the bigger
-    /// batch has to beat the wait that bought it, and mostly it does not. On a
-    /// four-core container, against the same build with this at `0`:
-    ///
-    /// | | 1 shard | 2 shards | 4 shards |
-    /// |---|---:|---:|---:|
-    /// | pipeline 1 | 0.95× | 1.00× | **1.23×** |
-    /// | pipeline 16 | 0.91× | 1.09× | 0.81× |
-    ///
-    /// The one real gain is at four shards and pipeline 1 — a batch of 1.9 rising
-    /// to 6.6 — which is a shard count the default moved away from precisely
-    /// because it fragments batching. **Fewer shards fixes the same problem
-    /// better**, so this is left for a deployment that needs many writers for
-    /// reasons of its own and takes the batching hit at low load. Everything else
-    /// is inside this box's run-to-run noise.
-    ///
-    /// Only the small case waits, so a loaded writer — whose queue never empties
-    /// — never pays for this.
-    pub adaptive_linger_batch: usize,
-    /// Ceiling on that wait.
-    ///
-    /// The wait is bounded by **what a commit actually costs**, tracked as a
-    /// moving average, because waiting longer than the commit being amortised
-    /// can never pay for itself. This caps that in turn, so a device that
-    /// stalls for 70 ms — which this hardware does — cannot talk the writer into
-    /// a 70 ms linger.
-    pub adaptive_linger_max_us: u64,
     /// How often the sweeper runs. Also how long the writer waits for work
     /// before waking to sweep, so idle sweeps cost nothing.
     pub sweep_interval_ms: u64,
@@ -242,8 +201,6 @@ impl Default for WriteConfig {
             max_batch: 1024,
             queue_depth: 4096,
             linger_us: 0,
-            adaptive_linger_batch: 0,
-            adaptive_linger_max_us: 500,
             sweep_interval_ms: 100,
             // Frequent enough that the loss window is a blink, rare enough that
             // the sync amortises across thousands of commits at any real write

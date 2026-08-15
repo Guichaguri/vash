@@ -6,26 +6,12 @@
 //! the whole batch instead of being paid per operation.
 //!
 //! The batch is **whatever had already queued while the previous commit was in
-//! flight**, plus — when that turns out to be almost nothing — a brief wait for
-//! company. A loaded server needs no help: its queue fills during each commit
-//! and batches form on their own. A lightly loaded one does, and plan §9's
-//! original "no artificial linger" turned out to cost more than it saved:
-//! measured on a four-core container, a closed-loop client at pipeline 1 across
-//! four shards produced a mean batch of **1.9**, which is a commit's fixed cost
-//! paid almost per record.
-//!
-//! So there is a wait, and it is conditional and bounded by the thing it is
-//! amortising: it happens only when the queue has run dry with a small batch,
-//! never for longer than a commit currently costs, and it turns itself off if it
-//! stops gathering anything.
-//!
-//! **It is off by default, because measured it does not pay.** A closed-loop
-//! client turns added latency into lost throughput one for one, and the bigger
-//! batch has to beat the wait that bought it — mostly it does not. It earns its
-//! keep at one shard count and one load, and that shard count is one the default
-//! has already moved away from. `write.adaptive_linger_batch` carries the
-//! numbers. `write.linger_us` is still the unconditional version for deployments
-//! that would rather trade latency for throughput on every batch.
+//! flight**. There is no artificial linger: an idle server commits a lone write
+//! immediately, and a loaded one naturally forms large batches because the
+//! queue fills during each commit. Throughput therefore self-regulates against
+//! load with no tuning knob and no latency penalty. `linger` exists for
+//! deployments that would rather trade latency for throughput, and defaults to
+//! zero.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -344,20 +330,6 @@ fn writer_loop(
     // `relaxed` has always claimed. Zero disables it.
     let sync_interval = Duration::from_millis(config.sync_interval_ms);
     let mut last_sync = Instant::now();
-    // What a commit costs, as a moving average. The adaptive wait below is
-    // bounded by it: waiting longer than the commit being amortised can never
-    // pay for itself, so this is the only bound that needs no tuning.
-    let mut commit_cost = Duration::ZERO;
-    let linger_cap = Duration::from_micros(config.adaptive_linger_max_us);
-    /// Batches between probes once the wait has turned itself off. Small enough
-    /// that a writer notices load arriving, large enough that a single-client
-    /// workload pays the wait about 1.5% of the time.
-    const PROBE_EVERY: usize = 64;
-    // Records a recent wait gathered, as a moving average. Starts optimistic so
-    // the first batches try; falls to zero against a client that cannot send
-    // its next write until this one is answered.
-    let mut wait_gain = 1.0f32;
-    let mut since_probe = 0usize;
     let mut batch: Vec<WriteJob> = Vec::with_capacity(config.max_batch);
 
     info!(
@@ -406,51 +378,6 @@ fn writer_loop(
             }
         }
 
-        // **The queue ran dry with a small batch**, which is the case group
-        // commit is failing at: the fixed cost of the commit about to happen is
-        // about to be paid for almost nothing. Wait for company — bounded by
-        // what a commit actually costs, so the wait can never exceed the thing
-        // it is trying to amortise, and capped so a stalled device cannot talk
-        // this into a linger measured in tens of milliseconds.
-        //
-        // A loaded writer never reaches here with a small batch: the drain above
-        // keeps succeeding while the queue has work.
-        //
-        // **And a writer with only one client must not wait either**, which the
-        // condition above cannot see — an empty queue looks the same whether the
-        // next write is 160 µs away or is not coming until this one is answered.
-        // So the wait pays for itself or stops: `wait_gain` tracks what recent
-        // waits actually gathered, and a wait that gathers nothing turns itself
-        // off. This was not a subtlety spotted in review; it was the test suite
-        // going from 6 seconds to 42, because sequential single writes were each
-        // waiting for company that could not arrive until they finished.
-        if config.adaptive_linger_batch > 0
-            && !batch.is_empty()
-            && batch.len() < config.adaptive_linger_batch
-        {
-            // Probing occasionally, so a writer that fell quiet can discover
-            // that company has arrived rather than never waiting again.
-            let probing = since_probe >= PROBE_EVERY;
-            if wait_gain >= 1.0 || probing {
-                since_probe = 0;
-                let before = batch.len();
-                let budget = commit_cost.min(linger_cap);
-                if !budget.is_zero() {
-                    let deadline = Instant::now() + budget;
-                    while batch.len() < config.adaptive_linger_batch {
-                        match rx.recv_deadline(deadline) {
-                            Ok(job) => batch.push(job),
-                            Err(_) => break,
-                        }
-                    }
-                }
-                let gained = (batch.len() - before) as f32;
-                wait_gain = wait_gain * 0.75 + gained * 0.25;
-            } else {
-                since_probe += 1;
-            }
-        }
-
         // Maintenance shares the batch's transaction, so it costs no extra
         // commit. Under sustained write load the interval check is what keeps
         // it from starving.
@@ -476,31 +403,14 @@ fn writer_loop(
             continue;
         }
 
-        // Measured around the call rather than taken from the metrics, because
-        // this feeds the adaptive wait above and wants *this* writer's recent
-        // behaviour rather than a total since startup.
-        let committing = batch.len();
-        let started_commit = Instant::now();
-        let outcome = commit_batch(
+        match commit_batch(
             &engine,
             &mut batch,
             due_for_maintenance,
             &config,
             &metrics,
             &mut reclaim_pending,
-        );
-        if committing > 0 {
-            let took = started_commit.elapsed();
-            // A plain exponential average, weighted so one slow commit on a
-            // stalling device does not set the linger for the next hundred.
-            commit_cost = if commit_cost.is_zero() {
-                took
-            } else {
-                (commit_cost * 7 + took) / 8
-            };
-        }
-
-        match outcome {
+        ) {
             Ok(()) => {}
             Err(e) if e.is_capacity() => {
                 // The map is full. The batch that hit it was aborted, and with
