@@ -229,7 +229,8 @@ total, silent cache loss is worse than a refusal to start.
 | Mode | Flags | On an OS crash |
 |---|---|---|
 | `durable` | none | Nothing is lost. |
-| `relaxed` (default) | `MDB_NOMETASYNC` | The last few transactions may be lost. **Cannot corrupt the database.** |
+| `relaxed` | `MDB_NOMETASYNC` | The last few transactions may be lost. **Cannot corrupt the database.** |
+| `lazy` (default) | `MDB_NOSYNC`, and never `MDB_WRITEMAP` | Writes newer than the last `write.sync_interval_ms` may be lost. **Cannot corrupt the database**, provided the filesystem preserves write order — LMDB's condition, and the reason this mode refuses `WRITE_MAP`. |
 | `ephemeral` | `MDB_NOSYNC`, plus `MDB_WRITEMAP` on Unix | The file may be corrupt; it is wiped and started empty. |
 
 `MDB_WRITEMAP` is Unix-only here: on Windows `mdb_env_open` fails with OS error

@@ -1892,7 +1892,7 @@ field.
 
 A write is acknowledged once committed to the storage engine. Depending on the
 server's `store.durability` setting, that commit may not yet be on stable
-storage — in `relaxed` (the default) an OS crash can lose the last few
+storage — in `lazy` (the default) an OS crash can lose the last few
 transactions, and in `ephemeral` a crash discards everything. This is a cache;
 treat an acknowledged write as durable only if the deployment is configured for
 it.

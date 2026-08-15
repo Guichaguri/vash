@@ -98,7 +98,7 @@ So the write gap decomposes as:
 
 | Layer | Marginal cost per record | Implied ceiling |
 |---|---:|---:|
-| vash, `relaxed` (default) | 0.23 ms | ~17,400/s |
+| vash, `relaxed` | 0.23 ms | ~17,400/s |
 | vash, `ephemeral` (no syncing at all) | 0.084 ms | ~47,600/s |
 | Redis, measured | — | 554,785/s |
 | memcached, measured | — | 912,234/s |
@@ -790,6 +790,13 @@ Three modes, one build, alternating order, medians of four:
 **1.65× and 4.45× over `relaxed`**, and the queue wait falls with it — 2.23 to
 1.17 ms and 3.98 to 0.77 ms — which is the point: the backlog was the sync, and
 removing the sync drained it.
+
+**`lazy` is now the default.** What that trades is a one-second window of writes
+against an OS crash, on a server whose own plan §9 opens by saying a lost write
+is a cache miss and a cache miss is already a supported outcome. What it does not
+trade is the database: integrity is preserved, so there is nothing to wipe and
+nothing to rebuild. Set `durability = "relaxed"` to have every commit on the
+device before it is acknowledged, and pay the 1.7–4.5×.
 
 ### The thing that fell out: `ephemeral` is leaving 2× on the floor
 

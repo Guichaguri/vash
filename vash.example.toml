@@ -61,7 +61,11 @@ max_readers = 256
 # LMDB's condition for that is that the filesystem preserves write order and
 # MDB_WRITEMAP is not used — this mode never sets it. On a filesystem that
 # reorders writes you have `ephemeral`'s risk without its name, so check.
-durability = "relaxed"
+#
+# `lazy` is the default. `relaxed` is the setting to reach for if you want every
+# commit on the device before it is acknowledged and are willing to pay 1.7-4.5x
+# for it.
+durability = "lazy"
 
 max_value_bytes = 1048576
 wipe_on_start = false

@@ -660,7 +660,7 @@ anticipate, both visible in the benchmark:
    writers is handed straight back. It therefore pays off with *offered load*, not with shard count
    alone: at 20k writes the gain peaked at 4 shards and regressed at 8; at 200k it kept climbing.
 2. **It only helps when the writer thread is the bottleneck.** With syncing off, 8 shards gave 1.5×.
-   With syncing on — the `relaxed` default — throughput is set by the disk, and splitting one device
+   With syncing on every commit — `relaxed`, which was the default when this was measured — throughput is set by the disk, and splitting one device
    between more environments fragments its I/O and makes things *worse*: 12.4k ops/s at one shard
    against 10.6k at eight, and `durable` fell from 10.9k to 5.5k. Sharding cannot fix a disk.
 
@@ -686,7 +686,8 @@ reframes the whole durability question and buys a lot of performance:
 | Mode | LMDB flags | Semantics |
 |---|---|---|
 | `durable` | default sync | fsync per commit. Slowest. Available for anyone who wants it. |
-| `relaxed` **(default)** | `MDB_NOMETASYNC` + periodic `force_sync` | Loses at most the last few transactions on OS crash; **cannot corrupt the database**. |
+| `relaxed` | `MDB_NOMETASYNC` + periodic `force_sync` | Loses at most the last few transactions on OS crash; **cannot corrupt the database**. |
+| `lazy` **(default)** | `MDB_NOSYNC` + periodic `force_sync`, never `MDB_WRITEMAP` | Loses writes newer than `write.sync_interval_ms`; **cannot corrupt the database** where the filesystem preserves write order. Measured 1.7–4.5× faster than `relaxed`, because the per-commit `fsync` is 92% of commit time and the writer queue backs up behind it — `docs/performance-proposals.md` §9. |
 | `ephemeral` | `MDB_NOSYNC` (+ `MDB_WRITEMAP` on Unix only — it fails on Windows, see §11) | Fastest. An OS crash or power loss *can* corrupt the file — handled by verifying integrity at boot and, on failure, **wiping and starting empty**. Legitimate for a cache; must never be used for a system of record. |
 
 A `--ephemeral` mode that also wipes on clean startup, and support for placing the database on tmpfs,

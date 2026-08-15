@@ -177,12 +177,24 @@ yours to make, not something the server can or should do on your behalf.
 
 | Mode | Use when |
 |---|---|
-| `relaxed` (default) | Almost always. Loses at most the last few transactions on an OS crash, and cannot corrupt the database. |
+| `lazy` (default) | Almost always. Syncs on a timer rather than on every commit, so an OS crash loses writes newer than `write.sync_interval_ms` — one second by default — and **cannot corrupt the database**. |
+| `relaxed` | You want every commit on the device and can pay for it: measured 4.5× slower on a pipelined write workload, because the `fsync` is what the writer queue backs up behind. |
 | `durable` | You are treating a cache as a system of record. Reconsider. |
-| `ephemeral` | The cache is genuinely disposable. Fastest; a crash means starting empty. |
+| `ephemeral` | The cache is genuinely disposable. A crash means starting empty. |
 
 A lost write is a cache miss, and a cache miss is already a supported outcome.
-That is what makes `relaxed` the right default rather than a compromise.
+That is what makes `lazy` the right default rather than a compromise — and note
+what it still is compared with the alternatives it replaces: Redis and memcached
+in their usual configurations lose *everything* on a restart.
+
+**The one condition worth checking before trusting it.** `lazy`'s integrity
+guarantee is LMDB's, and LMDB states it precisely: `MDB_NOSYNC` keeps the
+database consistent *"if the filesystem preserves write order and the
+`MDB_WRITEMAP` flag is not used"*. vash never sets `WRITE_MAP` in this mode, so
+the remaining half is yours. Journalled filesystems in their ordinary
+configurations qualify — ext4 with `data=ordered`, XFS, ZFS. If yours reorders
+writes, you have `ephemeral`'s risk without `ephemeral`'s wipe, and should set
+`durability = "relaxed"`.
 
 ## Monitoring
 

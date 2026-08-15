@@ -238,8 +238,8 @@ impl Default for TtlConfig {
 #[serde(rename_all = "lowercase")]
 pub enum Durability {
     Durable,
-    #[default]
     Relaxed,
+    #[default]
     Lazy,
     Ephemeral,
 }
@@ -730,9 +730,11 @@ impl Config {
     /// Capped at 4 rather than 8. Sharding buys concurrent *writers* and
     /// nothing else — LMDB reads are already lock-free and concurrent within
     /// one environment — so it only pays when the writer thread is the
-    /// bottleneck. When commits are disk-bound, which the default `relaxed`
-    /// durability makes likely, more environments fragment I/O across the same
-    /// device and measured throughput *falls*. Four is a compromise that helps
+    /// bottleneck. When commits are disk-bound — which `relaxed` durability
+    /// makes likely, and which was the default when this was measured — more
+    /// environments fragment I/O across the same device and measured throughput
+    /// *falls*. Worth re-measuring now that `lazy` is the default and a commit
+    /// no longer waits for the device. Four is a compromise that helps
     /// where sharding helps without punishing the disk-bound case; see the
     /// benchmark in the README before raising it.
     pub fn shard_count(&self) -> usize {

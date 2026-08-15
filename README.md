@@ -167,7 +167,8 @@ them into each transaction. Measured with:
 cargo run --release -p vash-store --example write_bench
 ```
 
-20,000 writes of a 256-byte value, `relaxed` durability, one environment
+20,000 writes of a 256-byte value, `relaxed` durability — which was the
+default when this was measured; `lazy` is now — one environment
 (Windows 11, NVMe):
 
 | | ops/s | mean ops per commit |
@@ -189,7 +190,7 @@ Each shard is an independent LMDB environment with its own writer thread, so the
 shard count is the ceiling on concurrent writers. Best of 3, 200,000 writes from
 64 concurrent callers:
 
-| shards | no syncing | `relaxed` (default) | `durable` |
+| shards | no syncing | `relaxed` | `durable` |
 |---:|---:|---:|---:|
 | 1 | 38,675 | 12,362 | 10,863 |
 | 2 | 40,478 | 13,059 | — |

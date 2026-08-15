@@ -24,7 +24,6 @@ pub enum Durability {
     Durable,
     /// Skips only the meta-page sync. An OS crash loses at most the last few
     /// transactions and **cannot corrupt the database**.
-    #[default]
     Relaxed,
     /// **Syncs on a timer rather than on every commit.**
     ///
@@ -45,6 +44,7 @@ pub enum Durability {
     /// not used"*. So this mode never sets `WRITE_MAP` — which costs nothing,
     /// since it measured as no gain — and an operator on a filesystem that
     /// reorders writes gets the `ephemeral` risk without the `ephemeral` label.
+    #[default]
     Lazy,
     /// No syncing at all, and a writable map. Fastest. An OS crash or power loss
     /// can corrupt the file, which is handled by wiping it at startup and
