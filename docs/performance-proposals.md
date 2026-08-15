@@ -1043,6 +1043,14 @@ Recorded so they do not get proposed again:
 | ~~6~~ | §9 `lazy` durability | done | **1.7–4.5× on writes**, and the queue wait with it | **measured** |
 | ~~7~~ | §10 adaptive group-commit wait | tried, reverted | neutral to negative; the shard cap fixes it better | **measured** |
 | 8 | §7 RAM write-back tier | a milestone | **not the bottleneck**; revisit only if the device becomes the limit again | measured against, see §7 |
+| 9 | §14 split a block into runs | a day | **2.11x on a 1:9 workload**, measured as a bound | **measured** as a bound, unbuilt |
+| 10 | §15 skip the redundant expiry put | an hour | commit is 54% of CPU and this is one of its two B-tree inserts | decomposed, unbuilt |
+
+**What changed since this table was written.** The writes row is no longer the
+only gap, and the bottleneck moved: §15's decomposition puts 54% of server CPU
+inside the LMDB commit, which is the first time storage rather than the path to
+it has been the limit. Meanwhile §14 says the mixed workload has been losing
+2.11x to a dispatch decision rather than to either tier.
 
 **Where that leaves the objective.** Reads are done: vash is ahead of both
 servers on both read workloads. Writes moved from 39–65× behind to roughly
@@ -1076,3 +1084,174 @@ and any of this work should inherit it:
   fall in commit-per-record from 0.23 ms; for §3 it is that the map stays
   resident under a memory-pressure test. Those are properties, not throughput
   figures, and they survive a noisy host.
+---
+
+## 14. The next one: a block is dispatched whole, and mixed blocks lose both fast paths
+
+**Status: proposed, and the prize is measured rather than modelled.**
+
+Every fast path this document has added is decided **per block**, all or nothing.
+`measure_resp` computes `all_reads` and `all_writes` by `&=` across every command
+in the block, and `drain` then picks one route for the whole thing: inline reads
+if every command is a read, the awaited write path if every command is an
+unconditional write, and otherwise the blocking pool for all of it.
+
+A pipelined cache client does not send blocks like that. At pipeline 16 with one
+write in ten, the chance a block is entirely reads is `0.9^16 = 18.5%`. **Four
+blocks in five lose inline reads because of a single write sitting among fifteen
+reads.**
+
+### The sweep says so
+
+`inline_reads` on, pipeline 16, RESP, sweeping the ratio. `P(all-read)` is
+`(1 - writeFraction)^16` — the chance a block takes the read fast path:
+
+| ratio | write fraction | P(all-read block) | ops/s |
+|---|---:|---:|---:|
+| 0:1 | 0 | 1.000 | 800,311 |
+| 1:199 | 0.5% | 0.923 | 593,554 |
+| 1:99 | 1% | 0.851 | 488,230 |
+| 1:19 | 5% | 0.440 | 213,950 |
+| 1:9 | 10% | 0.185 | 149,872 |
+| 1:3 | 25% | 0.010 | 107,867 |
+| 1:0 | 100% | 0.000 | **157,331** |
+
+Throughput tracks `P(all-read)`, not the write fraction. **One write per hundred
+operations costs 39% of throughput.** And the last row rules out every other
+explanation: **a workload of 25% writes is slower than a workload of 100%
+writes** — 107,867 against 157,331. No cost model in which writes are simply
+expensive produces that. Block homogeneity does: at 1:3 almost no block is
+uniform so nothing takes any fast path, while at 1:0 every block takes the
+awaited one.
+
+Fitting per-block time to `T = P·T_inline + (1-P)·T_slow` gives `T_inline` ≈ 20 µs
+and `T_slow` ≈ 127 µs, and that pair reproduces every row in the sweep to within
+about 10%.
+
+This is also why `resident_mode` is worth 3.2× on pure `GET` in
+[benchmarks.md](benchmarks.md) and only 1.06× on the mixed workload: the setting
+is working correctly and almost never getting the chance to.
+
+### The prize, measured
+
+The same 1:9 work over the same 100 connections, arranged two ways — mixed on
+every connection, or 90 read connections beside 10 write connections so that
+every block is uniform by construction:
+
+| | ops/s |
+|---|---:|
+| mixed on every connection | 159,369 |
+| split across connections | **336,392** |
+
+**2.11×**, with the achieved write share at 9.1–9.2% in both. That is an
+empirical upper bound on splitting blocks into runs, and it is lower than the
+naive model predicts (~3.8×) because in the split arrangement the writes still
+compete for the same cores. 2.11× is the number to hold this proposal to.
+
+### What it would take
+
+`measure` stops returning two booleans about the whole block and starts returning
+**runs**: consecutive commands of the same class, as byte ranges. `drain` then
+walks the runs in order — a read run served inline, an unconditional-write run
+awaited, anything else on the pool — appending replies as it goes. Order is
+preserved because the runs are processed in sequence, which is also what keeps
+this correct for a client that pipelines a write and a read of the same key.
+
+The block is already a refcounted `Bytes`, so a run is a slice of it and costs no
+copy. The executors already take a byte range and render into a shared buffer,
+so they need no change. The new cost is one small `Vec` of runs per block, at
+roughly 44,000 blocks a second, plus more dispatches per block for workloads that
+alternate — which is why the acceptance criterion is a sweep and not one row.
+
+**Acceptance criterion, stated before the run**: the 1:9 row moves from ~150,000
+toward the 336,392 bound, *and* the 0:1 and 1:0 rows do not regress — this change
+adds bookkeeping to the uniform blocks that are today's best case, and that is
+where it can both pay for itself and lose.
+
+**Risks.** `drain` is the function that already cost pipelined reads 6.7× once by
+growing a future it never polled (§8), so the awaited run must stay boxed and the
+read path must stay allocation-free. VCP keeps its current whole-block route: its
+replies carry a request id from each frame header and its pre-auth gate is read
+from the same header, neither of which the shared run model describes.
+
+---
+
+## 15. Writes are bound by the writer threads, and half of that is one redundant put
+
+**Status: proposed, from a decomposition rather than a guess.**
+
+`SET`-only through the admin counters, four-core container, at HEAD:
+
+| | pipeline 1 | pipeline 16 |
+|---|---:|---:|
+| client ops/s | 47,849 | 159,772 |
+| records per commit | 5.6 | 117.2 |
+| mean queue wait | 0.411 ms | 0.316 ms |
+| mean commit | 0.153 ms | 1.318 ms |
+| server CPU | 348% of 400 | 335% of 400 |
+| **CPU per record** | **72.8 µs** | **20.9 µs** |
+
+Two things fall out.
+
+**The commit is now the write path.** At pipeline 16 the commit costs 11.2 µs per
+record against 20.9 µs of total server CPU per record — **54% of everything the
+server burns is inside LMDB's commit**, on two writer threads. Two threads at
+11.2 µs a record is a ceiling of about 178,000 records a second, and the measured
+159,772 is **90% of it**. This is the first round in which the storage engine
+rather than the path to it is the limit; §2 and §7 both concluded the opposite,
+and both were right when they were written.
+
+Solving the two batch sizes for a fixed and a marginal part gives **~94 µs per
+commit plus ~10.5 µs per record**. At 117 records the fixed part is already down
+to 7%, so batching harder — §10's idea — cannot help. The marginal cost is the
+target.
+
+**Where the marginal cost goes.** Every write does a `get` on the main table, a
+`put` on the main table, and an **unconditional `put` into the expiry index**. §5
+already made the matching *delete* conditional, because an overwrite that stays
+in the same bucket writes a byte-identical index key, and deleting it to put it
+back was "most of the cost of a write". The put was deliberately left
+unconditional, as self-healing. It is the same churn: a second B-tree insert and
+a second copy-on-write page per write, which in the same-bucket case
+re-establishes a row that is already there.
+
+**The proposal**: skip the expiry-index put when `displaced.indexed_at` exists and
+falls in the same bucket as the new deadline — exactly the condition under which
+§5 already skips the delete. For a cache that overwrites existing keys, and for
+every key with no TTL at all (they share one bucket by construction), that
+removes one of the two B-tree inserts per write.
+
+**Acceptance criterion**: commit-per-record falls from 11.2 µs, read off the
+writer counters rather than inferred from ops/s. **What it costs**: the
+self-healing property — an index row lost some other way stops being silently
+restored by the next overwrite. That is a real trade, and it should be made
+deliberately rather than as a side effect.
+
+**Not the answer: more shards.** More writer threads is the obvious response to a
+writer-thread ceiling, and the arithmetic says there is no room — the server is
+already at 335% of a 400% quota with about 180% of that inside commits. Splitting
+the same work across four writer threads does not create CPU, and it halves the
+batch, which raises per-record cost through the 94 µs fixed part. Reducing the
+work is available; spreading it is not. Plan §9 and the round after `lazy` both
+measured two shards ahead, and this is why.
+
+---
+
+## 16. Closed-loop writes are still mostly not storage
+
+For completeness, from the same table: at pipeline 1 a write costs **72.8 µs of
+server CPU** against 20.9 µs at pipeline 16, and the commit accounts for 27.3 µs
+of it. So roughly 45 µs per write is per-request path — the wake-up, the read
+syscall, the parse, the submission, the reply wake, the write syscall — that
+pipelining amortises over sixteen and a closed-loop client pays in full.
+
+That is the same class of cost §8 attacked, and it is now the larger half of a
+closed-loop write. It is recorded rather than proposed because the obvious
+attacks are the ones already tried: §8 removed the parked thread, §10's linger
+made it worse, and what is left is syscalls per request — which needs either
+batched I/O (`io_uring`, not on every platform vash runs on) or fewer round
+trips, which is the client's decision rather than the server's.
+
+`SET` closed loop is 47,849 here against Redis's 60,810 — the closest the write
+path has been. Closing it further means attacking per-request syscalls, not
+anything in the storage tier.
