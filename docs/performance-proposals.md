@@ -303,9 +303,11 @@ throwing away the cause.
 
 ---
 
-## 5. Proposal 3 — stop relocating the expiry index on every overwrite
+## 5. Measured, not yet built: stop relocating the expiry index
 
-**Status: needs measurement before it is worth committing to.**
+**Status: priced. The largest write cost found so far, and the design it needs
+is settled — but it changes the on-disk format and the eviction ordering, so it
+is waiting on that call rather than on more measurement.**
 
 From §2: every `SET` is two B-tree puts and, on overwrite, a delete. The `exp`
 key is `(bucketed deadline, cas)` and CAS advances on every write, so an
@@ -328,15 +330,83 @@ Three candidate changes, in increasing order of what they give up:
   needs eviction to gain a separate sampler over `main`, which is its own
   project. Listed for completeness, not recommended.
 
-**Expected**: the marginal cost is 0.23 ms and one of the two tree writes is the
-index. If removing the relocation halves it, the §2 ceiling roughly doubles to
-~35,000 writes/s. That is a real gain and still two orders of magnitude short of
-the objective — which is the point of §7.
+### Measured: the index is most of the write
 
-**Measure before building.** A `cargo bench -p vash-bench --bench write_path`
-run with the index write stubbed out costs an afternoon and answers whether the
-0.23 ms is mostly the index or mostly `main`. Nothing here should be built on
-the assumption; §2's whole value is that it was measured rather than guessed.
+That measurement was taken. The index put and the displaced delete were stubbed
+out of `apply.rs` — a correctness-breaking hack, run only to price the ceiling —
+and `cargo bench -p vash-bench --bench write_path` run against it. Divan medians,
+in-process and under `ephemeral`, so no `fsync` and no queue hop is in these
+numbers; what is left is B-tree work:
+
+| benchmark | baseline | index stubbed | |
+|---|---:|---:|---:|
+| `overwrite_existing` 1 KiB | 116.9 µs | 68.1 µs | 1.72× |
+| `overwrite_existing` 64 KiB | 321.1 µs | 157.2 µs | 2.04× |
+| `set_many_untagged` | 177.9 µs | 60.2 µs | 2.96× |
+| `rmw_plain_set` — one hot key | 31.7 µs | 0.60 µs | **53×** |
+| `rmw_plain_set_large` — scattered keys | 104.5 µs | 70.8 µs | 1.47× |
+
+**The expiry index is between a third and almost all of the cost of a write**,
+and it is the largest single write cost this document has found. §5 guessed "up
+to 2×"; the honest number is at the top of that range for ordinary writes and far
+past it for a repeatedly overwritten key, which is the shape a cache actually
+sees.
+
+A second pass stubbed **only the delete**, leaving the put: `rmw_plain_set` went
+from 31.7 µs to 1.30 µs against 0.60 µs with both removed. **The delete is the
+dominant half.** That fits the structure — the put appends at the end of the
+bucket, and the delete removes an entry from wherever the previous write left it,
+dirtying a second page and rebalancing as the tree churns. (Medians across
+separate bench processes on this box are not directly comparable; the effect is
+large enough to survive that, the 1.7–2× ones less comfortably so.)
+
+### Every implementation hits something, and the codebase has already ruled on two
+
+Working through the three candidates above against the constraints actually in
+the tree:
+
+- **`bucket || user_key`** — exact, no collisions, and **blocked outright**.
+  LMDB caps a key at 511 bytes and `vash_core::MAX_KEY_LEN` is *also* 511, so an
+  8-byte prefix plus a maximum-length key does not fit. This is the same wall
+  [`reclaim.rs`](../crates/vash-store/src/reclaim.rs) hit, and its module docs
+  say so.
+- **`DUP_SORT`, `bucket -> [user_key]`** — the tidiest layout on paper, and the
+  plan originally specified exactly this for the tag index. `reclaim.rs` rejected
+  it after implementing it: heed cannot seek to a position *within* a duplicate
+  list, so a budgeted, resumable cursor has to re-walk everything it already
+  processed, which is quadratic. The expiry sweeper is the same shape of cursor,
+  so it inherits the same verdict.
+- **`bucket || xxh3_64(user_key)`** — 16 bytes, fits, stable across overwrites.
+  This is precisely the layout and precisely the trade `reclaim.rs` settled on
+  for the tag index, collision behaviour included: a 64-bit collision within one
+  bucket drops an index entry, so that record is not reclaimed proactively — it
+  stays correct, because reads check liveness and TTLs independently, it just
+  lingers. **This is the one to build.**
+
+CAS then leaves the key, and the staleness check it exists for gets *better*
+rather than worse: the sweeper can compare the entry's bucket against
+`bucket_for(record.expires_at_ms)` and drop an entry that no longer describes its
+record, which is exact where the CAS comparison was a proxy.
+
+### The two things it costs, which are decisions rather than details
+
+**Eviction ordering inside a bucket changes.** Today entries within one bucket
+are ordered by CAS, which is write order, so the capacity evictor takes the
+least-recently-*written* record first — a decent policy that
+[expiry.rs](../crates/vash-store/src/expiry.rs) documents as insertion order and
+that nothing claims as a design goal. Keyed by hash, that ordering becomes stable
+but arbitrary, and stable is the problem: a low-hash key that is evicted and then
+rewritten lands back at the same position and is evicted again, where CAS order
+would have moved it to the end. Eviction only runs above the 0.75 watermark, so
+this is a cost paid rarely against a benefit paid on every write — but it is a
+real regression in eviction quality, not a free win.
+
+**It is an on-disk format change**, so `SCHEMA_VERSION` goes to 3 and existing
+databases are refused at startup. There is precedent — version 1 was rejected
+the same way when never-expiring records started being indexed — and for a cache
+that is a documented, survivable operation. It could instead be migrated by
+rebuilding the index from `main` at startup, which is one full scan, at the cost
+of writing and testing a migration path.
 
 ---
 
@@ -506,7 +576,7 @@ Recorded so they do not get proposed again:
 | ~~1~~ | §3 `resident_mode` | done | **reads lead both servers** — 173,659 and 781,427 | **measured** |
 | ~~2~~ | §4 one submission per block, shards in parallel | done | **5.4–6.4× on pipelined writes** | **measured** |
 | ~~3~~ | §6 `WRITE_MAP` under `relaxed` | done | **no effect, reverted** — 6% the wrong way, worse stall tail | **measured** |
-| 4 | §5 expiry-index relocation | measure first, then ~1 week | unknown — and §2's correction means it should be re-costed against the new per-record figure first | unknown until measured |
+| 4 | §5 expiry-index relocation | ~1 week | **1.7–3× on writes, 53× on a hot key** | **measured** — blocked on a format/eviction decision, not on evidence |
 | 5 | §7 RAM write-back tier | a milestone | writes competitive with memcached | design-level only |
 
 **Where that leaves the objective.** Reads are done: vash is ahead of both
