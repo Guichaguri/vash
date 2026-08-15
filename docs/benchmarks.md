@@ -558,3 +558,10 @@ single sample of it was never enough to call anything.
 
 The setting is worth more than the table. The retraction is worth more than the
 setting.
+
+What to *do* about the gap is a separate question from measuring it, and it has
+its own document: [performance-proposals.md](performance-proposals.md) decomposes
+the write cost from the writer's own counters — a commit costs 2.37 ms before it
+writes anything and 0.23 ms per record, which caps vash near 17,400 writes/s no
+matter how well it batches — and works through what each candidate change is
+worth against that ceiling.

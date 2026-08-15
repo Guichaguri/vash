@@ -1078,7 +1078,7 @@ checked as well as the code — and any result that survives only one run is not
 | Risk | Impact | Mitigation |
 |---|---|---|
 | LMDB single writer caps write throughput | High | Sharded environments (§9) + group commit; `Store` trait keeps `libmdbx` a contained swap |
-| Copy-on-write write amplification under high churn | Medium | TTL bucketing to cluster index writes; batch commits; measure early in M1 — **this is the number to watch first** |
+| Copy-on-write write amplification under high churn | **Materialised** | TTL bucketing to cluster index writes; batch commits; measure early in M1 — **this is the number to watch first**. It was, and it is the binding constraint: 0.23 ms per record beyond the commit's fixed cost, capping writes near 17,400/s however well they batch. Decomposed and costed in [performance-proposals.md](performance-proposals.md) |
 | Long-lived read txn blocks page reuse ⇒ unbounded file growth | High | Per-batch txn renewal; `oldest_reader_age_ms` metric with an alarm; documented in operations.md |
 | `map_size` is fixed at open and cannot grow while txns are live | Medium | Generous sizing (verified not preallocated, §11); capacity metrics and watermarks well before the map fills |
 | `MDB_WRITEMAP` unusable on Windows (measured, §11) | Low | `ephemeral` mode drops the flag on Windows; dev parity is otherwise unaffected |
