@@ -194,6 +194,20 @@ pub struct WriteConfig {
     /// whatever queued during the previous commit, which adds no latency when
     /// idle and still forms large batches under load.
     pub linger_us: u64,
+    /// Wait for company only when the batch is smaller than this. **`0` — the
+    /// default — disables the wait.**
+    ///
+    /// It is off because it measured neutral to negative: a closed-loop client
+    /// turns added latency into lost throughput one for one, and the bigger
+    /// batch rarely beats the wait that bought it. The one configuration it
+    /// helps is a shard count high enough to fragment batching, which fewer
+    /// shards fixes better. See `vash_store::WriteConfig::adaptive_linger_batch`
+    /// for the measurement.
+    pub adaptive_linger_batch: usize,
+    /// Ceiling on that wait. The wait is bounded by what a commit actually costs
+    /// — waiting longer than the commit being amortised cannot pay — and this
+    /// caps that in turn, so a stalling device cannot produce a long linger.
+    pub adaptive_linger_max_us: u64,
     /// How often the writer forces committed data onto the device. `0` never
     /// does.
     ///
@@ -225,6 +239,8 @@ impl Default for WriteConfig {
             max_batch: defaults.max_batch,
             queue_depth: defaults.queue_depth,
             linger_us: defaults.linger_us,
+            adaptive_linger_batch: defaults.adaptive_linger_batch,
+            adaptive_linger_max_us: defaults.adaptive_linger_max_us,
             sync_interval_ms: defaults.sync_interval_ms,
         }
     }
@@ -796,6 +812,8 @@ impl Config {
                 max_batch: self.store.write.max_batch,
                 queue_depth: self.store.write.queue_depth,
                 linger_us: self.store.write.linger_us,
+                adaptive_linger_batch: self.store.write.adaptive_linger_batch,
+                adaptive_linger_max_us: self.store.write.adaptive_linger_max_us,
                 sync_interval_ms: self.store.write.sync_interval_ms,
                 sweep_interval_ms: self.store.ttl.sweep_interval_ms,
                 sweep_batch: self.store.ttl.sweep_batch,

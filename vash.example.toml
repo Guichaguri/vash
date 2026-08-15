@@ -170,9 +170,42 @@ max_batch = 1024
 # Writes beyond this many queued are refused with OVERLOADED rather than piling
 # up behind a writer that is already saturated.
 queue_depth = 4096
-# Artificial delay before sealing a batch. Zero adds no latency when idle and
-# still batches under load; raise it only to trade latency for throughput.
+# Artificial delay before sealing a batch. Unconditional, and therefore blunt:
+# it is paid on every batch, including the ones that were already large. Zero
+# adds no latency; raise it only to trade latency for throughput everywhere.
 linger_us = 0
+
+# Wait for company only when the batch is smaller than this. 0 disables the wait.
+#
+# A commit has a large fixed cost and group commit exists to spread it across a
+# batch. When the queue runs dry the writer commits whatever it has, however
+# small — measured, a mean batch of 1.9 at pipeline 1 across four shards, which
+# is the fixed cost paid almost per record. This waits, briefly, for the batch to
+# be worth committing.
+#
+# It pays for itself or stops. The wait is bounded by what a commit actually
+# costs (waiting longer than the thing you are amortising cannot pay), and a
+# wait that gathers nothing turns itself off — which is what keeps a single
+# sequential client from waiting on every write for company that cannot arrive
+# until its current write is answered.
+#
+# OFF BY DEFAULT, because measured it does not pay. A closed-loop client turns
+# added latency into lost throughput one for one, and the bigger batch has to
+# beat the wait that bought it. Against the same build with this at 0:
+#
+#                1 shard   2 shards   4 shards
+#   pipeline 1     0.95x     1.00x      1.23x
+#   pipeline 16    0.91x     1.09x      0.81x
+#
+# The one real gain is four shards at pipeline 1 — a batch of 1.9 rising to 6.6
+# — and that is a shard count the default moved away from for the same reason.
+# Fewer shards fixes it better. Set this only if you need many writers for
+# reasons of your own and are taking the batching hit at low load; 8 is a safer
+# starting point than 64, which waits even when the batch is already amortised.
+adaptive_linger_batch = 0
+
+# Ceiling on that wait, so a device that stalls cannot produce a long linger.
+adaptive_linger_max_us = 500
 
 # How often the writer forces committed data onto the device. 0 never does.
 #

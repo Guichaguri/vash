@@ -2195,3 +2195,77 @@ fn a_store_with_write_map_still_serves() {
     assert_eq!(h.get(b"k").as_deref(), Some(&b"w"[..]));
     assert_eq!(h.expiry_entries(), 1);
 }
+
+/// The adaptive wait must never hold a lone write. It is bounded by what a
+/// commit costs, and at startup that average is zero — so the very first write
+/// into an idle store has nothing to wait behind and must go straight through.
+/// A bug that waited unconditionally would show up here as a slow single write
+/// rather than as a wrong answer.
+#[test]
+fn a_lone_write_into_an_idle_store_is_not_held_back() {
+    let h = Harness::with(|c| {
+        c.write.adaptive_linger_batch = 64;
+        c.write.adaptive_linger_max_us = 50_000; // 50ms, far beyond any real wait
+    });
+
+    let started = Instant::now();
+    h.set(b"k", b"v", 0);
+    let took = started.elapsed();
+
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"v"[..]));
+    assert!(
+        took < Duration::from_millis(50),
+        "a lone write waited {took:?} for company that was never coming"
+    );
+}
+
+/// Turning the wait off restores the old behaviour, and the store still serves.
+#[test]
+fn the_adaptive_wait_can_be_switched_off() {
+    let h = Harness::with(|c| c.write.adaptive_linger_batch = 0);
+
+    for i in 0..32u32 {
+        h.set(format!("k{i}").as_bytes(), b"v", 0);
+    }
+    for i in 0..32u32 {
+        assert_eq!(
+            h.get(format!("k{i}").as_bytes()).as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+}
+
+/// **A writer with one sequential client must not wait for company**, because
+/// none can arrive until the write it is holding has been answered. The wait
+/// cannot see that from an empty queue — it looks identical to a lull — so it
+/// pays for itself or stops.
+///
+/// This is a regression test in the literal sense: the first version of the
+/// adaptive wait had no governor, and this workload took the full linger on
+/// every write. The whole store test suite went from 6 seconds to 42.
+#[test]
+fn sequential_single_writes_do_not_each_pay_the_wait() {
+    const WRITES: u32 = 300;
+
+    let h = Harness::with(|c| {
+        c.write.adaptive_linger_batch = 64;
+        // Far above any real commit, so an ungoverned wait would be obvious.
+        c.write.adaptive_linger_max_us = 20_000;
+    });
+
+    let started = Instant::now();
+    for i in 0..WRITES {
+        h.set(format!("k{i}").as_bytes(), b"v", 0);
+    }
+    let took = started.elapsed();
+
+    // Ungoverned, this would be at least WRITES × 20 ms. The bound is loose on
+    // purpose: it is testing that the wait turned itself off, not how fast the
+    // device is.
+    let ungoverned = Duration::from_micros(20_000) * WRITES;
+    assert!(
+        took < ungoverned / 10,
+        "{WRITES} sequential writes took {took:?}; an ungoverned wait would be \
+         about {ungoverned:?}, so the governor is not turning the wait off"
+    );
+}

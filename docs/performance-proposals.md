@@ -849,7 +849,68 @@ pairs it with `wipe_on_start`.
 
 ---
 
-## 10. Explicitly rejected
+## 10. Built and left off: the adaptive writer
+
+**Status: implemented, measured, defaulted to off. The shard cap already fixed
+what it was for, and better.**
+
+§9's shard sweep ended on a tension: pipeline 1 wants one shard and pipeline 16
+wants two, and a fixed cap serves neither perfectly. The idea was a writer that
+adapts — which needs one correction before anything else. **"Merging shards" is
+not possible.** A shard is an independent LMDB environment and a key's shard is
+`XXH3(key) % S`, fixed by the data's location; writes cannot be rerouted to a
+different one at runtime. What *can* adapt is when a writer decides its batch is
+finished.
+
+So: when the queue runs dry with a small batch, wait briefly for company. Bounded
+by what a commit currently costs — waiting longer than the thing you are
+amortising can never pay — and capped so a stalling device cannot produce a long
+linger.
+
+### The governor, which the test suite demanded
+
+The first version had no feedback and the store test suite went from **6 seconds
+to 42**. Sequential single writes were each waiting the full linger for company
+that could not arrive until the write in hand was answered — and an empty queue
+looks identical whether the next write is 160 µs away or is not coming at all.
+
+So the wait tracks what it actually gathers and turns itself off when that falls
+below one record, probing every 64 batches so a writer that fell quiet can
+discover load returning. The suite went back to 5.6 s, and the case is now a
+regression test.
+
+### Measured, and it does not pay
+
+Against the same build with the wait disabled, medians of three alternating
+rounds. With the target at 64 — wait until the batch reaches 64:
+
+| | 1 shard | 2 shards | 4 shards |
+|---|---:|---:|---:|
+| pipeline 1 | 0.57× | 0.93× | **1.23×** |
+| pipeline 16 | 0.85× | 0.83× | 0.81× |
+
+**A loss in five of six.** The reason is the target: at a batch of 40 the fixed
+cost is long since amortised, so waiting buys almost nothing and costs latency —
+and a closed-loop client turns latency into lost throughput one for one. Lowering
+the target to 8, where the fixed cost genuinely dominates:
+
+| | 1 shard | 2 shards |
+|---|---:|---:|
+| pipeline 1 | 0.95× | 1.00× |
+| pipeline 16 | 0.91× | 1.09× |
+
+Neutral — every figure inside this box's noise. The one real gain anywhere is
+four shards at pipeline 1, where a batch of 1.9 rises to 6.6, and **that is the
+shard count §9 moved the default away from for the same reason.** Fewer shards
+fixes batch fragmentation better than lingering does.
+
+It ships off (`write.adaptive_linger_batch = 0`), kept for a deployment that
+needs many writers for reasons of its own and takes the batching hit at low load.
+A knob that helps a configuration we recommend against is not a default.
+
+---
+
+## 11. Explicitly rejected
 
 Recorded so they do not get proposed again:
 
@@ -877,7 +938,7 @@ Recorded so they do not get proposed again:
 
 ---
 
-## 11. Sequencing
+## 12. Sequencing
 
 | Order | Proposal | Effort | Outcome | Confidence |
 |---|---|---|---|---|
@@ -898,7 +959,7 @@ believed, because the first version of it was wrong in the direction of despair.
 
 ---
 
-## 12. How to know it worked
+## 13. How to know it worked
 
 The last two rounds of benchmarking made the methodology a first-class concern,
 and any of this work should inherit it:
