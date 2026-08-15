@@ -259,7 +259,6 @@ impl LmdbEngine {
             }
 
             let expires_at_ms = record.expires_at_ms();
-            let cas = record.cas();
             let tag_ids: Vec<u32> = record.tags.iter().map(|t| t.tag_id.get()).collect();
 
             self.main
@@ -269,7 +268,11 @@ impl LmdbEngine {
                 self.exp
                     .delete(
                         wtxn,
-                        &crate::expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms),
+                        &crate::expiry::encode_key(
+                            expires_at_ms,
+                            &user_key,
+                            self.bucket_granularity_ms,
+                        ),
                     )
                     .map_err(StoreError::from_heed)?;
             }

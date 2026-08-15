@@ -1,18 +1,42 @@
 //! The expiry index.
 //!
-//! Entries are keyed `expires_at_bucket BE || cas BE` and valued with the user
-//! key. Two properties come out of that layout:
+//! Entries are keyed `expires_at_bucket BE || xxh3_64(user key) BE` and valued
+//! with the user key. Three properties come out of that layout:
 //!
 //! 1. **Big-endian means LMDB's byte ordering is time ordering.** The sweeper
 //!    opens a cursor at the start of the index and walks forward until it sees
 //!    a bucket in the future, so its cost is proportional to the number of
 //!    genuinely expired items, never to the size of the database. The idle case
 //!    costs one cursor seek.
-//! 2. **`cas` in the key makes stale entries harmless.** Overwriting a key with
-//!    a new TTL leaves the old entry pointing at it; the sweeper compares the
-//!    entry's `cas` against the record's and skips the mismatch. Writers do
-//!    delete the superseded entry, but the check means a crash between the two
-//!    puts cannot cause data loss.
+//! 2. **The key is stable across overwrites**, which is the whole point of the
+//!    second half. Rewriting a record without moving it to a different bucket
+//!    lands on the *same* index key, so the write path re-puts an identical
+//!    entry and has nothing to delete. This used to be `cas` — monotonic, so
+//!    every overwrite inserted a new entry and deleted the old one from
+//!    wherever the previous write had left it. Measured on the write-path
+//!    benchmarks, that churn was **most of the cost of a write**: removing it
+//!    took a repeatedly overwritten key from 31.7 µs to 1.3 µs, and an ordinary
+//!    1 KiB overwrite by 1.7×. See `docs/performance-proposals.md` §5.
+//! 3. **A stale entry is detected exactly**, by comparing its bucket against
+//!    the one the record's own deadline belongs in. `cas` used to do this job
+//!    and did it as a proxy; a bucket comparison answers the question the
+//!    sweeper is actually asking — *does this entry still describe this
+//!    record?* — so a crash between the delete and the put still cannot cause
+//!    data loss.
+//!
+//! **The hash is why this is 16 bytes and not `bucket || user key`.** LMDB caps
+//! a key at 511 bytes and [`vash_core::MAX_KEY_LEN`] is also 511, so a prefix
+//! plus a maximum-length key does not fit — the same wall, and the same answer,
+//! as [`crate::reclaim`]'s tag index. A 64-bit collision between two keys in
+//! one bucket drops an index entry, so that record is not swept or evicted
+//! proactively: it stays correct, because the read path checks liveness and the
+//! TTL independently, it just lingers until something else displaces it.
+//!
+//! **Ordering within a bucket is therefore by key hash**, which is stable and
+//! arbitrary, where it used to be by `cas` and so by write order. The capacity
+//! evictor walks this index, so it no longer prefers the least recently written
+//! record among equals. That is a deliberate trade: eviction runs only above
+//! the soft watermark, and the churn it cost was paid on every write.
 //!
 //! The bucket is the expiry time rounded **up** to a granularity, which
 //! clusters entries onto shared B-tree pages and cuts the write amplification
@@ -40,7 +64,8 @@ pub const EXPIRY_KEY_LEN: usize = 16;
 /// future, the expiry sweeper stops before reaching them — they are evictable
 /// but never *expire*.
 ///
-/// Within the bucket, entries are ordered by CAS, which is insertion order.
+/// Within the bucket, entries are ordered by key hash — stable, and unrelated
+/// to when the record was written. See the module docs.
 pub const NEVER_BUCKET: u64 = u64::MAX;
 
 /// Rounds an expiry timestamp up to the next multiple of `granularity_ms`.
@@ -67,14 +92,21 @@ pub fn bucket_for(expires_at_ms: u64, granularity_ms: u64) -> u64 {
 }
 
 #[inline]
-pub fn encode_key(expires_at_ms: u64, cas: u64, granularity_ms: u64) -> [u8; EXPIRY_KEY_LEN] {
+pub fn encode_key(
+    expires_at_ms: u64,
+    user_key: &[u8],
+    granularity_ms: u64,
+) -> [u8; EXPIRY_KEY_LEN] {
     let mut key = [0u8; EXPIRY_KEY_LEN];
     key[..8].copy_from_slice(&bucket_for(expires_at_ms, granularity_ms).to_be_bytes());
-    key[8..].copy_from_slice(&cas.to_be_bytes());
+    // Must be a stable hash: this is persisted, so a per-process seed would
+    // orphan the whole index on restart. The same reasoning, and the same
+    // function, as `reclaim::index_key`.
+    key[8..].copy_from_slice(&xxhash_rust::xxh3::xxh3_64(user_key).to_be_bytes());
     key
 }
 
-/// Splits an index key back into `(bucket, cas)`.
+/// Splits an index key back into `(bucket, key hash)`.
 #[inline]
 pub fn decode_key(key: &[u8]) -> Option<(u64, u64)> {
     if key.len() != EXPIRY_KEY_LEN {
@@ -177,7 +209,7 @@ impl LmdbEngine {
         stats.scanned = victims.len();
 
         for (index_key, user_key) in victims {
-            let (_, entry_cas) = crate::expiry::decode_key(&index_key).expect("validated above");
+            let (entry_bucket, _) = crate::expiry::decode_key(&index_key).expect("validated above");
 
             match self
                 .main
@@ -186,10 +218,15 @@ impl LmdbEngine {
             {
                 Some(blob) => {
                     let record = RecordRef::parse(blob)?;
-                    // The CAS check is what makes a stale entry harmless: if the
-                    // key was overwritten, this entry no longer describes the
-                    // record and must not delete it.
-                    let current = record.cas() == entry_cas;
+                    // What makes a stale entry harmless: if the record's
+                    // deadline has moved to a different bucket, this entry no
+                    // longer describes it and must not delete it. Exact rather
+                    // than a proxy — it compares the very thing the entry's
+                    // position encodes.
+                    let current = crate::expiry::bucket_for(
+                        record.expires_at_ms(),
+                        self.bucket_granularity_ms,
+                    ) == entry_bucket;
                     let take = current
                         && match accept {
                             Victims::ExpiredOnly => record.is_expired(now_ms),
@@ -264,42 +301,59 @@ mod tests {
 
     #[test]
     fn keys_roundtrip() {
-        let key = encode_key(1_700_000_000_123, 42, 1000);
-        assert_eq!(decode_key(&key), Some((1_700_000_001_000, 42)));
+        let hash = xxhash_rust::xxh3::xxh3_64(b"k");
+        let key = encode_key(1_700_000_000_123, b"k", 1000);
+        assert_eq!(decode_key(&key), Some((1_700_000_001_000, hash)));
         assert_eq!(decode_key(&key[..15]), None);
+    }
+
+    /// The property the whole change rests on: rewriting a record without
+    /// moving it to another bucket lands on the same index key, so there is
+    /// nothing to relocate. Keyed by CAS this was false by construction.
+    #[test]
+    fn the_same_key_in_the_same_bucket_encodes_identically() {
+        let first = encode_key(1_700_000_000_123, b"hot", 1000);
+        let second = encode_key(1_700_000_000_900, b"hot", 1000);
+        assert_eq!(first, second, "same bucket, same key, same entry");
+
+        // A different bucket does move it, which is when the old entry has to
+        // be deleted.
+        let later = encode_key(1_700_000_002_000, b"hot", 1000);
+        assert_ne!(first, later);
+    }
+
+    /// Two keys in one bucket are distinct entries, so neither evicts the
+    /// other's index row.
+    #[test]
+    fn different_keys_in_one_bucket_are_distinct() {
+        assert_ne!(
+            encode_key(1_700_000_000_123, b"a", 1000),
+            encode_key(1_700_000_000_123, b"b", 1000)
+        );
     }
 
     #[test]
     fn records_that_never_expire_sort_last() {
         // They must be in the index so the evictor can reach them, and last so
         // it takes everything with a TTL first.
-        let never = encode_key(vash_core::record::NEVER, 1, 1000);
+        let never = encode_key(vash_core::record::NEVER, b"k", 1000);
         assert_eq!(decode_key(&never).unwrap().0, NEVER_BUCKET);
 
         for expiry in [1u64, 1000, u64::MAX / 2] {
-            assert!(encode_key(expiry, 0, 1000) < never);
+            assert!(encode_key(expiry, b"k", 1000) < never);
         }
-    }
-
-    #[test]
-    fn never_expiring_entries_are_ordered_by_insertion() {
-        // Same bucket, so the CAS tiebreaker decides — and CAS is assigned in
-        // commit order, making eviction oldest-first.
-        let first = encode_key(vash_core::record::NEVER, 10, 1000);
-        let second = encode_key(vash_core::record::NEVER, 11, 1000);
-        assert!(first < second);
     }
 
     #[test]
     fn byte_order_matches_time_order() {
         // This is the property the whole sweeper design rests on.
-        let mut keys: Vec<_> = [(5000u64, 9u64), (1000, 3), (1000, 1), (9000, 0)]
+        let mut keys: Vec<_> = [5000u64, 1000, 9000, 2000]
             .into_iter()
-            .map(|(e, c)| encode_key(e, c, 1000))
+            .map(|e| encode_key(e, b"k", 1000))
             .collect();
         keys.sort();
 
-        let decoded: Vec<_> = keys.iter().map(|k| decode_key(k).unwrap()).collect();
-        assert_eq!(decoded, vec![(1000, 1), (1000, 3), (5000, 9), (9000, 0)]);
+        let buckets: Vec<_> = keys.iter().map(|k| decode_key(k).unwrap().0).collect();
+        assert_eq!(buckets, vec![1000, 2000, 5000, 9000]);
     }
 }

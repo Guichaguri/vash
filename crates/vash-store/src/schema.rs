@@ -7,7 +7,13 @@
 /// - 2: records that never expire are indexed too, so the capacity evictor can
 ///   reach them. A version-1 database would be under-indexed and those records
 ///   could never be evicted, so it is rejected rather than opened.
-pub const SCHEMA_VERSION: u32 = 2;
+/// - 3: the expiry index is keyed by the user key's hash instead of by CAS, so
+///   an overwrite that stays in the same bucket no longer relocates its entry —
+///   which was most of the cost of a write, see `docs/performance-proposals.md`
+///   §5. A version-2 index is keyed by a value this build never computes, so
+///   every entry in it would be unreachable: the sweeper would find nothing to
+///   expire and the evictor nothing to free. Rejected rather than opened.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Maximum named sub-databases. Fixed at environment-open time and impossible
 /// to raise afterwards without reopening, so it is sized now for every
@@ -27,7 +33,7 @@ pub mod db {
     pub const META: &str = "meta";
 
     // Created from M1/M2 onward; named here so the set is reviewable in one place.
-    /// (expires_at_ms BE || cas BE) -> key
+    /// (expires_at_bucket BE || xxh3_64(key) BE) -> key
     pub const EXPIRY: &str = "exp";
     /// DUP_SORT: tag_id BE -> [key]
     pub const TAG_INDEX: &str = "tagidx";

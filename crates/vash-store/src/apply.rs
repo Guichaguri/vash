@@ -135,6 +135,14 @@ struct Displaced {
     deadline: Option<u64>,
     /// Its value, captured only when the caller asked for it.
     previous: Option<Value>,
+    /// The deadline of the record that was there, live or not, which is what
+    /// says **which bucket its expiry entry sits in**.
+    ///
+    /// Distinct from `deadline`, which is `None` for a record that has expired
+    /// or been invalidated. Such a record is invisible to clients but its index
+    /// entry is still there and still has to be accounted for, so the two
+    /// cannot be the same field.
+    indexed_at: Option<u64>,
 }
 
 /// The result of storing a prepared record.
@@ -224,7 +232,18 @@ impl LmdbEngine {
     /// instead would be two more descents of the same B-tree, and — the reason
     /// this exists — they would be *outside* the write transaction, which is
     /// exactly where those two commands used to lose a race.
-    fn displace(&self, wtxn: &mut RwTxn, key: &[u8], want_value: bool) -> Result<Displaced> {
+    ///
+    /// `keep_expiry_row` leaves the expiry entry alone for a caller that will
+    /// decide about it once it knows the new deadline — see
+    /// [`Self::clear_expiry_row`]. The tag rows are cleared either way, because
+    /// nothing about them depends on the write that follows.
+    fn displace(
+        &self,
+        wtxn: &mut RwTxn,
+        key: &[u8],
+        want_value: bool,
+        keep_expiry_row: bool,
+    ) -> Result<Displaced> {
         let Some(blob) = self.main.get(wtxn, key).map_err(StoreError::from_heed)? else {
             return Ok(Displaced::default());
         };
@@ -251,10 +270,15 @@ impl LmdbEngine {
                     cas,
                     expires_at_ms: Some(expires_at_ms),
                 }),
+                indexed_at: Some(expires_at_ms),
             }
         };
 
-        self.clear_index_rows(wtxn, key, &rows)?;
+        if keep_expiry_row {
+            self.clear_tag_rows(wtxn, key, &rows)?;
+        } else {
+            self.clear_index_rows(wtxn, key, &rows)?;
+        }
         Ok(displaced)
     }
 
@@ -263,14 +287,28 @@ impl LmdbEngine {
     /// The half of [`Self::displace`] that reads nothing, so a caller holding
     /// [`IndexRows`] from its own read can reach it without a second lookup.
     fn clear_index_rows(&self, wtxn: &mut RwTxn, key: &[u8], rows: &IndexRows) -> Result<()> {
+        self.clear_expiry_row(wtxn, key, rows.expires_at_ms)?;
+        self.clear_tag_rows(wtxn, key, rows)
+    }
+
+    /// Removes the expiry entry a record owned.
+    ///
+    /// Split from the tag rows because [`Self::apply_set`] cannot decide whether
+    /// this one needs removing until it has resolved the *new* deadline: an
+    /// overwrite that stays in the same bucket writes the identical index key,
+    /// so deleting it and putting it back is pure churn — and that churn was
+    /// most of the cost of a write. See [`crate::expiry`].
+    fn clear_expiry_row(&self, wtxn: &mut RwTxn, key: &[u8], expires_at_ms: u64) -> Result<()> {
         // Every record is indexed, including those that never expire, so the
         // delete is unconditional too.
-        let index_key =
-            crate::expiry::encode_key(rows.expires_at_ms, rows.cas, self.bucket_granularity_ms);
+        let index_key = crate::expiry::encode_key(expires_at_ms, key, self.bucket_granularity_ms);
         self.exp
             .delete(wtxn, &index_key)
             .map_err(StoreError::from_heed)?;
+        Ok(())
+    }
 
+    fn clear_tag_rows(&self, wtxn: &mut RwTxn, key: &[u8], rows: &IndexRows) -> Result<()> {
         for tag_id in &rows.tag_ids {
             self.tagidx
                 .delete(wtxn, &reclaim::index_key(*tag_id, key))
@@ -351,11 +389,17 @@ impl LmdbEngine {
         // `apply_set` below in place of the lookup it would otherwise do.
         // `previous` is filled only when the client asked for it, never merely
         // because a concatenation needed the bytes.
+        // Presence, not liveness: an expired record still owns an index entry,
+        // so this comes from `rows` rather than from `existing`.
+        let indexed_at = rows.as_ref().map(|r| r.expires_at_ms);
         prepared.pre_read = Some(PreRead {
             rows,
             displaced: Displaced {
                 live: existing.is_some(),
-                deadline: existing.as_ref().map(|(_, _, expires_at_ms, _)| *expires_at_ms),
+                indexed_at,
+                deadline: existing
+                    .as_ref()
+                    .map(|(_, _, expires_at_ms, _)| *expires_at_ms),
                 previous: match (&existing, prepared.return_previous) {
                     (Some((cas, mc_flags, expires_at_ms, Some(value))), true) => Some(Value {
                         data: value.clone(),
@@ -702,10 +746,10 @@ impl LmdbEngine {
         patch_cas(&mut prepared.record, cas)?;
 
         let displaced = match prepared.pre_read.take() {
-            None => self.displace(wtxn, &prepared.key, prepared.return_previous)?,
+            None => self.displace(wtxn, &prepared.key, prepared.return_previous, true)?,
             Some(pre) => {
                 if let Some(rows) = &pre.rows {
-                    self.clear_index_rows(wtxn, &prepared.key, rows)?;
+                    self.clear_tag_rows(wtxn, &prepared.key, rows)?;
                 }
                 pre.displaced
             }
@@ -731,11 +775,29 @@ impl LmdbEngine {
             .put(wtxn, &prepared.key, &prepared.record)
             .map_err(StoreError::from_heed)?;
 
+        // **The displaced entry is only in the way if the record changed
+        // bucket.** When it did not, the key below is byte-identical to the one
+        // already indexed and the put re-establishes it, so there is nothing to
+        // delete — and skipping that delete is the whole of what makes an
+        // overwrite cheap. When it did, the old entry is somewhere else in the
+        // index and has to go, or it outlives the record it describes.
+        //
+        // The put stays unconditional even when the key is unchanged: it is one
+        // page against the delete's page plus rebalance, and it means an entry
+        // that somehow went missing is put back rather than assumed.
+        if let Some(previously) = displaced.indexed_at
+            && crate::expiry::bucket_for(previously, self.bucket_granularity_ms)
+                != crate::expiry::bucket_for(expires_at_ms, self.bucket_granularity_ms)
+        {
+            self.clear_expiry_row(wtxn, &prepared.key, previously)?;
+        }
+
         // Indexed unconditionally: a record outside this index cannot be chosen
         // as an eviction victim, so a cache of TTL-less keys would have nothing
         // to free under pressure. Never-expiring records sort last (see
         // `expiry::NEVER_BUCKET`), so they go only after everything with a TTL.
-        let index_key = crate::expiry::encode_key(expires_at_ms, cas, self.bucket_granularity_ms);
+        let index_key =
+            crate::expiry::encode_key(expires_at_ms, &prepared.key, self.bucket_granularity_ms);
         self.exp
             .put(wtxn, &index_key, &prepared.key)
             .map_err(StoreError::from_heed)?;
@@ -763,7 +825,7 @@ impl LmdbEngine {
         // `displace` already reads the record and judges its liveness, on the
         // way to clearing its index rows. Asking it rather than repeating the
         // lookup halves the B-tree descents a delete costs.
-        let displaced = self.displace(wtxn, key, false)?;
+        let displaced = self.displace(wtxn, key, false, false)?;
         self.main.delete(wtxn, key).map_err(StoreError::from_heed)?;
 
         Ok(displaced.live)

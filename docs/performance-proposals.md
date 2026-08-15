@@ -303,11 +303,11 @@ throwing away the cause.
 
 ---
 
-## 5. Measured, not yet built: stop relocating the expiry index
+## 5. Implemented: stop relocating the expiry index
 
-**Status: priced. The largest write cost found so far, and the design it needs
-is settled — but it changes the on-disk format and the eviction ordering, so it
-is waiting on that call rather than on more measurement.**
+**Status: shipped. A large win in the CPU-bound regime, and no measurable
+end-to-end change on this device-bound box — both results below, because only
+one of them supports the change.**
 
 From §2: every `SET` is two B-tree puts and, on overwrite, a delete. The `exp`
 key is `(bucketed deadline, cas)` and CAS advances on every write, so an
@@ -404,9 +404,68 @@ real regression in eviction quality, not a free win.
 **It is an on-disk format change**, so `SCHEMA_VERSION` goes to 3 and existing
 databases are refused at startup. There is precedent — version 1 was rejected
 the same way when never-expiring records started being indexed — and for a cache
-that is a documented, survivable operation. It could instead be migrated by
-rebuilding the index from `main` at startup, which is one full scan, at the cost
-of writing and testing a migration path.
+that is a documented, survivable operation. Verified end to end: a store written
+by the previous build refuses to open with
+
+```text
+database is corrupt or was written by an incompatible build:
+database has schema version 2, this build expects 3
+```
+
+Both were accepted deliberately. A migration — rebuilding the index from `main`
+at startup, one full scan — was available and not taken, because nothing is
+running on this yet.
+
+### What it measured
+
+Two regimes, and they disagree.
+
+**In-process, `ephemeral`, commits amortised over 256 operations** — so no
+`fsync` and no queue hop, and what is left is B-tree work. Measured as a
+same-session A/B, stashing the change and restoring it between runs rather than
+comparing across sessions, because medians on this box do not survive that:
+
+| benchmark | before | after | |
+|---|---:|---:|---:|
+| `rmw_plain_set` — one hot key | 68.3 µs | **1.30 µs** | 53× |
+| `rmw_plain_set_large` — scattered over 200,000 keys | 244.1 µs | **6.00 µs** | 41× |
+| `set_many_untagged` | 100.8 µs | 64.4 µs | 1.6× |
+| `overwrite_existing` 1 KiB | 51.7 µs | 66.7 µs | noise |
+
+The last row goes through the writer thread and a real commit, which dominate it;
+it swung from 116.9 µs to 50.8 µs across other runs of the same build. Only the
+engine-level rows say anything.
+
+**Through the server, four cores, `relaxed`, alternating rounds** — nothing:
+
+| keyspace | before, commit/record | after, commit/record |
+|---|---:|---:|
+| 20,000 keys | 0.129, 0.164 ms | 0.195 ms |
+| 1,000,000 keys | 0.185, 0.268 ms | 0.255, 0.294, 0.294 ms |
+
+Two to three clean samples per arm, with the device stalling in half the rounds
+— `exp-off` twice at over 6 ms per record, `exp-on` once. **On what survives,
+the change is flat to slightly worse.**
+
+### Why the two disagree, and why it stayed
+
+The engine benchmark removes device time entirely, so B-tree work is 100% of what
+it measures. The container pays 0.13–0.3 ms per record of commit on a virtualised
+disk, and the tens of microseconds of tree work this saves are a small share of
+that, inside the noise of a box that stalls every other round.
+
+There is also a real countervailing effect. The old scheme's *put* was a
+sequential append — CAS is monotonic, so it always landed at the right edge of
+the bucket — and its *delete* was at a random position. The new scheme has one
+random put and no delete. It removes the expensive half and makes the cheap half
+expensive, which is still a net removal of work but not the clean subtraction the
+stub measured.
+
+It stayed because it strictly removes a B-tree operation from every write, it is
+covered by tests, and the regime it wins in is the one a real device and an
+`--ephemeral` deployment both sit closer to than this container does. **The
+end-to-end benefit on this hardware is unproven, and that is the honest state of
+it** — the outstanding validation is a run on a machine whose disk does not stall.
 
 ---
 
@@ -576,7 +635,7 @@ Recorded so they do not get proposed again:
 | ~~1~~ | §3 `resident_mode` | done | **reads lead both servers** — 173,659 and 781,427 | **measured** |
 | ~~2~~ | §4 one submission per block, shards in parallel | done | **5.4–6.4× on pipelined writes** | **measured** |
 | ~~3~~ | §6 `WRITE_MAP` under `relaxed` | done | **no effect, reverted** — 6% the wrong way, worse stall tail | **measured** |
-| 4 | §5 expiry-index relocation | ~1 week | **1.7–3× on writes, 53× on a hot key** | **measured** — blocked on a format/eviction decision, not on evidence |
+| ~~4~~ | §5 expiry-index relocation | done | **41–53× less B-tree work**; no measurable end-to-end change on this box | **measured**, and the two regimes disagree — see §5 |
 | 5 | §7 RAM write-back tier | a milestone | writes competitive with memcached | design-level only |
 
 **Where that leaves the objective.** Reads are done: vash is ahead of both

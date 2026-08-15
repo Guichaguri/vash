@@ -187,6 +187,50 @@ fn overwriting_does_not_accumulate_index_entries() {
     assert_eq!(h.entries(), 1);
 }
 
+/// **Distinct keys sharing a bucket are distinct entries.** The expiry index is
+/// keyed by the deadline bucket and a hash of the user key, so every record
+/// expiring in the same second lands next to the others — if that second half
+/// did not separate them they would overwrite one another's rows and all but
+/// one record would be left unreachable by the sweeper.
+#[test]
+fn many_keys_in_one_bucket_are_all_indexed_and_all_swept() {
+    let h = Harness::with(|c| c.write.sweep_interval_ms = 5);
+
+    // The same TTL, so the same bucket, for every one of them.
+    for i in 0..64u32 {
+        h.set(format!("shared-{i:03}").as_bytes(), b"v", 1);
+    }
+    assert_eq!(
+        h.expiry_entries(),
+        64,
+        "every key needs its own row, however crowded the bucket"
+    );
+
+    h.wait_for("the whole bucket to be reclaimed", |h| h.entries() == 0);
+    assert_eq!(h.expiry_entries(), 0);
+}
+
+/// Extending a deadline must move the record out of reach of the old one. The
+/// entry is keyed by the bucket, so the sweeper reaching the old bucket has to
+/// find nothing that still points at this record.
+#[test]
+fn extending_a_ttl_saves_the_record_from_its_old_deadline() {
+    let h = Harness::with(|c| c.write.sweep_interval_ms = 5);
+
+    h.set(b"reprieved", b"v", 1);
+    h.set(b"reprieved", b"v", 3600);
+    assert_eq!(h.expiry_entries(), 1);
+
+    // Well past the deadline it was first given.
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(
+        h.get(b"reprieved").as_deref(),
+        Some(&b"v"[..]),
+        "the old deadline must not reach a record that has moved past it"
+    );
+    assert_eq!(h.expiry_entries(), 1);
+}
+
 #[test]
 fn overwriting_with_a_different_ttl_replaces_the_entry() {
     let h = Harness::new();
