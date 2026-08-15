@@ -340,23 +340,58 @@ the assumption; §2's whole value is that it was measured rather than guessed.
 
 ---
 
-## 6. Proposal 4 — `WRITE_MAP` under `relaxed`, on Unix
+## 6. Tried and rejected: `WRITE_MAP` under `relaxed`
 
-**Status: a flag, an hour, and a benchmark run.**
+**Status: implemented, measured, reverted.**
 
 `env_flags` sets `MDB_WRITEMAP` only for `ephemeral`. It writes dirty pages
 straight through the map instead of allocating and copying them, and it is
-independent of the sync flags — `MDB_NOMETASYNC` and `MDB_WRITEMAP` compose.
-Windows keeps today's flags; §11 of the plan measured `WRITE_MAP` failing at
-env-open there at every map size tried.
+independent of the sync flags — `MDB_NOMETASYNC` and `MDB_WRITEMAP` compose, so
+`relaxed`'s guarantee that a crash cannot corrupt the database would have been
+kept. **Expected: single-digit percent to perhaps 1.5×** on the marginal cost.
 
-**Expected**: single-digit percent to perhaps 1.5× on the marginal cost, because
-it removes a copy per dirty page from exactly the path §2 says dominates. Cheap
-to try, trivially revertible, and worth knowing before the larger work starts.
+It was a three-line change. Two images were built from the same tree differing
+only in that flag, and the mapping was checked in `/proc/1/maps` to confirm the
+difference reached the binary — `r--s` without it, `rw-s` with — because "no
+measurable difference" is also what comparing two identical binaries looks like.
 
-**Caveat worth stating**: `WRITE_MAP` gives up LMDB's protection against a stray
-write corrupting the map through a dangling pointer. In a codebase with no
-`unsafe` in the write path that is a small risk, but it is not zero.
+### What it measured
+
+Ten alternating rounds, `SET`-only at pipeline 16 over 100 connections, on the
+four-core container. The box stalls: four to five rounds in ten had a commit cost
+an order of magnitude above the rest, and the alternating order caught one round
+where **both** images collapsed together (675 and 670 ops/s), which is what says
+those are the device rather than the build.
+
+Splitting the rounds where the device behaved from the rounds where it did not:
+
+| | clean rounds | median ops/s | median commit/record |
+|---|---:|---:|---:|
+| without `WRITE_MAP` | 6 of 10 | 21,497 | 0.176 ms |
+| **with `WRITE_MAP`** | 5 of 10 | 20,254 | 0.186 ms |
+
+**A 6% difference, in favour of not having it, against a run-to-run spread of
+19,240–26,193 on the same configuration.** There is no effect here to adopt.
+
+One difference was consistent, and it points the wrong way: **the stalls are far
+worse with the flag on.** The worst commit costs without it were 5.6–7.1 ms per
+record; with it, 52.8 and 77.0 ms, with the writer's batch swelling to 114 as the
+queue backed up behind them. That is what `msync` over a dirty 4 GiB mapping
+costs when the device is already struggling, against `pwrite` of exactly the
+pages that changed — plausible as a mechanism, and unmeasured beyond the fact
+that it happened twice and never happened without the flag.
+
+### Why it stays reverted
+
+`WRITE_MAP` gives up LMDB's protection against a stray write corrupting the map
+through a dangling pointer. In a codebase with no `unsafe` in the write path that
+risk is small, but `relaxed` is the **default** durability, and the bar for
+trading a safety property on a default is a clear and repeatable win. A 6%
+difference of the wrong sign, plus a worse tail, is not that.
+
+Worth re-testing on a real device rather than a virtualised one, where the
+`msync`-versus-`pwrite` difference should be smaller and the stalls should not
+exist. Nothing here generalises past the hardware described at the top.
 
 ---
 
@@ -470,7 +505,7 @@ Recorded so they do not get proposed again:
 |---|---|---|---|---|
 | ~~1~~ | §3 `resident_mode` | done | **reads lead both servers** — 173,659 and 781,427 | **measured** |
 | ~~2~~ | §4 one submission per block, shards in parallel | done | **5.4–6.4× on pipelined writes** | **measured** |
-| 3 | §6 `WRITE_MAP` under `relaxed` | hours | 1.0–1.5× on writes | low, but nearly free to find out |
+| ~~3~~ | §6 `WRITE_MAP` under `relaxed` | done | **no effect, reverted** — 6% the wrong way, worse stall tail | **measured** |
 | 4 | §5 expiry-index relocation | measure first, then ~1 week | unknown — and §2's correction means it should be re-costed against the new per-record figure first | unknown until measured |
 | 5 | §7 RAM write-back tier | a milestone | writes competitive with memcached | design-level only |
 

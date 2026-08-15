@@ -26,6 +26,9 @@ fn env_flags(durability: Durability) -> EnvFlags {
     let mut flags = EnvFlags::empty();
     match durability {
         Durability::Durable => {}
+        // `WRITE_MAP` belongs here on paper and was measured not to earn its
+        // place: no throughput gain under `relaxed`, and a far worse tail when
+        // the device stalls. See `docs/performance-proposals.md` §6.
         Durability::Relaxed => flags |= EnvFlags::NO_META_SYNC,
         Durability::Ephemeral => {
             flags |= EnvFlags::NO_SYNC;
