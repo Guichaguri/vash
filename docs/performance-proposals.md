@@ -734,6 +734,24 @@ then 4,929 for the same build and command), so their ratios are direction, not
 magnitude. The server-side signal agrees with the direction: queue wait fell from
 18.0 ms to 10.3 ms at pipeline 16 and from 14.3 ms to 4.8 ms at pipeline 1.
 
+### It also cost 7× on reads, which took three rounds to notice
+
+**This change carried a bug for two commits, and the benchmark that caught it
+issues no writes.** Awaiting a future inline splices its state into the caller's,
+so the decoded `WriteRun`, the permit and the pending submission became part of
+`drain`'s future — and `drain`'s future is part of every connection task's,
+polled on every block whether or not it contains a write. Pipelined `GET` with
+`resident_mode` fell from 484,861 to 70,032, and the ordinary read path lost
+about 26% alongside it. It showed up in
+[benchmarks.md](benchmarks.md#resident_mode-reversed-on-pipelined-reads-and-why)
+as an unexplained reversal in a setting three sections above this one.
+
+`Box::pin` on the single call site fixes it: 762,859 against 101,852 with
+`resident_mode`, 237,584 against 135,231 without, and pipelined `SET` at 0.97×
+which is inside this box's noise. **The lesson generalises past this change: an
+`.await` costs the function it sits in, not only the path that reaches it.** A
+cold branch holding a large future taxes every poll of the task containing it.
+
 ---
 
 ## 9. Implemented: stop syncing on every commit
