@@ -25,8 +25,15 @@ pub fn simple(out: &mut Vec<u8>, text: &str) {
 }
 
 pub fn ok(out: &mut Vec<u8>) {
-    out.extend_from_slice(b"+OK\r\n");
+    out.extend_from_slice(OK);
 }
+
+/// `+OK`, as bytes.
+///
+/// Named because the awaited write path in `vash-server` renders a whole run of
+/// these at once, and a reply spelled out at that call site is one that can
+/// drift from [`ok`].
+pub const OK: &[u8] = b"+OK\r\n";
 
 /// `-<code> <message>`. `code` is the part clients pattern-match on, so it is
 /// separated from the prose rather than baked into it.

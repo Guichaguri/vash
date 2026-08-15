@@ -1880,3 +1880,73 @@ async fn inline_reads_stays_an_explicit_choice() {
         Some("yes")
     );
 }
+
+/// **The multi-threaded runtime takes a different hand-off**, and it is the one
+/// production runs on while `#[tokio::test]` defaults to the other. `run_block`
+/// uses `block_in_place` there and `spawn_blocking` on a current-thread runtime,
+/// because `block_in_place` panics rather than degrading when there is no other
+/// worker to hand the queue to. A test on the default flavour therefore cannot
+/// see the path that actually ships.
+///
+/// This drives writes, reads and a guarded write over the real runtime, so a
+/// mistake in that branch is a failed test rather than a panicking server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_multi_threaded_runtime_serves_the_whole_command_surface() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    assert_eq!(conn.line("set k 0 0 1\r\nA\r\n").await, "STORED\r\n");
+    assert_eq!(conn.get("get k\r\n").await, "VALUE k 0 1\r\nA\r\nEND\r\n");
+    assert_eq!(conn.line("add k 0 0 1\r\nB\r\n").await, "NOT_STORED\r\n");
+    assert_eq!(conn.line("delete k\r\n").await, "DELETED\r\n");
+    assert_eq!(conn.get("get k\r\n").await, "END\r\n");
+
+    // And a pipelined run of writes, which is the shape the hand-off change was
+    // made for: one block, one submission, one reply each.
+    let mut block = String::new();
+    for i in 0..16 {
+        block.push_str(&format!("set p{i} 0 0 1\r\nv\r\n"));
+    }
+    conn.send(block.as_bytes()).await;
+    assert_eq!(conn.read_until("STORED\r\n").await, "STORED\r\n".repeat(16));
+}
+
+/// **Admission control must bound writes, not deadlock them.** An awaited write
+/// holds a permit across its submit *and* its wait, so a server with one permit
+/// serialises every writer in the process. If the permit were ever dropped late
+/// — or not at all — this is where it would show, as a hang rather than a wrong
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_share_a_single_write_permit() {
+    const CONNECTIONS: usize = 8;
+    const EACH: usize = 12;
+
+    // One permit for the whole server: `write_permits` is sized from this.
+    let server = TestServer::start_with(|config| config.server.max_blocking_threads = 1).await;
+
+    let mut clients = Vec::new();
+    for id in 0..CONNECTIONS {
+        let mut conn = server.connect().await;
+        clients.push(tokio::spawn(async move {
+            for n in 0..EACH {
+                let key = format!("c{id}-{n}");
+                let line = format!("set {key} 0 0 1\r\nv\r\n");
+                assert_eq!(conn.line(&line).await, "STORED\r\n");
+            }
+        }));
+    }
+    for client in clients {
+        client.await.expect("a writer panicked or hung");
+    }
+
+    // Every write landed, so nothing was lost to the permit hand-off.
+    let mut conn = server.connect().await;
+    for id in 0..CONNECTIONS {
+        for n in 0..EACH {
+            assert_eq!(
+                conn.get(&format!("get c{id}-{n}\r\n")).await,
+                format!("VALUE c{id}-{n} 0 1\r\nv\r\nEND\r\n")
+            );
+        }
+    }
+}

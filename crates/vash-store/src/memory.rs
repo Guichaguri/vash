@@ -261,6 +261,12 @@ impl Store for MemoryStore {
         true
     }
 
+    /// Applied inline — there is no writer thread to wait for — so the handle
+    /// comes back already resolved.
+    fn submit_set_many(&self, sets: &[Set<'_>]) -> Result<crate::PendingSetMany> {
+        self.set_many(sets).map(crate::PendingSetMany::ready)
+    }
+
     fn set_many(&self, sets: &[Set<'_>]) -> Result<Vec<u64>> {
         let now = self.clock.now_ms();
         let mut inner = self.lock()?;

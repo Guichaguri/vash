@@ -141,10 +141,12 @@ pub async fn handle(
         // only a dialect's own parser can say where its commands end — and what
         // a fatal framing error owes the client. Everything after that point is
         // identical, and used to be written out three times.
+        // Ordered so an authenticated connection never touches the lock. A gated
+        // connection's write owes a refusal that only the dialect's own executor
+        // can render, so the awaited path is withheld from it entirely.
+        let gated = !conn_auth.is_authenticated() && state.auth.required();
         let keep_going = match protocol.expect("set above") {
             Protocol::Vcp => {
-                // Ordered so an authenticated connection never touches the lock.
-                let gated = !conn_auth.is_authenticated() && state.auth.required();
                 drain(
                     &state,
                     &mut conn_auth,
@@ -156,6 +158,7 @@ pub async fn handle(
                         crate::dispatch::execute_vcp_block(state, conn, block, out)
                     },
                     |_, _| {},
+                    None,
                 )
                 .await?
             }
@@ -169,6 +172,11 @@ pub async fn handle(
                     measure_memcached,
                     |state, conn, block, (), out| execute_memcached_block(state, conn, block, out),
                     |_, _| {},
+                    (!gated).then_some((
+                        crate::dispatch::parse_memcached_writes as ParseWrites,
+                        crate::metrics::Dialect::Memcached,
+                        memcached::encode::STORED,
+                    )),
                 )
                 .await?
             }
@@ -184,6 +192,11 @@ pub async fn handle(
                     // Redis answers a protocol error and *then* hangs up, so the
                     // client learns why instead of seeing a bare disconnect.
                     vash_proto::resp::encode::protocol_error,
+                    (!gated).then_some((
+                        crate::resp::parse_writes as ParseWrites,
+                        crate::metrics::Dialect::Resp,
+                        vash_proto::resp::encode::OK,
+                    )),
                 )
                 .await?
             }
@@ -240,6 +253,10 @@ struct Measured {
     complete: usize,
     /// Every one of them can be answered without touching the writer.
     all_reads: bool,
+    /// Every one of them is an unconditional write that [`crate::dispatch::SetBatch`]
+    /// may hold back — so the whole block is one submission, and it can be
+    /// *awaited* rather than blocked on. See `docs/performance-proposals.md` §8.
+    all_writes: bool,
     /// Framing is unrecoverable; the connection closes once any reply is out.
     fatal: Option<&'static str>,
     /// Total length of the command still arriving, so the buffer can be sized
@@ -252,6 +269,10 @@ impl Default for Measured {
         Self {
             complete: 0,
             all_reads: true,
+            // Both start true and are cleared by the first command that is not
+            // one; an empty block is neither, which the `complete > 0` guard in
+            // `drain` takes care of.
+            all_writes: true,
             fatal: None,
             reserve: 0,
         }
@@ -260,6 +281,68 @@ impl Default for Measured {
 
 /// Executes a block of one dialect's commands, rendering the replies.
 type RunBlock<S> = fn(&ServerState, &mut ConnAuth, &[u8], &mut S, &mut Vec<u8>) -> Closing;
+
+/// A block that is nothing but unconditional writes, decoded and ready to send.
+///
+/// The two text dialects reduce to the same thing here — a list of writes and,
+/// for each, whether the client asked to be told about it — so one run type and
+/// one driver serve both.
+pub(crate) struct WriteRun<'a> {
+    pub sets: Vec<vash_core::Set<'a>>,
+    /// `noreply` for memcached; always false for RESP, which has no such thing.
+    pub suppress: Vec<bool>,
+}
+
+/// Decodes a whole block of writes, or declines.
+type ParseWrites = for<'a> fn(&'a [u8]) -> Option<WriteRun<'a>>;
+
+/// **Serves a block of writes without leaving the runtime worker.**
+///
+/// The ordinary path hands the block to `spawn_blocking`, and that thread then
+/// sleeps on the writer queue for the whole commit — one OS thread parked per
+/// in-flight write. Measured on a four-core container, a write's round trip was
+/// 12.5 ms of which the storage layer accounted for 0.99 ms; the rest was that
+/// hand-off and the contention behind it. Here the work is prepared on the
+/// worker, handed to the shard writers, and *awaited*, so nothing is parked.
+///
+/// Returns `None` when it declines — a decode this path does not model, a
+/// refused submission, or a failed batch — and the caller then runs the block
+/// the ordinary way, which counts, classifies and retries per command exactly
+/// as it always did. Re-running an unconditional write that a shard already
+/// committed rewrites the same bytes, which is the same trade
+/// [`crate::dispatch::SetBatch`] already documents for its own retry.
+async fn run_writes_awaited(
+    state: &Arc<ServerState>,
+    block: &[u8],
+    out: &mut Vec<u8>,
+    parse: ParseWrites,
+    dialect: crate::metrics::Dialect,
+    stored: &'static [u8],
+) -> Option<()> {
+    let run = parse(block)?;
+    if run.sets.is_empty() {
+        return None;
+    }
+
+    // Held across the submit *and* the wait, so this bounds writes in flight
+    // rather than writes being submitted. Without it the shard queues take
+    // everything a hundred connections can offer at once — see
+    // [`ServerState::write_permits`].
+    let _permit = state.write_permits.acquire().await.ok()?;
+
+    let started = std::time::Instant::now();
+    let pending = state.store.submit_set_many(&run.sets).ok()?;
+    let cas = pending.wait().await.ok()?;
+
+    crate::dispatch::count_stored(state, dialect, &run.sets, &cas, started.elapsed());
+    for (index, suppressed) in run.suppress.iter().enumerate() {
+        if !suppressed {
+            let _ = index;
+            out.extend_from_slice(stored);
+        }
+    }
+    Some(())
+}
 
 /// Executes one block of whole commands in whichever tier is safe for it.
 ///
@@ -347,6 +430,10 @@ async fn drain<S: Copy + Send + 'static>(
     measure: impl Fn(&[u8]) -> Measured,
     run: RunBlock<S>,
     on_fatal: fn(&mut Vec<u8>, &'static str),
+    // How this dialect decodes a block of nothing but writes, and what it says
+    // for each one that stored. `None` for a dialect that stays on the ordinary
+    // path — see `measure_vcp`.
+    writes: Option<(ParseWrites, crate::metrics::Dialect, &'static [u8])>,
 ) -> std::io::Result<bool> {
     let measured = measure(read_buf);
     let mut closing = measured.fatal.is_some();
@@ -356,14 +443,27 @@ async fn drain<S: Copy + Send + 'static>(
         // decoded keys and values borrow directly from them.
         let block = read_buf.split_to(measured.complete).freeze();
 
-        // Reads may run on this worker; anything that can write must not,
-        // because a write waits on the shard's writer queue and would block the
-        // worker — and every other connection it serves — behind it.
-        let inline = state.inline_reads && measured.all_reads;
-        if run_block(state, conn_auth, dialect, block, write_buf, inline, run).await?
-            == Closing::Yes
-        {
-            closing = true;
+        // A block that is only writes is submitted and awaited here, holding no
+        // thread while the writer works. It declines — `None` — for anything it
+        // does not model, and the ordinary path below then runs the block
+        // untouched, so this is a shortcut and never the only route.
+        let awaited = match (measured.all_writes, writes) {
+            (true, Some((parse, dialect_kind, stored))) => {
+                run_writes_awaited(state, &block, write_buf, parse, dialect_kind, stored).await
+            }
+            _ => None,
+        };
+
+        if awaited.is_none() {
+            // Reads may run on this worker; anything that can write must not,
+            // because a write waits on the shard's writer queue and would block
+            // the worker — and every other connection it serves — behind it.
+            let inline = state.inline_reads && measured.all_reads;
+            if run_block(state, conn_auth, dialect, block, write_buf, inline, run).await?
+                == Closing::Yes
+            {
+                closing = true;
+            }
         }
     }
 
@@ -388,6 +488,10 @@ fn measure_vcp(buf: &[u8], gated: bool) -> Measured {
             FrameLen::Complete(len) => {
                 let frame = &buf[measured.complete..measured.complete + len];
                 measured.all_reads &= is_read_only_frame(frame);
+                // VCP stays on the ordinary path: a reply carries the request id
+                // from its own frame header, and the pre-auth gate is read from
+                // that header too, neither of which the shared write run models.
+                measured.all_writes = false;
                 measured.complete += len;
             }
             FrameLen::Incomplete { needed } => {
@@ -433,12 +537,19 @@ fn measure_memcached(buf: &[u8]) -> Measured {
             Ok(Outcome::Incomplete) => break,
             Ok(Outcome::Command(parsed)) => {
                 measured.all_reads &= parsed.command.inline_safe();
+                measured.all_writes &= matches!(
+                    parsed.style,
+                    vash_proto::memcached::encode::ResponseStyle::Storage
+                ) && crate::dispatch::awaitable(&parsed.command);
                 measured.complete += parsed.consumed;
             }
             // Counted in, not handled here: the error line has to land in the
             // response stream in the position the bad command occupied, which
             // only the executor knows how to do.
-            Err(ProtocolError::Recoverable { consumed, .. }) => measured.complete += consumed,
+            Err(ProtocolError::Recoverable { consumed, .. }) => {
+                measured.all_writes = false;
+                measured.complete += consumed;
+            }
             Err(ProtocolError::Fatal(detail)) => {
                 measured.fatal = Some(detail);
                 break;
@@ -457,9 +568,13 @@ fn measure_resp(buf: &[u8]) -> Measured {
             Ok(resp::Outcome::Incomplete) => break,
             Ok(resp::Outcome::Command(parsed)) => {
                 measured.all_reads &= crate::resp::inline_safe(&parsed.command);
+                measured.all_writes &= crate::resp::batchable_write(&parsed.command);
                 measured.complete += parsed.consumed;
             }
-            Err(resp::ProtocolError::Recoverable { consumed, .. }) => measured.complete += consumed,
+            Err(resp::ProtocolError::Recoverable { consumed, .. }) => {
+                measured.all_writes = false;
+                measured.complete += consumed;
+            }
             Err(resp::ProtocolError::Fatal(detail)) => {
                 measured.fatal = Some(detail);
                 break;

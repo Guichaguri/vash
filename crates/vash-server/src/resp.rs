@@ -161,6 +161,50 @@ fn flush_sets(
     );
 }
 
+/// Whether a `SET` is one the awaited write path can serve.
+///
+/// Translation is the test: a `SET` whose expiry cannot be represented, or whose
+/// key this store will not hold, has an error to report that only [`execute`]
+/// words correctly, so it fails this and takes the ordinary route.
+pub fn batchable_write(command: &Command<'_>) -> bool {
+    matches!(command, Command::Set(_))
+        && translate(command)
+            .ok()
+            .is_some_and(|domain| crate::dispatch::awaitable(&domain))
+}
+
+/// Decodes a RESP block that is nothing but plain `SET`s.
+///
+/// `None` the moment anything else appears — see
+/// [`crate::dispatch::parse_memcached_writes`], which this mirrors. RESP has no
+/// `noreply`, so every write in the run is answered.
+pub(crate) fn parse_writes(block: &[u8]) -> Option<crate::conn::WriteRun<'_>> {
+    let mut run = crate::conn::WriteRun {
+        sets: Vec::new(),
+        suppress: Vec::new(),
+    };
+    let mut rest = block;
+    while !rest.is_empty() {
+        let Ok(Outcome::Command(parsed)) = vash_proto::resp::parse(rest) else {
+            return None;
+        };
+        if !matches!(parsed.command, Command::Set(_)) {
+            return None;
+        }
+        let domain = translate(&parsed.command).ok()?;
+        let vash_core::Command::Set(set) = domain else {
+            return None;
+        };
+        if !crate::dispatch::awaitable(&vash_core::Command::Set(set.clone())) {
+            return None;
+        }
+        run.sets.push(set);
+        run.suppress.push(false);
+        rest = &rest[parsed.consumed..];
+    }
+    Some(run)
+}
+
 /// Whether a command can be answered without any chance of writing.
 ///
 /// Note what is missing: every arithmetic command rewrites its key, and so does

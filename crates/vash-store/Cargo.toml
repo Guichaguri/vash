@@ -11,6 +11,11 @@ vash-core.workspace = true
 bytes.workspace = true
 crossbeam-channel.workspace = true
 heed.workspace = true
+# `sync` only: a write's reply travels on a `oneshot` so the caller can *await*
+# it instead of parking a thread on it. Nothing here starts or touches a
+# runtime — `tokio::sync` is runtime-agnostic — and tokio is already built for
+# the workspace, so this adds no crate to the graph. See `writer::Writer::send`.
+tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 xxhash-rust.workspace = true

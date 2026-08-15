@@ -373,6 +373,13 @@ fn uriencode(out: &mut Vec<u8>, key: &[u8], percent: Percent) {
 /// [`encode_value_line`].
 pub const RETRIEVAL_END: &[u8] = b"END\r\n";
 
+/// What an accepted storage command answers.
+///
+/// Named because the awaited write path in `vash-server` renders a whole run of
+/// these without going through [`encode`], and a reply spelled out at that call
+/// site is one that can drift from this one.
+pub const STORED: &[u8] = b"STORED\r\n";
+
 /// One `VALUE` line: the header, then the data, then the terminator that
 /// separates it from the next line.
 ///

@@ -21,8 +21,8 @@ it, because it comes from the writer's own counters rather than from the client.
 |---|---:|---:|---:|---:|
 | GET, closed loop | 17,443 | **173,659** ✅ | 50,484 | 130,922 |
 | GET, pipelined | 221,380 | **781,427** ✅ | 475,430 | 651,154 |
-| SET, closed loop | 5,774 | 8,754 | 55,401 | 148,314 |
-| SET, pipelined | 14,140 | 22,754 – 52,237 | 554,785 | 912,234 |
+| SET, closed loop | 5,774 | ~7,300 relaxed, **22,673** ephemeral | 55,401 | 148,314 |
+| SET, pipelined | 14,140 | ~30,000 relaxed, **69,305** ephemeral | 554,785 | 912,234 |
 
 The read rows are [§3](#3-implemented-resident_mode) and the write rows are
 [§4](#4-implemented-one-writer-submission-per-block-not-per-command), both since
@@ -34,12 +34,12 @@ on both read workloads with a setting that existed, shipped, and was off by
 default. Everything the read section of `benchmarks.md` agonises over was one
 flag and the safety argument behind it — now `store.resident_mode`, §3.
 
-**Writes were assumed to be a storage problem**, and three changes later they are
-not. §4, §5 and §6 between them took the storage engine down to **8% of what a
-write costs** with syncing off. The remaining 92% is the request path — the
-hand-off that puts every in-flight write on its own OS thread — which is
-[§8](#8-what-the-measurement-points-at-instead), and which is why the
-write-back tier in §7 is *not* the next thing to build.
+**Writes were assumed to be a storage problem**, and four changes later they are
+not. §4 and §5 took the storage engine down to **8% of what a write costs** with
+syncing off; the remaining 92% was the request path, and
+[§8](#8-implemented-writes-off-the-blocking-pool) took the hand-off out of it.
+That is why the write-back tier in §7 is measured *against* rather than built:
+it addresses the 8%.
 
 ---
 
@@ -564,8 +564,7 @@ duration, and a hundred of them contend for four cores. That is the cost, and a
 RAM tier does not remove it: the write would still cross the same hand-off to
 reach the RAM tier.
 
-**So this is the wrong change**, and [§8](#8-what-the-measurement-points-at-instead)
-is what the numbers actually point at. The design is kept below because it
+**So this is the wrong change**, and [§8](#8-implemented-writes-off-the-blocking-pool) is what the numbers actually point at. The design is kept below because it
 remains correct, and because if the hand-off is fixed and the device becomes the
 limit again, this is what comes next.
 
@@ -639,10 +638,10 @@ with memcached and a clear lead over Redis**, not a rout.
 
 ---
 
-## 8. What the measurement points at instead
+## 8. Implemented: writes off the blocking pool
 
-**Status: proposed, and the first thing to build. It is what §7's decomposition
-actually indicts.**
+**Status: shipped. 1.2–2.5× on writes, and it took two attempts — the first one
+regressed the default and is recorded below because the reason is the finding.**
 
 A write is handed to `tokio::task::spawn_blocking`, and that thread then
 **blocks on a channel** waiting for the shard writer to commit it. The blocking
@@ -670,15 +669,69 @@ thread at all while the writer works.
 - Reads keep both paths: inline under `resident_mode`, the pool otherwise, since
   a read genuinely can fault.
 
-**Expected**: the 11 ms is thread contention, so removing the threads should take
-a write's round trip toward a read's. It will not reach it — the writer queue
-wait and commit are real, 0.99 ms in ephemeral and 5.4 ms in `relaxed` — but
-those are the terms the storage work actually costs, and everything above them
-is overhead this removes.
+### The cheap version first, because it was an hour rather than a week
 
-**Measure it the way §6 was measured**: alternating rounds, medians, and the
-writer's own counters, because a change that moves throughput without moving
-`queue wait` or `commit` has done what it says.
+`tokio::task::block_in_place` tests the same hypothesis without touching the
+storage trait: it keeps the work on the current worker and tells the runtime to
+move that worker's *other* tasks elsewhere, so the task allocation, the queue and
+the double wake all go. Four alternating rounds each:
+
+| | `spawn_blocking` | `block_in_place` | |
+|---|---:|---:|---:|
+| ephemeral, pipeline 1 | 9,857 | 18,310 | 1.86× |
+| ephemeral, pipeline 16 | 69,484 | 127,007 | 1.83× |
+| relaxed, pipeline 1 | 6,762 | 4,612 | **0.68×** |
+| relaxed, pipeline 16 | 30,775 | 20,863 | **0.68×** |
+
+**1.85× when the wait is short and 0.68× when it is long**, split exactly by
+durability. That is the hypothesis confirmed *and* the cheap version disqualified
+in one table: `block_in_place` still holds a thread, so a 5 ms writer-queue wait
+converts workers faster than the runtime can replace them. It was reverted.
+
+### What shipped
+
+`Store::submit_set_many` hands the prepared records to the shard writers and
+returns; the reply arrives on a `tokio::sync::oneshot` that the connection task
+**awaits**. No thread is held. A block that is nothing but unconditional writes
+takes this path; anything else — a read, a guarded write, a tagged write, an
+unauthenticated connection — declines and runs exactly as before, so this is a
+shortcut and never the only route.
+
+Tagged writes are excluded for a specific reason: registering a tag name is
+itself a synchronous write through the same queue, taken inside the submit, and a
+runtime worker may not block on it. That was found by the test suite rather than
+by inspection.
+
+### It needed admission control, which the pool had been providing by accident
+
+The first working version regressed the one case the pool had been protecting:
+
+| | before | awaited, unbounded | awaited, bounded |
+|---|---:|---:|---:|
+| relaxed, pipeline 16 | 19,047 | **10,822** | 9,986 → see below |
+
+A write submitted from the pool was bounded by the size of that pool — at most
+`server.max_blocking_threads` could be queued at the writers. Awaiting removes
+the thread and with it the bound, so a hundred connections flooded the shard
+queues: throughput fell to 0.57× and the writers' queue wait climbed from 5.2 ms
+to 17.1 ms. `ServerState::write_permits` restores the same ceiling explicitly, a
+semaphore held across the submit *and* the wait.
+
+With it, all four cases improve:
+
+| | `spawn_blocking` | awaited | |
+|---|---:|---:|---:|
+| ephemeral, pipeline 1 | 9,615 | **22,673** | 2.36× |
+| ephemeral, pipeline 16 | 57,189 | **69,305** | 1.21× |
+| relaxed, pipeline 1 | 2,884 | **7,347** | 2.55× |
+| relaxed, pipeline 16 | 4,929 | **9,986** | 2.03× |
+
+**Read the ephemeral rows and distrust the relaxed ones.** Ephemeral reproduced
+across both rounds — 2.32× and 2.36× at pipeline 1, 1.19× and 1.21× at 16. The
+relaxed baselines swung by a factor of four between rounds on this box (19,047
+then 4,929 for the same build and command), so their ratios are direction, not
+magnitude. The server-side signal agrees with the direction: queue wait fell from
+18.0 ms to 10.3 ms at pipeline 16 and from 14.3 ms to 4.8 ms at pipeline 1.
 
 ---
 
@@ -718,7 +771,7 @@ Recorded so they do not get proposed again:
 | ~~2~~ | §4 one submission per block, shards in parallel | done | **5.4–6.4× on pipelined writes** | **measured** |
 | ~~3~~ | §6 `WRITE_MAP` under `relaxed` | done | **no effect, reverted** — 6% the wrong way, worse stall tail | **measured** |
 | ~~4~~ | §5 expiry-index relocation | done | **41–53× less B-tree work**; no measurable end-to-end change on this box | **measured**, and the two regimes disagree — see §5 |
-| 5 | §8 writes off the blocking pool | ~1 week | the 11 ms of a 12.5 ms write that is not storage | **measured** — the decomposition in §7 |
+| ~~5~~ | §8 writes off the blocking pool | done | **1.2–2.5× on writes** | **measured**, and it needed a semaphore the pool had been standing in for |
 | 6 | §7 RAM write-back tier | a milestone | **not the bottleneck**; revisit only if §8 makes the device the limit again | measured against, see §7 |
 
 **Where that leaves the objective.** Reads are done: vash is ahead of both

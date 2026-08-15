@@ -195,9 +195,12 @@ impl Store for LmdbStore {
     }
 
     fn set_many(&self, sets: &[Set<'_>]) -> Result<Vec<u64>> {
+        self.submit_set_many(sets)?.wait_blocking()
+    }
+
+    fn submit_set_many(&self, sets: &[Set<'_>]) -> Result<crate::PendingSetMany> {
         self.ensure_tags_registered(sets)?;
 
-        let mut results = vec![0u64; sets.len()];
         let grouped = self.shards.group(sets, |set| set.key.as_bytes());
 
         // **Every shard is given its work before any of them is waited on.**
@@ -205,7 +208,7 @@ impl Store for LmdbStore {
         // milliseconds; waiting for each before submitting the next turned a
         // batch across four shards into four commits end to end, which is most
         // of why sharding did so little for batched writes. Sent here, awaited
-        // below, so the commits overlap.
+        // by the caller, so the commits overlap.
         let mut pending = Vec::with_capacity(self.shards.all().len());
         for (index, group) in grouped.runs() {
             let shard = &self.shards.all()[index];
@@ -226,19 +229,14 @@ impl Store for LmdbStore {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            pending.push((group, shard.writer.send_set_many(prepared)?));
+            // Positions rather than the group itself, so what comes back owns
+            // everything it needs and can be awaited after the caller's `sets`
+            // have gone out of scope.
+            let positions: Vec<usize> = group.iter().map(|placed| placed.position).collect();
+            pending.push((positions, shard.writer.send_set_many(prepared)?));
         }
 
-        // A batch spanning shards is atomic per shard, not overall — see the
-        // module note in `shard`. Failing here therefore leaves the shards that
-        // did commit committed, which was already true when this was
-        // sequential; the `?` is in the same place it always was.
-        for (group, sent) in pending {
-            for (placed, cas) in group.iter().zip(sent.wait()?) {
-                results[placed.position] = cas;
-            }
-        }
-        Ok(results)
+        Ok(crate::PendingSetMany::sharded(sets.len(), pending))
     }
 
     fn map_locked(&self) -> bool {

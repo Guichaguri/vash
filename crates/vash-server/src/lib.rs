@@ -372,7 +372,15 @@ impl Server {
         // Get everything buffered onto disk before exiting. In `relaxed`
         // durability this is the difference between a clean restart and losing
         // the last few seconds of writes.
-        if let Err(e) = state.store.sync() {
+        // On the blocking pool, not here: a `Sync` crosses the writer queue like
+        // any other operation and waits for it, and that wait is not one a
+        // runtime worker may take.
+        let syncing = Arc::clone(&state.store);
+        if let Err(e) = tokio::task::spawn_blocking(move || syncing.sync())
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|result| result.map_err(std::io::Error::other))
+        {
             error!(error = %e, "final sync failed");
         }
 

@@ -19,6 +19,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 use vash_core::{Applied, Arithmetic, ExpireGuard, Key, SetMode, TtlChange};
 
@@ -31,7 +32,13 @@ use crate::queue::{OwnedArithmetic, PostCommit, WriteOp, WriteOutcome, apply, mi
 
 struct WriteJob {
     op: WriteOp,
-    reply: Sender<Result<WriteOutcome>>,
+    /// Where this job's outcome goes.
+    ///
+    /// A `oneshot` rather than a `crossbeam` channel for one reason: it can be
+    /// **awaited**. A caller that blocks on the reply parks an OS thread for the
+    /// whole queue wait, and measured on a four-core container that hand-off was
+    /// most of what a write cost. See `docs/performance-proposals.md` §8.
+    reply: oneshot::Sender<Result<WriteOutcome>>,
     /// When the caller handed this to the queue.
     ///
     /// The difference between this and the moment its transaction opens is the
@@ -81,12 +88,23 @@ pub(crate) struct Writer {
 /// deliberately not `Drop`-safe in any clever way: dropping one without
 /// [`SetManyPending::wait`] simply abandons the reply, and the writer discovers
 /// that when its send fails.
-pub struct SetManyPending(Receiver<Result<WriteOutcome>>);
+pub struct SetManyPending(oneshot::Receiver<Result<WriteOutcome>>);
 
 impl SetManyPending {
-    /// Blocks until this shard's batch has committed.
+    /// Blocks until this shard's batch has committed. Off a runtime worker
+    /// only — see [`Writer::collect`].
     pub fn wait(self) -> Result<Vec<u64>> {
         Writer::set_many_reply(Writer::collect(self.0)?)
+    }
+
+    /// Awaits this shard's batch, holding no thread while the writer works.
+    ///
+    /// The whole point of the `oneshot`: a connection task can submit a write
+    /// and yield, instead of occupying a pool thread that does nothing but
+    /// sleep until the commit lands.
+    pub async fn wait_async(self) -> Result<Vec<u64>> {
+        let outcome = self.0.await.map_err(|_| StoreError::ShuttingDown)??;
+        Writer::set_many_reply(outcome)
     }
 }
 
@@ -122,8 +140,8 @@ impl Writer {
     ///
     /// The receiver must be drained, or the writer's reply send fails and the
     /// job's work is discarded after it has already been applied.
-    fn send(&self, op: WriteOp) -> Result<Receiver<Result<WriteOutcome>>> {
-        let (reply_tx, reply_rx) = bounded(1);
+    fn send(&self, op: WriteOp) -> Result<oneshot::Receiver<Result<WriteOutcome>>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         let job = WriteJob {
             op,
             reply: reply_tx,
@@ -142,9 +160,16 @@ impl Writer {
         Ok(reply_rx)
     }
 
-    /// Waits for an outcome sent by [`Self::send`].
-    fn collect(reply: Receiver<Result<WriteOutcome>>) -> Result<WriteOutcome> {
-        reply.recv().map_err(|_| StoreError::ShuttingDown)?
+    /// Blocks until an outcome sent by [`Self::send`] arrives.
+    ///
+    /// **Only legal off a runtime worker** — a blocking pool thread, a test, or
+    /// a plain thread. Every caller of the synchronous `Store` write methods is
+    /// on one; the async path uses [`SetManyPending::wait`] instead and parks
+    /// nothing.
+    fn collect(reply: oneshot::Receiver<Result<WriteOutcome>>) -> Result<WriteOutcome> {
+        reply
+            .blocking_recv()
+            .map_err(|_| StoreError::ShuttingDown)?
     }
 
     /// Submits an operation and blocks until it has been committed.

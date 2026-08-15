@@ -55,6 +55,73 @@ pub use engine::Pressure;
 pub use error::{Result, StoreError};
 pub use lmdb::LmdbStore;
 
+/// A [`Store::submit_set_many`] in flight.
+///
+/// Owns everything it needs, so the caller can let its `Set`s go out of scope
+/// and await this afterwards. Awaiting holds no thread: the shard writers do the
+/// work on their own threads and wake this when they are done.
+pub struct PendingSetMany(Submitted);
+
+enum Submitted {
+    /// Nothing to wait for — an implementation that applied the writes inline.
+    Ready(Vec<u64>),
+    /// One entry per shard the batch touched: where its results belong in the
+    /// caller's ordering, and the reply it is waiting on.
+    Sharded {
+        len: usize,
+        shards: Vec<(Vec<usize>, writer::SetManyPending)>,
+    },
+}
+
+impl PendingSetMany {
+    pub(crate) fn ready(cas: Vec<u64>) -> Self {
+        Self(Submitted::Ready(cas))
+    }
+
+    pub(crate) fn sharded(len: usize, shards: Vec<(Vec<usize>, writer::SetManyPending)>) -> Self {
+        Self(Submitted::Sharded { len, shards })
+    }
+
+    /// Blocks until every shard has committed.
+    ///
+    /// **Off a runtime worker only** — this is the path the synchronous
+    /// [`Store::set_many`] takes, and its callers are on the blocking pool.
+    pub fn wait_blocking(self) -> Result<Vec<u64>> {
+        match self.0 {
+            Submitted::Ready(cas) => Ok(cas),
+            Submitted::Sharded { len, shards } => {
+                let mut results = vec![0u64; len];
+                // A batch spanning shards is atomic per shard, not overall — see
+                // the module note in `shard`. Failing here leaves the shards
+                // that did commit committed, which was already true when this
+                // was one sequential loop.
+                for (positions, sent) in shards {
+                    for (position, cas) in positions.into_iter().zip(sent.wait()?) {
+                        results[position] = cas;
+                    }
+                }
+                Ok(results)
+            }
+        }
+    }
+
+    /// Awaits every shard, holding no thread while they work.
+    pub async fn wait(self) -> Result<Vec<u64>> {
+        match self.0 {
+            Submitted::Ready(cas) => Ok(cas),
+            Submitted::Sharded { len, shards } => {
+                let mut results = vec![0u64; len];
+                for (positions, sent) in shards {
+                    for (position, cas) in positions.into_iter().zip(sent.wait_async().await?) {
+                        results[position] = cas;
+                    }
+                }
+                Ok(results)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StoreStats {
     /// Environments in the shard set.
@@ -286,6 +353,20 @@ pub trait Store: Send + Sync + 'static {
 
     /// Stores many values in one transaction: all of them apply, or none do.
     fn set_many(&self, sets: &[Set<'_>]) -> Result<Vec<u64>>;
+
+    /// [`Store::set_many`] split in two: hand the work to the shard writers and
+    /// return without waiting for it.
+    ///
+    /// **This is what lets a write be awaited rather than blocked on.** The
+    /// synchronous form parks the calling thread for the whole queue wait, so a
+    /// server serving it from a pool holds one OS thread per in-flight write —
+    /// measured on a four-core container as most of what a write costs, see
+    /// `docs/performance-proposals.md` §8. The returned handle owns everything
+    /// it needs, so the caller may drop `sets` and `await` it.
+    ///
+    /// Preparation — validation, encoding, the value copy — still happens here,
+    /// on the caller's thread, exactly as it did.
+    fn submit_set_many(&self, sets: &[Set<'_>]) -> Result<PendingSetMany>;
 
     /// Whether **every** shard's map is pinned in memory, so no read can fault
     /// to disk.

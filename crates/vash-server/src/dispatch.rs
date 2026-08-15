@@ -131,23 +131,9 @@ impl<'a, T> SetBatch<'a, T> {
         let started = std::time::Instant::now();
         match state.store.set_many(&self.sets) {
             Ok(cas) => {
-                let each = started.elapsed() / self.sets.len() as u32;
+                count_stored(state, dialect, &self.sets, &cas, started.elapsed());
                 for (index, note) in self.notes.iter().enumerate() {
-                    let token = cas.get(index).copied().unwrap_or_default();
-                    state
-                        .metrics
-                        .commands
-                        .observe(CommandKind::Set, dialect, each);
-                    // Through the same observer the single-command path uses,
-                    // against the command that was actually issued — an
-                    // unconditional `Set` answered by `Stored`, which is the one
-                    // arm this batch can produce.
-                    state.metrics.outcomes.observe(
-                        &Command::Set(self.sets[index].clone()),
-                        &Reply::Stored(vash_core::Stored::Stored(token)),
-                    );
-                    state.metrics.write();
-                    render(out, note, Ok(token));
+                    render(out, note, Ok(cas.get(index).copied().unwrap_or_default()));
                 }
             }
             Err(err) => {
@@ -182,6 +168,85 @@ impl<'a, T> SetBatch<'a, T> {
         self.sets.clear();
         self.notes.clear();
     }
+}
+
+/// Counts a run of writes that stored, exactly as [`execute`] counts one.
+///
+/// Shared by [`SetBatch::flush`] and the awaited write path in [`crate::conn`],
+/// so `cmd_set` and the write counters cannot depend on which route a client's
+/// pipelining happened to take. The batch has a single duration, so it is
+/// divided across its members: the mean stays honest and the distribution comes
+/// out narrower than reality.
+pub fn count_stored(
+    state: &ServerState,
+    dialect: Dialect,
+    sets: &[vash_core::Set<'_>],
+    cas: &[u64],
+    elapsed: std::time::Duration,
+) {
+    if sets.is_empty() {
+        return;
+    }
+    let each = elapsed / sets.len() as u32;
+    for (index, set) in sets.iter().enumerate() {
+        state
+            .metrics
+            .commands
+            .observe(CommandKind::Set, dialect, each);
+        state.metrics.outcomes.observe(
+            &Command::Set(set.clone()),
+            &Reply::Stored(vash_core::Stored::Stored(
+                cas.get(index).copied().unwrap_or_default(),
+            )),
+        );
+        state.metrics.write();
+    }
+}
+
+/// Decodes a memcached block that is nothing but plain `set`s.
+///
+/// `None` the moment anything else appears, so the caller falls back to the
+/// ordinary executor rather than this path having to grow a second opinion on
+/// what a command means. The block has already been measured as all-writes, so
+/// `None` here is a disagreement between the two and the safe answer is the
+/// slow one.
+pub(crate) fn parse_memcached_writes(block: &[u8]) -> Option<crate::conn::WriteRun<'_>> {
+    use vash_proto::memcached::{Outcome, parse};
+
+    let mut run = crate::conn::WriteRun {
+        sets: Vec::new(),
+        suppress: Vec::new(),
+    };
+    let mut rest = block;
+    while !rest.is_empty() {
+        let Ok(Outcome::Command(parsed)) = parse(rest) else {
+            return None;
+        };
+        if !matches!(
+            parsed.style,
+            vash_proto::memcached::encode::ResponseStyle::Storage
+        ) {
+            return None;
+        }
+        if !awaitable(&parsed.command) {
+            return None;
+        }
+        run.sets.push(batchable(&parsed.command)?.clone());
+        run.suppress.push(parsed.noreply);
+        rest = &rest[parsed.consumed..];
+    }
+    Some(run)
+}
+
+/// Whether an unconditional write can also be served **without blocking**.
+///
+/// Stricter than [`batchable`] by one thing: a tagged write cannot. Registering
+/// a tag name that the store has not seen is itself a write through the same
+/// queue, taken synchronously inside `submit_set_many` before anything is
+/// queued — and a runtime worker may not block on that. `SetBatch` is unaffected
+/// because it runs on the blocking pool, where such a wait is legal.
+pub fn awaitable(command: &Command<'_>) -> bool {
+    batchable(command).is_some_and(|set| set.tags.is_empty())
 }
 
 /// Whether a command is an unconditional write that [`SetBatch`] may hold back.

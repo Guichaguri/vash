@@ -1402,6 +1402,7 @@ dependencies = [
  "libc",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "vash-core",
  "xxhash-rust",

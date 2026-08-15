@@ -28,6 +28,16 @@ pub struct ServerState {
     /// Read-only requests skip the hop to the storage tier. See
     /// [`crate::config::StoreConfig::inline_reads`].
     pub inline_reads: bool,
+    /// How many awaited writes may be in flight at once.
+    ///
+    /// **Admission control that used to be accidental.** A write submitted from
+    /// the blocking pool was bounded by the size of that pool, so at most
+    /// `server.max_blocking_threads` of them could be queued at the shard
+    /// writers. Awaiting the reply removes the thread and with it the bound —
+    /// and measured, an unbounded version flooded the queue: pipelined `SET` on
+    /// the default durability fell from 19,047 to 10,822 ops/s with the writers'
+    /// queue wait climbing from 5.2 ms to 17.1 ms. Same ceiling, made explicit.
+    pub write_permits: Arc<tokio::sync::Semaphore>,
     /// Live `SCAN` cursors. See [`crate::scan`].
     pub scan_cursors: crate::scan::ScanCursors,
     /// When this process began serving, for `stats uptime` and `INFO
@@ -81,6 +91,9 @@ impl ServerState {
         inline_reads: bool,
         binding: Binding,
     ) -> Arc<Self> {
+        let write_permits = Arc::new(tokio::sync::Semaphore::new(
+            binding.max_blocking_threads.max(1) as usize,
+        ));
         Arc::new(Self {
             store,
             info,
@@ -89,6 +102,7 @@ impl ServerState {
             metrics: crate::metrics::ServerMetrics::default(),
             cluster,
             inline_reads,
+            write_permits,
             scan_cursors: crate::scan::ScanCursors::new(
                 protocol.scan_cursors,
                 std::time::Duration::from_millis(protocol.scan_cursor_ttl_ms),
