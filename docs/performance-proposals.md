@@ -798,6 +798,38 @@ trade is the database: integrity is preserved, so there is nothing to wipe and
 nothing to rebuild. Set `durability = "relaxed"` to have every commit on the
 device before it is acknowledged, and pay the 1.7–4.5×.
 
+### And the shard cap, which rested on the thing that changed
+
+[plan.md](plan.md) §9 measured sharding twice and found two effects: it divides
+the mean batch by roughly the shard count, and it only pays back when the writer
+thread is the bottleneck. Under `relaxed` the writer *was* the bottleneck —
+commits waited for the device — so a second writer had real work to take, and 4
+was the compromise. `lazy` removes the wait, which removes the benefit and leaves
+the cost.
+
+Re-measured, `SET`-only, medians of three alternating rounds:
+
+| shards | pipeline 16 | pipeline 1 | mean batch at pipeline 1 |
+|---:|---:|---:|---:|
+| 1 | 83,925 | **66,605** | 42.3 |
+| **2** | **140,767** | 42,357 | 5.5 |
+| 4 — the old default | 126,292 | 24,901 | 1.9 |
+| 8 | 47,554 | 19,922 | 1.5 |
+
+**At pipeline 1, one shard beats four by 2.7×**, and the batch column is the
+mechanism: four shards see a mean batch of 1.9, which is group commit doing
+nothing at all. At pipeline 16 the offered load is enough to keep two writers
+busy and two leads, but eight still collapses.
+
+The default is now `min(num_cpus, 2)`. Two is the only count not beaten by four
+in either shape, and the old cap of 4 was right for a bottleneck that no longer
+exists. One box and one workload — a machine with many more cores under sustained
+write load may want more writers, which is what the setting is for.
+
+Note that `map_size` is **per shard**, so halving the count halves total capacity
+unless `map_size_mb` goes up. That costs nothing: the map is a reservation, not
+an allocation.
+
 ### The thing that fell out: `ephemeral` is leaving 2× on the floor
 
 `lazy` beats `ephemeral` at pipeline 16 by **109,839 against 56,233**, and the
@@ -806,11 +838,14 @@ measurement pointing the same way — §6 found it worth nothing under `relaxed`
 and far worse in the tail — so `ephemeral` is now the slowest way to run with
 syncing off *and* the only one that has to be wiped at startup.
 
-Dropping `WRITE_MAP` from `ephemeral` is one line, but it is not only a
-performance change: without that flag `MDB_NOSYNC` preserves integrity, so
-`ephemeral` would stop needing its wipe and would become `lazy` with the timer
-off. That is a question about what the two modes are *for*, not a tuning knob,
-and it is left open rather than answered in passing.
+**Resolved: `ephemeral` was retired as a durability mode.** Without `WRITE_MAP`
+it *is* `lazy`, so what the name added was a wipe — which was always a startup
+policy rather than a durability guarantee. `--ephemeral` now means `lazy` plus
+`wipe_on_start`, and `store.write_map` carries the flag on its own, off by
+default and documented for the one thing it buys: LMDB stops allocating a copy of
+every dirty page, so a large transaction has a lower peak footprint. That is
+memory, not speed, and it costs `lazy` its integrity guarantee, so the config
+pairs it with `wipe_on_start`.
 
 ---
 

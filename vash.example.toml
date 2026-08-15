@@ -18,15 +18,29 @@ max_blocking_threads = 128
 path = "data"
 
 # Independent LMDB environments, and therefore the ceiling on concurrent
-# writers. 0 picks min(num_cpus, 4).
+# writers. 0 picks min(num_cpus, 2).
 #
-# Capped at four rather than at the core count, because sharding buys concurrent
+# Capped at two rather than at the core count, because sharding buys concurrent
 # writers and nothing else — reads are already lock-free and concurrent within
-# one environment. When commits are disk-bound — which `relaxed` makes likely,
-# and which was the default when this was measured — splitting one device
-# between more environments fragments its I/O and throughput *falls*. Worth
-# re-measuring now that `lazy` is the default and a commit no longer waits for
-# the device.
+# one environment — and it costs something on every write: splitting the offered
+# load across N queues divides the mean batch by roughly N.
+#
+# The cap was 4 while commits waited for the device, because a second writer had
+# real work to take. `lazy` stops them waiting, which leaves the cost without the
+# benefit. Re-measured on a four-core container, SET-only, medians of three:
+#
+#   shards   pipeline 16   pipeline 1   batch at pipeline 1
+#     1         83,925       66,605          42.3
+#     2        140,767       42,357           5.5
+#     4        126,292       24,901           1.9
+#     8         47,554       19,922           1.5
+#
+# Two is the only count not beaten by four in either shape. Note map_size_mb is
+# PER SHARD, so halving this halves total capacity unless you raise it — which
+# costs nothing, the map being a reservation rather than an allocation.
+#
+# One box, one workload: a machine with many more cores under sustained write
+# load may want more, and that is what this setting is for.
 #
 # Fixed once a database exists: changing it would route every key to a different
 # environment, so startup refuses to open a store built for a different count

@@ -669,6 +669,14 @@ concurrent within one environment.
 
 The default is therefore `min(num_cpus, 4)` rather than the 8 this section originally proposed.
 
+**Re-measured under `lazy` (2026-08-15), and lowered again to `min(num_cpus, 2)`.** Both effects above
+were measured while commits waited for the device. `lazy` stops them waiting, which removes the benefit
+of a second writer and leaves effect 1 — the batch division — in full. On a four-core container,
+`SET`-only, medians of three alternating rounds: at pipeline 1, one shard reaches 66,605 ops/s against
+four shards' 24,901, and the mean batch falls from 42.3 to 1.9, which is group commit doing nothing.
+At pipeline 16 two shards lead at 140,767 against four's 126,292 and eight's 47,554. Two is the only
+count not beaten by four in either shape. See `docs/performance-proposals.md` §9.
+
 Consequences, accepted deliberately:
 
 - **Multi-key operations are grouped by shard and executed in parallel**, then fanned back in. With

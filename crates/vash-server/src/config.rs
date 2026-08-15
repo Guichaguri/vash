@@ -42,8 +42,8 @@ pub struct ServerConfig {
 pub struct StoreConfig {
     pub path: PathBuf,
     /// Independent LMDB environments, and therefore the ceiling on concurrent
-    /// writers. `0` picks `min(num_cpus, 4)` — see [`Config::shard_count`] for
-    /// why it is capped there.
+    /// writers. `0` picks `min(num_cpus, 2)` — see [`Config::shard_count`] for
+    /// why it is capped there, and for the measurement that lowered it from 4.
     ///
     /// Fixed once a database exists: changing it would route every key to a
     /// different environment, so startup refuses to open a mismatched store
@@ -735,22 +735,41 @@ impl Config {
 
     /// Shards actually used, resolving the `0` default.
     ///
-    /// Capped at 4 rather than 8. Sharding buys concurrent *writers* and
-    /// nothing else — LMDB reads are already lock-free and concurrent within
-    /// one environment — so it only pays when the writer thread is the
-    /// bottleneck. When commits are disk-bound — which `relaxed` durability
-    /// makes likely, and which was the default when this was measured — more
-    /// environments fragment I/O across the same device and measured throughput
-    /// *falls*. Worth re-measuring now that `lazy` is the default and a commit
-    /// no longer waits for the device. Four is a compromise that helps
-    /// where sharding helps without punishing the disk-bound case; see the
-    /// benchmark in the README before raising it.
+    /// **Capped at 2**, lowered from 4 when `lazy` became the default.
+    ///
+    /// Sharding buys concurrent *writers* and nothing else — LMDB reads are
+    /// already lock-free and concurrent within one environment — so it only pays
+    /// when a writer thread is the bottleneck. It costs something on every
+    /// write: splitting the offered load across N queues divides the mean batch
+    /// by roughly N, so each commit amortises over fewer records.
+    ///
+    /// The cap was 4 because the writer *was* the bottleneck: commits waited for
+    /// the device, so a second writer had real work to take. `lazy` stops a
+    /// commit waiting for the device, which removes the benefit and leaves the
+    /// cost. Re-measured on a four-core container, `SET`-only, medians of three
+    /// alternating rounds:
+    ///
+    /// | shards | pipeline 16 | pipeline 1 | mean batch at pipeline 1 |
+    /// |---:|---:|---:|---:|
+    /// | 1 | 83,925 | **66,605** | 42.3 |
+    /// | 2 | **140,767** | 42,357 | 5.5 |
+    /// | 4 | 126,292 | 24,901 | 1.9 |
+    /// | 8 | 47,554 | 19,922 | 1.5 |
+    ///
+    /// Two is the only count that is not beaten by 4 in either shape, and the
+    /// batch column is the mechanism: at pipeline 1 four shards see a batch of
+    /// 1.9, which is group commit doing nothing at all.
+    ///
+    /// **This is one box and one workload.** A machine with many more cores under
+    /// sustained write load may well want more writers than two, and the setting
+    /// is there for that. What the measurement rules out is the old default
+    /// being right for the new one.
     pub fn shard_count(&self) -> usize {
         match self.store.shards {
             0 => std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
-                .min(4),
+                .min(2),
             n => n,
         }
     }
