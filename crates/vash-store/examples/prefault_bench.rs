@@ -60,7 +60,7 @@ mod linux {
             path: db_path(),
             map_size: 4 * 1024 * 1024 * 1024,
             shards: SHARDS,
-            durability: Durability::Ephemeral,
+            durability: Durability::Lazy,
             prefault,
             ..StoreConfig::default()
         }

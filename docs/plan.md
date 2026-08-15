@@ -688,10 +688,14 @@ reframes the whole durability question and buys a lot of performance:
 | `durable` | default sync | fsync per commit. Slowest. Available for anyone who wants it. |
 | `relaxed` | `MDB_NOMETASYNC` + periodic `force_sync` | Loses at most the last few transactions on OS crash; **cannot corrupt the database**. |
 | `lazy` **(default)** | `MDB_NOSYNC` + periodic `force_sync`, never `MDB_WRITEMAP` | Loses writes newer than `write.sync_interval_ms`; **cannot corrupt the database** where the filesystem preserves write order. Measured 1.7–4.5× faster than `relaxed`, because the per-commit `fsync` is 92% of commit time and the writer queue backs up behind it — `docs/performance-proposals.md` §9. |
-| `ephemeral` | `MDB_NOSYNC` (+ `MDB_WRITEMAP` on Unix only — it fails on Windows, see §11) | Fastest. An OS crash or power loss *can* corrupt the file — handled by verifying integrity at boot and, on failure, **wiping and starting empty**. Legitimate for a cache; must never be used for a system of record. |
 
-A `--ephemeral` mode that also wipes on clean startup, and support for placing the database on tmpfs,
-cover the brief's "in-memory caching" option without a separate code path.
+**`ephemeral` was retired as a durability mode.** It was `MDB_NOSYNC` plus
+`MDB_WRITEMAP`, and that flag measured slower than going without twice, so what it
+named was `lazy` with a worse guarantee. `--ephemeral` now means `lazy` durability
+plus `wipe_on_start` — a startup policy — and `store.write_map` carries the flag
+for the memory profile it genuinely buys. That, and support for placing the
+database on tmpfs, cover the brief's "in-memory caching" option without a separate
+code path.
 
 ### Backpressure
 

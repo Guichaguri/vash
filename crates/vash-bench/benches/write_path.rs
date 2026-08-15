@@ -57,7 +57,7 @@ impl Fixture {
             shards,
             path: dir.path().join("db"),
             map_size: 1024 * 1024 * 1024,
-            durability: vash_store::Durability::Ephemeral,
+            durability: vash_store::Durability::Lazy,
             write: WriteConfig {
                 sweep_interval_ms: 3_600_000,
                 ..WriteConfig::default()
@@ -266,7 +266,7 @@ impl Rmw {
         let config = StoreConfig {
             path: dir.path().join("db"),
             map_size: 1024 * 1024 * 1024,
-            durability: vash_store::Durability::Ephemeral,
+            durability: vash_store::Durability::Lazy,
             ..StoreConfig::default()
         };
         let engine = vash_store::engine::LmdbEngine::open(&config, 0, 1).expect("open");

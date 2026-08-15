@@ -180,7 +180,13 @@ yours to make, not something the server can or should do on your behalf.
 | `lazy` (default) | Almost always. Syncs on a timer rather than on every commit, so an OS crash loses writes newer than `write.sync_interval_ms` — one second by default — and **cannot corrupt the database**. |
 | `relaxed` | You want every commit on the device and can pay for it: measured 4.5× slower on a pipelined write workload, because the `fsync` is what the writer queue backs up behind. |
 | `durable` | You are treating a cache as a system of record. Reconsider. |
-| `ephemeral` | The cache is genuinely disposable. A crash means starting empty. |
+
+`ephemeral` is no longer one of these. It named `lazy` plus `MDB_WRITEMAP`, and
+that flag measured slower than going without — so what was left was `lazy` with a
+worse name and a wipe. `--ephemeral` still does what it always did, and now says
+what it is: **`lazy` durability plus `wipe_on_start`**, a startup policy rather
+than a durability guarantee. `store.write_map` is separately available for the
+one thing that flag genuinely buys, which is memory rather than speed.
 
 A lost write is a cache miss, and a cache miss is already a supported outcome.
 That is what makes `lazy` the right default rather than a compromise — and note

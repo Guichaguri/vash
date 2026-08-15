@@ -445,7 +445,8 @@ async fn main() -> anyhow::Result<()> {
             let mut config = vash_server::Config::default();
             config.server.listen = "127.0.0.1:0".parse()?;
             config.store.path = dir.path().join("db");
-            config.store.durability = vash_server::config::Durability::Ephemeral;
+            config.store.durability = vash_server::config::Durability::Lazy;
+            config.store.wipe_on_start = true;
             config.store.map_size_mb = 4096;
             config.observability.admin_listen = String::new();
             if options.shards > 0 {

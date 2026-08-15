@@ -231,11 +231,15 @@ total, silent cache loss is worse than a refusal to start.
 | `durable` | none | Nothing is lost. |
 | `relaxed` | `MDB_NOMETASYNC` | The last few transactions may be lost. **Cannot corrupt the database.** |
 | `lazy` (default) | `MDB_NOSYNC`, and never `MDB_WRITEMAP` | Writes newer than the last `write.sync_interval_ms` may be lost. **Cannot corrupt the database**, provided the filesystem preserves write order — LMDB's condition, and the reason this mode refuses `WRITE_MAP`. |
-| `ephemeral` | `MDB_NOSYNC`, plus `MDB_WRITEMAP` on Unix | The file may be corrupt; it is wiped and started empty. |
 
-`MDB_WRITEMAP` is Unix-only here: on Windows `mdb_env_open` fails with OS error
-6 at every map size tested, so `ephemeral` drops it there and uses `MDB_NOSYNC`
-alone.
+`MDB_WRITEMAP` is no longer part of a durability mode. It was welded to
+`MDB_NOSYNC` as `ephemeral`, and measured slower than going without twice, so it
+is now `store.write_map` — off by default, Unix only (on Windows
+`mdb_env_open` fails with OS error 6 at every map size tested), and documented
+for what it actually buys: LMDB stops allocating a copy of every dirty page, so
+a large transaction has a lower peak footprint. Setting it removes `lazy`'s
+integrity guarantee, so pair it with `wipe_on_start` — which together is exactly
+what `--ephemeral` now means.
 
 ## Reader slots
 

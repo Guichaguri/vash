@@ -77,7 +77,7 @@ fn main() {
         LmdbStore::open(&StoreConfig {
             path: dir.path().join("db"),
             map_size: 2 * 1024 * 1024 * 1024,
-            durability: Durability::Ephemeral,
+            durability: Durability::Lazy,
             write: WriteConfig {
                 sweep_interval_ms: 60_000,
                 ..WriteConfig::default()

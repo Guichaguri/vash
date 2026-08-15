@@ -31,7 +31,7 @@ In another terminal:
 cargo run -p vash-client --example smoke -- 127.0.0.1:11311
 ```
 
-Run with `--ephemeral` to start from an empty database and skip syncing, or
+Run with `--ephemeral` to start from an empty database, or
 `--config vash.example.toml` for the full configuration surface.
 
 ## What works today

@@ -54,7 +54,16 @@ pub struct StoreConfig {
     pub max_readers: u32,
     pub durability: Durability,
     pub max_value_bytes: usize,
+    /// Start from an empty database. What `--ephemeral` sets, together with
+    /// `lazy` durability.
     pub wipe_on_start: bool,
+    /// Let LMDB write dirty pages straight into the map (`MDB_WRITEMAP`, Unix
+    /// only).
+    ///
+    /// Lower peak memory in a large transaction, and **measured slower here
+    /// twice** — see `docs/performance-proposals.md` §6 and §9. It also removes
+    /// `lazy`'s integrity guarantee, so pair it with `wipe_on_start`.
+    pub write_map: bool,
     /// Read every shard's data file at startup, so the map is resident before
     /// the first request instead of faulting in under one.
     ///
@@ -241,7 +250,6 @@ pub enum Durability {
     Relaxed,
     #[default]
     Lazy,
-    Ephemeral,
 }
 
 impl From<Durability> for vash_store::Durability {
@@ -250,7 +258,6 @@ impl From<Durability> for vash_store::Durability {
             Durability::Durable => Self::Durable,
             Durability::Relaxed => Self::Relaxed,
             Durability::Lazy => Self::Lazy,
-            Durability::Ephemeral => Self::Ephemeral,
         }
     }
 }
@@ -523,6 +530,7 @@ impl Default for StoreConfig {
             durability: Durability::default(),
             max_value_bytes: vash_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
+            write_map: false,
             prefault: false,
             inline_reads: false,
             resident_mode: false,
@@ -756,6 +764,7 @@ impl Config {
             durability: self.store.durability.into(),
             max_value_len: self.store.max_value_bytes,
             wipe_on_start: self.store.wipe_on_start,
+            write_map: self.store.write_map,
             // `resident_mode` implies prefaulting: locking pages that were
             // never read in would pin an empty map and answer `true` to a
             // question about data that is not there.
@@ -817,13 +826,13 @@ mod tests {
             listen = "0.0.0.0:1234"
 
             [store]
-            durability = "ephemeral"
+            durability = "durable"
             "#,
         )
         .unwrap();
 
         assert_eq!(config.server.listen.port(), 1234);
-        assert_eq!(config.store.durability, Durability::Ephemeral);
+        assert_eq!(config.store.durability, Durability::Durable);
         // Untouched keys keep their defaults.
         assert_eq!(config.store.map_size_mb, 4096);
     }

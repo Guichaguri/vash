@@ -22,28 +22,28 @@ fn create_db(env: &Env<WithTls>, wtxn: &mut RwTxn, name: &str) -> Result<Db> {
         .map_err(StoreError::from_heed)
 }
 
-fn env_flags(durability: Durability) -> EnvFlags {
+fn env_flags(durability: Durability, write_map: bool) -> EnvFlags {
     let mut flags = EnvFlags::empty();
     match durability {
         Durability::Durable => {}
-        // `WRITE_MAP` belongs here on paper and was measured not to earn its
-        // place: no throughput gain under `relaxed`, and a far worse tail when
-        // the device stalls. See `docs/performance-proposals.md` §6.
         Durability::Relaxed => flags |= EnvFlags::NO_META_SYNC,
-        // **Deliberately without `WRITE_MAP`**, and not for want of a platform:
-        // it is the flag LMDB names as the thing that turns `NO_SYNC` from
-        // "loses the last transactions" into "may corrupt the database". §6
-        // measured it as worth nothing anyway, so the integrity this mode
-        // promises costs no throughput to keep.
         Durability::Lazy => flags |= EnvFlags::NO_SYNC,
-        Durability::Ephemeral => {
-            flags |= EnvFlags::NO_SYNC;
-            // WRITE_MAP would add a further gain but fails at env-open on
-            // Windows with OS error 6 at every map size tested. Unix only.
-            #[cfg(unix)]
-            {
-                flags |= EnvFlags::WRITE_MAP;
-            }
+    }
+
+    // Separate from the durability mode because it is not a durability
+    // decision: it trades LMDB's dirty-page copies for a lower memory
+    // footprint, and it was measured *slower* here twice — no gain under
+    // `relaxed`, and a `lazy` store without it beating the old `ephemeral`
+    // mode, which was `lazy` plus this flag, by nearly 2×. An operator who
+    // wants the memory profile can still have it, and `store.write_map`
+    // documents that it costs `lazy` its integrity guarantee.
+    //
+    // Unix only: on Windows `mdb_env_open` fails with OS error 6 at every map
+    // size tested.
+    if write_map {
+        #[cfg(unix)]
+        {
+            flags |= EnvFlags::WRITE_MAP;
         }
     }
     flags
@@ -116,7 +116,7 @@ impl LmdbEngine {
                 // exits, so the slot table has to cover every thread that can
                 // read at once. That is exactly the `store.max_readers >
                 // server.max_blocking_threads` rule startup already enforces.
-                .flags(env_flags(config.durability))
+                .flags(env_flags(config.durability, config.write_map))
                 .map_size(config.map_size)
                 .max_dbs(MAX_DBS)
                 .max_readers(config.max_readers)

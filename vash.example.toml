@@ -22,10 +22,11 @@ path = "data"
 #
 # Capped at four rather than at the core count, because sharding buys concurrent
 # writers and nothing else — reads are already lock-free and concurrent within
-# one environment. When commits are disk-bound, which the default `relaxed`
-# durability makes likely, splitting one device between more environments
-# fragments its I/O and throughput *falls*. See the benchmark in the README
-# before raising it.
+# one environment. When commits are disk-bound — which `relaxed` makes likely,
+# and which was the default when this was measured — splitting one device
+# between more environments fragments its I/O and throughput *falls*. Worth
+# re-measuring now that `lazy` is the default and a commit no longer waits for
+# the device.
 #
 # Fixed once a database exists: changing it would route every key to a different
 # environment, so startup refuses to open a store built for a different count
@@ -47,8 +48,10 @@ max_readers = 256
 #           on an OS crash and cannot corrupt the database
 # lazy      syncs on a timer instead of on every commit; loses writes newer than
 #           the last sync_interval_ms, and keeps the database intact
-# ephemeral no syncing and a writable map; fastest, and a crash means starting
-#           empty
+#
+# `ephemeral` is gone as a durability mode: it named `lazy` plus MDB_WRITEMAP,
+# and that flag measured slower than going without, twice. `--ephemeral` now
+# means `lazy` durability plus wipe_on_start, which is what it always was.
 #
 # `lazy` is the one worth understanding, because the per-commit fsync is what a
 # write actually waits for: measured on a four-core container, `relaxed` spends
@@ -68,7 +71,22 @@ max_readers = 256
 durability = "lazy"
 
 max_value_bytes = 1048576
+
+# Start from an empty database. What --ephemeral sets, alongside `lazy`.
 wipe_on_start = false
+
+# Let LMDB write dirty pages straight into the map (MDB_WRITEMAP; Unix only,
+# ignored on Windows where env-open fails with it at every map size tested).
+#
+# Not a speed setting on the evidence here — no gain under `relaxed`, a worse
+# tail when the device stalls, and a `lazy` store without it beat the old
+# `ephemeral` mode, which was `lazy` plus this flag, by nearly 2x on pipelined
+# writes. What it buys is memory: LMDB stops allocating a copy of every dirty
+# page, so a large transaction has a lower peak footprint.
+#
+# It removes `lazy`'s integrity guarantee — LMDB keeps a NOSYNC database
+# consistent only if WRITEMAP is not used — so pair it with wipe_on_start.
+write_map = false
 
 # Read every shard's data file at startup, so the map is resident before the
 # first request rather than faulting in underneath it.

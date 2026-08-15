@@ -111,7 +111,12 @@ fn main() -> anyhow::Result<()> {
         config.store.path = data;
     }
     if cli.ephemeral {
-        config.store.durability = vash_server::config::Durability::Ephemeral;
+        // `--ephemeral` is a startup policy, not a durability mode: start empty,
+        // and do not wait for the device on every commit. It used to name a
+        // fourth durability mode that was exactly this plus `MDB_WRITEMAP`, and
+        // that flag measured slower than going without — see
+        // `docs/performance-proposals.md` §9 — so what is left is the wipe.
+        config.store.durability = vash_server::config::Durability::Lazy;
         config.store.wipe_on_start = true;
     }
     if cli.enable_flush {

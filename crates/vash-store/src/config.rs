@@ -46,10 +46,6 @@ pub enum Durability {
     /// reorders writes gets the `ephemeral` risk without the `ephemeral` label.
     #[default]
     Lazy,
-    /// No syncing at all, and a writable map. Fastest. An OS crash or power loss
-    /// can corrupt the file, which is handled by wiping it at startup and
-    /// beginning empty.
-    Ephemeral,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +59,32 @@ pub struct StoreConfig {
     pub durability: Durability,
     pub max_value_len: usize,
     /// Wipe any existing database on startup.
+    ///
+    /// What `--ephemeral` sets, alongside [`Durability::Lazy`]. It used to be
+    /// paired with a durability mode of its own; that mode was `NO_SYNC` plus
+    /// `WRITE_MAP`, and once `WRITE_MAP` measured slower than going without —
+    /// twice, see `docs/performance-proposals.md` §6 and §9 — what was left was
+    /// `lazy` with a worse name and a wipe. So the wipe is all that remains of
+    /// it, which is what it always actually was: a startup policy, not a
+    /// durability guarantee.
     pub wipe_on_start: bool,
+    /// Let LMDB write dirty pages straight into the memory map.
+    ///
+    /// `MDB_WRITEMAP`. **Not a speed setting on the evidence here**: it measured
+    /// no gain under `relaxed` and a far worse tail when the device stalled, and
+    /// a `lazy` store without it beat the old `ephemeral` mode — which was
+    /// `lazy` plus this flag — by nearly 2× on pipelined writes. What it does
+    /// buy is memory: LMDB stops allocating a copy of every dirty page, so a
+    /// large transaction has a lower peak footprint.
+    ///
+    /// **It removes `lazy`'s integrity guarantee.** LMDB keeps a `NO_SYNC`
+    /// database consistent only *"if the filesystem preserves write order and
+    /// the `MDB_WRITEMAP` flag is not used"*, so a store that sets both should
+    /// also set [`Self::wipe_on_start`] and treat a crash as a fresh start.
+    ///
+    /// Unix only: on Windows `mdb_env_open` fails with OS error 6 at every map
+    /// size tested, so this is ignored there.
+    pub write_map: bool,
     /// Read the whole data file at startup, so the map is resident before the
     /// first request rather than after it.
     ///
@@ -201,6 +222,7 @@ impl Default for StoreConfig {
             durability: Durability::default(),
             max_value_len: vash_core::DEFAULT_MAX_VALUE_LEN,
             wipe_on_start: false,
+            write_map: false,
             prefault: false,
             lock_map: false,
             bucket_granularity_ms: 1000,

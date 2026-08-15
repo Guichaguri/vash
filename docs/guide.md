@@ -40,7 +40,7 @@ records are evicted when that fills. Nothing here is a system of record.
 | **Batches** | `GET_MANY` / `SET_MANY` / `DELETE_MANY`, and memcached / Redis multi-key commands. One transaction per batch, one round trip. |
 | **Atomic counters** | Read-modify-write inside one transaction, with optional bounds, saturation and TTL. Counters are decimal text, so all three dialects move the same counter. |
 | **CAS** | Every record carries a CAS token; memcached `gets`/`cas` work as upstream, and tokens never go backwards across a restart. |
-| **Persistence** | LMDB-backed, so the cache survives a restart. `relaxed`, `durable` or `ephemeral` durability. |
+| **Persistence** | LMDB-backed, so the cache survives a restart. `lazy` (default), `relaxed` or `durable` durability. |
 | **Bounded capacity** | Watermarked eviction, **TTL-ordered rather than LRU** — soonest-to-expire goes first, never-expiring last. |
 | **Write throughput** | Group commit across independent shards: batches form on their own from whatever queued during the previous commit, with no added delay. |
 | **Clustering** | Independent nodes, no replication and no consensus. Only tag invalidation crosses node boundaries, by fan-out plus anti-entropy gossip. |
@@ -72,7 +72,8 @@ To try it without leaving anything on disk:
 cargo run --release --bin vash-server -- --ephemeral
 ```
 
-`--ephemeral` starts from an empty database and stops syncing — the fastest
+`--ephemeral` starts from an empty database and keeps the default `lazy`
+durability — the fastest
 mode, and the right one for tests and local development.
 
 ### Container

@@ -2176,3 +2176,22 @@ fn the_writer_syncs_on_its_own_timer() {
     h.set(b"k2", b"v2", 0);
     assert_eq!(h.get(b"k2").as_deref(), Some(&b"v2"[..]));
 }
+
+/// **`write_map` is a memory setting, not a durability one**, and it is now
+/// separable from both. The old `ephemeral` mode welded it to `NO_SYNC`; it
+/// measured slower than going without, twice, so what it buys — LMDB not
+/// allocating a copy of every dirty page — is available on its own to anyone who
+/// wants that trade. This pins that a store which sets it still works.
+#[test]
+fn a_store_with_write_map_still_serves() {
+    let h = Harness::with(|c| {
+        c.write_map = true;
+        c.wipe_on_start = true;
+    });
+
+    h.set(b"k", b"v", 0);
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"v"[..]));
+    h.set(b"k", b"w", 60);
+    assert_eq!(h.get(b"k").as_deref(), Some(&b"w"[..]));
+    assert_eq!(h.expiry_entries(), 1);
+}

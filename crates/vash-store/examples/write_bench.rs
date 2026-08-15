@@ -192,7 +192,7 @@ fn main() {
     for shards in [1usize, 2, 4, 8] {
         scenario(
             &format!("{shards} shard(s)"),
-            Durability::Ephemeral,
+            Durability::Lazy,
             shards,
             |store| concurrent(store, 64),
         );
