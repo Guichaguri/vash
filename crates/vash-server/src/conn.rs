@@ -447,9 +447,26 @@ async fn drain<S: Copy + Send + 'static>(
         // thread while the writer works. It declines — `None` — for anything it
         // does not model, and the ordinary path below then runs the block
         // untouched, so this is a shortcut and never the only route.
+        //
+        // **Boxed, and reads are why.** Awaiting this future inline would splice
+        // its state — a decoded `WriteRun`, a permit, the pending submission —
+        // into `drain`'s, and `drain`'s into the future of every connection
+        // task. Measured, that inflation cost pipelined `GET` 6.7x (466k ->
+        // 70k ops/s with `inline_reads`) on blocks that never take this branch
+        // at all. Behind a `Box` the read path polls a small future again, and
+        // the allocation lands only on blocks that are entirely writes, where a
+        // commit dwarfs it. See `docs/benchmarks.md`.
         let awaited = match (measured.all_writes, writes) {
             (true, Some((parse, dialect_kind, stored))) => {
-                run_writes_awaited(state, &block, write_buf, parse, dialect_kind, stored).await
+                Box::pin(run_writes_awaited(
+                    state,
+                    &block,
+                    write_buf,
+                    parse,
+                    dialect_kind,
+                    stored,
+                ))
+                .await
             }
             _ => None,
         };
