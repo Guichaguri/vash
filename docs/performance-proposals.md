@@ -1079,6 +1079,15 @@ and any of this work should inherit it:
   device time; `stats` reports the same batch size as `vash_mean_batch`. §2
   exists only because they were scraped. A change that moves ops/s without
   moving one of those has probably not done what its author thinks.
+- **Measure both sides of any setting the change is gated on.** §14 shipped a
+  0.58x regression on the default configuration because every benchmark written
+  for it ran with `inline_reads` on, which was the setting the work was about.
+  The matrix caught what the purpose-built benchmark could not.
+- **Alternating builds does not remove ordering effects.** It removes the
+  machine's drift between builds and nothing else. §14 chased a 0.75x that turned
+  out to be a row measured third, against a server two earlier workloads had
+  already grown; isolated on a fresh server it was 1.01x. When a row disagrees
+  with what the code can possibly do, suspect the harness before the build.
 - **State the acceptance criterion before the run.** For §4 that is "mean batch
   at pipeline 128 on one connection rises from 1.13 to above 16"; for §6 it is a
   fall in commit-per-record from 0.23 ms; for §3 it is that the map stays
@@ -1209,6 +1218,41 @@ Two details carry their weight:
 
 Ordering is what makes it correct, and the tests that already covered a read
 seeing the writes before it in the same block now cross a run boundary to do so.
+
+### Two things the first version got wrong
+
+Both are measurement failures rather than design ones, and both are the reason
+this section is longer than the change.
+
+**It shipped a 0.58x regression on the default configuration.** Every benchmark
+written for this change ran with `inline_reads` on, because that is the setting
+the sweep was about. With it *off* a read run takes the same blocking pool an
+`Other` run does, so peeling the writes out of a mixed block buys the reads
+nothing and fragments what used to be one hop into several: 147,180 -> 85,521
+ops/s on a 1:9 pipelined workload. The full matrix caught it; the benchmark
+written for the change could not, because it never ran the configuration that
+most deployments use. **A change gated on a setting has to be measured on both
+sides of that setting**, and the sweep that motivated this work was not that.
+
+The fix is one condition — split only when `inline_reads` is on, and collapse to
+a single run otherwise, which is exactly the old route. A block that is only
+writes is one run either way and still takes §8's awaited path.
+
+**And then a phantom regression on uniform writes.** With the fix in, three
+rounds put `SET`-only at 0.85x and five rounds put it at 0.75x — moving away from
+1.0 as rounds were added, which is not how noise usually behaves, and on a code
+path the fix cannot reach: a block of nothing but writes is a single run and is
+dispatched identically by both builds. Re-measured with **a fresh server per
+reading and nothing else run against it first**, it came out at 1.01x.
+
+The harness was the bug. That row was measured third, after the read-only and
+mixed rows had already run against the same server and grown its store, so it was
+reading the state its predecessors left rather than the build under test. Worth
+recording next to §13's methodology: alternating builds removes the machine's
+drift between *builds*, and does nothing about ordering effects *within* a build.
+The isolated readings also spread 84,335 to 150,087, which is the honest noise
+floor for a write row on this box and wide enough to swallow most of what was
+being argued about.
 
 **Risks.** `drain` is the function that already cost pipelined reads 6.7× once by
 growing a future it never polled (§8), so the awaited run must stay boxed and the
