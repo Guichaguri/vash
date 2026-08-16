@@ -91,33 +91,44 @@ fn set_of<'a>(key: Key<'a>, value: &'a [u8]) -> Set<'a> {
 /// Alternating inside a repeat rather than running all of one engine and then
 /// all of the other: whatever else the machine is doing drifts over seconds, and
 /// interleaving is what keeps that drift from landing on one column.
+///
+/// **Reports the median and the spread, not just the best.** Best-of-N hides
+/// variance, and on this workload the variance is the story: LMDB's own batched
+/// `lazy` figure spanned 2.3× across five runs of one machine, which is wider
+/// than any difference between the engines. A ratio of medians whose ranges
+/// overlap has not measured anything, and the table should show that rather
+/// than imply a winner.
 fn compare(name: &str, durability: Durability, run: impl Fn(&Arc<dyn Store>) -> f64) {
-    let mut best = [0.0f64; 2];
+    let mut samples: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
     for _ in 0..repeats() {
         for (slot, backend) in ENGINES.iter().enumerate() {
             let dir = tempfile::tempdir().expect("temp dir");
             let handle = open(&dir.path().join("db"), *backend, durability);
             let rate = run(handle.store());
             handle.close();
-            if rate > best[slot] {
-                best[slot] = rate;
-            }
+            samples[slot].push(rate);
         }
     }
 
-    let ratio = if best[0] > 0.0 {
-        best[1] / best[0]
-    } else {
-        0.0
+    let stat = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        (v[v.len() / 2], v[0], v[v.len() - 1])
     };
+    let (lmdb, lmdb_lo, lmdb_hi) = stat(&mut samples[0]);
+    let (mdbx, mdbx_lo, mdbx_hi) = stat(&mut samples[1]);
+
+    let ratio = if lmdb > 0.0 { mdbx / lmdb } else { 0.0 };
+    // Overlapping ranges mean the repeats cannot tell the engines apart, whatever
+    // the ratio of their medians happens to be.
+    let overlap = lmdb_lo <= mdbx_hi && mdbx_lo <= lmdb_hi;
     println!(
-        "{name:<38} {:>11.0} {:>11.0}   {ratio:>5.2}x{}",
-        best[0],
-        best[1],
-        if ratio >= 1.0 { " mdbx" } else { " lmdb" }
+        "{name:<34} {lmdb:>9.0} [{:>7.0}-{:>7.0}] {mdbx:>9.0} [{:>7.0}-{:>7.0}] {ratio:>6.2}x {}",
+        lmdb_lo,
+        lmdb_hi,
+        mdbx_lo,
+        mdbx_hi,
+        if overlap { "(overlap)" } else { "" }
     );
-    // Rust block-buffers stdout when it is a pipe, and the durable scenarios
-    // take minutes each: without this the whole run looks hung until it ends.
     std::io::stdout().flush().ok();
 }
 
@@ -208,7 +219,10 @@ fn reads() {
 ",
         env_usize("VASH_BENCH_READ_SECS", 2)
     );
-    println!("{:<38} {:>11} {:>11}   {:>5}", "", "lmdb", "mdbx", "ratio");
+    println!(
+        "{:<34} {:>9} {:>17} {:>9} {:>17} {:>7}",
+        "", "lmdb", "[min-max]", "mdbx", "[min-max]", "ratio"
+    );
 
     let value = vec![b'v'; 1024];
     for threads in [1usize, 4, 8] {
@@ -228,7 +242,10 @@ fn reads() {
 
 fn writes() {
     println!("\n== writes ({} ops per scenario, 256 B values)\n", ops());
-    println!("{:<38} {:>11} {:>11}   {:>5}", "", "lmdb", "mdbx", "ratio");
+    println!(
+        "{:<34} {:>9} {:>17} {:>9} {:>17} {:>7}",
+        "", "lmdb", "[min-max]", "mdbx", "[min-max]", "ratio"
+    );
 
     let value = vec![b'w'; 256];
     for durability in [Durability::Lazy, Durability::Relaxed, Durability::Durable] {
@@ -394,7 +411,10 @@ fn main() {
 ",
             ops()
         );
-        println!("{:<38} {:>11} {:>11}   {:>5}", "", "lmdb", "mdbx", "ratio");
+        println!(
+            "{:<34} {:>9} {:>17} {:>9} {:>17} {:>7}",
+            "", "lmdb", "[min-max]", "mdbx", "[min-max]", "ratio"
+        );
         let value = vec![b'w'; 256];
         compare(
             "set_many, blocks of 256, Lazy",
@@ -420,6 +440,8 @@ fn main() {
 
     println!(
         "\nRatios are mdbx relative to lmdb: above 1.00 means mdbx did more work.\n\
-         Read the caveats in docs/benchmarks.md before quoting any of this."
+         An `(overlap)` row means the two engines' ranges intersect, so these
+         repeats did not separate them. Read the caveats in docs/benchmarks.md
+         before quoting any of this."
     );
 }

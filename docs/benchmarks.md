@@ -685,154 +685,117 @@ engine is about 8% of what a write costs — a 2.8× win here is worth roughly 5
 end to end, not 2.8× end to end. Reads are the other way round: the store is most
 of what a read is, so a read regression here mostly survives to the wire.
 
-Run on both platforms, and **that turned out to be the whole story**: nearly
-every ratio inverts between them. Windows 11 native and Linux in a container, on
-one i7-9750H (6 cores / 12 threads), best of 2 repeats each.
+Run on both platforms with identical methodology: **five repeats, each section
+in its own process, medians reported with the full range**. Earlier versions of
+this section reported best-of-two from a single run and were wrong twice — see
+[the corrections](#two-corrections-worth-keeping) at the end.
 
-### The short version
+One i7-9750H (6 cores / 12 threads): Windows 11 native, and Linux in a container
+on the same machine. `(overlap)` marks a row whose two ranges intersect, meaning
+those repeats did not separate the engines whatever the ratio of medians says.
 
-| | Windows | Linux |
+### Reads
+
+| Scenario | Windows | Linux |
 |---|---:|---:|
-| Reads, 8 threads | 0.55–0.61× | 0.97–0.98× |
-| `set_many`, `lazy` | **2.81×** | 1.02× |
-| `set_many`, `relaxed` | 2.66× | 1.04× |
-| `set_many`, `durable` | 1.36× | 1.08× |
-| Soak, accepted writes | 1.31× | 0.93× |
+| `get`, 1 thread | 0.93× | 1.00× (overlap) |
+| `get_with`, 1 thread | 0.90× (overlap) | 1.03× (overlap) |
+| `get`, 4 threads | 0.93× (overlap) | 0.94× (overlap) |
+| `get_with`, 4 threads | 0.88× | 0.98× (overlap) |
+| `get`, 8 threads | 0.94× (overlap) | 0.96× (overlap) |
+| `get_with`, 8 threads | 0.82× | 0.99× (overlap) |
 
-**On Linux the two engines are indistinguishable** — every ratio, read and
-write, falls between 0.93× and 1.08×. On Windows they trade: libmdbx wins
-batched writes by up to 2.8× and loses reads by up to 45%. So the platform
-decides whether there is any difference at all.
+**On Linux the engines are indistinguishable on reads** — every row overlaps. On
+Windows libmdbx is consistently about 10% behind, and three of the six rows
+separate cleanly, so the effect is small but real there.
 
-The asymmetry is LMDB's, not libmdbx's. LMDB is much faster on Linux than on
-Windows and libmdbx is roughly the same on both, so the Windows gaps are mostly
-LMDB being slow there — which
-[performance-proposals.md](performance-proposals.md) §6 had already found from
-the other direction, when `WRITE_MAP` measured 1.08–1.26× on Windows and
-nothing at all on Linux.
+Absolute figures, for scale: at eight threads Linux does 4.2M `get`/s against
+Windows' 2.9M, on the same hardware.
 
-> **A correction, and how it was caught.** The first version of this section
-> reported libmdbx at **0.16×** on Linux for batched `lazy` — a 6.4× loss — and
-> that number was wrong. It came from running `reads`, `writes` and `soak` in one
-> process: `reads` writes and re-reads about a gigabyte, the kernel is still
-> flushing it when `writes` starts, and that cost lands on whichever engine is
-> growing a file rather than writing into a preallocated one. Measured in
-> isolation the same scenario is 1.02×. The tell was a follow-up sweep whose own
-> baseline came out at 0.77×, five times better than the published figure for an
-> identical configuration. `examples/engine_ab.rs` now warns when the sections
-> are run together.
+### Writes
 
-### Reads — libmdbx is behind on Windows, level on Linux
+| Scenario | Windows | Linux |
+|---|---:|---:|
+| `set` one at a time, `lazy` | 1.08× (overlap) | 0.71× |
+| `set_many` blocks of 256, `lazy` | **1.83×** | **0.06×** |
+| `set` one at a time, `relaxed` | **0.19×** | 0.98× (overlap) |
+| `set_many` blocks of 256, `relaxed` | **2.49×** | 0.93× (overlap) |
+| `set` one at a time, `durable` | 0.85× (overlap) | 2.49× (overlap) |
+| `set_many` blocks of 256, `durable` | **1.53×** | 1.03× (overlap) |
 
-2 s per engine per scenario, 50,000 keys of 1 KiB, warmed before the clock
-starts.
+Two things stand out, and they point opposite ways.
 
-| Scenario | lmdb | mdbx | ratio |
-|---|---:|---:|---:|
-| `get`, 1 thread | 504,051 | 440,920 | 0.87× |
-| `get_with`, 1 thread | 579,498 | 454,313 | 0.78× |
-| `get`, 4 threads | 1,728,915 | 1,279,539 | 0.74× |
-| `get_with`, 4 threads | 1,509,852 | 1,290,704 | 0.85× |
-| `get`, 8 threads | 2,866,307 | 1,568,011 | **0.55×** |
-| `get_with`, 8 threads | 3,550,050 | 2,154,106 | 0.61× |
+On **Windows**, libmdbx wins every batched mode — 1.5× to 2.5× — and loses
+unbatched `relaxed` by 5×. On **Linux**, everything that syncs is parity, and
+batched `lazy` is a 17× loss: LMDB's median is 519,722 [443k–523k] against
+libmdbx's 29,040 [21k–48k], with no overlap across five repeats.
 
-On Windows LMDB scales 5.7× from one thread to eight; libmdbx manages 3.6× and
-flattens. The Phase 0 spike found the same shape by a different route —
-transaction begin, with no store in the way — putting libmdbx 25% behind at
-sixteen threads.
+That last row is the only large, reproducible gap in this document, and
+`lazy` is the default durability.
 
-**Linux, same harness:**
+### The soak, which points the other way again
 
-| Scenario | lmdb | mdbx | ratio |
-|---|---:|---:|---:|
-| `get`, 1 thread | 875,438 | 869,285 | 0.99× |
-| `get_with`, 1 thread | 879,375 | 892,794 | 1.02× |
-| `get`, 4 threads | 2,697,350 | 2,498,198 | 0.93× |
-| `get_with`, 4 threads | 2,661,685 | 2,627,697 | 0.99× |
-| `get`, 8 threads | 4,235,600 | 4,123,933 | 0.97× |
-| `get_with`, 8 threads | 4,207,100 | 4,126,475 | 0.98× |
-
-**The read regression is Windows-specific.** On Linux the engines are within 3%
-at every thread count and scale almost identically — LMDB 4.84× from one thread
-to eight, libmdbx 4.74×. Both are also far faster in absolute terms than on
-Windows, libmdbx more so (2.6× against LMDB's 1.5×), which is what closes the
-gap.
-
-The control this table needs is inside it: LMDB's read path is lock-free, so it
-*must* scale, and here it does. Phase 0's container could not manage that — its
-own LMDB column was flat — which is why that attempt was reported as unreadable
-rather than as a result.
-
-### Writes — libmdbx is far ahead once writes are batched
-
-4,000 operations of 256 B per scenario. "One at a time" is a commit per
-operation; "blocks of 256" is what group commit actually does under load.
-
-| Scenario | lmdb | mdbx | ratio |
-|---|---:|---:|---:|
-| `set` one at a time, `lazy` | 9,147 | 8,598 | 0.94× |
-| `set_many` blocks of 256, `lazy` | 52,032 | 146,388 | **2.81×** |
-| `set` one at a time, `relaxed` | 1,506 | 263 | 0.17× |
-| `set_many` blocks of 256, `relaxed` | 17,878 | 47,628 | **2.66×** |
-| `set` one at a time, `durable` | 1,483 | 1,220 | 0.82× |
-| `set_many` blocks of 256, `durable` | 16,655 | 22,585 | 1.36× |
-
-On Windows the pattern is a higher **per-commit** cost and a much better
-**per-batch** one, which would suit this server: a loaded writer packs whatever
-queued during the previous commit into the next one.
-
-**Linux, same harness, run as its own process:**
-
-| Scenario | lmdb | mdbx | ratio |
-|---|---:|---:|---:|
-| `set` one at a time, `lazy` | 9,072 | 8,775 | 0.97× |
-| `set_many` blocks of 256, `lazy` | 202,242 | 206,332 | 1.02× |
-| `set` one at a time, `relaxed` | 472 | 478 | 1.01× |
-| `set_many` blocks of 256, `relaxed` | 44,728 | 46,551 | 1.04× |
-| `set` one at a time, `durable` | 274 | 271 | 0.99× |
-| `set_many` blocks of 256, `durable` | 30,100 | 32,512 | 1.08× |
-
-Parity in every mode. The syncing modes are level because the device sets the
-pace and neither engine can change it; `lazy` is where the engine sets the pace,
-and on Linux the two are within 2%.
-
-**Batched `lazy` is also the noisiest thing measured here.** LMDB's own figure
-for that one row came out at 202k, 397k, 426k, 452k and 462k across five runs on
-one machine — a 2.3× spread, wider than any engine difference in this document.
-Treat single measurements of it as unusable; it is the row
-[What this cannot tell you](#what-this-cannot-tell-you) was written for.
-
-A geometry sweep — growth step at 16 and 64 MiB, `size_now` preallocated,
-`MDBX_LIFORECLAIM` off, the internal sync period off — moved nothing outside
-that noise band. It was run to close a 6.4× gap that turned out not to exist, so
-there is nothing for it to fix and the shipped geometry is unchanged.
-
-### The soak, which neither engine had been measured under
-
-30 s of sustained overfill on a 32 MiB map with 4 KiB values — permanently above
-the critical watermark, so the evictor never stops. `ops/s` counts **accepted**
-writes: a full store refuses rather than blocks, and refusals return fast, so
-counting attempts rewards whichever engine rejects more.
+20–30 s of sustained overfill on a 32 MiB map with 4 KiB values, permanently
+above the critical watermark. `ops/s` counts **accepted** writes.
 
 | Backend | accepted ops/s | utilisation | used MiB | file MiB | evicted |
 |---|---:|---:|---:|---:|---:|
-| lmdb (windows) | 27,133 | 0.974 | 31.2 | 32.0 | 810,496 |
-| mdbx (windows) | 35,418 | 0.962 | 30.8 | 32.0 | 1,058,944 |
-| lmdb (linux) | 95,968 | 0.848 | 27.1 | 32.0 | 2,875,712 |
-| mdbx (linux) | 89,499 | 0.869 | 27.8 | 32.0 | 2,681,536 |
+| lmdb (windows) | 46,947 | 0.974 | 31.2 | 32.0 | 935,488 |
+| mdbx (windows) | 56,464 | 0.861 | 27.6 | 32.0 | 1,126,080 |
+| lmdb (linux) | 83,651 | 0.974 | 31.2 | 32.0 | 1,669,120 |
+| mdbx (linux) | 103,927 | 0.946 | 30.3 | 32.0 | 2,075,200 |
 
-libmdbx sustains 31% more accepted writes on Windows and 7% fewer on Linux —
-the same inversion as everywhere else. Linux runs the whole soak 3.5× harder and
-holds utilisation further below the watermark, on both engines.
-**Neither engine drifts**, which is the result worth having: used bytes stay
-bounded, the file never passes `map_size`, and the evictor holds the line for
-both over a workload nothing else in this document covers.
+**libmdbx wins the soak on both platforms, by about 1.2×** — and the soak is
+sustained `lazy` writes, the same mode it loses by 17× above. It also holds
+utilisation further below the watermark on both.
 
-That is also a **negative result for the main operational argument**.
-[mdbx-proposal.md](mdbx-proposal.md) §7 expected libmdbx's LIFO recycling and
-continuous compactification to show up here as a file that stays smaller under
-churn. It does not: both files sit at the 32 MiB ceiling. Whatever the throughput
-difference is, it is not visible as space behaviour at this scale.
+Neither engine drifts: used bytes stay bounded and the file never passes
+`map_size`. That remains a **negative result** for
+[mdbx-proposal.md](mdbx-proposal.md) §7's expectation that libmdbx's
+compactification would show up as a smaller file under churn.
+
+### The one mechanism that explains both
+
+The soak's store is **already at its ceiling and no longer growing**. The write
+scenario writes into a **fresh store that grows continuously**. LMDB never pays
+for growth because it sizes its file to `map_size` at creation and leaves it
+sparse; libmdbx grows on demand, which is the property
+[mdbx-proposal.md](mdbx-proposal.md) §6 advertised as an advantage.
+
+Three observations fit that and nothing else does:
+
+- libmdbx loses the growing case by 17× and wins the grown case by 1.2×.
+- Preallocating `size_now` at 64 MiB in a geometry sweep took libmdbx's batched
+  `lazy` figure from 358k to 450k, level with LMDB's 450k.
+- The gap is worse when a read workload has run first, filling the page cache —
+  growth allocates under memory pressure, and a preallocated file does not.
+
+**Not yet confirmed**, because the sweep that suggested it ran before this
+methodology was fixed. The test that would settle it is batched `lazy` on Linux
+with and without `size_now` preallocated, five repeats, nothing else running. If
+it holds, the fix is a geometry that preallocates, and the cost is the disk that
+[mdbx-proposal.md](mdbx-proposal.md) Phase 2 gave up to make a fresh database
+cost 0.3 MiB instead of 16 MiB.
+
+### Two corrections worth keeping
+
+This section was published wrong twice, both times from single measurements.
+
+**First**, best-of-two on Windows gave reads at 0.55–0.87× and a headline of
+"45% behind at eight threads". Five repeats give 0.82–0.94×. The direction was
+right and the magnitude was not.
+
+**Second**, the first Linux run reported batched `lazy` at 0.16×, then a
+follow-up "isolated" run reported 1.02×, and this run reports 0.06×. The
+difference is not process isolation — it is whether a read workload ran first on
+the same kernel, because the page cache is not per-process. Running each section
+in its own process is necessary and not sufficient; what the numbers above do is
+run reads first *consistently*, on both platforms, so the comparison is at least
+like for like.
+
+The lesson is in the harness now: it reports ranges, and flags overlapping ones,
+because on this workload a single measurement of a write scenario carries no
+information at all.
 
 ### What this cannot tell you
 
