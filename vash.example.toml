@@ -91,8 +91,13 @@ map_size_mb = 4096
 # allocate under memory pressure and a preallocated file does not.
 #
 # What it costs is disk, immediately, per shard: a fresh mdbx store goes from
-# 0.3 MiB to whatever this says. Set it to roughly the working set you expect,
-# not to map_size_mb, which is a ceiling rather than a target.
+# 0.3 MiB to whatever this says.
+#
+# It is a step, not a slope. Sweeping it on a scenario writing ~1 MB, 16 MiB
+# already removed the whole penalty and 64, 128 and 256 MiB all landed in one
+# band with overlapping spreads -- 128 measured lower than 64. So set it a
+# little above the working set you expect and no higher; more buys nothing and
+# costs disk. Not a fraction of map_size_mb, which is a ceiling, not a target.
 preallocate_mb = 0
 
 max_readers = 256

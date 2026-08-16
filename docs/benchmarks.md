@@ -775,6 +775,32 @@ was the entire gap. It is worst under memory pressure, which is why the figure
 moved between 0.06× and 0.70× depending on whether reads had run first: growth
 has to allocate while the kernel is reclaiming, and a preallocated file does not.
 
+**How much is enough: a step, not a slope.** Same worst case, sweeping the
+setting, five repeats each:
+
+| `store.preallocate_mb` | lmdb | mdbx | ratio |
+|---|---:|---:|---:|
+| 0 | 427,056 | 68,939 | **0.16×** |
+| 16 | 459,937 | 409,645 | 0.89× (overlap) |
+| 64 | 428,828 | 524,740 | **1.22×** |
+| 128 | 449,411 | 458,598 | 1.02× (overlap) |
+| 256 | 423,956 | 489,492 | 1.15× (overlap) |
+
+**16 MiB already removes the penalty**, on a scenario that writes about 1 MB —
+so the threshold is "somewhat more than the working set", not a fraction of
+`map_size`. Above it every result lands in one band, 410k–525k, whose ranges
+overlap each other: 128 MiB measured *lower* than 64 MiB, and 256 MiB did not
+recover the difference. **There is no evidence that preallocating more than a
+modest amount buys anything**, and it costs disk per shard, so do not.
+
+LMDB is the control here and ignores the setting; its column stays flat across
+all five rows, which is what makes the mdbx column readable.
+
+Once growth is out of the way libmdbx lands slightly *ahead* — 1.02× to 1.22×,
+though only the 64 MiB row separated cleanly. That is the neighbourhood of the
+"up to 30% faster than LMDB" its README claims, and it is the same neighbourhood
+as the soak, which is the other regime where nothing is growing.
+
 That is what `store.preallocate_mb` is for. It costs the disk immediately, per
 shard — a fresh mdbx store goes from 0.3 MiB to whatever it says — which is
 exactly what [mdbx-proposal.md](mdbx-proposal.md) Phase 2 gave up when it
