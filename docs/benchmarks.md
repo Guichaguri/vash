@@ -320,6 +320,21 @@ At 1:9 closed loop, `vash-resident` reaches 124,618 against Redis's 58,453 and
 memcached's 142,472 — ahead of one, within 13% of the other. Pipelined it is
 155,347 against 521,078 and 738,317, which is the worst vash shows anywhere.
 
+**Both mixed rows above are superseded, and by a large factor.** They were
+measured when a block was dispatched whole, so a single write among fifteen reads
+sent all sixteen to the blocking pool and `resident_mode` was worth 1.06x here
+against 3.2x on pure reads. Splitting a block into runs
+([performance-proposals.md](performance-proposals.md) §14) moves the pipelined
+1:9 row by roughly 2x — 153,182 to 299,750 in a controlled A/B, and 115,702 to
+257,769 for pool against `resident_mode` in a matrix round.
+
+That matrix round is **not** reproduced in the tables above, deliberately: it ran
+after hours of continuous benchmarking and every target was depressed with it,
+Redis at 402,388 against the 474,300 above and memcached at 492,882 against
+707,270. The ratios inside it are worth reading and its absolute numbers are not,
+so the tables keep the last round measured on a rested box and this note records
+what has changed since. The matrix is due a re-run at `f9b2df7` or later.
+
 A cache doing 90% reads inherits more from the writes than the ratio suggests,
 because in vash a write still costs several times a read. The gap between the two
 mixed rows is the whole story of this document in miniature: where the client
