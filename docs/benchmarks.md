@@ -808,6 +808,30 @@ stopped pinning a lower bound. **An operator setting `backend = "mdbx"` should
 set this too**; without it the default durability's write path is several times
 slower than LMDB's.
 
+**`MDBX_opt_txn_dp_limit` has no headroom to give.** It caps the dirty pages a
+write transaction may hold before spilling, so if a 256-op batch were spilling
+mid-commit it would be undoing exactly what group commit is for. Bracketed from
+below, with preallocation on:
+
+| `dp_limit` (pages) | mdbx | against the default |
+|---|---:|---|
+| 32 | **aborted the process** | — |
+| 128 | 400,919 | 0.78×, separated — spilling |
+| 1,024 | 497,174 | flat |
+| 16,384 | 515,513 | flat |
+| 1,048,576 | 538,238 | flat |
+| default, ~107,000 | 515,088 | — |
+
+The knee sits between 128 and 1,024 pages, so a transaction here dirties
+something like 0.5–4 MB. libmdbx auto-tunes the default to
+`(total_ram + avail_ram) / 42`, which on this 9.9 GiB host is ~107,000 pages —
+about 428 MB, two orders of magnitude above what the workload uses. Raising it
+does nothing because nothing was ever spilling.
+
+Worth recording separately: **an under-sized `dp_limit` aborts the process**
+rather than failing gracefully — `SIGABRT` at 32 pages. That is a good reason
+not to expose it as a configuration knob.
+
 Two other levers measured nothing. `MDBX_WRITEMAP` — which mdbx permits under a
 no-sync mode and LMDB forbids — made both engines *worse* on Linux, reproducing
 [performance-proposals.md](performance-proposals.md) §6's finding that it is
