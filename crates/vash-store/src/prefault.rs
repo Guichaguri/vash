@@ -110,10 +110,7 @@ use tracing::warn;
 
 /// LMDB's data file within an environment directory.
 ///
-/// Fixed rather than discovered: the environment is opened without
-/// `MDB_NOSUBDIR`, so LMDB chooses this name and the directory holds only this
-/// and `lock.mdb`.
-const DATA_FILE: &str = "data.mdb";
+use crate::backend::lmdb::DATA_FILE;
 
 /// Read size for the warming pass. Large enough that the per-call overhead
 /// disappears against the copy, small enough to stay out of the way.

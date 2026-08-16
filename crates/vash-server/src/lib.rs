@@ -23,7 +23,7 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
-use vash_store::{LmdbStore, Store};
+use vash_store::{Store, StoreHandle};
 
 pub use config::Config;
 pub use state::ServerState;
@@ -51,7 +51,11 @@ pub struct Server {
     ///
     /// `None` when the store came from [`Server::bind_with`], where releasing it
     /// is the caller's business.
-    lmdb: Option<Arc<LmdbStore>>,
+    ///
+    /// A handle rather than a concrete store since M11: which engine is
+    /// underneath is a configuration question, and `vash-server` is the one
+    /// crate that should not have to answer it.
+    store: Option<StoreHandle>,
 }
 
 impl Server {
@@ -61,16 +65,20 @@ impl Server {
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
         config.validate()?;
 
-        let lmdb = Arc::new(
-            LmdbStore::open(&config.store_config())
-                .with_context(|| format!("opening store at {}", config.store.path.display()))?,
-        );
+        let handle = vash_store::open(&config.store_config()).with_context(|| {
+            format!(
+                "opening the {} store at {}",
+                config.store.backend.as_str(),
+                config.store.path.display()
+            )
+        })?;
 
-        // The concrete handle is kept alongside the trait object for exactly one
-        // reason, and it is spelled out on the field: LMDB needs an explicit,
+        // The handle is kept alongside the trait object for exactly one reason,
+        // and it is spelled out on the field: an engine may need an explicit,
         // blocking release that `Drop` does not give.
-        let mut server = Self::bind_with(config, Arc::clone(&lmdb) as Arc<dyn Store>).await?;
-        server.lmdb = Some(lmdb);
+        let store = Arc::clone(handle.store());
+        let mut server = Self::bind_with(config, store).await?;
+        server.store = Some(handle);
         Ok(server)
     }
 
@@ -211,7 +219,7 @@ impl Server {
             state,
             connections: Arc::new(Semaphore::new(config.server.max_connections)),
             config,
-            lmdb: None,
+            store: None,
         })
     }
 
@@ -240,7 +248,7 @@ impl Server {
             config,
             connections,
             pre_auth,
-            lmdb,
+            store: store_handle,
         } = self;
         let enforcing = state.auth.required();
 
@@ -384,19 +392,17 @@ impl Server {
             error!(error = %e, "final sync failed");
         }
 
-        // Release the LMDB environment, if this server is the one that opened
-        // it. Dropping only schedules the close, and LMDB refuses to reopen a
-        // path still registered in this process, so anything that restarts
-        // in-process needs the wait.
+        // Release the storage environment, if this server is the one that
+        // opened it. Under LMDB, dropping only *schedules* the close and a
+        // reopen of the same path in this process is refused until it lands, so
+        // an in-process restart needs the wait; other engines close on drop and
+        // this costs nothing.
         //
         // The state has to go first: it holds the trait object, which shares a
         // reference count with the handle below.
-        if let Some(lmdb) = lmdb {
+        if let Some(handle) = store_handle {
             drop(state);
-            match Arc::try_unwrap(lmdb) {
-                Ok(store) => store.close(),
-                Err(_) => warn!("store still referenced at shutdown; environment left open"),
-            }
+            handle.close();
         }
 
         Ok(())

@@ -25,7 +25,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-targets
-      - run: cargo test --all-features
+      # Two runs, because the storage suites are parameterised by which engine
+      # is compiled rather than by a runtime flag, and both engines have to be
+      # covered. `--all-features` turns `mdbx` on, so it is the libmdbx pass;
+      # the default one is LMDB, which is what ships. See
+      # docs/mdbx-proposal.md §11 and crates/vash-store/tests/store.rs.
+      - name: Test on LMDB (the shipping default)
+        run: cargo test
+      - name: Test on libmdbx
+        run: cargo test --all-features
 
   # The compatibility claim is only worth anything if it is checked against real
   # clients, and against the real servers. Running the identical suite on both
@@ -149,6 +157,20 @@ jobs:
       - name: Install the musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --bin vash-server --target x86_64-unknown-linux-musl
+
+      # **libmdbx does not link under musl without help**, and this is the job
+      # that would find out. Its runtime SIMD dispatch needs CPU-model symbols
+      # musl's libgcc does not carry, so `crates/vash-store/build.rs` turns the
+      # dispatch off for this target; glibc and MSVC are unaffected, which is
+      # exactly why it needs asserting *here*. See docs/mdbx-proposal.md §Q1.
+      #
+      # Built beside the release binary rather than into it: the artefact below
+      # is the shipping configuration, and that is still LMDB.
+      - name: Check libmdbx also links statically under musl
+        run: |
+          cargo build --release --bin vash-server --features vash-server/mdbx             --target x86_64-unknown-linux-musl
+          ldd target/x86_64-unknown-linux-musl/release/vash-server 2>&1             | grep -q "not a dynamic executable"             || { echo "the mdbx build is dynamically linked"; exit 1; }
+          cargo build --release --bin vash-server --target x86_64-unknown-linux-musl
 
       # A "static" binary that turns out to be dynamically linked is a problem
       # discovered on the target machine, so it is asserted here instead.

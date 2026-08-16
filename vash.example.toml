@@ -17,6 +17,28 @@ max_blocking_threads = 128
 [store]
 path = "data"
 
+# Which storage engine to open: lmdb (default) or mdbx.
+#
+# mdbx is libmdbx, a fork of LMDB with a growable file, a stronger no-sync mode
+# and a cross-platform warm-up. It needs a binary built with the `mdbx` feature
+# and is refused at startup rather than silently downgraded when that is
+# missing.
+#
+# THE TWO ARE NOT INTERCHANGEABLE ON AN EXISTING DATABASE. They write different
+# file formats, so switching empties the cache: startup refuses a directory the
+# other engine wrote rather than opening it and missing on every key. Wipe the
+# directory when you change this.
+#
+# lmdb is the default because the measurements have not yet said otherwise --
+# the storage engine is about 8% of what a write costs here, so a faster B-tree
+# is worth single digits end to end. What mdbx changes that lmdb cannot is
+# mostly operational: map_size becomes a ceiling the file grows toward and can
+# shrink back from rather than a fixed reservation, `lazy` keeps its integrity
+# guarantee without LMDB's caveat about filesystem write ordering, and
+# resident_mode can pin the map on Windows and macOS as well as Linux. See
+# docs/mdbx-proposal.md.
+backend = "lmdb"
+
 # Independent LMDB environments, and therefore the ceiling on concurrent
 # writers. 0 picks min(num_cpus, 2).
 #

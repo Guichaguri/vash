@@ -31,14 +31,48 @@
 //! [`docs/mdbx-proposal.md`]: https://github.com/guichaguri/vash/blob/main/docs/mdbx-proposal.md
 
 pub mod lmdb;
+/// The libmdbx backend. Off by default — it compiles and links a second C
+/// library, so every build should not pay for it until the measurements say so.
+#[cfg(feature = "mdbx")]
+pub mod mdbx;
 
 use std::ops::Bound;
 use std::path::Path;
+
+use crate::error::StoreError;
 
 use crate::config::StoreConfig;
 use crate::error::Result;
 
 pub use lmdb::LmdbBackend;
+#[cfg(feature = "mdbx")]
+pub use mdbx::MdbxBackend;
+
+/// Refuses to open a directory that the other engine wrote.
+///
+/// The two file formats are not interchangeable — mdbx is a fork of LMDB's
+/// design, not of its layout — and the engines name their data files
+/// differently, so this costs one `exists` check and catches the whole class.
+///
+/// Refusing is the same call `env.rs` makes for a shard-count mismatch, and for
+/// the same reason: the alternative is a store that appears to open and misses
+/// on every key, which is a silent, total cache loss. A cache's data is
+/// reconstructible by definition, so "refuse, and let the operator wipe" is
+/// both safer and less code than a conversion. See `docs/storage.md`.
+pub(crate) fn refuse_foreign_database(
+    path: &Path,
+    ours: &str,
+    theirs: &str,
+    their_name: &str,
+) -> Result<()> {
+    if path.join(ours).exists() || !path.join(theirs).exists() {
+        return Ok(());
+    }
+    Err(StoreError::Corrupt(format!(
+        "database at {} was written by the {their_name} backend, but this server is          configured for a different one; the file formats are not interchangeable,          so wipe the directory or change store.backend",
+        path.display()
+    )))
+}
 
 /// The half-open key range a scan walks.
 ///

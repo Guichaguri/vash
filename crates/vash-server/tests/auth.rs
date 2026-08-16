@@ -39,6 +39,14 @@ impl TestServer {
         let mut config = Config::default();
         config.server.listen = "127.0.0.1:0".parse().unwrap();
         config.store.path = dir.path().join("db");
+        // The whole protocol suite runs against whichever engine this build
+        // carries, so `--features mdbx` re-runs it on the second one. See
+        // `crates/vash-store/tests/store.rs` for the same arrangement a layer
+        // down, and `docs/mdbx-proposal.md` for why the choice is per build.
+        #[cfg(feature = "mdbx")]
+        {
+            config.store.backend = vash_server::config::Backend::Mdbx;
+        }
         config.store.map_size_mb = 64;
         // One LMDB environment rather than one per shard. Nothing here is about
         // sharding, and the suite runs in parallel against a finite pool of

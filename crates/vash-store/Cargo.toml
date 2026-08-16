@@ -30,6 +30,18 @@ libc.workspace = true
 # A second `Store` implementation, held in memory. Off by default: it is a test
 # double, not a cache, and nothing in a release build should be able to reach it.
 testing = []
+# The libmdbx storage backend, beside LMDB. Off by default: it compiles and
+# links a second C library, and until the benchmarks say it wins there is no
+# reason for every build to carry it. With it on, `store.backend = "mdbx"`
+# becomes a valid configuration; without it, that setting is refused at startup
+# rather than silently falling back. See `docs/mdbx-proposal.md`.
+mdbx = []
+
+[build-dependencies]
+# Compiles the vendored libmdbx, and only when the `mdbx` feature is on. The
+# same crate `heed` already uses to compile LMDB, so this adds nothing to a
+# default build's graph.
+cc = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -48,6 +48,7 @@ pub mod lmdb;
 /// An in-memory implementation, for tests. See [`memory::MemoryStore`].
 #[cfg(feature = "testing")]
 pub mod memory;
+mod open;
 mod prefault;
 mod queue;
 mod read;
@@ -61,11 +62,14 @@ mod writer;
 use vash_core::{BatchGuard, ExpireGuard, Key, Listing, Set, Value, ValueRef};
 
 pub use apply::Written;
+#[cfg(feature = "mdbx")]
+pub use backend::MdbxBackend;
 pub use backend::{Backend, LmdbBackend, ReadTxn, WriteTxn};
-pub use config::{Durability, EvictionConfig, StoreConfig, WriteConfig};
+pub use config::{BackendKind, Durability, EvictionConfig, StoreConfig, WriteConfig};
 pub use engine::Pressure;
 pub use error::{Result, StoreError};
 pub use lmdb::{LmdbStore, VashStore};
+pub use open::{StoreHandle, open};
 
 /// A [`Store::submit_set_many`] in flight.
 ///

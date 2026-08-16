@@ -48,9 +48,43 @@ pub enum Durability {
     Lazy,
 }
 
+/// Which storage engine to open.
+///
+/// A runtime choice rather than only a build-time one, because the question
+/// this exists to answer — which engine is faster for *this* workload — can
+/// only be settled by running both on one host, in one binary, in paired runs.
+/// A host whose write numbers swing by a factor of two between runs cannot
+/// answer it any other way; see `docs/benchmarks.md`.
+///
+/// The cargo feature and this setting do different jobs. The feature decides
+/// whether the mdbx C library is compiled and linked at all; this decides which
+/// engine a given deployment opens. A binary built without the feature refuses
+/// [`BackendKind::Mdbx`] at startup rather than silently falling back — the same
+/// rule the shard-count check follows, and for the same reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendKind {
+    #[default]
+    Lmdb,
+    Mdbx,
+}
+
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lmdb => "lmdb",
+            Self::Mdbx => "mdbx",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
     pub path: PathBuf,
+    /// Which engine to open. **Not interchangeable on an existing database**:
+    /// the two write different file formats, so switching empties the cache and
+    /// startup refuses a directory the other engine wrote. See
+    /// [`BackendKind`].
+    pub backend: BackendKind,
     /// Address-space reservation for the memory map. Measured on Windows and
     /// Linux to be a lazy reservation, not a preallocation, so a generous value
     /// costs nothing until the data actually arrives.
@@ -217,6 +251,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::from("data"),
+            backend: BackendKind::default(),
             map_size: 4 * 1024 * 1024 * 1024,
             max_readers: 256,
             durability: Durability::default(),

@@ -11,16 +11,42 @@ the bytes.
 
 ---
 
+## Two engines, one format
+
+Everything below describes the **logical** format — the sub-databases, the key
+encodings, the record layout — and it is identical on both engines. What differs
+is the file the engine writes it into, and the engines cannot read each other's.
+
+| | `store.backend = "lmdb"` (default) | `store.backend = "mdbx"` |
+|---|---|---|
+| Files | `data.mdb`, `lock.mdb` | `mdbx.dat`, `mdbx.lck` |
+| `map_size_mb` | A fixed reservation; the file is sparse | A **ceiling** the file grows toward and can shrink back from |
+| `max_readers` | Exact | A floor — mdbx rounds the reader table up to fill its pages |
+| `lazy` durability | `MDB_NOSYNC`, and never `MDB_WRITEMAP` | `MDBX_SAFE_NOSYNC`, which keeps its integrity guarantee without LMDB's caveat about filesystem write ordering, and composes with `WRITEMAP` |
+| Pinning the map | Linux only | Every platform, via `mdbx_env_warmup` |
+
+**Opening a database with the wrong engine is refused**, by looking for the
+other one's data file. The alternative is worse than a crash: mdbx would create
+an empty database beside the LMDB one, so the old data would sit on disk taking
+up space while every read missed — the same silent, total cache loss the
+[shard count](#shard-count-is-fixed) check exists to prevent. Changing
+`store.backend` therefore means wiping the directory.
+
+mdbx requires a binary built with the `mdbx` feature; without it the setting is
+refused at startup rather than quietly served by LMDB. The rationale for
+carrying two engines at all, and the measurements behind the default, are in
+[mdbx-proposal.md](mdbx-proposal.md).
+
 ## Layout on disk
 
-One directory per shard, each a complete, independent LMDB environment:
+One directory per shard, each a complete, independent environment:
 
 ```
 <store.path>/                 a single-shard store, or
 <store.path>/shard-0/         shard N of a multi-shard store
 <store.path>/shard-1/
-    data.mdb                  the memory-mapped database
-    lock.mdb                  LMDB's reader table and write lock
+    data.mdb                  the memory-mapped database (mdbx.dat under mdbx)
+    lock.mdb                  the reader table and write lock (mdbx.lck)
 ```
 
 A single-shard store uses `store.path` directly, so a database created before

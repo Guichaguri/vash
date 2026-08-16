@@ -42,6 +42,14 @@ impl TestServer {
         let mut config = Config::default();
         config.server.listen = "127.0.0.1:0".parse().unwrap();
         config.store.path = dir.path().join("db");
+        // The whole protocol suite runs against whichever engine this build
+        // carries, so `--features mdbx` re-runs it on the second one. See
+        // `crates/vash-store/tests/store.rs` for the same arrangement a layer
+        // down, and `docs/mdbx-proposal.md` for why the choice is per build.
+        #[cfg(feature = "mdbx")]
+        {
+            config.store.backend = vash_server::config::Backend::Mdbx;
+        }
         // Small enough to be cheap in CI, large enough for these tests.
         config.store.map_size_mb = 64;
         // Port 0: these run in parallel and would otherwise fight over 9090.

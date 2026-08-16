@@ -15,12 +15,21 @@ use std::path::Path;
 use heed::types::Bytes as HeedBytes;
 use heed::{Env, EnvFlags, EnvOpenOptions, RwTxn, WithTls};
 
-use crate::backend::{Backend, DbStat, EnvInfo, Range, ReadTxn, Warmed, WriteTxn};
+use crate::backend::{
+    Backend, DbStat, EnvInfo, Range, ReadTxn, Warmed, WriteTxn, refuse_foreign_database,
+};
 use crate::config::{Durability, StoreConfig};
 use crate::error::{Result, StoreError};
 use crate::schema::MAX_DBS;
 
 type HeedDb = heed::Database<HeedBytes, HeedBytes>;
+
+/// LMDB's data file.
+///
+/// Fixed rather than discovered: the environment is opened without
+/// `MDB_NOSUBDIR`, so LMDB chooses this name and the directory holds only this
+/// and `lock.mdb`.
+pub(crate) const DATA_FILE: &str = "data.mdb";
 
 /// Maps LMDB's `MDB_MAP_FULL` onto the dedicated capacity variant, and
 /// everything else onto the engine-neutral one.
@@ -77,6 +86,9 @@ impl Backend for LmdbBackend {
     type RwTxn<'e> = LmdbRwTxn<'e>;
 
     fn open(config: &StoreConfig, path: &Path) -> Result<Self> {
+        #[cfg(feature = "mdbx")]
+        refuse_foreign_database(path, DATA_FILE, super::mdbx::DATA_FILE, "mdbx")?;
+
         // SAFETY: LMDB maps the file into this process's address space. The
         // contract is that no other process mutates the file outside of LMDB's
         // own locking, which the lock file in the same directory enforces.

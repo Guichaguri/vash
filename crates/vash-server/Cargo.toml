@@ -38,6 +38,10 @@ tracing-subscriber.workspace = true
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]
+# Builds the libmdbx backend into the binary, making `store.backend = "mdbx"`
+# a valid configuration. Off by default: it compiles and links a second C
+# library. See `docs/mdbx-proposal.md`.
+mdbx = ["vash-store/mdbx"]
 # Off by default, against plan §2, which expected 10-20% from it on
 # allocation-heavy connection handling. Measured on this workload it is worth
 # nothing: 1.13M against 1.11M ops/s on 64-byte GETs and 537k against 540k on

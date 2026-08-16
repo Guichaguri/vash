@@ -5,6 +5,8 @@
 /data
 *.mdb
 *.mdb-lock
+mdbx.dat
+mdbx.lck
 
 # IDE
 /.idea

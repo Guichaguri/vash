@@ -7,10 +7,23 @@
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use vash_core::{Key, Set};
-use vash_store::{LmdbStore, Store, StoreConfig, WriteConfig};
+use vash_store::{Store, StoreConfig, WriteConfig};
+
+/// The engine every test in this file runs against.
+///
+/// **The suite is the acceptance criterion for a backend, so it has to run on
+/// each of them.** It runs against whichever engine is compiled: LMDB by
+/// default, libmdbx when the `mdbx` feature is on, and CI runs the file twice
+/// for that reason. Running both in one pass would mean a generic parameter on
+/// every one of these tests, which buys nothing a second CI job does not — the
+/// invariants are the same invariants either way.
+#[cfg(not(feature = "mdbx"))]
+type TestStore = vash_store::LmdbStore;
+#[cfg(feature = "mdbx")]
+type TestStore = vash_store::VashStore<vash_store::MdbxBackend>;
 
 struct Harness {
-    store: Option<LmdbStore>,
+    store: Option<TestStore>,
     _dir: TempDir,
 }
 
@@ -36,12 +49,12 @@ impl Harness {
         tweak(&mut config);
 
         Self {
-            store: Some(LmdbStore::open(&config).unwrap()),
+            store: Some(TestStore::open(&config).unwrap()),
             _dir: dir,
         }
     }
 
-    fn store(&self) -> &LmdbStore {
+    fn store(&self) -> &TestStore {
         self.store.as_ref().unwrap()
     }
 
@@ -515,7 +528,7 @@ fn concurrent_writers_share_commits_and_never_reuse_a_cas() {
     use std::sync::Arc;
 
     let h = Harness::new();
-    let store: Arc<&LmdbStore> = Arc::new(h.store());
+    let store: Arc<&TestStore> = Arc::new(h.store());
 
     // Group commit is the point of the writer thread: many threads submitting
     // at once must all land, with unique CAS tokens, and no lost updates.
@@ -749,7 +762,7 @@ fn reclamation_resumes_across_a_restart() {
     };
 
     {
-        let store = LmdbStore::open(&config).unwrap();
+        let store = TestStore::open(&config).unwrap();
         for i in 0..100u32 {
             let key = format!("k{i}");
             store
@@ -782,7 +795,7 @@ fn reclamation_resumes_across_a_restart() {
     }
 
     // Reopen: the persisted job and cursor must carry on.
-    let store = LmdbStore::open(&config).unwrap();
+    let store = TestStore::open(&config).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while store.stats().unwrap().entries > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -814,7 +827,7 @@ fn tag_generations_survive_a_restart() {
     };
 
     {
-        let store = LmdbStore::open(&config).unwrap();
+        let store = TestStore::open(&config).unwrap();
         store
             .set(&Set {
                 key: Key::new(b"k").unwrap(),
@@ -830,7 +843,7 @@ fn tag_generations_survive_a_restart() {
         store.close();
     }
 
-    let store = LmdbStore::open(&config).unwrap();
+    let store = TestStore::open(&config).unwrap();
     assert!(
         store.get(Key::new(b"k").unwrap()).unwrap().is_none(),
         "an invalidated record must not be resurrected by a restart"
@@ -852,7 +865,7 @@ fn tag_ids_are_stable_across_a_restart() {
     };
 
     {
-        let store = LmdbStore::open(&config).unwrap();
+        let store = TestStore::open(&config).unwrap();
         for (i, tag) in [b"a".as_slice(), b"b", b"c"].iter().enumerate() {
             store
                 .set(&Set {
@@ -869,7 +882,7 @@ fn tag_ids_are_stable_across_a_restart() {
         store.close();
     }
 
-    let store = LmdbStore::open(&config).unwrap();
+    let store = TestStore::open(&config).unwrap();
     // Invalidating "b" must hit only k1. If ids were reassigned on load, this
     // would kill the wrong record.
     store.delete_by_tag(b"b").unwrap();
@@ -1404,7 +1417,7 @@ fn reopening_with_a_different_shard_count_is_refused() {
         ..StoreConfig::default()
     };
 
-    let store = LmdbStore::open(&config).unwrap();
+    let store = TestStore::open(&config).unwrap();
     store
         .set(&Set {
             key: Key::new(b"k").unwrap(),
@@ -1419,7 +1432,7 @@ fn reopening_with_a_different_shard_count_is_refused() {
     store.close();
 
     config.shards = 8;
-    let Err(err) = LmdbStore::open(&config) else {
+    let Err(err) = TestStore::open(&config) else {
         panic!("must refuse a changed shard count");
     };
     assert!(
@@ -1560,7 +1573,7 @@ fn data_and_the_expiry_index_survive_a_reopen() {
     };
 
     let cas = {
-        let store = LmdbStore::open(&config).unwrap();
+        let store = TestStore::open(&config).unwrap();
         let cas = store
             .set(&Set {
                 key: Key::new(b"k").unwrap(),
@@ -1576,7 +1589,7 @@ fn data_and_the_expiry_index_survive_a_reopen() {
         cas
     };
 
-    let store = LmdbStore::open(&config).unwrap();
+    let store = TestStore::open(&config).unwrap();
     let stats = store.stats().unwrap();
     assert_eq!(stats.entries, 1);
     assert_eq!(
@@ -1607,7 +1620,7 @@ fn data_and_the_expiry_index_survive_a_reopen() {
 /// Deliberately a real paging loop rather than one big call: the cursor
 /// arithmetic across shard boundaries is the part worth testing, and a single
 /// call with a large limit would never exercise it.
-fn page_keys(store: &LmdbStore, limit: u32, pattern: &[u8], max_scan: usize) -> Vec<Vec<u8>> {
+fn page_keys(store: &TestStore, limit: u32, pattern: &[u8], max_scan: usize) -> Vec<Vec<u8>> {
     let mut names = Vec::new();
     let mut cursor: Vec<u8> = Vec::new();
     // A listing must terminate; a bound turns "the cursor stopped advancing"
@@ -2057,7 +2070,7 @@ fn a_prefaulted_store_opens_and_serves_every_shard() {
     };
 
     {
-        let store = LmdbStore::open(&config).unwrap();
+        let store = TestStore::open(&config).unwrap();
         for i in 0..64u32 {
             store
                 .set(&Set {
@@ -2075,7 +2088,7 @@ fn a_prefaulted_store_opens_and_serves_every_shard() {
     }
 
     config.prefault = true;
-    let store = LmdbStore::open(&config).unwrap();
+    let store = TestStore::open(&config).unwrap();
     for i in 0..64u32 {
         let key = format!("k{i}");
         assert!(
@@ -2101,7 +2114,7 @@ fn prefaulting_an_empty_database_is_not_an_error() {
         ..StoreConfig::default()
     };
 
-    let store = LmdbStore::open(&config).unwrap();
+    let store = TestStore::open(&config).unwrap();
     assert_eq!(store.stats().unwrap().entries, 0);
     store.close();
 }
@@ -2122,7 +2135,7 @@ fn a_lazy_store_reopens_with_its_data() {
     };
 
     {
-        let store = LmdbStore::open(&config).unwrap();
+        let store = TestStore::open(&config).unwrap();
         for i in 0..64u32 {
             store
                 .set(&Set {
@@ -2139,7 +2152,7 @@ fn a_lazy_store_reopens_with_its_data() {
         store.close();
     }
 
-    let store = LmdbStore::open(&config).unwrap();
+    let store = TestStore::open(&config).unwrap();
     for i in 0..64u32 {
         let key = format!("k{i}");
         assert_eq!(

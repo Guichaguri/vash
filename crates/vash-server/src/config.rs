@@ -41,6 +41,14 @@ pub struct ServerConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct StoreConfig {
     pub path: PathBuf,
+    /// Which storage engine to open.
+    ///
+    /// **Not interchangeable on an existing database.** The engines write
+    /// different file formats, so switching empties the cache — startup refuses
+    /// a directory the other one wrote rather than opening it and missing on
+    /// every key. `mdbx` also needs a binary built with the `mdbx` feature, and
+    /// is refused rather than quietly downgraded when it is not.
+    pub backend: Backend,
     /// Independent LMDB environments, and therefore the ceiling on concurrent
     /// writers. `0` picks `min(num_cpus, 2)` — see [`Config::shard_count`] for
     /// why it is capped there, and for the measurement that lowered it from 4.
@@ -242,6 +250,36 @@ impl Default for TtlConfig {
             bucket_granularity_ms: 1000,
             sweep_interval_ms: defaults.sweep_interval_ms,
             sweep_batch: defaults.sweep_batch,
+        }
+    }
+}
+
+/// Mirrors `vash_store::BackendKind`, kept separate for the same reason as
+/// [`Durability`]: the store crate takes no serde dependency for the config
+/// file's sake.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    Lmdb,
+    Mdbx,
+}
+
+impl Backend {
+    /// The name this engine goes by in the config file and in log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lmdb => "lmdb",
+            Self::Mdbx => "mdbx",
+        }
+    }
+}
+
+impl From<Backend> for vash_store::BackendKind {
+    fn from(b: Backend) -> Self {
+        match b {
+            Backend::Lmdb => Self::Lmdb,
+            Backend::Mdbx => Self::Mdbx,
         }
     }
 }
@@ -528,6 +566,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::from("data"),
+            backend: Backend::default(),
             map_size_mb: 4096,
             // Comfortably above the default blocking pool, which is the ceiling
             // on concurrent readers; validation enforces the relationship.
@@ -782,6 +821,7 @@ impl Config {
     pub fn store_config(&self) -> vash_store::StoreConfig {
         vash_store::StoreConfig {
             path: self.store.path.clone(),
+            backend: self.store.backend.into(),
             shards: self.shard_count(),
             map_size: self.store.map_size_mb * 1024 * 1024,
             max_readers: self.store.max_readers,
