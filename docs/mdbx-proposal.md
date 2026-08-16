@@ -747,7 +747,46 @@ One thing the naive conversion got wrong and review caught: `utilisation_in`
 took two `info()` snapshots per commit where it had taken one, because
 `used_bytes_in` now needs the page size from the same call. It takes one.
 
-### Phase 2 — the mdbx backend behind the feature
+### Phase 2 — the mdbx backend behind the feature ✅ **done**
+
+`crates/vash-store/src/backend/mdbx/` over `vendor/libmdbx/mdbx.c`, behind the
+`mdbx` feature and `store.backend`. Both engines run the whole store suite and
+the whole server protocol suite, and CI runs each twice — once per engine — with
+the musl link asserted separately.
+
+**What it found, none of which was in the plan:**
+
+- **`max_readers` is a floor under mdbx, not an exact count.** It rounds the
+  reader table up to fill its pages — 256 became 368. Harmless in the direction
+  it goes, since the startup rule this setting exists for is
+  `store.max_readers > server.max_blocking_threads`, but it is a semantic
+  difference and `docs/storage.md` now says so.
+- **Stating a geometry lower bound cost 16 MiB per fresh shard.** Pinning it to
+  `MIN_MAP_SIZE` made every new database allocate that much up front, which
+  quietly contradicts the property `map_size` has always been documented with.
+  Stating only the ceiling brings a fresh store to **0.3 MiB**, and
+  `examples/mdbx_geometry.rs` is the measurement — LMDB 0.0 MiB, mdbx 0.3 MiB, at
+  64 MiB, 1 GiB and 4 GiB alike. `MIN_MAP_SIZE` is still enforced on `map_size`
+  itself; it is LMDB's floor, and there is no reason a growable file starts
+  there.
+- **Both `MDBX_MAP_FULL` and `MDBX_TXN_FULL` have to map to `CapacityFull`.**
+  LMDB has only the first. The second is one transaction dirtying more than it
+  may, and the writer's answer — free space, retry smaller — is right for both.
+- **mdbx pins the map on Windows**, once the process working set is raised,
+  which is item 3 of [§7](#7-what-libmdbx-actually-gives-us) delivered rather
+  than predicted. `tests/backends.rs` asserts it there.
+
+**Exit — met.** The store suite passes on both engines (77 tests each), the
+server suites pass on both, and a database written by one engine is refused by
+the other with an instruction to wipe.
+
+**One caveat on how "both" is achieved.** The suites are parameterised by which
+engine is *compiled*, not by a runtime flag, so covering both takes two CI runs
+rather than one. Running both in a single pass would mean a generic parameter on
+all 77 tests, which buys nothing a second job does not — the invariants are the
+same invariants.
+
+### Phase 2 — the original plan
 
 `backend/mdbx.rs` over raw FFI, the vendored `mdbx.c` and its build script
 (including the musl define), the `mdbx` cargo feature, `store.backend`, the
