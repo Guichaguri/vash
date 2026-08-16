@@ -315,9 +315,12 @@ pub trait WriteTxn<B: Backend>: ReadTxn<B> {
 ```
 
 `LmdbEngine` becomes `Engine<B: Backend>`, and the generic travels up through
-`Shards<B>`, `ShardWriter<B>` and `LmdbStore` → `VashStore<B>`. **It stops
-there**, because `ServerState` holds `Arc<dyn Store>`: the server, the cluster,
-the executors, the protocol layer and every server test see no change at all.
+`Shards<B>` and `LmdbStore` → `VashStore<B>`. (Not the writer: it owns a queue
+and a thread handle, and the engine only exists inside the thread it spawned, so
+only `Writer::spawn` is generic — a detail Phase 1 found rather than planned.)
+**It stops there**, because `ServerState` holds `Arc<dyn Store>`: the server, the
+cluster, the executors, the protocol layer and every server test see no change
+at all.
 That containment is the reason the m10 seam was worth building even though this
 document says it is the wrong seam for the engine — it is the right seam for
 keeping the engine swap out of the server.
@@ -715,16 +718,34 @@ pinning work on both platforms tested, given a raised process limit.
   Linux box, and the same run should re-check the 25% read regression Windows
   showed — one platform is not a result.
 
-### Phase 1 — extract the `Backend` trait, LMDB only
+### Phase 1 — extract the `Backend` trait, LMDB only ✅ **done**
 
-The whole refactor, one backend, no new dependency, no feature flag. `env.rs`
-splits, `Engine<B>` gains its parameter, `StoreError::Lmdb` becomes
-`StoreError::Engine`.
+`crates/vash-store/src/backend/` holds the trait and the heed implementation;
+`env.rs` kept the schema check, the shard-identity check, the tag registry load
+and the CAS resumption, and lost everything else. `Engine<B>`, `Shards<B>` and
+`VashStore<B>` carry the parameter; `LmdbEngine` and `LmdbStore` remain as type
+aliases, so the benchmarks, the examples and `vash-server` compile untouched.
 
-**Exit:** `tests/store.rs` and the server suite pass unchanged; the benchmark
-suite shows no regression against the commit before it (this is a
-zero-behaviour-change refactor, and a measurable delta means the generic did
-something the `dyn` boundary was hiding).
+**Exit — met.** 651 tests pass unchanged, and the `hot_path` read benchmarks are
+within run-to-run noise against the previous commit, mostly slightly ahead. The
+diff removes 482 lines and adds 405: `.map_err(StoreError::from_heed)?` on every
+operation is gone, because a backend maps its own errors.
+
+Three things worth recording, none of them the point:
+
+- **`Writer` needed no parameter.** It owns a queue and a thread handle; the
+  engine only exists inside the thread it spawned, so only `Writer::spawn` is
+  generic. `Shard<B>` holds an `Arc<Engine<B>>` and a plain `Writer`.
+- **`StoreError::Lmdb(heed::Error)` became `Engine(String)`**, which made
+  `clone_shallow` lossless — it used to downgrade an engine failure to `Corrupt`
+  because `heed::Error` is not `Clone`.
+- **The borrow discipline needed no restructuring**, exactly as §2 predicted:
+  heed's own rules had already forced every scan to collect a bounded batch
+  before deleting from it.
+
+One thing the naive conversion got wrong and review caught: `utilisation_in`
+took two `info()` snapshots per commit where it had taken one, because
+`used_bytes_in` now needs the page size from the same call. It takes one.
 
 ### Phase 2 — the mdbx backend behind the feature
 
