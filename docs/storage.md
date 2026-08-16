@@ -21,6 +21,7 @@ is the file the engine writes it into, and the engines cannot read each other's.
 |---|---|---|
 | Files | `data.mdb`, `lock.mdb` | `mdbx.dat`, `mdbx.lck` |
 | `map_size_mb` | A fixed reservation; the file is sparse | A **ceiling** the file grows toward and can shrink back from |
+| `preallocate_mb` | Ignored — the file is already `map_size` at creation | How much to allocate up front, to avoid paying for growth on the write path |
 | `max_readers` | Exact | A floor — mdbx rounds the reader table up to fill its pages |
 | `lazy` durability | `MDB_NOSYNC`, and never `MDB_WRITEMAP` | `MDBX_SAFE_NOSYNC`, which keeps its integrity guarantee without LMDB's caveat about filesystem write ordering, and composes with `WRITEMAP` |
 | Pinning the map | Linux only | Every platform, via `mdbx_env_warmup` |

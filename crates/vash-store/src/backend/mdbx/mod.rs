@@ -170,8 +170,16 @@ impl Backend for MdbxBackend {
             // `Engine::open`. It is LMDB's floor rather than a general one —
             // below it LMDB can report a full map permanently — and there is no
             // reason to make a growable file start there.
+            // `size_now` is `store.preallocate_mb`, and `-1` — grow on demand —
+            // is what it means when that is zero. Growth is the one thing this
+            // backend does that LMDB never has to: see `StoreConfig::preallocate`
+            // for what it costs on the write path and what it costs on disk.
+            let now = match config.preallocate {
+                0 => -1,
+                bytes => bytes.min(config.map_size) as isize,
+            };
             check(
-                ffi::mdbx_env_set_geometry(env, -1, -1, config.map_size as isize, -1, -1, -1),
+                ffi::mdbx_env_set_geometry(env, -1, now, config.map_size as isize, -1, -1, -1),
                 "set_geometry",
             )?;
 

@@ -77,6 +77,24 @@ shards = 0
 # permanently even after everything has been deleted, because the free list
 # needs pages of its own to record freed pages.
 map_size_mb = 4096
+
+# How much of the file to allocate at creation, PER SHARD. 0 grows on demand.
+#
+# Only backend = "mdbx" does anything with this. LMDB sizes its file to
+# map_size_mb when it creates it and leaves the rest sparse, so it never grows
+# and never pays for growing.
+#
+# mdbx grows on demand, and growth is not free on the write path. Measured on
+# Linux, batched writes under lazy durability ran at 0.70x LMDB with a growing
+# file and 0.99x with 64 MiB preallocated -- and the same scenario collapses to
+# 0.06x once a read workload has filled the page cache, because growth has to
+# allocate under memory pressure and a preallocated file does not.
+#
+# What it costs is disk, immediately, per shard: a fresh mdbx store goes from
+# 0.3 MiB to whatever this says. Set it to roughly the working set you expect,
+# not to map_size_mb, which is a ceiling rather than a target.
+preallocate_mb = 0
+
 max_readers = 256
 
 # durable   fsync on every commit

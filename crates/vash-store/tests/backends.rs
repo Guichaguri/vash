@@ -148,6 +148,57 @@ fn pinning_the_map_does_not_lie() {
     handle.close();
 }
 
+/// `store.preallocate` has to actually reserve the file, and has to stay a
+/// no-op for the engine that has nothing to reserve.
+///
+/// It exists because growth is not free on the write path — batched `lazy`
+/// writes measured 0.70x LMDB with a growing file and 0.99x with 64 MiB
+/// preallocated — and a knob that quietly did nothing would leave that
+/// unfixed while looking fixed. See `docs/benchmarks.md`.
+#[test]
+fn preallocation_reserves_the_file_up_front() {
+    fn bytes_on_disk(path: &std::path::Path) -> u64 {
+        std::fs::read_dir(path)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.metadata().expect("metadata").len())
+            .sum()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let reserve = 32 * 1024 * 1024;
+
+    let grown = dir.path().join("grown");
+    let mut cfg = config(&grown, BackendKind::Mdbx);
+    let handle = vash_store::open(&cfg).unwrap();
+    let on_demand = bytes_on_disk(&grown);
+    handle.close();
+
+    let reserved = dir.path().join("reserved");
+    cfg = config(&reserved, BackendKind::Mdbx);
+    cfg.preallocate = reserve;
+    let handle = vash_store::open(&cfg).unwrap();
+    let up_front = bytes_on_disk(&reserved);
+    handle.close();
+
+    assert!(
+        on_demand < reserve as u64,
+        "a store that grows on demand should start far below {reserve} bytes, got {on_demand}"
+    );
+    assert!(
+        up_front >= reserve as u64,
+        "preallocating {reserve} bytes left only {up_front} on disk"
+    );
+
+    // LMDB has nothing to reserve — it sizes its file to `map_size` at creation
+    // either way — so the setting must not change what it does, and above all
+    // must not be refused.
+    let lmdb = dir.path().join("lmdb");
+    let mut cfg = config(&lmdb, BackendKind::Lmdb);
+    cfg.preallocate = reserve;
+    vash_store::open(&cfg).unwrap().close();
+}
+
 /// Both engines have to agree on what they promise the rest of the server.
 ///
 /// Not an exhaustive comparison — `store.rs` is that, run twice — but the

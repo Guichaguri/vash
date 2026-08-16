@@ -89,6 +89,26 @@ pub struct StoreConfig {
     /// Linux to be a lazy reservation, not a preallocation, so a generous value
     /// costs nothing until the data actually arrives.
     pub map_size: usize,
+    /// How much of the file to allocate **at creation**, per shard. `0` grows
+    /// it on demand, which is the default.
+    ///
+    /// **Only the mdbx backend has anything to do here.** LMDB sizes its file
+    /// to `map_size` when it creates it and leaves the rest sparse, so it never
+    /// grows and never pays for growing; libmdbx grows on demand, which is the
+    /// property that makes `map_size` a ceiling rather than a reservation.
+    ///
+    /// **What it buys, and what it costs.** Growth is not free on the write
+    /// path: measured on Linux, batched writes under `lazy` ran at 0.70× LMDB
+    /// with a growing file and 0.99× with 64 MiB preallocated — and the same
+    /// scenario collapses to 0.06× when a read workload has filled the page
+    /// cache first, because growth allocates under memory pressure and a
+    /// preallocated file does not. What it costs is disk, immediately, per
+    /// shard: a fresh store goes from 0.3 MiB to this. See
+    /// `docs/benchmarks.md`.
+    ///
+    /// Capped at [`Self::map_size`], since a file cannot start larger than its
+    /// own ceiling.
+    pub preallocate: usize,
     pub max_readers: u32,
     pub durability: Durability,
     pub max_value_len: usize,
@@ -253,6 +273,10 @@ impl Default for StoreConfig {
             path: PathBuf::from("data"),
             backend: BackendKind::default(),
             map_size: 4 * 1024 * 1024 * 1024,
+            // Grow on demand. The engine that pays for growth is the one that
+            // is not the default, and a default that silently allocated
+            // hundreds of megabytes per shard would be a surprise.
+            preallocate: 0,
             max_readers: 256,
             durability: Durability::default(),
             max_value_len: vash_core::DEFAULT_MAX_VALUE_LEN,

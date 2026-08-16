@@ -47,6 +47,16 @@ impl StoreHandle {
 
 /// Opens the store the configuration asks for.
 pub fn open(config: &StoreConfig) -> Result<StoreHandle> {
+    // Said once here rather than per shard, and said at all because a setting
+    // that silently does nothing is worse than one that is refused: LMDB sizes
+    // its file to `map_size` at creation regardless, so there is no growth for
+    // preallocation to avoid.
+    if config.preallocate > 0 && config.backend == BackendKind::Lmdb {
+        tracing::warn!(
+            "store.preallocate is set but the lmdb backend ignores it; it sizes its file              to store.map_size at creation and never grows"
+        );
+    }
+
     match config.backend {
         BackendKind::Lmdb => handle(LmdbStore::open(config)?),
         #[cfg(feature = "mdbx")]

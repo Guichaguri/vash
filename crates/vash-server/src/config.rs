@@ -59,6 +59,14 @@ pub struct StoreConfig {
     pub shards: usize,
     /// Map size **per shard**, not in total.
     pub map_size_mb: usize,
+    /// How much of the file to allocate at creation, **per shard**. `0` grows
+    /// it on demand.
+    ///
+    /// Only `backend = "mdbx"` does anything with this: LMDB sizes its file to
+    /// `map_size_mb` at creation and leaves it sparse, so it never grows.
+    /// Preallocating costs that much disk immediately and buys back what
+    /// growing costs the write path — see `docs/benchmarks.md`.
+    pub preallocate_mb: usize,
     pub max_readers: u32,
     pub durability: Durability,
     pub max_value_bytes: usize,
@@ -568,6 +576,7 @@ impl Default for StoreConfig {
             path: PathBuf::from("data"),
             backend: Backend::default(),
             map_size_mb: 4096,
+            preallocate_mb: 0,
             // Comfortably above the default blocking pool, which is the ceiling
             // on concurrent readers; validation enforces the relationship.
             max_readers: 256,
@@ -615,6 +624,12 @@ impl Config {
              report a full map permanently even after everything has been deleted",
             self.store.map_size_mb,
             vash_store::config::MIN_MAP_SIZE / (1024 * 1024)
+        );
+        anyhow::ensure!(
+            self.store.preallocate_mb <= self.store.map_size_mb,
+            "store.preallocate_mb is {} MiB, which is larger than store.map_size_mb ({} MiB);              a file cannot start bigger than its own ceiling",
+            self.store.preallocate_mb,
+            self.store.map_size_mb
         );
         anyhow::ensure!(self.store.max_readers > 0, "store.max_readers must be > 0");
         // Bounded by u32 because the drain on shutdown reacquires every permit
@@ -824,6 +839,7 @@ impl Config {
             backend: self.store.backend.into(),
             shards: self.shard_count(),
             map_size: self.store.map_size_mb * 1024 * 1024,
+            preallocate: self.store.preallocate_mb * 1024 * 1024,
             max_readers: self.store.max_readers,
             durability: self.store.durability.into(),
             max_value_len: self.store.max_value_bytes,

@@ -754,7 +754,7 @@ Neither engine drifts: used bytes stay bounded and the file never passes
 [mdbx-proposal.md](mdbx-proposal.md) §7's expectation that libmdbx's
 compactification would show up as a smaller file under churn.
 
-### The one mechanism that explains both
+### The one mechanism that explains both, now confirmed
 
 The soak's store is **already at its ceiling and no longer growing**. The write
 scenario writes into a **fresh store that grows continuously**. LMDB never pays
@@ -762,20 +762,31 @@ for growth because it sizes its file to `map_size` at creation and leaves it
 sparse; libmdbx grows on demand, which is the property
 [mdbx-proposal.md](mdbx-proposal.md) §6 advertised as an advantage.
 
-Three observations fit that and nothing else does:
+Preallocating the file settles it. Linux, batched `lazy`, five repeats, in the
+worst case — a read workload run first so the page cache is full:
 
-- libmdbx loses the growing case by 17× and wins the grown case by 1.2×.
-- Preallocating `size_now` at 64 MiB in a geometry sweep took libmdbx's batched
-  `lazy` figure from 358k to 450k, level with LMDB's 450k.
-- The gap is worse when a read workload has run first, filling the page cache —
-  growth allocates under memory pressure, and a preallocated file does not.
+| `store.preallocate_mb` | lmdb | mdbx | ratio |
+|---|---:|---:|---:|
+| 0 (grow on demand) | 448,001 | 66,286 | **0.15×** |
+| 64 | 495,096 [391k–547k] | 448,127 [405k–555k] | **0.91× (overlap)** |
 
-**Not yet confirmed**, because the sweep that suggested it ran before this
-methodology was fixed. The test that would settle it is batched `lazy` on Linux
-with and without `size_now` preallocated, five repeats, nothing else running. If
-it holds, the fix is a geometry that preallocates, and the cost is the disk that
-[mdbx-proposal.md](mdbx-proposal.md) Phase 2 gave up to make a fresh database
-cost 0.3 MiB instead of 16 MiB.
+**libmdbx goes 6.8× faster and the row stops separating the engines.** Growth
+was the entire gap. It is worst under memory pressure, which is why the figure
+moved between 0.06× and 0.70× depending on whether reads had run first: growth
+has to allocate while the kernel is reclaiming, and a preallocated file does not.
+
+That is what `store.preallocate_mb` is for. It costs the disk immediately, per
+shard — a fresh mdbx store goes from 0.3 MiB to whatever it says — which is
+exactly what [mdbx-proposal.md](mdbx-proposal.md) Phase 2 gave up when it
+stopped pinning a lower bound. **An operator setting `backend = "mdbx"` should
+set this too**; without it the default durability's write path is several times
+slower than LMDB's.
+
+Two other levers measured nothing. `MDBX_WRITEMAP` — which mdbx permits under a
+no-sync mode and LMDB forbids — made both engines *worse* on Linux, reproducing
+[performance-proposals.md](performance-proposals.md) §6's finding that it is
+worth nothing there. Turning `MDBX_LIFORECLAIM` off, and dropping the internal
+sync period, both stayed inside the noise band.
 
 ### Two corrections worth keeping
 

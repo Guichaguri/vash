@@ -860,12 +860,20 @@ demand, which is exactly the property [§6](#6-configuration-mapping) advertised
 as an advantage. A geometry sweep pointed the same way: preallocating `size_now`
 took libmdbx's batched `lazy` figure to parity with LMDB's.
 
-**That is a hypothesis, not a result** -- the sweep predates the methodology fix
-below. The test that settles it is batched `lazy` on Linux with and without
-`size_now` preallocated, five repeats, quiet machine. If it holds, the fix is a
-geometry that preallocates, and the price is the disk that Phase 2 deliberately
-gave up to make a fresh database cost 0.3 MiB instead of 16 MiB per shard. That
-trade is worth putting to an operator rather than choosing silently.
+**Confirmed, and fixed by a knob.** Preallocating the file takes libmdbx from
+66,286 to 448,127 on the worst case — batched `lazy` on Linux with the page
+cache already full — against LMDB's 495,096, with the ranges overlapping. 6.8×,
+and the row stops separating the engines. Growth was the whole gap.
+
+That is now `store.preallocate_mb`, per shard, defaulting to 0 so nothing
+changes for anyone who does not ask. It costs the disk immediately, which is
+what Phase 2 gave up to make a fresh database cost 0.3 MiB instead of 16 MiB, so
+it is offered rather than imposed. **Anyone setting `backend = "mdbx"` should
+set it too.**
+
+Two other levers measured nothing: `MDBX_WRITEMAP` made both engines worse on
+Linux, and turning off `MDBX_LIFORECLAIM` or the internal sync period stayed
+inside the noise.
 
 **This phase published wrong numbers twice, both from single measurements.**
 Best-of-two on Windows gave reads at 0.55x where five repeats give 0.94x -- right

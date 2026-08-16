@@ -64,6 +64,10 @@ fn open(dir: &std::path::Path, backend: BackendKind, durability: Durability) -> 
         backend,
         durability,
         map_size: 512 * 1024 * 1024,
+        // `VASH_BENCH_PREALLOC_MB` drives `store.preallocate_mb`, which only the
+        // mdbx backend acts on. Growth is the one cost LMDB never pays, so this
+        // is the knob that decides whether the two are compared on equal terms.
+        preallocate: env_usize("VASH_BENCH_PREALLOC_MB", 0) * 1024 * 1024,
         shards: 1,
         write: WriteConfig {
             sync_interval_ms: 1000,
