@@ -685,9 +685,35 @@ engine is about 8% of what a write costs — a 2.8× win here is worth roughly 5
 end to end, not 2.8× end to end. Reads are the other way round: the store is most
 of what a read is, so a read regression here mostly survives to the wire.
 
-Windows 11, i7-9750H (6 cores / 12 threads), best of 2 repeats.
+Run on both platforms, and **that turned out to be the whole story**: nearly
+every ratio inverts between them. Windows 11 native and Linux in a container, on
+one i7-9750H (6 cores / 12 threads), best of 2 repeats each.
 
-### Reads — libmdbx is behind, and further behind the more threads read
+### The short version
+
+| | Windows | Linux |
+|---|---:|---:|
+| Reads, 8 threads | 0.55–0.61× | **0.97–0.98×** |
+| `set_many`, `lazy` | **2.81×** | **0.16×** |
+| `set_many`, `relaxed` | 2.66× | 0.98× |
+| `set_many`, `durable` | 1.36× | 0.99× |
+| Soak, accepted writes | 1.31× | 0.93× |
+
+**Neither platform alone gives the right answer.** Measured on Windows, libmdbx
+looks like a clear win on writes and a clear loss on reads; measured on Linux it
+is level everywhere except the default write path, where it loses by 6×. Any
+decision taken from one of these tables would have been confidently wrong about
+the other.
+
+The reason is mostly LMDB, not libmdbx. Between Windows and Linux, LMDB's
+batched `lazy` writes go from 52,032 to 451,792 — **8.7× faster on Linux** —
+while libmdbx goes from 146,388 to 70,737, which is *slower*. libmdbx's apparent
+Windows advantage is LMDB being slow on Windows, which
+[performance-proposals.md](performance-proposals.md) §6 had already found from
+the other direction when `WRITE_MAP` measured 1.08–1.26× there and nothing on
+Linux.
+
+### Reads — libmdbx is behind on Windows, level on Linux
 
 2 s per engine per scenario, 50,000 keys of 1 KiB, warmed before the clock
 starts.
@@ -701,11 +727,32 @@ starts.
 | `get`, 8 threads | 2,866,307 | 1,568,011 | **0.55×** |
 | `get_with`, 8 threads | 3,550,050 | 2,154,106 | 0.61× |
 
-LMDB scales 5.7× from one thread to eight; libmdbx manages 3.6× and is
-flattening. This is the same shape the Phase 0 spike found by a different route
-— transaction begin, measured without the store in the way — which put mdbx 25%
-behind at sixteen threads. Two independent measurements agreeing is most of why
-this table is worth trusting.
+On Windows LMDB scales 5.7× from one thread to eight; libmdbx manages 3.6× and
+flattens. The Phase 0 spike found the same shape by a different route —
+transaction begin, with no store in the way — putting libmdbx 25% behind at
+sixteen threads.
+
+**Linux, same harness:**
+
+| Scenario | lmdb | mdbx | ratio |
+|---|---:|---:|---:|
+| `get`, 1 thread | 875,438 | 869,285 | 0.99× |
+| `get_with`, 1 thread | 879,375 | 892,794 | 1.02× |
+| `get`, 4 threads | 2,697,350 | 2,498,198 | 0.93× |
+| `get_with`, 4 threads | 2,661,685 | 2,627,697 | 0.99× |
+| `get`, 8 threads | 4,235,600 | 4,123,933 | 0.97× |
+| `get_with`, 8 threads | 4,207,100 | 4,126,475 | 0.98× |
+
+**The read regression is Windows-specific.** On Linux the engines are within 3%
+at every thread count and scale almost identically — LMDB 4.84× from one thread
+to eight, libmdbx 4.74×. Both are also far faster in absolute terms than on
+Windows, libmdbx more so (2.6× against LMDB's 1.5×), which is what closes the
+gap.
+
+The control this table needs is inside it: LMDB's read path is lock-free, so it
+*must* scale, and here it does. Phase 0's container could not manage that — its
+own LMDB column was flat — which is why that attempt was reported as unreadable
+rather than as a result.
 
 ### Writes — libmdbx is far ahead once writes are batched
 
@@ -721,10 +768,33 @@ operation; "blocks of 256" is what group commit actually does under load.
 | `set` one at a time, `durable` | 1,483 | 1,220 | 0.82× |
 | `set_many` blocks of 256, `durable` | 16,655 | 22,585 | 1.36× |
 
-The pattern is a higher **per-commit** cost and a much better **per-batch** one.
-That suits this server: a loaded writer packs whatever queued during the previous
-commit into the next one, so the batched row is the one a busy deployment lives
-on, and the unbatched row is what an idle one pays.
+On Windows the pattern is a higher **per-commit** cost and a much better
+**per-batch** one, which would suit this server: a loaded writer packs whatever
+queued during the previous commit into the next one.
+
+**Linux, same harness:**
+
+| Scenario | lmdb | mdbx | ratio |
+|---|---:|---:|---:|
+| `set` one at a time, `lazy` | 11,104 | 8,891 | 0.80× |
+| `set_many` blocks of 256, `lazy` | 451,792 | 70,737 | **0.16×** |
+| `set` one at a time, `relaxed` | 519 | 524 | 1.01× |
+| `set_many` blocks of 256, `relaxed` | 52,104 | 51,133 | 0.98× |
+| `set` one at a time, `durable` | 295 | 284 | 0.96× |
+| `set_many` blocks of 256, `durable` | 35,346 | 34,968 | 0.99× |
+
+Every mode is parity except one, and it is the one that matters most: **batched
+`lazy`, the default durability and the path group commit takes under load, where
+LMDB is 6.4× ahead**. Everything that syncs — `relaxed`, `durable` — is level,
+because there the device sets the pace and the engine cannot change it. `lazy` is
+where the engine is the pace, and on Linux LMDB's is much better.
+
+Why libmdbx is *slower* here than on Windows is not isolated. The likely
+suspects are its growable geometry paying file-extension syscalls that LMDB's
+preallocated sparse map never pays, and `MDBX_LIFORECLAIM` doing garbage-list
+work that only earns its keep once the free list is under pressure — which,
+four thousand writes into an empty store, it is not. A tuned geometry may close
+some of this, and nobody has tried.
 
 ### The soak, which neither engine had been measured under
 
@@ -735,10 +805,14 @@ counting attempts rewards whichever engine rejects more.
 
 | Backend | accepted ops/s | utilisation | used MiB | file MiB | evicted |
 |---|---:|---:|---:|---:|---:|
-| lmdb | 27,133 | 0.974 | 31.2 | 32.0 | 810,496 |
-| mdbx | 35,418 | 0.962 | 30.8 | 32.0 | 1,058,944 |
+| lmdb (windows) | 27,133 | 0.974 | 31.2 | 32.0 | 810,496 |
+| mdbx (windows) | 35,418 | 0.962 | 30.8 | 32.0 | 1,058,944 |
+| lmdb (linux) | 95,968 | 0.848 | 27.1 | 32.0 | 2,875,712 |
+| mdbx (linux) | 89,499 | 0.869 | 27.8 | 32.0 | 2,681,536 |
 
-libmdbx sustains 31% more accepted writes and holds utilisation slightly lower.
+libmdbx sustains 31% more accepted writes on Windows and 7% fewer on Linux —
+the same inversion as everywhere else. Linux runs the whole soak 3.5× harder and
+holds utilisation further below the watermark, on both engines.
 **Neither engine drifts**, which is the result worth having: used bytes stay
 bounded, the file never passes `map_size`, and the evictor holds the line for
 both over a workload nothing else in this document covers.
@@ -752,11 +826,19 @@ difference is, it is not visible as space behaviour at this scale.
 ### What this cannot tell you
 
 Everything in [What this cannot tell you](#what-this-cannot-tell-you) applies,
-plus two things specific to this table. It is **one host and one OS** — Phase 0
-could not get a usable answer out of the Linux container, whose own LMDB
-baseline failed to scale, so the Linux half of this comparison is still unrun.
+plus three things specific to this table.
+
+It is **one machine**: both platforms are the same laptop, with Linux in a
+container on WSL2 rather than on bare metal, so "Linux" here means "Linux as this
+Windows box runs it". A real server may sit somewhere else again — and given how
+far the two columns already move, that is not a hypothetical worry.
+
+The **`lazy` gap on Linux is unexplained**, not just unfavourable. Until someone
+has tried a tuned geometry it is a measurement, not a property of the engine.
+
 And a cache's traffic is mostly reads, so the read and write columns do not
-deserve equal weight in a decision.
+deserve equal weight in a decision — though on Linux the reads are level, so the
+decision rests on the writes anyway.
 
 ---
 

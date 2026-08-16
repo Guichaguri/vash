@@ -33,14 +33,17 @@ honestly worth.
 ---
 
 > **Outcome, now that all four phases have run: LMDB stays the default and
-> libmdbx ships as an option.** Reads regress 13–45% under libmdbx, widening with
-> concurrency, and reads are what this server is best at; batched writes are
-> 2.7–2.8× faster, which is why it stays available rather than being deleted. The
-> §7 argument that mattered most — better space behaviour under churn — did not
-> reproduce. [Phase 3](#phase-3--measure-then-decide-the-default--done) has the
-> reasoning and [benchmarks.md](benchmarks.md#lmdb-against-libmdbx) the numbers.
-> The rest of this document is kept as written, including the parts the
-> measurements went on to contradict.
+> libmdbx ships as an option.** The comparison is **strongly platform-dependent
+> and inverts between Windows and Linux**, so neither host alone would have
+> answered it: libmdbx wins batched writes by 2.8x on Windows and loses them by
+> 6.4x on Linux, and the read regression that looked decisive on Windows does not
+> exist there. Linux is the deployment target, and on Linux the default write
+> path is where LMDB wins. The §7 argument that mattered most - better space
+> behaviour under churn - did not reproduce on either platform.
+> [Phase 3](#phase-3--measure-then-decide-the-default--done) has the reasoning
+> and [benchmarks.md](benchmarks.md#lmdb-against-libmdbx) the numbers. The rest
+> of this document is kept as written, including the parts the measurements went
+> on to contradict.
 
 ---
 
@@ -820,37 +823,48 @@ mdbx refuses to start with a wipe instruction.
 ### Phase 3 — measure, then decide the default ✅ **done**
 
 **Decision: LMDB stays the default. libmdbx stays an option, and is not
-removed.** Full tables in
-[benchmarks.md](benchmarks.md#lmdb-against-libmdbx); the short version:
+removed.** Full tables in [benchmarks.md](benchmarks.md#lmdb-against-libmdbx).
 
-| | libmdbx vs LMDB |
-|---|---|
-| Reads, 1 thread | 0.78–0.87× |
-| Reads, 8 threads | **0.55–0.61×** |
-| Writes, batched, `lazy` / `relaxed` | **2.81× / 2.66×** |
-| Writes, batched, `durable` | 1.36× |
-| Writes, one commit each | 0.17–0.94× |
-| Soak, accepted writes under continuous eviction | 1.31× |
+**The measurement had to be run on both platforms, and that is the finding.**
+Nearly every ratio inverts between them:
 
-**Why not promote it.** Reads regress 13% at one thread and 45% at eight, and the
-gap widens monotonically with concurrency — LMDB scales 5.7× from one thread to
-eight where libmdbx manages 3.6×. A cache serves mostly reads, and reads are the
-workload vash already wins on: [benchmarks.md](benchmarks.md) has it ahead of
-both Redis and memcached on closed-loop and pipelined GETs. Trading that for
-writes is the wrong direction for this server, whatever the write column says.
-The Phase 0 spike found the same regression by a different route — transaction
-begin, with no store in the way — and two independent measurements agreeing is
-what makes this a decision rather than a data point.
+| | Windows | Linux |
+|---|---:|---:|
+| Reads, 8 threads | 0.55-0.61x | 0.97-0.98x |
+| Writes, batched, `lazy` | **2.81x** | **0.16x** |
+| Writes, batched, `relaxed` | 2.66x | 0.98x |
+| Writes, batched, `durable` | 1.36x | 0.99x |
+| Soak, accepted writes | 1.31x | 0.93x |
 
-**Why not remove it.** The batched write win is not marginal: 2.8× on the
-storage layer under `lazy`, which is the default durability and the path group
-commit actually takes under load. §8 predicted 2–3% end to end from an engine
-worth 8% of a write; a 2.8× engine is worth about 5% end to end by the same
-arithmetic, which is small but is the right sign. A write-heavy deployment on
-`relaxed` has a real reason to set `store.backend = "mdbx"`, and it now costs one
-config line to try. It also earned its keep as a second implementation: it is
-what turned the `Backend` trait from an assertion into something checked, and
-three of the bugs it found were in code shared by both engines.
+**Why not promote it - and the reason is not the one Windows gave.** Measured on
+Windows alone, the case against libmdbx was a 13-45% read regression widening
+with concurrency. **That regression is Windows-specific**: on Linux the engines
+are within 3% at every thread count and scale almost identically. Had the
+decision been taken from the Windows table it would have been right by accident
+and wrong in its reasoning - which matters, because the reasoning is what the
+next person reuses.
+
+The Linux case is narrower and stronger. Everything that syncs is parity, and
+the one gap is **batched `lazy`, where LMDB is 6.4x ahead** - the default
+durability and the path group commit takes under load. Linux is the deployment
+target; that is the number that decides it.
+
+**Why not remove it.** On Windows the batched write win is real and large - 2.8x
+under `lazy`, 2.7x under `relaxed` - and Windows is where development happens.
+libmdbx also pins the map there, which LMDB cannot, so `store.resident_mode` is
+only reachable on Windows through this backend. And it earned its keep as a
+second implementation: it is what turned the `Backend` trait from an assertion
+into something checked, and several of the bugs it found were in code shared by
+both engines.
+
+**What is not explained, and should be before anyone reads too much into it.**
+libmdbx's batched `lazy` writes are *slower on Linux than on Windows* - 70,737
+against 146,388 - while LMDB's improve 8.7x on the same move. The likely
+suspects are the growable geometry paying file-extension syscalls that LMDB's
+preallocated sparse map never pays, and `MDBX_LIFORECLAIM` doing garbage-list
+work that has nothing to recycle four thousand writes into an empty store. A
+tuned geometry may close some of it. Nobody has tried, and until someone does the
+Linux write gap is a measurement rather than a property.
 
 **What did not survive contact.** §7 item 5 — LIFO recycling and continuous
 compactification showing up as better space behaviour under churn — is a
@@ -880,9 +894,12 @@ documents as matching `MDB_NOSYNC`, and it is what `lazy` means now, with the
 loss window bounded by `MDBX_opt_sync_period` set from `write.sync_interval_ms`.
 That one flag was the difference between 0.01× and 2.81×.
 
-**Still unrun:** the Linux half. Phase 0's container could not scale a lock-free
-lookup, so its own LMDB baseline was unreadable, and nothing since has had a
-quiet multi-core Linux box to run on. Every number above is Windows.
+**On the host.** Both platforms are the same laptop, with Linux in a container
+on WSL2 rather than bare metal. Phase 0's attempt at this was reported as
+unreadable because its own LMDB column would not scale; this one does - LMDB
+goes 4.84x from one thread to eight - which is the control that makes the rest
+of the table quotable. A real server is still a third data point nobody has, and
+given how far these two move apart, that is not a hypothetical concern.
 
 ### Phase 3 — the original plan
 
