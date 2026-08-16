@@ -671,6 +671,95 @@ the cost of being the wrong operation.
 
 ---
 
+## LMDB against libmdbx
+
+Phase 3 of [mdbx-proposal.md](mdbx-proposal.md). Both engines in one binary, on
+one host, alternated inside each repeat so drift lands on both columns —
+`cargo run --release -p vash-store --features mdbx --example engine_ab`.
+
+**These are store-level numbers, not the wire-level ones everywhere else in this
+document.** They go through the `Store` trait directly, with no socket, no codec
+and no runtime, so they measure the storage layer alone. Against the
+decomposition in [performance-proposals.md](performance-proposals.md) §2 — the
+engine is about 8% of what a write costs — a 2.8× win here is worth roughly 5%
+end to end, not 2.8× end to end. Reads are the other way round: the store is most
+of what a read is, so a read regression here mostly survives to the wire.
+
+Windows 11, i7-9750H (6 cores / 12 threads), best of 2 repeats.
+
+### Reads — libmdbx is behind, and further behind the more threads read
+
+2 s per engine per scenario, 50,000 keys of 1 KiB, warmed before the clock
+starts.
+
+| Scenario | lmdb | mdbx | ratio |
+|---|---:|---:|---:|
+| `get`, 1 thread | 504,051 | 440,920 | 0.87× |
+| `get_with`, 1 thread | 579,498 | 454,313 | 0.78× |
+| `get`, 4 threads | 1,728,915 | 1,279,539 | 0.74× |
+| `get_with`, 4 threads | 1,509,852 | 1,290,704 | 0.85× |
+| `get`, 8 threads | 2,866,307 | 1,568,011 | **0.55×** |
+| `get_with`, 8 threads | 3,550,050 | 2,154,106 | 0.61× |
+
+LMDB scales 5.7× from one thread to eight; libmdbx manages 3.6× and is
+flattening. This is the same shape the Phase 0 spike found by a different route
+— transaction begin, measured without the store in the way — which put mdbx 25%
+behind at sixteen threads. Two independent measurements agreeing is most of why
+this table is worth trusting.
+
+### Writes — libmdbx is far ahead once writes are batched
+
+4,000 operations of 256 B per scenario. "One at a time" is a commit per
+operation; "blocks of 256" is what group commit actually does under load.
+
+| Scenario | lmdb | mdbx | ratio |
+|---|---:|---:|---:|
+| `set` one at a time, `lazy` | 9,147 | 8,598 | 0.94× |
+| `set_many` blocks of 256, `lazy` | 52,032 | 146,388 | **2.81×** |
+| `set` one at a time, `relaxed` | 1,506 | 263 | 0.17× |
+| `set_many` blocks of 256, `relaxed` | 17,878 | 47,628 | **2.66×** |
+| `set` one at a time, `durable` | 1,483 | 1,220 | 0.82× |
+| `set_many` blocks of 256, `durable` | 16,655 | 22,585 | 1.36× |
+
+The pattern is a higher **per-commit** cost and a much better **per-batch** one.
+That suits this server: a loaded writer packs whatever queued during the previous
+commit into the next one, so the batched row is the one a busy deployment lives
+on, and the unbatched row is what an idle one pays.
+
+### The soak, which neither engine had been measured under
+
+30 s of sustained overfill on a 32 MiB map with 4 KiB values — permanently above
+the critical watermark, so the evictor never stops. `ops/s` counts **accepted**
+writes: a full store refuses rather than blocks, and refusals return fast, so
+counting attempts rewards whichever engine rejects more.
+
+| Backend | accepted ops/s | utilisation | used MiB | file MiB | evicted |
+|---|---:|---:|---:|---:|---:|
+| lmdb | 27,133 | 0.974 | 31.2 | 32.0 | 810,496 |
+| mdbx | 35,418 | 0.962 | 30.8 | 32.0 | 1,058,944 |
+
+libmdbx sustains 31% more accepted writes and holds utilisation slightly lower.
+**Neither engine drifts**, which is the result worth having: used bytes stay
+bounded, the file never passes `map_size`, and the evictor holds the line for
+both over a workload nothing else in this document covers.
+
+That is also a **negative result for the main operational argument**.
+[mdbx-proposal.md](mdbx-proposal.md) §7 expected libmdbx's LIFO recycling and
+continuous compactification to show up here as a file that stays smaller under
+churn. It does not: both files sit at the 32 MiB ceiling. Whatever the throughput
+difference is, it is not visible as space behaviour at this scale.
+
+### What this cannot tell you
+
+Everything in [What this cannot tell you](#what-this-cannot-tell-you) applies,
+plus two things specific to this table. It is **one host and one OS** — Phase 0
+could not get a usable answer out of the Linux container, whose own LMDB
+baseline failed to scale, so the Linux half of this comparison is still unrun.
+And a cache's traffic is mostly reads, so the read and write columns do not
+deserve equal weight in a decision.
+
+---
+
 ## What to take from all of this
 
 **Reads are where vash now leads.** Closed loop with `resident_mode`, `GET` is

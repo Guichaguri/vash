@@ -66,11 +66,19 @@ fn env_flags(config: &StoreConfig) -> u32 {
     let mut flags = match config.durability {
         Durability::Durable => ffi::MDBX_SYNC_DURABLE,
         Durability::Relaxed => ffi::MDBX_NOMETASYNC,
-        // Stronger than LMDB's `MDB_NOSYNC`: mdbx documents `SAFE_NOSYNC` as
-        // avoiding corruption after a system crash outright, without LMDB's
-        // proviso about the filesystem preserving write order — and unlike
-        // LMDB's, it composes with `WRITEMAP`. See `docs/storage.md`.
-        Durability::Lazy => ffi::MDBX_SAFE_NOSYNC,
+        // **`UTTERLY_NOSYNC`, not `SAFE_NOSYNC`.** The proposal picked the
+        // latter for its stronger guarantee, and measuring it showed why the
+        // header says what it says: "the number and volume of disk IOPs with
+        // MDBX_SAFE_NOSYNC will [be] exactly the same as without any no-sync
+        // flags". It buys integrity and no speed at all — under it, `lazy`
+        // measured *slower* than `relaxed` and `durable`, which is the
+        // durability ladder upside down.
+        //
+        // `UTTERLY_NOSYNC` is the mode mdbx documents as matching
+        // `MDB_NOSYNC`, so it is what `lazy` means here: the same trade vash
+        // already documents, with the loss window bounded by the periodic sync
+        // set below rather than by the filesystem's goodwill.
+        Durability::Lazy => ffi::MDBX_UTTERLY_NOSYNC,
     };
 
     if config.write_map {
@@ -168,6 +176,24 @@ impl Backend for MdbxBackend {
             )?;
 
             open_env(env, path, env_flags(config))?;
+
+            // **After the open, not before.** This option lives in the shared
+            // lock file rather than in the handle, so setting it on an unopened
+            // environment is refused outright — `MDBX_EINVAL` on POSIX, and
+            // `ERROR_INVALID_FUNCTION` here.
+            //
+            // Bounds the loss window from inside the engine as well as from the
+            // writer's own timer: mdbx's docs recommend pairing a no-sync mode
+            // with one of these thresholds rather than relying on the caller
+            // alone, and the two agree by construction, since the same number
+            // drives both.
+            if config.durability == Durability::Lazy && config.write.sync_interval_ms > 0 {
+                let period = config.write.sync_interval_ms.saturating_mul(65_536) / 1_000;
+                check(
+                    ffi::mdbx_env_set_option(env, ffi::MDBX_OPT_SYNC_PERIOD, period),
+                    "set sync_period",
+                )?;
+            }
         }
 
         Ok(backend)

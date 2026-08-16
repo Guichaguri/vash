@@ -123,6 +123,9 @@ pub struct Envinfo {
 pub const MDBX_SYNC_DURABLE: u32 = 0;
 pub const MDBX_NOMETASYNC: u32 = 0x40000;
 pub const MDBX_SAFE_NOSYNC: u32 = 0x10000;
+/// `SAFE_NOSYNC` plus actually skipping the writes, which is what LMDB's
+/// `MDB_NOSYNC` does. See the durability mapping in this module's parent.
+pub const MDBX_UTTERLY_NOSYNC: u32 = 0x110000;
 pub const MDBX_WRITEMAP: u32 = 0x80000;
 /// LIFO recycling of the garbage list, which reuses pages still hot in the
 /// write-back cache. See `docs/mdbx-proposal.md` §7.
@@ -146,6 +149,10 @@ pub const MDBX_SET_RANGE: c_int = 17;
 
 pub const MDBX_OPT_MAX_DB: c_int = 0;
 pub const MDBX_OPT_MAX_READERS: c_int = 1;
+/// Bytes of unsynced data that force a flush under a no-sync mode.
+pub const MDBX_OPT_SYNC_BYTES: c_int = 2;
+/// Time since the last steady commit that forces one, in 1/65536 of a second.
+pub const MDBX_OPT_SYNC_PERIOD: c_int = 3;
 
 // ---- warm-up ------------------------------------------------------------
 

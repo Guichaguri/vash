@@ -32,6 +32,18 @@ honestly worth.
 
 ---
 
+> **Outcome, now that all four phases have run: LMDB stays the default and
+> libmdbx ships as an option.** Reads regress 13–45% under libmdbx, widening with
+> concurrency, and reads are what this server is best at; batched writes are
+> 2.7–2.8× faster, which is why it stays available rather than being deleted. The
+> §7 argument that mattered most — better space behaviour under churn — did not
+> reproduce. [Phase 3](#phase-3--measure-then-decide-the-default--done) has the
+> reasoning and [benchmarks.md](benchmarks.md#lmdb-against-libmdbx) the numbers.
+> The rest of this document is kept as written, including the parts the
+> measurements went on to contradict.
+
+---
+
 ## Phase 0 results
 
 Run on 2026-08-16, on one host: Windows 11 natively (i7-9750H, 6 cores /
@@ -805,7 +817,74 @@ not in a comment, since neither breaks anything visible when it regresses.
 started on each answers the same protocol suite; an LMDB directory opened as
 mdbx refuses to start with a wipe instruction.
 
-### Phase 3 — measure, then decide the default
+### Phase 3 — measure, then decide the default ✅ **done**
+
+**Decision: LMDB stays the default. libmdbx stays an option, and is not
+removed.** Full tables in
+[benchmarks.md](benchmarks.md#lmdb-against-libmdbx); the short version:
+
+| | libmdbx vs LMDB |
+|---|---|
+| Reads, 1 thread | 0.78–0.87× |
+| Reads, 8 threads | **0.55–0.61×** |
+| Writes, batched, `lazy` / `relaxed` | **2.81× / 2.66×** |
+| Writes, batched, `durable` | 1.36× |
+| Writes, one commit each | 0.17–0.94× |
+| Soak, accepted writes under continuous eviction | 1.31× |
+
+**Why not promote it.** Reads regress 13% at one thread and 45% at eight, and the
+gap widens monotonically with concurrency — LMDB scales 5.7× from one thread to
+eight where libmdbx manages 3.6×. A cache serves mostly reads, and reads are the
+workload vash already wins on: [benchmarks.md](benchmarks.md) has it ahead of
+both Redis and memcached on closed-loop and pipelined GETs. Trading that for
+writes is the wrong direction for this server, whatever the write column says.
+The Phase 0 spike found the same regression by a different route — transaction
+begin, with no store in the way — and two independent measurements agreeing is
+what makes this a decision rather than a data point.
+
+**Why not remove it.** The batched write win is not marginal: 2.8× on the
+storage layer under `lazy`, which is the default durability and the path group
+commit actually takes under load. §8 predicted 2–3% end to end from an engine
+worth 8% of a write; a 2.8× engine is worth about 5% end to end by the same
+arithmetic, which is small but is the right sign. A write-heavy deployment on
+`relaxed` has a real reason to set `store.backend = "mdbx"`, and it now costs one
+config line to try. It also earned its keep as a second implementation: it is
+what turned the `Backend` trait from an assertion into something checked, and
+three of the bugs it found were in code shared by both engines.
+
+**What did not survive contact.** §7 item 5 — LIFO recycling and continuous
+compactification showing up as better space behaviour under churn — is a
+**negative result**. Over 30 s of sustained overfill both engines sit at the same
+used bytes, the same file size and the same watermark; neither drifts. That was
+billed as "the honest reason to do this", and the soak that was built to check it
+says it is not one.
+
+**Two harness bugs found by disbelieving the first numbers**, both of which would
+have produced a confident wrong answer:
+
+- The first read harness divided a fixed op count among threads, so at four
+  threads the measurement window was 7 ms and reported 14× scaling from one
+  thread to four. It is duration-based now, like `examples/txn_bench.rs`.
+- `get_with` was handed a closure that read `data.len()` and never touched the
+  value bytes, so it measured a header parse and called it a read. It reported
+  mdbx 2.45× *ahead*; consuming the bytes reversed that to 0.78×.
+
+**And one real bug in the backend**, which the benchmark existed to catch:
+`lazy` was mapped to `MDBX_SAFE_NOSYNC` on the strength of §7 item 1. libmdbx's
+own header says the quiet part — "the number and volume of disk IOPs with
+`MDBX_SAFE_NOSYNC` will [be] exactly the same as without any no-sync flags" — so
+it buys integrity and no speed whatever. Under it, `lazy` measured *slower* than
+`relaxed` and `durable`: the durability ladder upside down, and single writes at
+77 ops/s against LMDB's 7,625. `MDBX_UTTERLY_NOSYNC` is the mode libmdbx
+documents as matching `MDB_NOSYNC`, and it is what `lazy` means now, with the
+loss window bounded by `MDBX_opt_sync_period` set from `write.sync_interval_ms`.
+That one flag was the difference between 0.01× and 2.81×.
+
+**Still unrun:** the Linux half. Phase 0's container could not scale a lock-free
+lookup, so its own LMDB baseline was unreadable, and nothing since has had a
+quiet multi-core Linux box to run on. Every number above is Windows.
+
+### Phase 3 — the original plan
 
 A/B in one binary, on one host, paired runs: read and write, closed loop and
 pipelined, all three durability modes, plus the soak from §8 that neither engine
