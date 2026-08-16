@@ -24,6 +24,182 @@ honestly worth.
    cross-platform warm-up, `SAFE_NOSYNC`, and a handle for the slow-reader risk —
    and they are worth more than the throughput. [§8](#8-expected-performance)
    does that arithmetic in the open.
+4. **The backend talks to libmdbx through raw FFI over a vendored `mdbx.c`, not
+   through a wrapper crate.** This was the spike's finding, not the plan: every
+   maintained Rust wrapper hardcodes a flag that costs 56× on reads. See
+   [Phase 0 results](#phase-0-results) — read that before the rest of this
+   document, because it contradicts parts of it.
+
+---
+
+## Phase 0 results
+
+Run on 2026-08-16, on one host: Windows 11 natively (i7-9750H, 6 cores /
+12 threads, MSVC 2022) and Linux in `rust:1.92-alpine` on the same machine's
+Rancher Desktop WSL2 VM — the same host family
+[benchmarks.md](benchmarks.md#what-this-cannot-tell-you) warns about.
+libmdbx v0.13.7, the version `signet-mdbx-sys` 0.1.0 vendors.
+
+The spike talks to the C library through a hand-written FFI — about fifteen
+`extern` declarations — rather than through a wrapper crate, because two of the
+four questions are about platforms the candidate wrappers do not all support.
+Same amalgamated `mdbx.c`, same build defines `signet-mdbx-sys` uses. It also
+carries `heed` at the workspace's pinned version, so the LMDB baseline is
+measured in the same binary, on the same host, in the same run.
+
+**Verdict: not a stop, but the binding recommendation in [§10](#10-which-rust-binding--withdrawn)
+is wrong and is corrected below.** Q2 passes outright. Q1 passes with a
+one-line fix in a build script we would have to own. Q3 fails as packaged —
+but in the wrappers, not in the engine.
+
+### Q1 — does it build and link statically for musl? **Conditionally.**
+
+Better than assumed in one way: **nothing runs `bindgen` at build time.**
+`signet-mdbx-sys` ships pre-generated per-platform bindings and its only build
+dependency is `cc`. The alpine image needs no `libclang`, and neither does the
+`--all-features` clippy job. The C toolchain LMDB already requires is the whole
+requirement.
+
+Worse in another. **The unmodified `signet-libmdbx` crate does not link in
+`rust:1.92-alpine`**, under the repo's exact release profile:
+
+```
+mdbx.c:(.text.scan4seq_resolver+0x12): undefined reference to `__cpu_indicator_init_local'
+mdbx.c:(.text.scan4seq_resolver+0x19): undefined reference to `__cpu_model'
+```
+
+mdbx dispatches its free-list scan across SSE2/AVX2/AVX-512 at runtime using
+GCC's `__builtin_cpu_supports`, and musl's libgcc does not carry the CPU-model
+symbols that emits. glibc Linux and Windows/MSVC are unaffected — this is
+musl-specific, and **musl is the release artifact**: the static binary is a CI
+gate and the Docker image is `scratch`.
+
+The fix is one define, `MDBX_HAVE_BUILTIN_CPU_SUPPORTS=0`, and it must come
+from the build script that compiles `mdbx.c` — adding `-lgcc` downstream does
+*not* work. With it, alpine produces a working `static-pie` binary carrying
+both engines. What it costs is the runtime AVX2/AVX-512 choice for the
+free-list scan; the compile-time path remains, which on x86-64 is SSE2.
+
+> **A trap worth recording.** The first probe linked fine and was a false pass:
+> it only called `Environment::builder()`, and a linker never pulls an archive
+> member nothing references. A probe has to actually open an environment and
+> commit a write. Any future spike here should do the same.
+
+### Q2 — does a `get` borrow, or copy? **Borrows. Decisively.**
+
+| | Windows | Linux |
+|---|---:|---:|
+| 8 B value | 67.0 ns/get | 45.7 ns/get |
+| 4 MiB value | 68.8 ns/get | 55.2 ns/get |
+| ratio | **1.03×** | **1.21×** |
+| 4 MiB dirtied by the *same write txn* | 81.6 ns/get | 73.2 ns/get |
+
+A memcpy of 4 MiB would be ~10³×. The address is also byte-identical across two
+independent read transactions, which is only true of a pointer into the shared
+mapping.
+
+The last row is the case `apply.rs` actually hits — 28 of the crate's `get`
+calls are inside the write transaction, and `signet-libmdbx`'s documentation
+warns that read-write transactions "require a check to see if the data is
+dirty". They do come back from a different address region, but they are still
+borrowed, not copied. `get_with`, `ValueRef` and the value-as-suffix record
+layout all survive the port intact.
+
+### Q3 — what does `NOSTICKYTHREADS` cost? **56×, and every wrapper sets it.**
+
+Windows, one transaction per lookup, 50,000 keys of 1 KiB, 2 s per cell:
+
+| threads | mdbx sticky | mdbx NOSTICKY | lmdb TLS | lmdb NO_TLS | control |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 732,683 | 186,591 | 778,236 | 347,230 | 985,877 |
+| 2 | 1,611,723 | 282,866 | 1,814,145 | 110,009 | 2,689,924 |
+| 4 | 2,570,953 | 67,739 | 3,131,601 | 98,132 | 4,570,461 |
+| 8 | 3,351,612 | 64,597 | 4,626,970 | 95,451 | 6,014,480 |
+| 16 | 3,931,970 | **69,737** | 5,234,201 | 100,135 | 5,524,307 |
+
+The control shares one transaction across 64 lookups, so it is the lock-free
+descent alone; it has to scale, and it does. **The LMDB columns reproduce this
+repo's own documented figures almost exactly** — `env.rs:110` records 344k
+falling to 91k without TLS and 948k rising to 5.3M with it, against 347k → 100k
+and 778k → 5.23M here. That is the harness validating itself, and it is why the
+mdbx columns can be trusted.
+
+Two findings:
+
+1. **`NOSTICKYTHREADS` collapses reads**: 56× below sticky mdbx at 16 threads,
+   and 75× below LMDB. It is worse in absolute terms than LMDB's own no-TLS
+   mode. This is the failure this document predicted, and it is not a default
+   to override —
+
+   | Crate | Where | Configurable? |
+   |---|---|---|
+   | `signet-libmdbx` 0.8.3 | `src/flags.rs`, `make_flags()` | No — `flags \|= ffi::MDBX_NOTLS;` unconditional |
+   | `reth-libmdbx` | `src/flags.rs`, `make_flags()` | No — `flags \|= ffi::MDBX_NOSTICKYTHREADS;` unconditional |
+   | `libmdbx` 0.6.6 | `src/database.rs:162` | No — `flags \|= ffi::MDBX_NOTLS;` unconditional |
+
+   All three descend from the same lineage and set it for the same reason: reth
+   wants `Send` transactions. vash does not — reads begin and end a transaction
+   inside one blocking-pool call and never cross a thread, which is exactly the
+   argument `env.rs:110` already makes about heed's `read_txn_without_tls()`.
+
+2. **Sticky mdbx is still ~25% below LMDB** on this path: 3.93M against 5.23M at
+   16 threads, and 733k against 778k at one. Transaction begin is what one
+   read costs in this server, so this is representative, and it contradicts the
+   "predict parity on reads" in [§8](#8-expected-performance).
+
+**The Linux half of this question is unanswered.** In the container the control
+column does not scale either — 1.27M at one thread, 1.18M at sixteen — so the
+host is saturated and every number in that table is unreadable. All four
+engines measured the same, which is the signature of a ceiling that is not
+theirs. Answering Q3 on Linux needs a quiet multi-core box.
+
+### Q4 — does `mdbx_env_warmup` work, with the lock? **Yes, with a prerequisite.**
+
+| | Windows | Linux |
+|---|---|---|
+| `force` | OK, 43–58 ms | OK, 8.8–10.3 ms |
+| `force\|lock`, as-is | **FAILED** — winerror 1453, working-set quota | **FAILED** — `ENOMEM`, `RLIMIT_MEMLOCK` 64 MiB |
+| `force\|lock`, after raising the limit | **OK**, 7.5 ms | **OK**, 11.5 ms |
+
+Neither failure is a missing capability; both are process limits. On Windows
+`VirtualLock` refuses past the process working-set maximum until
+`SetProcessWorkingSetSize` raises it — one `kernel32` call, and then it
+succeeds. On Linux it is `RLIMIT_MEMLOCK`, which is the same limit
+`prefault.rs` already lives under.
+
+So the [§7](#7-what-libmdbx-actually-gives-us) claim holds with a qualifier:
+warming is genuinely cross-platform, and *pinning* is achievable everywhere
+tested but the store has to raise the limit itself on Windows and document it
+on Linux. 11.5 ms to pin ~50 MiB also confirms it locks the resident region
+rather than the geometry's upper bound, which matters when that bound is 4 GiB.
+
+**macOS is unanswered** — no machine. It stays open.
+
+### What this changes
+
+- **[§10](#10-which-rust-binding--withdrawn) is withdrawn.** The mdbx backend should be
+  raw FFI over a vendored `mdbx.c`, sized to the `Backend` trait — which the
+  spike shows is about fifteen `extern` declarations. Three reasons, all
+  measured above: every wrapper hardcodes a flag that costs 56×; the musl fix
+  has to live in the build script that compiles the C; and a wrapper is a
+  second copy of the abstraction `Backend` already is. It also settles the
+  licence question, since only the Apache-2.0 C is vendored and no MPL-2.0
+  crate enters the graph.
+- **`signet-libmdbx` could not have been the recommendation anyway**:
+  `signet-mdbx-sys` 0.1.0 ships an *empty* `bindings_windows.rs` and links no
+  Windows system libraries. It fails with 355 errors on Windows — a platform
+  two of this document's own arguments are about. The C library itself builds
+  and runs there under MSVC without complaint.
+- **[§8](#8-expected-performance)'s read prediction was wrong** in the one
+  direction that matters. Reads may regress ~25% on transaction begin, and
+  Phase 3 has to measure reads, not assume them.
+- **[§9](#9-what-it-costs) gets cheaper and more precise**: no `libclang`
+  anywhere, and the musl risk is real but closed, with a known fix and a known
+  cost.
+
+The spike lives outside the tree, as Phase 0 intended. Whether to land it as
+`crates/vash-store/examples/mdbx_bench.rs` — it is `txn_bench` with two more
+engines — is a Phase 1 decision.
 
 ---
 
@@ -182,11 +358,18 @@ crates/vash-store/src/backend/
     mod.rs          the traits above, EnvInfo, DbStat, Warmed
     lmdb.rs         heed, moved out of env.rs — no behaviour change
     mdbx.rs         new, behind #[cfg(feature = "mdbx")]
+    mdbx/ffi.rs     ~15 extern declarations, hand-written
+    mdbx/libmdbx/   vendored mdbx.c + mdbx.h, Apache-2.0
 ```
 
 `env.rs` keeps what it is really about — schema version checks, shard-identity
 checks, the tag registry load, CAS resumption — and loses only the
 `EnvOpenOptions` block and the flag mapping, which become `LmdbBackend::open`.
+
+The vendored C and the hand-written externs are [Phase 0](#phase-0-results)'s
+conclusion rather than the original plan; `mdbx.rs` is where the `Backend` impl
+sits either way. The build script beside it owns two things no wrapper crate
+does correctly for us: the musl define, and *not* setting `NOSTICKYTHREADS`.
 
 ## 4. Choosing between them
 
@@ -334,7 +517,10 @@ that natively on Windows, `lazy` + `WRITE_MAP` measured 1.08× closed loop,
 supports writemap on Windows and permits it under `SAFE_NOSYNC`. The gain is
 already measured; the engine is what blocks collecting it.
 
-**3. `mdbx_env_warmup` could take `resident_mode` off Linux.**
+**3. `mdbx_env_warmup` could take `resident_mode` off Linux.** *(Measured — see
+[Q4](#q4--does-mdbx_env_warmup-work-with-the-lock-yes-with-a-prerequisite).
+Warming works on both platforms tested; pinning needs the store to raise a
+process limit first.)*
 `prefault.rs` is Linux-only because Linux is the one platform exposing both the
 mapping table and an advice meaning "prefault this", and `Store::map_locked`
 exists precisely so the server can *check* rather than assume. mdbx ships a
@@ -377,7 +563,14 @@ copy more per dirty page. Listed as something to measure, not as a claim.
 
 ## 8. Expected performance
 
-### Reads: parity, ±noise
+### Reads: predicted parity, measured ~25% worse
+
+> **Superseded by [Q3](#q3--what-does-nostickythreads-cost-56-and-every-wrapper-sets-it).**
+> The reasoning below is sound and the conclusion was wrong. On Windows, mdbx
+> with sticky threads does 3.93M transaction-begin-plus-get per second at 16
+> threads against LMDB's 5.23M — a 25% regression on the path a vash read
+> actually takes, since a read is one transaction. Left in place because the
+> prediction and its failure are both worth keeping.
 
 The read path is a B-tree descent into a resident memory map, a header parse and
 a subslice. Both engines do the same work with the same page layout, and
@@ -386,6 +579,10 @@ a subslice. Both engines do the same work with the same page layout, and
 engine. **Predict no measurable change on Linux**, and treat any large
 difference in either direction as a bug in the port (most likely `NOTLS`, see
 §6).
+
+What the prediction missed is that a read is not only a descent: it is a
+transaction begin, and mdbx's does more work than LMDB's. The descent itself
+was never in question — Q2 shows the value comes back borrowed either way.
 
 The exception is item 3 above: on Windows and macOS, where `resident_mode`
 cannot currently engage at all, the ceiling is whatever the platform's page
@@ -443,20 +640,25 @@ should come out the same.
 
 ## 9. What it costs
 
-**Build.** mdbx is vendored C. The Dockerfile's alpine stage installs
-`musl-dev` for LMDB; mdbx needs at least that, and the `-sys` crates in this
-family generate bindings with `bindgen`, which needs `libclang`. CI runs
-`cargo clippy --all-targets --all-features`, so **an additive `mdbx` feature is
-built by CI the moment it exists** — the clippy job needs the toolchain too.
+**Build.** *(Measured — [Q1](#q1--does-it-build-and-link-statically-for-musl-conditionally).)*
+mdbx is vendored C, and the `musl-dev` the alpine stage already installs for
+LMDB is the whole requirement: **no `bindgen`, no `libclang`**, in the build or
+in the `--all-features` clippy job. CI runs
+`cargo clippy --all-targets --all-features`, so an additive `mdbx` feature is
+built by CI the moment it exists — but it needs no new toolchain to do it.
 
-**The musl static build is a release gate**, and CI asserts the binary is not a
-dynamic executable. Whether `mdbx-sys` compiles and links statically for
-`x86_64-unknown-linux-musl` is a go/no-go question that must be answered
-*before* any refactor lands, not after. It is item one of the spike.
+**The musl static build is a release gate**, and it is where the one real build
+problem lives: mdbx's runtime SIMD dispatch does not link against musl's
+libgcc. Closed, at the cost of one define in the build script and the runtime
+AVX2/AVX-512 choice for the free-list scan — which is a cost worth restating,
+because the free-list is [§7](#7-what-libmdbx-actually-gives-us) item 5, the
+main performance reason to want mdbx at all. Whether the SSE2 fallback gives
+that back is a Phase 3 measurement.
 
 **Licensing.** libmdbx the C library is Apache-2.0 (relicensed in 2024), which
-is compatible with this workspace's `MIT OR Apache-2.0`. The Rust wrappers are
-not uniform, which drives the choice below.
+is compatible with this workspace's `MIT OR Apache-2.0`. Vendoring it directly
+means that is the only licence involved, and the wrapper table below becomes
+moot.
 
 **A second engine is a second thing to keep correct.** `tests/store.rs` is 2,197
 lines of invariants; they all have to run against both backends, which means
@@ -470,7 +672,15 @@ seam.
 ("the map is a reservation, not an allocation"). Under mdbx some of that is
 false. Each such statement needs a backend qualifier or a table row.
 
-## 10. Which Rust binding
+## 10. Which Rust binding — **withdrawn**
+
+> **Superseded by [Phase 0](#phase-0-results).** The answer is *none of them*:
+> use raw FFI over a vendored `mdbx.c`, sized to the `Backend` trait. Every
+> crate below hardcodes `NOSTICKYTHREADS`, which measured 56× on reads;
+> `signet-libmdbx` additionally does not build on Windows at all, its sys crate
+> shipping an empty `bindings_windows.rs`. The survey is kept because the
+> licence and maintenance picture is still what a future reader would want if
+> the wrappers ever fix the flag.
 
 | Crate | Version | Licence | Notes |
 |---|---|---|---|
@@ -489,23 +699,21 @@ of the existing one.
 
 ## 11. Staging
 
-### Phase 0 — spike, ~1 day, no refactor
+### Phase 0 — spike ✅ **done**
 
-Answer the questions that can kill the whole thing, in a throwaway branch, with
-nothing merged:
+Four questions, answered in [Phase 0 results](#phase-0-results) above: musl
+links with one define in a build script we own; `get` borrows; every wrapper
+hardcodes the flag that costs 56×, so the backend goes to raw FFI; warm-up and
+pinning work on both platforms tested, given a raised process limit.
 
-1. Does `mdbx-sys` build and link statically for `x86_64-unknown-linux-musl` on
-   the alpine image? Does the clippy job's toolchain need `libclang`?
-2. Does a `get` return a borrow valid for the transaction's life, with no copy?
-   (If it copies, `get_with` and the whole zero-copy record layout lose their
-   point and this stops here.)
-3. Is `MDBX_NOTLS` off by default in the chosen wrapper? Reproduce
-   `examples/txn_bench` against mdbx and confirm the sixteen-thread number rises
-   rather than falls.
-4. Does `mdbx_env_warmup` with lock report success on Windows and macOS?
+**Two things it left open, and neither blocks Phase 1:**
 
-**Exit:** four yes/no answers written into this document. Any "no" on 1–3 is a
-stop.
+- **macOS warm-up.** No machine. It is the third platform `resident_mode` would
+  reach and nobody has run a line of this on it.
+- **Q3 on Linux.** The container could not answer it: its own lock-free control
+  column did not scale, so the host was the ceiling. Needs a quiet multi-core
+  Linux box, and the same run should re-check the 25% read regression Windows
+  showed — one platform is not a result.
 
 ### Phase 1 — extract the `Backend` trait, LMDB only
 
@@ -520,9 +728,18 @@ something the `dyn` boundary was hiding).
 
 ### Phase 2 — the mdbx backend behind the feature
 
-`backend/mdbx.rs`, the `mdbx` cargo feature, `store.backend`, the wrong-format
-detection from §5, and the test suite parameterised over both. CI gains one job:
-`--features mdbx`, full store suite.
+`backend/mdbx.rs` over raw FFI, the vendored `mdbx.c` and its build script
+(including the musl define), the `mdbx` cargo feature, `store.backend`, the
+wrong-format detection from §5, and the test suite parameterised over both. CI
+gains one job: `--features mdbx`, full store suite, **including the musl
+static-link assertion** — that is where Phase 0's one real build failure lives,
+and it must be a gate rather than a comment.
+
+Two things Phase 0 says this phase must get right, because they are silent
+failures rather than loud ones: **do not set `NOSTICKYTHREADS`**, and raise the
+process working set before asking for a locked warm-up on Windows. Both belong
+in a test — a reader-slot scaling assertion and a `map_locked()` assertion —
+not in a comment, since neither breaks anything visible when it regresses.
 
 **Exit:** every invariant in `tests/store.rs` holds on both backends; a server
 started on each answers the same protocol suite; an LMDB directory opened as
@@ -534,6 +751,13 @@ A/B in one binary, on one host, paired runs: read and write, closed loop and
 pipelined, all three durability modes, plus the soak from §8 that neither engine
 has been measured under.
 
+**Reads are no longer a formality.** Phase 0 measured mdbx 25% behind LMDB on
+transaction begin, on the one platform whose numbers were readable. If that
+holds on Linux, an engine worth ~2–3% on writes costs a quarter of the read
+path, and the arithmetic stops favouring the swap regardless of what the
+free-list does. Measure reads first; if they regress, the rest may not be worth
+running.
+
 **Exit:** numbers in `benchmarks.md`, and a decision recorded here — mdbx
 becomes the default, stays an option, or is removed. **Removing it is a real
 outcome**, and Phase 1 is worth keeping either way: the `Backend` trait makes
@@ -544,7 +768,7 @@ crate currently gives in prose.
 
 | # | Scope | Exit criteria |
 |---|---|---|
-| **M11** | Storage backend seam: `Backend` trait under the engine, a libmdbx implementation behind a cargo feature and `store.backend`, both engines under one test suite, an A/B and a soak | The full store suite passes on both backends; switching engines is one config line and a wipe, refused rather than silently mis-opened; the engines are measured against each other in one binary on one host, and the default is set from that measurement rather than from either project's claims |
+| **M11** | Storage backend seam: `Backend` trait under the engine, a libmdbx implementation over raw FFI behind a cargo feature and `store.backend`, both engines under one test suite, an A/B and a soak | The full store suite passes on both backends; the musl static build is green with mdbx compiled in; reader-slot scaling and `map_locked()` are asserted by tests rather than assumed; switching engines is one config line and a wipe, refused rather than silently mis-opened; the engines are measured against each other in one binary on one host, **reads included**, and the default is set from that measurement rather than from either project's claims |
 
 ## 12. How to back out
 
@@ -566,6 +790,13 @@ cache is a cold start, not a data loss.
   requirement that matters: both engines in one binary, so the comparison can be
   paired on one host. It also makes the two backends' divergence invisible,
   since only one ever compiles.
+- **Use one of the wrapper crates instead of vendoring.** This was the
+  recommendation until Phase 0 measured it: all three hardcode
+  `NOSTICKYTHREADS`, which costs 56× on reads, and the one whose licence
+  matched does not build on Windows. Patching a fork of a wrapper to unset one
+  flag is a fork either way, and a smaller one is fifteen `extern` lines. If a
+  wrapper ever makes the flag configurable, revisit — the `Backend` trait is
+  where that swap would land, and it would be a file.
 - **Wait for heed to add an mdbx backend.** It has not, and the design of the
   seam is the same work either way.
 - **Port to mdbx outright, no LMDB.** Rejected on evidence: the arithmetic in §8
@@ -573,6 +804,30 @@ cache is a cold start, not a data loss.
   repo warns that the host swings by more than that. A change this size needs a
   paired comparison to justify itself, and deleting the incumbent removes the
   only thing to compare against.
+
+---
+
+## How to reproduce Phase 0
+
+The spike is a single crate outside the tree: `build.rs` compiling the
+amalgamated `mdbx.c` with `cc`, about fifteen `extern` declarations, and the
+three questions as subcommands. It carries `heed` at the workspace's pinned
+version so both engines are measured in one binary.
+
+```bash
+cargo run --release -- borrow   # Q2   (also: warmup, tls)
+```
+
+For the musl half, `rust:1.92-alpine` plus `apk add musl-dev` — no other
+package — and `file` on the output to confirm `static-pie linked`. Raise the
+limits before believing a failed lock: `--ulimit memlock=-1` on Linux,
+`SetProcessWorkingSetSize` on Windows.
+
+Two ways to get a false answer, both hit during this spike: a probe that only
+calls `Environment::builder()` never pulls the archive member in and links
+cleanly whatever is wrong with it; and a benchmark host that cannot scale a
+lock-free lookup will report every engine as equal. Always open and commit, and
+always keep the control column.
 
 ---
 
