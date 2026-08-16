@@ -920,6 +920,51 @@ async fn commands_outside_the_subset_are_rejected_by_name() {
     c.call(&["PING"], "+PONG\r\n").await;
 }
 
+/// **A block that alternates reads and writes is served as runs, in order.**
+///
+/// Each command class goes to the tier that suits it — reads on the worker,
+/// unconditional writes awaited — instead of the whole block taking the slowest
+/// route any one command needs. Five runs here, and the only thing that makes
+/// the answer right is that they execute in sequence: every `GET` must see the
+/// `SET` before it and none of the ones after.
+#[tokio::test]
+async fn an_alternating_block_is_answered_in_order() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    let mut pipeline = request(&["GET", "k"]);
+    pipeline.extend_from_slice(&request(&["SET", "k", "one"]));
+    pipeline.extend_from_slice(&request(&["GET", "k"]));
+    pipeline.extend_from_slice(&request(&["SET", "k", "two"]));
+    pipeline.extend_from_slice(&request(&["GET", "k"]));
+    c.send(&pipeline).await;
+
+    let expected = "$-1\r\n+OK\r\n$3\r\none\r\n+OK\r\n$3\r\ntwo\r\n";
+    c.fill(expected.len()).await;
+    assert_eq!(String::from_utf8_lossy(&c.buf[..expected.len()]), expected);
+}
+
+/// The same, with a command belonging to neither run kind wedged in the middle:
+/// `DEL` is not an unconditional write, so it splits the block again and still
+/// has to land in its own position in the reply stream.
+#[tokio::test]
+async fn a_block_mixing_all_three_run_kinds_stays_ordered() {
+    let server = TestServer::start().await;
+    let mut c = server.connect().await;
+
+    let mut pipeline = request(&["SET", "a", "1"]);
+    pipeline.extend_from_slice(&request(&["GET", "a"]));
+    pipeline.extend_from_slice(&request(&["DEL", "a"]));
+    pipeline.extend_from_slice(&request(&["GET", "a"]));
+    pipeline.extend_from_slice(&request(&["SET", "a", "2"]));
+    pipeline.extend_from_slice(&request(&["GET", "a"]));
+    c.send(&pipeline).await;
+
+    let expected = "+OK\r\n$1\r\n1\r\n:1\r\n$-1\r\n+OK\r\n$1\r\n2\r\n";
+    c.fill(expected.len()).await;
+    assert_eq!(String::from_utf8_lossy(&c.buf[..expected.len()]), expected);
+}
+
 #[tokio::test]
 async fn a_rejected_command_does_not_desynchronise_a_pipeline() {
     let server = TestServer::start().await;

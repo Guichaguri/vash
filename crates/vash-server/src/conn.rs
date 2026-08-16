@@ -45,6 +45,10 @@ pub async fn handle(
 
     let mut read_buf = BytesMut::with_capacity(read_buffer);
     let mut write_buf: Vec<u8> = Vec::with_capacity(read_buffer);
+    // Held for the life of the connection so measuring a block allocates
+    // nothing once it has seen its widest mix of command kinds. A uniform
+    // block — every `GET`, or every `SET` — measures to exactly one run.
+    let mut runs: Vec<Run> = Vec::new();
     let mut protocol: Option<Protocol> = None;
     // Redis connections start at RESP2 and move to RESP3 only if the client
     // asks. Per-connection state, because that is exactly what `HELLO`
@@ -153,12 +157,13 @@ pub async fn handle(
                     &mut read_buf,
                     &mut write_buf,
                     &mut (),
-                    |buf| measure_vcp(buf, gated),
+                    |buf, runs| measure_vcp(buf, gated, runs),
                     |state, conn, block, (), out| {
                         crate::dispatch::execute_vcp_block(state, conn, block, out)
                     },
                     |_, _| {},
                     None,
+                    &mut runs,
                 )
                 .await?
             }
@@ -177,6 +182,7 @@ pub async fn handle(
                         crate::metrics::Dialect::Memcached,
                         memcached::encode::STORED,
                     )),
+                    &mut runs,
                 )
                 .await?
             }
@@ -197,6 +203,7 @@ pub async fn handle(
                         crate::metrics::Dialect::Resp,
                         vash_proto::resp::encode::OK,
                     )),
+                    &mut runs,
                 )
                 .await?
             }
@@ -247,16 +254,10 @@ pub async fn handle(
 /// knows where a command ends — and for the storage commands of all three that
 /// is length-delimited rather than line-delimited, since a value may contain
 /// anything, CRLF included.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Measured {
     /// Bytes at the front of the buffer that form complete commands.
     complete: usize,
-    /// Every one of them can be answered without touching the writer.
-    all_reads: bool,
-    /// Every one of them is an unconditional write that [`crate::dispatch::SetBatch`]
-    /// may hold back — so the whole block is one submission, and it can be
-    /// *awaited* rather than blocked on. See `docs/performance-proposals.md` §8.
-    all_writes: bool,
     /// Framing is unrecoverable; the connection closes once any reply is out.
     fatal: Option<&'static str>,
     /// Total length of the command still arriving, so the buffer can be sized
@@ -264,17 +265,50 @@ struct Measured {
     reserve: usize,
 }
 
-impl Default for Measured {
-    fn default() -> Self {
-        Self {
-            complete: 0,
-            all_reads: true,
-            // Both start true and are cleared by the first command that is not
-            // one; an empty block is neither, which the `complete > 0` guard in
-            // `drain` takes care of.
-            all_writes: true,
-            fatal: None,
-            reserve: 0,
+/// How a stretch of commands may be served.
+///
+/// **The block used to be classified as a whole, and that cost more than
+/// anything else left in the request path.** `all_reads` and `all_writes` were
+/// folded with `&=` across every command, so a single write among fifteen reads
+/// disqualified the whole block from the inline read path and sent all sixteen
+/// to the blocking pool. A pipelined cache client sends exactly that: at
+/// pipeline 16 with one write in ten, only `0.9^16` — 18.5% — of blocks are
+/// uniform. Measured, one write per *hundred* operations cost 39% of
+/// throughput, and a 25% write workload ran slower than a 100% write one, which
+/// nothing but this explains. See `docs/performance-proposals.md` §14.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    /// Answerable without touching the writer, so it may run on this worker
+    /// when `inline_reads` is on.
+    Reads,
+    /// Unconditional writes that [`crate::dispatch::SetBatch`] may hold back, so
+    /// the run is one submission and can be *awaited* rather than blocked on.
+    /// See §8.
+    Writes,
+    /// Everything else: guarded writes, tagged writes, `AUTH`, `QUIT`, a
+    /// recoverable parse error. These take the blocking pool, as the whole
+    /// block used to.
+    Other,
+}
+
+/// A maximal stretch of commands of one kind, measured in bytes of the block.
+///
+/// Byte lengths rather than command counts because that is what the executors
+/// take, and because the block is a refcounted `Bytes` — a run is a slice of it
+/// and costs no copy.
+#[derive(Debug)]
+struct Run {
+    len: usize,
+    kind: RunKind,
+}
+
+impl Run {
+    /// Adds `len` bytes of `kind`, extending the run in progress when it
+    /// matches so that the common uniform block still produces exactly one.
+    fn extend(runs: &mut Vec<Run>, kind: RunKind, len: usize) {
+        match runs.last_mut() {
+            Some(last) if last.kind == kind => last.len += len,
+            _ => runs.push(Run { len, kind }),
         }
     }
 }
@@ -427,59 +461,106 @@ async fn drain<S: Copy + Send + 'static>(
     read_buf: &mut BytesMut,
     write_buf: &mut Vec<u8>,
     dialect: &mut S,
-    measure: impl Fn(&[u8]) -> Measured,
+    measure: impl Fn(&[u8], &mut Vec<Run>) -> Measured,
     run: RunBlock<S>,
     on_fatal: fn(&mut Vec<u8>, &'static str),
-    // How this dialect decodes a block of nothing but writes, and what it says
+    // How this dialect decodes a run of nothing but writes, and what it says
     // for each one that stored. `None` for a dialect that stays on the ordinary
     // path — see `measure_vcp`.
     writes: Option<(ParseWrites, crate::metrics::Dialect, &'static [u8])>,
+    // Reused across every block this connection ever measures, so a block costs
+    // no allocation once the connection has seen its widest mix.
+    runs: &mut Vec<Run>,
 ) -> std::io::Result<bool> {
-    let measured = measure(read_buf);
+    runs.clear();
+    let measured = measure(read_buf, runs);
     let mut closing = measured.fatal.is_some();
 
     if measured.complete > 0 {
         // `split_to` hands the bytes over by reference count. No copy, and the
         // decoded keys and values borrow directly from them.
         let block = read_buf.split_to(measured.complete).freeze();
+        debug_assert_eq!(
+            measured.complete,
+            runs.iter().map(|r| r.len).sum::<usize>(),
+            "every measured byte belongs to exactly one run"
+        );
 
-        // A block that is only writes is submitted and awaited here, holding no
-        // thread while the writer works. It declines — `None` — for anything it
-        // does not model, and the ordinary path below then runs the block
-        // untouched, so this is a shortcut and never the only route.
-        //
-        // **Boxed, and reads are why.** Awaiting this future inline would splice
-        // its state — a decoded `WriteRun`, a permit, the pending submission —
-        // into `drain`'s, and `drain`'s into the future of every connection
-        // task. Measured, that inflation cost pipelined `GET` 6.7x (466k ->
-        // 70k ops/s with `inline_reads`) on blocks that never take this branch
-        // at all. Behind a `Box` the read path polls a small future again, and
-        // the allocation lands only on blocks that are entirely writes, where a
-        // commit dwarfs it. See `docs/benchmarks.md`.
-        let awaited = match (measured.all_writes, writes) {
-            (true, Some((parse, dialect_kind, stored))) => {
-                Box::pin(run_writes_awaited(
+        // **Each run goes to the tier that suits it, in order.** Order is what
+        // makes this safe: a client may pipeline a write and then a read of the
+        // same key, and running the runs in sequence answers them in sequence.
+        let mut offset = 0;
+        let mut index = 0;
+        while index < runs.len() {
+            let start = offset;
+            let mut len = runs[index].len;
+
+            // What this run can take. A write run needs a dialect that decodes
+            // one, which a gated connection is denied because its refusal is
+            // the executor's to word.
+            let inline = runs[index].kind == RunKind::Reads && state.inline_reads;
+            let awaitable = runs[index].kind == RunKind::Writes && writes.is_some();
+
+            // Runs that both end up on the pool are merged into one hop, so a
+            // block that gains nothing from splitting pays for nothing either —
+            // with `inline_reads` off, that includes its read runs.
+            if !inline && !awaitable {
+                while let Some(next) = runs.get(index + 1) {
+                    let next_inline = next.kind == RunKind::Reads && state.inline_reads;
+                    let next_awaitable = next.kind == RunKind::Writes && writes.is_some();
+                    if next_inline || next_awaitable {
+                        break;
+                    }
+                    index += 1;
+                    len += runs[index].len;
+                }
+            }
+            offset += len;
+            index += 1;
+
+            let slice = block.slice(start..start + len);
+
+            // A run of writes is submitted and awaited here, holding no thread
+            // while the writer works. It declines — `None` — for anything it
+            // does not model, and the ordinary path below then runs the same
+            // bytes untouched, so this is a shortcut and never the only route.
+            //
+            // **Boxed, and reads are why.** Awaiting this future inline would
+            // splice its state — a decoded `WriteRun`, a permit, the pending
+            // submission — into `drain`'s, and `drain`'s into the future of
+            // every connection task. Measured, that inflation cost pipelined
+            // `GET` 6.7x (466k -> 70k ops/s with `inline_reads`) on blocks that
+            // never take this branch at all. Behind a `Box` the read path polls
+            // a small future again, and the allocation lands only on runs that
+            // are entirely writes, where a commit dwarfs it. See
+            // `docs/benchmarks.md`.
+            if awaitable {
+                let (parse, dialect_kind, stored) = writes.expect("checked by `awaitable`");
+                if Box::pin(run_writes_awaited(
                     state,
-                    &block,
+                    &slice,
                     write_buf,
                     parse,
                     dialect_kind,
                     stored,
                 ))
                 .await
+                .is_some()
+                {
+                    continue;
+                }
             }
-            _ => None,
-        };
 
-        if awaited.is_none() {
             // Reads may run on this worker; anything that can write must not,
             // because a write waits on the shard's writer queue and would block
             // the worker — and every other connection it serves — behind it.
-            let inline = state.inline_reads && measured.all_reads;
-            if run_block(state, conn_auth, dialect, block, write_buf, inline, run).await?
+            if run_block(state, conn_auth, dialect, slice, write_buf, inline, run).await?
                 == Closing::Yes
             {
+                // `quit`, and nothing after it on this connection matters — the
+                // same answer the block executors already give mid-block.
                 closing = true;
+                break;
             }
         }
     }
@@ -498,17 +579,22 @@ async fn drain<S: Copy + Send + 'static>(
 }
 
 /// Measures VCP frames from their length headers, without decoding a body.
-fn measure_vcp(buf: &[u8], gated: bool) -> Measured {
+fn measure_vcp(buf: &[u8], gated: bool, runs: &mut Vec<Run>) -> Measured {
     let mut measured = Measured::default();
     loop {
         match peek_frame_len(&buf[measured.complete..]) {
             FrameLen::Complete(len) => {
                 let frame = &buf[measured.complete..measured.complete + len];
-                measured.all_reads &= is_read_only_frame(frame);
-                // VCP stays on the ordinary path: a reply carries the request id
+                // VCP never produces a write run: a reply carries the request id
                 // from its own frame header, and the pre-auth gate is read from
                 // that header too, neither of which the shared write run models.
-                measured.all_writes = false;
+                // Its reads still split out and still run inline.
+                let kind = if is_read_only_frame(frame) {
+                    RunKind::Reads
+                } else {
+                    RunKind::Other
+                };
+                Run::extend(runs, kind, len);
                 measured.complete += len;
             }
             FrameLen::Incomplete { needed } => {
@@ -547,24 +633,31 @@ fn is_read_only_frame(frame: &[u8]) -> bool {
         .is_some_and(|opcode| opcode.inline_safe())
 }
 
-fn measure_memcached(buf: &[u8]) -> Measured {
+fn measure_memcached(buf: &[u8], runs: &mut Vec<Run>) -> Measured {
     let mut measured = Measured::default();
     loop {
         match memcached::parse(&buf[measured.complete..]) {
             Ok(Outcome::Incomplete) => break,
             Ok(Outcome::Command(parsed)) => {
-                measured.all_reads &= parsed.command.inline_safe();
-                measured.all_writes &= matches!(
+                let storage = matches!(
                     parsed.style,
                     vash_proto::memcached::encode::ResponseStyle::Storage
-                ) && crate::dispatch::awaitable(&parsed.command);
+                );
+                let kind = if parsed.command.inline_safe() {
+                    RunKind::Reads
+                } else if storage && crate::dispatch::awaitable(&parsed.command) {
+                    RunKind::Writes
+                } else {
+                    RunKind::Other
+                };
+                Run::extend(runs, kind, parsed.consumed);
                 measured.complete += parsed.consumed;
             }
             // Counted in, not handled here: the error line has to land in the
             // response stream in the position the bad command occupied, which
             // only the executor knows how to do.
             Err(ProtocolError::Recoverable { consumed, .. }) => {
-                measured.all_writes = false;
+                Run::extend(runs, RunKind::Other, consumed);
                 measured.complete += consumed;
             }
             Err(ProtocolError::Fatal(detail)) => {
@@ -576,7 +669,7 @@ fn measure_memcached(buf: &[u8]) -> Measured {
     measured
 }
 
-fn measure_resp(buf: &[u8]) -> Measured {
+fn measure_resp(buf: &[u8], runs: &mut Vec<Run>) -> Measured {
     use vash_proto::resp;
 
     let mut measured = Measured::default();
@@ -584,12 +677,18 @@ fn measure_resp(buf: &[u8]) -> Measured {
         match resp::parse(&buf[measured.complete..]) {
             Ok(resp::Outcome::Incomplete) => break,
             Ok(resp::Outcome::Command(parsed)) => {
-                measured.all_reads &= crate::resp::inline_safe(&parsed.command);
-                measured.all_writes &= crate::resp::batchable_write(&parsed.command);
+                let kind = if crate::resp::inline_safe(&parsed.command) {
+                    RunKind::Reads
+                } else if crate::resp::batchable_write(&parsed.command) {
+                    RunKind::Writes
+                } else {
+                    RunKind::Other
+                };
+                Run::extend(runs, kind, parsed.consumed);
                 measured.complete += parsed.consumed;
             }
             Err(resp::ProtocolError::Recoverable { consumed, .. }) => {
-                measured.all_writes = false;
+                Run::extend(runs, RunKind::Other, consumed);
                 measured.complete += consumed;
             }
             Err(resp::ProtocolError::Fatal(detail)) => {

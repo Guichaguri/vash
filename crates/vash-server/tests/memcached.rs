@@ -1758,6 +1758,26 @@ async fn a_read_in_the_same_block_sees_the_writes_before_it() {
     );
 }
 
+/// **A block that alternates reads and writes is served as runs, in order.**
+///
+/// Each class goes to the tier that suits it rather than the whole block taking
+/// the slowest route any one command needs, and the only thing that makes the
+/// answer right is that the runs execute in sequence: every `get` sees the `set`
+/// before it and none of the ones after.
+#[tokio::test]
+async fn an_alternating_block_is_answered_in_order() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    conn.send(b"get k\r\nset k 0 0 3\r\none\r\nget k\r\nset k 0 0 3\r\ntwo\r\nget k\r\n")
+        .await;
+
+    assert_eq!(
+        conn.read_until("two\r\nEND\r\n").await,
+        "END\r\nSTORED\r\nVALUE k 0 3\r\none\r\nEND\r\nSTORED\r\nVALUE k 0 3\r\ntwo\r\nEND\r\n"
+    );
+}
+
 /// Two writes to one key in a single block keep last-write-wins, and each still
 /// gets its own `STORED`.
 #[tokio::test]
