@@ -693,25 +693,34 @@ one i7-9750H (6 cores / 12 threads), best of 2 repeats each.
 
 | | Windows | Linux |
 |---|---:|---:|
-| Reads, 8 threads | 0.55–0.61× | **0.97–0.98×** |
-| `set_many`, `lazy` | **2.81×** | **0.16×** |
-| `set_many`, `relaxed` | 2.66× | 0.98× |
-| `set_many`, `durable` | 1.36× | 0.99× |
+| Reads, 8 threads | 0.55–0.61× | 0.97–0.98× |
+| `set_many`, `lazy` | **2.81×** | 1.02× |
+| `set_many`, `relaxed` | 2.66× | 1.04× |
+| `set_many`, `durable` | 1.36× | 1.08× |
 | Soak, accepted writes | 1.31× | 0.93× |
 
-**Neither platform alone gives the right answer.** Measured on Windows, libmdbx
-looks like a clear win on writes and a clear loss on reads; measured on Linux it
-is level everywhere except the default write path, where it loses by 6×. Any
-decision taken from one of these tables would have been confidently wrong about
-the other.
+**On Linux the two engines are indistinguishable** — every ratio, read and
+write, falls between 0.93× and 1.08×. On Windows they trade: libmdbx wins
+batched writes by up to 2.8× and loses reads by up to 45%. So the platform
+decides whether there is any difference at all.
 
-The reason is mostly LMDB, not libmdbx. Between Windows and Linux, LMDB's
-batched `lazy` writes go from 52,032 to 451,792 — **8.7× faster on Linux** —
-while libmdbx goes from 146,388 to 70,737, which is *slower*. libmdbx's apparent
-Windows advantage is LMDB being slow on Windows, which
+The asymmetry is LMDB's, not libmdbx's. LMDB is much faster on Linux than on
+Windows and libmdbx is roughly the same on both, so the Windows gaps are mostly
+LMDB being slow there — which
 [performance-proposals.md](performance-proposals.md) §6 had already found from
-the other direction when `WRITE_MAP` measured 1.08–1.26× there and nothing on
-Linux.
+the other direction, when `WRITE_MAP` measured 1.08–1.26× on Windows and
+nothing at all on Linux.
+
+> **A correction, and how it was caught.** The first version of this section
+> reported libmdbx at **0.16×** on Linux for batched `lazy` — a 6.4× loss — and
+> that number was wrong. It came from running `reads`, `writes` and `soak` in one
+> process: `reads` writes and re-reads about a gigabyte, the kernel is still
+> flushing it when `writes` starts, and that cost lands on whichever engine is
+> growing a file rather than writing into a preallocated one. Measured in
+> isolation the same scenario is 1.02×. The tell was a follow-up sweep whose own
+> baseline came out at 0.77×, five times better than the published figure for an
+> identical configuration. `examples/engine_ab.rs` now warns when the sections
+> are run together.
 
 ### Reads — libmdbx is behind on Windows, level on Linux
 
@@ -772,29 +781,31 @@ On Windows the pattern is a higher **per-commit** cost and a much better
 **per-batch** one, which would suit this server: a loaded writer packs whatever
 queued during the previous commit into the next one.
 
-**Linux, same harness:**
+**Linux, same harness, run as its own process:**
 
 | Scenario | lmdb | mdbx | ratio |
 |---|---:|---:|---:|
-| `set` one at a time, `lazy` | 11,104 | 8,891 | 0.80× |
-| `set_many` blocks of 256, `lazy` | 451,792 | 70,737 | **0.16×** |
-| `set` one at a time, `relaxed` | 519 | 524 | 1.01× |
-| `set_many` blocks of 256, `relaxed` | 52,104 | 51,133 | 0.98× |
-| `set` one at a time, `durable` | 295 | 284 | 0.96× |
-| `set_many` blocks of 256, `durable` | 35,346 | 34,968 | 0.99× |
+| `set` one at a time, `lazy` | 9,072 | 8,775 | 0.97× |
+| `set_many` blocks of 256, `lazy` | 202,242 | 206,332 | 1.02× |
+| `set` one at a time, `relaxed` | 472 | 478 | 1.01× |
+| `set_many` blocks of 256, `relaxed` | 44,728 | 46,551 | 1.04× |
+| `set` one at a time, `durable` | 274 | 271 | 0.99× |
+| `set_many` blocks of 256, `durable` | 30,100 | 32,512 | 1.08× |
 
-Every mode is parity except one, and it is the one that matters most: **batched
-`lazy`, the default durability and the path group commit takes under load, where
-LMDB is 6.4× ahead**. Everything that syncs — `relaxed`, `durable` — is level,
-because there the device sets the pace and the engine cannot change it. `lazy` is
-where the engine is the pace, and on Linux LMDB's is much better.
+Parity in every mode. The syncing modes are level because the device sets the
+pace and neither engine can change it; `lazy` is where the engine sets the pace,
+and on Linux the two are within 2%.
 
-Why libmdbx is *slower* here than on Windows is not isolated. The likely
-suspects are its growable geometry paying file-extension syscalls that LMDB's
-preallocated sparse map never pays, and `MDBX_LIFORECLAIM` doing garbage-list
-work that only earns its keep once the free list is under pressure — which,
-four thousand writes into an empty store, it is not. A tuned geometry may close
-some of this, and nobody has tried.
+**Batched `lazy` is also the noisiest thing measured here.** LMDB's own figure
+for that one row came out at 202k, 397k, 426k, 452k and 462k across five runs on
+one machine — a 2.3× spread, wider than any engine difference in this document.
+Treat single measurements of it as unusable; it is the row
+[What this cannot tell you](#what-this-cannot-tell-you) was written for.
+
+A geometry sweep — growth step at 16 and 64 MiB, `size_now` preallocated,
+`MDBX_LIFORECLAIM` off, the internal sync period off — moved nothing outside
+that noise band. It was run to close a 6.4× gap that turned out not to exist, so
+there is nothing for it to fix and the shipped geometry is unchanged.
 
 ### The soak, which neither engine had been measured under
 

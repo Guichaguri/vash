@@ -15,6 +15,15 @@
 //! an engine worth a couple of percent on writes costs a quarter of the read
 //! path, and the rest of the table stops mattering.
 //!
+//! **Run one section per process.** `reads` writes and then re-reads about a
+//! gigabyte across its repeats, and the kernel is still flushing that when the
+//! next section starts — which lands entirely on whichever engine is growing a
+//! file rather than writing into a preallocated one. Measured: batched `lazy`
+//! on Linux reads 0.16× for libmdbx when `reads` ran first in the same process
+//! and 1.02× when it did not, and the second number is the true one. `all` runs
+//! them in order and says so; it is for a quick look, not for numbers anyone
+//! quotes.
+//!
 //! Environment overrides, matching `write_bench.rs`:
 //!
 //! - `VASH_BENCH_OPS` — operations per scenario (default 20,000)
@@ -362,11 +371,48 @@ fn main() {
     );
 
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
+    if which == "all" {
+        eprintln!(
+            "warning: sections contaminate each other in one process — `reads` leaves the 
+             kernel flushing ~1 GiB, which costs the growing-file engine several times over.
+             Run `reads`, `writes` and `soak` separately for numbers worth quoting."
+        );
+    }
     if which == "all" || which == "reads" {
         reads();
     }
     if which == "all" || which == "writes" {
         writes();
+    }
+    // Just the batched-`lazy` row, which is the only scenario the two engines
+    // genuinely disagree on under Linux. Its own mode so a geometry sweep is
+    // seconds rather than minutes.
+    if which == "lazy" {
+        println!(
+            "
+== batched lazy only ({} ops)
+",
+            ops()
+        );
+        println!("{:<38} {:>11} {:>11}   {:>5}", "", "lmdb", "mdbx", "ratio");
+        let value = vec![b'w'; 256];
+        compare(
+            "set_many, blocks of 256, Lazy",
+            Durability::Lazy,
+            move |store| {
+                let started = Instant::now();
+                for block in (0..ops()).step_by(256) {
+                    let keys: Vec<Vec<u8>> =
+                        (block..(block + 256).min(ops())).map(key_for).collect();
+                    let sets: Vec<Set<'_>> = keys
+                        .iter()
+                        .map(|k| set_of(Key::new(k).expect("valid"), &value))
+                        .collect();
+                    store.set_many(&sets).expect("set_many");
+                }
+                ops() as f64 / started.elapsed().as_secs_f64()
+            },
+        );
     }
     if which == "all" || which == "soak" {
         soak();

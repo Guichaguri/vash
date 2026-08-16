@@ -33,17 +33,17 @@ honestly worth.
 ---
 
 > **Outcome, now that all four phases have run: LMDB stays the default and
-> libmdbx ships as an option.** The comparison is **strongly platform-dependent
-> and inverts between Windows and Linux**, so neither host alone would have
-> answered it: libmdbx wins batched writes by 2.8x on Windows and loses them by
-> 6.4x on Linux, and the read regression that looked decisive on Windows does not
-> exist there. Linux is the deployment target, and on Linux the default write
-> path is where LMDB wins. The §7 argument that mattered most - better space
-> behaviour under churn - did not reproduce on either platform.
-> [Phase 3](#phase-3--measure-then-decide-the-default--done) has the reasoning
-> and [benchmarks.md](benchmarks.md#lmdb-against-libmdbx) the numbers. The rest
-> of this document is kept as written, including the parts the measurements went
-> on to contradict.
+> libmdbx ships as an option.** On Linux — the deployment target — the two are
+> **indistinguishable**, every ratio between 0.93x and 1.08x; on Windows they
+> trade, libmdbx taking batched writes by up to 2.8x and losing reads by up to
+> 45%. LMDB stays default because parity is not a reason to move off the
+> incumbent, not because libmdbx measured slower. The §7 argument that mattered
+> most — better space behaviour under churn — did not reproduce on either
+> platform. [Phase 3](#phase-3--measure-then-decide-the-default--done) has the
+> reasoning, including a Linux write figure that was published wrong and
+> corrected, and [benchmarks.md](benchmarks.md#lmdb-against-libmdbx) the numbers.
+> The rest of this document is kept as written, including the parts the
+> measurements went on to contradict.
 
 ---
 
@@ -825,46 +825,48 @@ mdbx refuses to start with a wipe instruction.
 **Decision: LMDB stays the default. libmdbx stays an option, and is not
 removed.** Full tables in [benchmarks.md](benchmarks.md#lmdb-against-libmdbx).
 
-**The measurement had to be run on both platforms, and that is the finding.**
-Nearly every ratio inverts between them:
+**The measurement had to be run on both platforms.** On Linux the engines are
+indistinguishable; on Windows they trade:
 
 | | Windows | Linux |
 |---|---:|---:|
 | Reads, 8 threads | 0.55-0.61x | 0.97-0.98x |
-| Writes, batched, `lazy` | **2.81x** | **0.16x** |
-| Writes, batched, `relaxed` | 2.66x | 0.98x |
-| Writes, batched, `durable` | 1.36x | 0.99x |
+| Writes, batched, `lazy` | **2.81x** | 1.02x |
+| Writes, batched, `relaxed` | 2.66x | 1.04x |
+| Writes, batched, `durable` | 1.36x | 1.08x |
 | Soak, accepted writes | 1.31x | 0.93x |
 
-**Why not promote it - and the reason is not the one Windows gave.** Measured on
-Windows alone, the case against libmdbx was a 13-45% read regression widening
-with concurrency. **That regression is Windows-specific**: on Linux the engines
-are within 3% at every thread count and scale almost identically. Had the
-decision been taken from the Windows table it would have been right by accident
-and wrong in its reasoning - which matters, because the reasoning is what the
-next person reuses.
+**Why not promote it.** Not because libmdbx is slower — on Linux, the deployment
+target, every ratio sits between 0.93x and 1.08x and nothing distinguishes the
+two. It stays the default because **nothing measured justifies moving off the
+incumbent**: LMDB is what every existing deployment runs, what the rest of this
+repository's tuning was measured against, and the engine whose failure modes are
+documented here in detail. Parity is not a reason to switch.
 
-The Linux case is narrower and stronger. Everything that syncs is parity, and
-the one gap is **batched `lazy`, where LMDB is 6.4x ahead** - the default
-durability and the path group commit takes under load. Linux is the deployment
-target; that is the number that decides it.
+On Windows the two trade rather than one winning: libmdbx takes batched writes
+by up to 2.8x and gives up as much as 45% on reads.
 
-**Why not remove it.** On Windows the batched write win is real and large - 2.8x
-under `lazy`, 2.7x under `relaxed` - and Windows is where development happens.
-libmdbx also pins the map there, which LMDB cannot, so `store.resident_mode` is
-only reachable on Windows through this backend. And it earned its keep as a
-second implementation: it is what turned the `Backend` trait from an assertion
-into something checked, and several of the bugs it found were in code shared by
-both engines.
+**Why not remove it.** The Windows write win is real and large, and Windows is
+where development happens. libmdbx also pins the map there, which LMDB cannot,
+so `store.resident_mode` is only reachable on Windows through this backend. And
+it earned its keep as a second implementation: it turned the `Backend` trait
+from an assertion into something checked, and several of the bugs it found were
+in code shared by both engines.
 
-**What is not explained, and should be before anyone reads too much into it.**
-libmdbx's batched `lazy` writes are *slower on Linux than on Windows* - 70,737
-against 146,388 - while LMDB's improve 8.7x on the same move. The likely
-suspects are the growable geometry paying file-extension syscalls that LMDB's
-preallocated sparse map never pays, and `MDBX_LIFORECLAIM` doing garbage-list
-work that has nothing to recycle four thousand writes into an empty store. A
-tuned geometry may close some of it. Nobody has tried, and until someone does the
-Linux write gap is a measurement rather than a property.
+**The Linux write comparison was published wrong and then corrected.** The first
+Linux run reported libmdbx at 0.16x on batched `lazy` — a 6.4x loss — and the
+whole "platforms invert" story was built on it. It was an artefact of running
+`reads`, `writes` and `soak` in one process: `reads` leaves the kernel flushing
+about a gigabyte, and that cost lands on whichever engine is growing a file
+rather than writing into a preallocated one. Isolated, the same scenario is
+1.02x. A geometry sweep run to close that gap found nothing to close, and its own
+baseline came out five times better than the published number, which is what
+exposed the error. The shipped geometry is unchanged and
+`examples/engine_ab.rs` now warns when the sections are run together.
+
+**That row is also the noisiest thing here.** LMDB's own batched-`lazy` figure
+spans 202k to 462k across five runs on one machine — 2.3x, wider than any engine
+difference in this document. Single measurements of it are not usable.
 
 **What did not survive contact.** §7 item 5 — LIFO recycling and continuous
 compactification showing up as better space behaviour under churn — is a
