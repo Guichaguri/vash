@@ -15,7 +15,8 @@ use std::ops::Bound;
 use tracing::warn;
 use vash_core::RecordRef;
 
-use crate::engine::LmdbEngine;
+use crate::backend::{Backend, ReadTxn};
+use crate::engine::Engine;
 
 use vash_core::{CoreError, MAX_KEY_LEN};
 
@@ -98,7 +99,7 @@ pub struct ShardScan {
     pub budget_exhausted: bool,
 }
 
-impl LmdbEngine {
+impl<B: Backend> Engine<B> {
     /// One shard's contribution to a key listing.
     ///
     /// Walks `main` in key order from `after` (exclusive), collecting the live
@@ -134,12 +135,8 @@ impl LmdbEngine {
         };
 
         let mut scan = ShardScan::default();
-        for entry in self
-            .main
-            .range(&rtxn, &bounds)
-            .map_err(StoreError::from_heed)?
-        {
-            let (key, blob) = entry.map_err(StoreError::from_heed)?;
+        for entry in rtxn.range(self.main, bounds)? {
+            let (key, blob) = entry?;
             scan.scanned += 1;
 
             match RecordRef::parse(blob) {

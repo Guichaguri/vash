@@ -2,26 +2,39 @@ use std::sync::atomic::Ordering;
 
 use vash_core::{Key, Listing, Set, Value, ValueRef};
 
+use crate::backend::{Backend, LmdbBackend};
 use crate::config::StoreConfig;
-use crate::engine::{LmdbEngine, Pressure};
+use crate::engine::{Engine, Pressure};
 use crate::error::Result;
 use crate::shard::Shards;
 use crate::{Store, StoreStats};
 
-/// The [`Store`] implementation: a set of independent LMDB environments, each
+/// The store on the LMDB backend — what every deployment and every benchmark
+/// in this repository actually opens.
+///
+/// A type alias rather than a type: the engine is chosen by a parameter, and
+/// naming the common choice keeps `LmdbStore::open` working for callers that
+/// have never heard of [`Backend`].
+pub type LmdbStore = VashStore<LmdbBackend>;
+
+/// The [`Store`] implementation: a set of independent storage environments, each
 /// with its own writer thread, addressed by a hash of the key.
 ///
-/// Reads go straight to the owning shard's engine — LMDB's MVCC lets any number
-/// run concurrently with the writer and with each other, taking no locks.
-/// Writes go through that shard's queue so they can be batched into shared
-/// commits. Nothing is shared between shards, which is the point: N shards are
-/// N concurrent writers.
-pub struct LmdbStore {
-    shards: Shards,
+/// Reads go straight to the owning shard's engine — a copy-on-write B-tree's
+/// MVCC lets any number run concurrently with the writer and with each other,
+/// taking no locks. Writes go through that shard's queue so they can be batched
+/// into shared commits. Nothing is shared between shards, which is the point:
+/// N shards are N concurrent writers.
+///
+/// **This is where the engine parameter stops.** `vash-server` holds an
+/// `Arc<dyn Store>`, so the generic is absorbed here and nothing above this
+/// crate is parameterised by it. See [`crate::backend`].
+pub struct VashStore<B: Backend> {
+    shards: Shards<B>,
     max_tags_per_record: usize,
 }
 
-impl LmdbStore {
+impl<B: Backend> VashStore<B> {
     pub fn open(config: &StoreConfig) -> Result<Self> {
         Ok(Self {
             shards: Shards::open(config)?,
@@ -71,7 +84,7 @@ impl LmdbStore {
     /// given shard; afterwards resolution is a RAM lookup.
     ///
     /// Each name is registered at the generation the rest of the node already
-    /// holds for it rather than at zero — see [`LmdbStore::node_generation`].
+    /// holds for it rather than at zero — see [`VashStore::node_generation`].
     fn ensure_tags_registered(&self, sets: &[Set<'_>]) -> Result<()> {
         self.check_tag_counts(sets)?;
 
@@ -120,7 +133,7 @@ impl LmdbStore {
     fn read_batch<T: Clone + Default>(
         &self,
         keys: &[Key<'_>],
-        read: impl Fn(&LmdbEngine, &[Key<'_>]) -> Result<Vec<T>>,
+        read: impl Fn(&Engine<B>, &[Key<'_>]) -> Result<Vec<T>>,
     ) -> Result<Vec<T>> {
         if self.shards.len() == 1 {
             return read(&self.shards.all()[0].engine, keys);
@@ -158,7 +171,7 @@ impl LmdbStore {
     }
 }
 
-impl Store for LmdbStore {
+impl<B: Backend> Store for VashStore<B> {
     fn shard_count(&self) -> usize {
         self.shards.len()
     }
@@ -177,7 +190,7 @@ impl Store for LmdbStore {
     }
 
     fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {
-        self.read_batch(keys, LmdbEngine::get_many)
+        self.read_batch(keys, Engine::get_many)
     }
 
     fn deadline(&self, key: Key<'_>) -> Result<Option<u64>> {
@@ -185,7 +198,7 @@ impl Store for LmdbStore {
     }
 
     fn deadlines(&self, keys: &[Key<'_>]) -> Result<Vec<Option<u64>>> {
-        self.read_batch(keys, LmdbEngine::deadlines)
+        self.read_batch(keys, Engine::deadlines)
     }
 
     fn set(&self, set: &Set<'_>) -> Result<u64> {
@@ -390,7 +403,7 @@ impl Store for LmdbStore {
         //
         // Shards that do not hold the name at all are left alone: one that
         // registers it later adopts the node-wide value anyway (see
-        // [`LmdbStore::node_generation`]), and creating it here would add an
+        // [`VashStore::node_generation`]), and creating it here would add an
         // entry to every shard's registry for every tag ever invalidated.
         if let Some(generation) = highest {
             for shard in self.shards.all() {

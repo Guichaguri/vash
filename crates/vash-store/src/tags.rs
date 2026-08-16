@@ -20,10 +20,10 @@
 //! node-wide value rather than starting at zero, because the number this node
 //! reports to its peers has to mean the same thing everywhere inside it.
 
-use heed::RwTxn;
 use tracing::warn;
 
-use crate::engine::LmdbEngine;
+use crate::backend::{Backend, ReadTxn, WriteTxn};
+use crate::engine::Engine;
 use crate::reclaim::Job;
 
 use std::collections::HashMap;
@@ -321,7 +321,7 @@ fn validate_tag_name(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
-impl LmdbEngine {
+impl<B: Backend> Engine<B> {
     /// Registers a tag, returning its id and starting generation.
     ///
     /// A record may never reference a tag that is not durably registered: after
@@ -337,26 +337,25 @@ impl LmdbEngine {
     /// a record that was written after the last invalidation.
     pub fn apply_create_tag(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut B::RwTxn<'_>,
         name: &[u8],
         start_generation: u64,
     ) -> Result<(u32, u64)> {
         validate_tag_name(name)?;
 
         // Another job in the same batch may have created it already.
-        if let Some(raw) = self
-            .tag_meta
-            .get(wtxn, name)
-            .map_err(StoreError::from_heed)?
+        if let Some(raw) = wtxn.get(self.tag_meta, name)?
             && let Some(existing) = crate::tags::decode_entry(raw)
         {
             return Ok(existing);
         }
 
         let id = self.tags.allocate_id()?;
-        self.tag_meta
-            .put(wtxn, name, &crate::tags::encode_entry(id, start_generation))
-            .map_err(StoreError::from_heed)?;
+        wtxn.put(
+            self.tag_meta,
+            name,
+            &crate::tags::encode_entry(id, start_generation),
+        )?;
 
         Ok((id, start_generation))
     }
@@ -371,17 +370,13 @@ impl LmdbEngine {
     /// set of consequences.
     pub fn apply_merge_tag(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut B::RwTxn<'_>,
         name: &[u8],
         generation: u64,
     ) -> Result<TagMerge> {
         validate_tag_name(name)?;
 
-        let existing = match self
-            .tag_meta
-            .get(wtxn, name)
-            .map_err(StoreError::from_heed)?
-        {
+        let existing = match wtxn.get(self.tag_meta, name)? {
             Some(raw) => Some(crate::tags::decode_entry(raw).ok_or_else(|| {
                 StoreError::Corrupt(format!("tag registry entry for {name:?} is malformed"))
             })?),
@@ -403,15 +398,15 @@ impl LmdbEngine {
             });
         }
 
-        self.tag_meta
-            .put(wtxn, name, &crate::tags::encode_entry(id, generation))
-            .map_err(StoreError::from_heed)?;
+        wtxn.put(
+            self.tag_meta,
+            name,
+            &crate::tags::encode_entry(id, generation),
+        )?;
 
         // One job per tag: raising the target mid-reclaim restarts the scan
         // rather than queueing a second pass.
-        self.jobs
-            .put(wtxn, &id.to_be_bytes(), &Job::new(generation).encode())
-            .map_err(StoreError::from_heed)?;
+        wtxn.put(self.jobs, &id.to_be_bytes(), &Job::new(generation).encode())?;
 
         Ok(TagMerge::Raised { id, generation })
     }
@@ -424,12 +419,12 @@ impl LmdbEngine {
     ///
     /// Returns `None` when the tag has never been registered, in which case no
     /// record can reference it and there is nothing to do.
-    pub fn apply_delete_by_tag(&self, wtxn: &mut RwTxn, name: &[u8]) -> Result<Option<(u32, u64)>> {
-        let Some(raw) = self
-            .tag_meta
-            .get(wtxn, name)
-            .map_err(StoreError::from_heed)?
-        else {
+    pub fn apply_delete_by_tag(
+        &self,
+        wtxn: &mut B::RwTxn<'_>,
+        name: &[u8],
+    ) -> Result<Option<(u32, u64)>> {
+        let Some(raw) = wtxn.get(self.tag_meta, name)? else {
             return Ok(None);
         };
         let Some((id, generation)) = crate::tags::decode_entry(raw) else {

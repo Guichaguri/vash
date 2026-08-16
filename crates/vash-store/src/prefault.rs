@@ -103,6 +103,8 @@
 use std::io::Read;
 use std::path::Path;
 
+use crate::backend::Warmed;
+
 #[cfg(target_os = "linux")]
 use tracing::warn;
 
@@ -116,25 +118,6 @@ const DATA_FILE: &str = "data.mdb";
 /// Read size for the warming pass. Large enough that the per-call overhead
 /// disappears against the copy, small enough to stay out of the way.
 const CHUNK: usize = 1024 * 1024;
-
-/// What warming achieved for one environment.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct Warmed {
-    /// Bytes of the data file pulled into the page cache.
-    pub bytes: u64,
-    /// Whether the mapping was **locked** into memory, so the kernel cannot
-    /// reclaim it again under pressure.
-    ///
-    /// This is the difference between "resident now" and "resident from here
-    /// on", and it is the whole reason `store.resident_mode` can enable inline
-    /// reads when `store.prefault` alone cannot: warming makes the promise true
-    /// at startup, and only the lock keeps it true.
-    ///
-    /// `false` whenever locking was not asked for, could not be applied, or is
-    /// not reachable on this platform — never optimistic, because a caller uses
-    /// it to decide whether to put reads on a runtime worker.
-    pub locked: bool,
-}
 
 /// Warms one environment's map. Returns the bytes made resident.
 ///

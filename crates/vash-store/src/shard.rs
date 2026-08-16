@@ -1,7 +1,7 @@
-//! Routing across independent LMDB environments.
+//! Routing across independent storage environments.
 //!
-//! LMDB allows one writer per environment, so a single environment caps write
-//! throughput at whatever one thread can commit. Running several — each with
+//! Both engines behind [`crate::backend`] allow one writer per environment, so a
+//! single environment caps write throughput at whatever one thread can commit. Running several — each with
 //! its own environment, writer thread and maintenance — multiplies that ceiling
 //! by the shard count. See plan §9.
 //!
@@ -27,25 +27,29 @@
 
 use std::sync::Arc;
 
+use crate::backend::Backend;
 use crate::config::StoreConfig;
-use crate::engine::LmdbEngine;
+use crate::engine::Engine;
 use crate::error::Result;
 use crate::writer::Writer;
 
 /// One environment and the writer thread that owns its write transaction.
-pub(crate) struct Shard {
-    pub engine: Arc<LmdbEngine>,
+///
+/// `Writer` carries no engine parameter of its own: it owns a queue and a
+/// thread handle, and the engine only exists inside the thread it spawned.
+pub(crate) struct Shard<B: Backend> {
+    pub engine: Arc<Engine<B>>,
     pub writer: Writer,
 }
 
-impl Shard {
+impl<B: Backend> Shard<B> {
     fn open(config: &StoreConfig, index: usize) -> Result<Self> {
         let mut shard_config = config.clone();
         shard_config.path = shard_path(config, index);
         // Each environment reserves the whole map size, so the configured value
         // is per shard rather than shared. Splitting it instead would make the
         // shard count silently change how much a single hot shard can hold.
-        let engine = Arc::new(LmdbEngine::open(&shard_config, index, config.shards)?);
+        let engine = Arc::new(Engine::<B>::open(&shard_config, index, config.shards)?);
         let writer = Writer::spawn(Arc::clone(&engine), config.write);
         Ok(Self { engine, writer })
     }
@@ -89,16 +93,21 @@ impl<'a, T> Grouped<'a, T> {
     /// transaction with nothing in it.
     pub fn runs(&self) -> impl Iterator<Item = (usize, &[Placed<'a, T>])> {
         (0..self.bounds.len() - 1)
-            .map(move |shard| (shard, &self.placed[self.bounds[shard]..self.bounds[shard + 1]]))
+            .map(move |shard| {
+                (
+                    shard,
+                    &self.placed[self.bounds[shard]..self.bounds[shard + 1]],
+                )
+            })
             .filter(|(_, run)| !run.is_empty())
     }
 }
 
-pub(crate) struct Shards {
-    shards: Vec<Shard>,
+pub(crate) struct Shards<B: Backend> {
+    shards: Vec<Shard<B>>,
 }
 
-impl Shards {
+impl<B: Backend> Shards<B> {
     pub fn open(config: &StoreConfig) -> Result<Self> {
         let count = config.shards.max(1);
         let mut shards = Vec::with_capacity(count);
@@ -112,7 +121,7 @@ impl Shards {
         self.shards.len()
     }
 
-    pub fn all(&self) -> &[Shard] {
+    pub fn all(&self) -> &[Shard<B>] {
         &self.shards
     }
 
@@ -122,7 +131,7 @@ impl Shards {
     /// a randomly-seeded hash would send a key to a different shard after every
     /// restart, turning the whole cache into a miss.
     #[inline]
-    pub fn for_key(&self, key: &[u8]) -> &Shard {
+    pub fn for_key(&self, key: &[u8]) -> &Shard<B> {
         &self.shards[self.index_of(key)]
     }
 
@@ -176,7 +185,7 @@ impl Shards {
         Grouped { placed, bounds }
     }
 
-    /// Releases every environment, blocking until LMDB has let go of each.
+    /// Releases every environment, blocking if the engine needs it.
     pub fn close(self) {
         for mut shard in self.shards {
             shard.writer.shutdown();

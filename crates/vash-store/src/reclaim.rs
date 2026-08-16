@@ -30,10 +30,10 @@
 
 use std::ops::Bound;
 
-use heed::{AnyTls, RoTxn, RwTxn};
 use vash_core::{NEVER, RecordRef};
 
-use crate::engine::LmdbEngine;
+use crate::backend::{Backend, FULL, ReadTxn, WriteTxn};
+use crate::engine::Engine;
 
 use crate::error::{Result, StoreError};
 
@@ -141,14 +141,18 @@ pub struct ReclaimStats {
 // the compound key is what makes resumption an O(log n) seek rather than a
 // re-walk, and that property is only legible with both halves in view.
 
-impl LmdbEngine {
+impl<B: Backend> Engine<B> {
     /// Advances the oldest outstanding tag-reclamation job by up to `budget`
     /// index entries.
     ///
     /// Resumable by design: the cursor is persisted in the same transaction as
     /// the deletions, so a crash or restart continues from where it stopped
     /// rather than starting the tag over.
-    pub fn reclaim_step(&self, wtxn: &mut RwTxn, budget: usize) -> Result<Option<ReclaimStats>> {
+    pub fn reclaim_step(
+        &self,
+        wtxn: &mut B::RwTxn<'_>,
+        budget: usize,
+    ) -> Result<Option<ReclaimStats>> {
         let Some((tag_id, job)) = self.next_job(wtxn)? else {
             return Ok(None);
         };
@@ -169,13 +173,8 @@ impl LmdbEngine {
                 },
                 Bound::Included(high.as_slice()),
             );
-            let iter = self
-                .tagidx
-                .range(wtxn, &bounds)
-                .map_err(StoreError::from_heed)?;
-
-            for entry in iter {
-                let (index_key, user_key) = entry.map_err(StoreError::from_heed)?;
+            for entry in wtxn.range(self.tagidx, bounds)? {
+                let (index_key, user_key) = entry?;
                 let mut owned = [0u8; INDEX_KEY_LEN];
                 if index_key.len() != INDEX_KEY_LEN {
                     return Err(StoreError::Corrupt(format!(
@@ -205,15 +204,9 @@ impl LmdbEngine {
         for (index_key, user_key) in batch {
             cursor = Some(index_key);
 
-            let Some(blob) = self
-                .main
-                .get(wtxn, &user_key)
-                .map_err(StoreError::from_heed)?
-            else {
+            let Some(blob) = wtxn.get(self.main, &user_key)? else {
                 // The record is already gone; its index entry is litter.
-                self.tagidx
-                    .delete(wtxn, &index_key)
-                    .map_err(StoreError::from_heed)?;
+                wtxn.delete(self.tagidx, &index_key)?;
                 stats.orphaned += 1;
                 continue;
             };
@@ -234,9 +227,7 @@ impl LmdbEngine {
                 None => {
                     // The record no longer carries this tag, so the entry is
                     // litter â€” but the record itself is somebody else's.
-                    self.tagidx
-                        .delete(wtxn, &index_key)
-                        .map_err(StoreError::from_heed)?;
+                    wtxn.delete(self.tagidx, &index_key)?;
                     stats.orphaned += 1;
                     continue;
                 }
@@ -261,57 +252,40 @@ impl LmdbEngine {
             let expires_at_ms = record.expires_at_ms();
             let tag_ids: Vec<u32> = record.tags.iter().map(|t| t.tag_id.get()).collect();
 
-            self.main
-                .delete(wtxn, &user_key)
-                .map_err(StoreError::from_heed)?;
+            wtxn.delete(self.main, &user_key)?;
             if expires_at_ms != NEVER {
-                self.exp
-                    .delete(
-                        wtxn,
-                        &crate::expiry::encode_key(
-                            expires_at_ms,
-                            &user_key,
-                            self.bucket_granularity_ms,
-                        ),
-                    )
-                    .map_err(StoreError::from_heed)?;
+                wtxn.delete(
+                    self.exp,
+                    &crate::expiry::encode_key(
+                        expires_at_ms,
+                        &user_key,
+                        self.bucket_granularity_ms,
+                    ),
+                )?;
             }
             for other in tag_ids {
-                self.tagidx
-                    .delete(wtxn, &self::index_key(other, &user_key))
-                    .map_err(StoreError::from_heed)?;
+                wtxn.delete(self.tagidx, &self::index_key(other, &user_key))?;
             }
             stats.reclaimed += 1;
         }
 
         // Fewer than the budget means the range ran out, so the tag is done.
         if stats.scanned < budget {
-            self.jobs
-                .delete(wtxn, &tag_id.to_be_bytes())
-                .map_err(StoreError::from_heed)?;
+            wtxn.delete(self.jobs, &tag_id.to_be_bytes())?;
             stats.completed = true;
         } else {
             let resumed = Job {
                 target_generation: job.target_generation,
                 cursor,
             };
-            self.jobs
-                .put(wtxn, &tag_id.to_be_bytes(), &resumed.encode())
-                .map_err(StoreError::from_heed)?;
+            wtxn.put(self.jobs, &tag_id.to_be_bytes(), &resumed.encode())?;
         }
 
         Ok(Some(stats))
     }
 
-    fn next_job(&self, wtxn: &RwTxn) -> Result<Option<(u32, Job)>> {
-        let Some(entry) = self
-            .jobs
-            .iter(wtxn)
-            .map_err(StoreError::from_heed)?
-            .next()
-            .transpose()
-            .map_err(StoreError::from_heed)?
-        else {
+    fn next_job(&self, wtxn: &B::RwTxn<'_>) -> Result<Option<(u32, Job)>> {
+        let Some(entry) = wtxn.range(self.jobs, FULL)?.next().transpose()? else {
             return Ok(None);
         };
 
@@ -322,8 +296,8 @@ impl LmdbEngine {
         Ok(Some((u32::from_be_bytes(id), Job::decode(raw_job)?)))
     }
 
-    pub fn pending_jobs(&self, txn: &RoTxn<'_, AnyTls>) -> Result<u64> {
-        Ok(self.jobs.stat(txn).map_err(StoreError::from_heed)?.entries as u64)
+    pub fn pending_jobs(&self, txn: &impl ReadTxn<B>) -> Result<u64> {
+        Ok(txn.db_stat(self.jobs)?.entries)
     }
 }
 

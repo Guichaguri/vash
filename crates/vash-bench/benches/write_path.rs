@@ -19,7 +19,9 @@
 
 use tempfile::TempDir;
 use vash_core::{Key, Set, SetMode, TtlChange};
-use vash_store::{LmdbStore, Store, StoreConfig, WriteConfig};
+// `WriteTxn` is in scope for `commit`: since M11 a transaction is a trait
+// object of the storage seam rather than a heed type. See `vash_store::backend`.
+use vash_store::{LmdbStore, Store, StoreConfig, WriteConfig, WriteTxn};
 
 fn main() {
     divan::main();

@@ -25,8 +25,9 @@ use vash_core::{Applied, Arithmetic, ExpireGuard, Key, SetMode, TtlChange};
 
 use crate::SweepStats;
 use crate::apply::{PreparedSet, Written};
+use crate::backend::{Backend, WriteTxn};
 use crate::config::WriteConfig;
-use crate::engine::{LmdbEngine, Pressure};
+use crate::engine::{Engine, Pressure};
 use crate::error::{Result, StoreError};
 use crate::queue::{OwnedArithmetic, PostCommit, WriteOp, WriteOutcome, apply, mismatched_reply};
 
@@ -109,7 +110,7 @@ impl SetManyPending {
 }
 
 impl Writer {
-    pub fn spawn(engine: Arc<LmdbEngine>, config: WriteConfig) -> Self {
+    pub fn spawn<B: Backend>(engine: Arc<Engine<B>>, config: WriteConfig) -> Self {
         let (tx, rx) = bounded(config.queue_depth);
         let metrics = Arc::new(WriterMetrics::default());
         let thread_metrics = Arc::clone(&metrics);
@@ -318,8 +319,8 @@ impl Drop for Writer {
     }
 }
 
-fn writer_loop(
-    engine: Arc<LmdbEngine>,
+fn writer_loop<B: Backend>(
+    engine: Arc<Engine<B>>,
     rx: Receiver<WriteJob>,
     config: WriteConfig,
     metrics: Arc<WriterMetrics>,
@@ -459,8 +460,8 @@ fn writer_loop(
     info!("writer thread stopped");
 }
 
-fn commit_batch(
-    engine: &LmdbEngine,
+fn commit_batch<B: Backend>(
+    engine: &Engine<B>,
     batch: &mut Vec<WriteJob>,
     maintenance: bool,
     config: &WriteConfig,
@@ -629,7 +630,7 @@ fn commit_batch(
         Err(e) => {
             // The transaction is atomic: if the commit failed, nothing landed,
             // so no caller may be told it succeeded.
-            let err = StoreError::from_heed(e);
+            let err = e;
             let message = err.to_string();
             for job in batch.drain(..) {
                 let _ = job.reply.send(Err(match &err {
@@ -649,7 +650,11 @@ fn commit_batch(
 /// because the deletions themselves need pages: on a copy-on-write B-tree,
 /// removing a record dirties the path to it, so an eviction batch sized for
 /// normal running can be too large to commit on a full map.
-fn free_space(engine: &LmdbEngine, config: &WriteConfig, metrics: &WriterMetrics) -> Result<()> {
+fn free_space<B: Backend>(
+    engine: &Engine<B>,
+    config: &WriteConfig,
+    metrics: &WriterMetrics,
+) -> Result<()> {
     for budget in [config.eviction.batch, config.eviction.batch / 8, 8] {
         let budget = budget.max(1);
         let mut wtxn = engine.write_txn()?;
@@ -685,9 +690,9 @@ fn free_space(engine: &LmdbEngine, config: &WriteConfig, metrics: &WriterMetrics
 ///
 /// The measurement is taken inside the write transaction, so it reflects the
 /// space this batch just consumed rather than a stale reading.
-fn apply_pressure(
-    engine: &LmdbEngine,
-    wtxn: &mut heed::RwTxn,
+fn apply_pressure<B: Backend>(
+    engine: &Engine<B>,
+    wtxn: &mut B::RwTxn<'_>,
     config: &WriteConfig,
 ) -> Result<usize> {
     let limits = &config.eviction;

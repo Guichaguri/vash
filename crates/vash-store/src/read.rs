@@ -10,15 +10,15 @@
 //! record still counts. See [`vash_core::RecordRef::is_alive`].
 
 use bytes::Bytes;
-use heed::{AnyTls, RoTxn};
 use vash_core::{Key, RecordRef, Value, ValueRef};
 
-use crate::engine::LmdbEngine;
+use crate::backend::{Backend, ReadTxn};
+use crate::engine::Engine;
 use crate::env::TrackedTxn;
-use crate::error::{Result, StoreError};
+use crate::error::Result;
 use crate::tags::TagLookup;
 
-impl LmdbEngine {
+impl<B: Backend> Engine<B> {
     /// Looks a key up, applies the liveness check, and hands the caller
     /// whatever it needs off the record.
     ///
@@ -29,13 +29,13 @@ impl LmdbEngine {
     /// [`Snapshot`].
     fn read_alive<'txn, T>(
         &self,
-        txn: &'txn RoTxn<'_, AnyTls>,
+        txn: &'txn B::RoTxn<'_>,
         tags: &mut LazyTags<'_>,
         at: Snapshot,
         key: &[u8],
         project: impl FnOnce(&RecordRef<'txn>) -> T,
     ) -> Result<Option<T>> {
-        let Some(blob) = self.main.get(txn, key).map_err(StoreError::from_heed)? else {
+        let Some(blob) = txn.get(self.main, key)? else {
             return Ok(None);
         };
 
@@ -61,7 +61,7 @@ impl LmdbEngine {
 
     fn read_record(
         &self,
-        txn: &RoTxn<'_, AnyTls>,
+        txn: &B::RoTxn<'_>,
         tags: &mut LazyTags<'_>,
         at: Snapshot,
         key: &[u8],
@@ -127,7 +127,13 @@ impl LmdbEngine {
         let rtxn = self.read_txn()?;
         let mut tags = LazyTags::new(&self.tags);
         let at = self.snapshot(&rtxn);
-        self.read_alive(&rtxn, &mut tags, at, key.as_bytes(), RecordRef::expires_at_ms)
+        self.read_alive(
+            &rtxn,
+            &mut tags,
+            at,
+            key.as_bytes(),
+            RecordRef::expires_at_ms,
+        )
     }
 
     /// [`Engine::deadline`] over a batch, against one snapshot.
@@ -137,7 +143,13 @@ impl LmdbEngine {
         let at = self.snapshot(&rtxn);
         keys.iter()
             .map(|key| {
-                self.read_alive(&rtxn, &mut tags, at, key.as_bytes(), RecordRef::expires_at_ms)
+                self.read_alive(
+                    &rtxn,
+                    &mut tags,
+                    at,
+                    key.as_bytes(),
+                    RecordRef::expires_at_ms,
+                )
             })
             .collect()
     }
@@ -159,7 +171,7 @@ impl LmdbEngine {
     /// clock read per key, a batch spanning a millisecond boundary could count
     /// one key live and the next one expired against the *same* deadline.
     #[inline]
-    fn snapshot(&self, txn: &TrackedTxn<'_>) -> Snapshot {
+    fn snapshot(&self, txn: &TrackedTxn<'_, B>) -> Snapshot {
         Snapshot {
             now_ms: txn.opened_at_ms(),
             epoch: self.epoch(),

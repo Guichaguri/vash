@@ -17,7 +17,8 @@ use vash_core::{
 };
 
 use crate::apply::{PreparedSet, Written};
-use crate::engine::LmdbEngine;
+use crate::backend::Backend;
+use crate::engine::Engine;
 use crate::error::{Result, StoreError};
 use crate::tags::TagMerge;
 
@@ -129,9 +130,9 @@ pub(crate) enum PostCommit {
     Epoch(u32),
 }
 
-pub(crate) fn apply(
-    engine: &LmdbEngine,
-    wtxn: &mut heed::RwTxn,
+pub(crate) fn apply<B: Backend>(
+    engine: &Engine<B>,
+    wtxn: &mut B::RwTxn<'_>,
     op: &mut WriteOp,
     effects: &mut Vec<PostCommit>,
 ) -> Result<WriteOutcome> {

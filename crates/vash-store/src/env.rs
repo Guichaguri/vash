@@ -1,59 +1,25 @@
-//! Opening, closing and transacting on one LMDB environment.
+//! Opening, closing and transacting on one environment.
 //!
-//! Everything that knows about `heed` flags, map sizing, sub-database creation
-//! and the on-disk schema version lives here, so the operation modules beside it
-//! see only an open environment and a transaction. Plan §8 named this file
-//! before any of it was written; it took until M10 to actually separate it.
+//! What is left here after [`crate::backend`] took the engine out is the part
+//! that was never about LMDB: the on-disk schema version, the shard-identity
+//! check, the tag registry load and the CAS resumption. Plan §8 named this file
+//! before any of it was written; it took until M10 to separate it from the
+//! operations, and until M11 to separate it from the engine.
 
-use heed::{Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
 use tracing::{info, warn};
 
 use vash_core::Clock;
 
-use crate::config::{Durability, StoreConfig};
-use crate::engine::{Db, LmdbEngine, Pressure};
+use crate::backend::{Backend, FULL, ReadTxn, WriteTxn};
+use crate::config::StoreConfig;
+use crate::engine::{Engine, Pressure};
 use crate::error::{Result, StoreError};
-use crate::schema::{MAX_DBS, SCHEMA_VERSION, db, meta_key};
+use crate::schema::{SCHEMA_VERSION, db, meta_key};
 use crate::tags::TagRegistry;
 
-fn create_db(env: &Env<WithTls>, wtxn: &mut RwTxn, name: &str) -> Result<Db> {
-    env.create_database(wtxn, Some(name))
-        .map_err(StoreError::from_heed)
-}
-
-fn env_flags(durability: Durability, write_map: bool) -> EnvFlags {
-    let mut flags = EnvFlags::empty();
-    match durability {
-        Durability::Durable => {}
-        Durability::Relaxed => flags |= EnvFlags::NO_META_SYNC,
-        Durability::Lazy => flags |= EnvFlags::NO_SYNC,
-    }
-
-    // Separate from the durability mode because it is not a durability
-    // decision: it trades LMDB's dirty-page copies for a lower memory
-    // footprint. **Whether it is also faster depends on the platform, and the
-    // measurements disagree by more than the flag's own effect.** On Linux it
-    // is worth nothing — 1.04x, 0.96x and 1.01x under `lazy` on the same NVMe
-    // the Windows numbers below were taken on — which is the result §6 and §9
-    // of `docs/performance-proposals.md` were written against. Natively on
-    // Windows the same build under `lazy` measures 1.08x closed loop, 1.26x
-    // pipelined and 1.17x mixed, winning all fifteen paired runs. The device
-    // was identical in both, so this is an mmap-and-filesystem difference, not
-    // a storage one.
-    //
-    // No longer Unix-gated: the `mdb_env_open` failure that gate was written
-    // for does not reproduce, at 4, 16 or 64 GiB map sizes, and while it stood
-    // it made `store.write_map` a silent no-op on the one platform where the
-    // flag pays. `store.write_map` documents what it costs `lazy` in exchange.
-    if write_map {
-        flags |= EnvFlags::WRITE_MAP;
-    }
-    flags
-}
-
-fn read_u32(db: &Db, txn: &RwTxn, key: &[u8]) -> Result<Option<u32>> {
-    match db.get(txn, key).map_err(StoreError::from_heed)? {
+fn read_u32<B: Backend>(txn: &B::RwTxn<'_>, db: B::Db, key: &[u8]) -> Result<Option<u32>> {
+    match txn.get(db, key)? {
         Some(raw) => raw
             .try_into()
             .map(u32::from_le_bytes)
@@ -63,8 +29,8 @@ fn read_u32(db: &Db, txn: &RwTxn, key: &[u8]) -> Result<Option<u32>> {
     }
 }
 
-fn read_u64(db: &Db, txn: &RwTxn, key: &[u8]) -> Result<Option<u64>> {
-    match db.get(txn, key).map_err(StoreError::from_heed)? {
+fn read_u64<B: Backend>(txn: &B::RwTxn<'_>, db: B::Db, key: &[u8]) -> Result<Option<u64>> {
+    match txn.get(db, key)? {
         Some(raw) => raw
             .try_into()
             .map(u64::from_le_bytes)
@@ -74,7 +40,7 @@ fn read_u64(db: &Db, txn: &RwTxn, key: &[u8]) -> Result<Option<u64>> {
     }
 }
 
-impl LmdbEngine {
+impl<B: Backend> Engine<B> {
     /// Opens one environment. `shard_index` and `shard_count` identify its
     /// place in the shard set and are validated against what the database
     /// already records.
@@ -95,72 +61,38 @@ impl LmdbEngine {
         }
         std::fs::create_dir_all(&config.path)?;
 
-        // SAFETY: LMDB maps the file into this process's address space. The
-        // contract is that no other process mutates the file outside of LMDB's
-        // own locking, which the lock file in the same directory enforces.
-        let env = unsafe {
-            EnvOpenOptions::new()
-                // Thread-local reader slots, which is LMDB's fast path and the
-                // single biggest thing measured in M6.
-                //
-                // Plan Â§9 specified `read_txn_without_tls()` so a `RoTxn` would
-                // be `Send` and a hand-rolled reader pool could move one
-                // between threads. That pool was never built â€” reads run on the
-                // blocking pool, where a transaction is created and dropped
-                // inside one call and never crosses a thread â€” so the flag was
-                // being paid for and not used. And it is not cheap: without
-                // TLS, every `mdb_txn_begin` claims a slot in a shared reader
-                // table behind a process-wide mutex, which turns the read path
-                // from lock-free into serialised. Measured by
-                // `examples/txn_bench`: 344k lookups/s on one thread falling to
-                // 91k on sixteen, against 948k rising to 5.3M with TLS.
-                //
-                // The cost is that a thread holds its reader slot until it
-                // exits, so the slot table has to cover every thread that can
-                // read at once. That is exactly the `store.max_readers >
-                // server.max_blocking_threads` rule startup already enforces.
-                .flags(env_flags(config.durability, config.write_map))
-                .map_size(config.map_size)
-                .max_dbs(MAX_DBS)
-                .max_readers(config.max_readers)
-                .open(&config.path)
-        }
-        .map_err(StoreError::from_heed)?;
+        let backend = B::open(config, &config.path)?;
 
-        let mut wtxn = env.write_txn().map_err(StoreError::from_heed)?;
-        let main: Db = create_db(&env, &mut wtxn, db::MAIN)?;
-        let exp: Db = create_db(&env, &mut wtxn, db::EXPIRY)?;
-        let tagidx: Db = create_db(&env, &mut wtxn, db::TAG_INDEX)?;
-        let tag_meta: Db = create_db(&env, &mut wtxn, db::TAGS)?;
-        let jobs: Db = create_db(&env, &mut wtxn, db::JOBS)?;
-        let meta: Db = create_db(&env, &mut wtxn, db::META)?;
+        let mut wtxn = backend.write_txn()?;
+        let main = backend.create_db(&mut wtxn, db::MAIN)?;
+        let exp = backend.create_db(&mut wtxn, db::EXPIRY)?;
+        let tagidx = backend.create_db(&mut wtxn, db::TAG_INDEX)?;
+        let tag_meta = backend.create_db(&mut wtxn, db::TAGS)?;
+        let jobs = backend.create_db(&mut wtxn, db::JOBS)?;
+        let meta = backend.create_db(&mut wtxn, db::META)?;
 
-        match read_u32(&meta, &wtxn, meta_key::SCHEMA_VERSION)? {
+        match read_u32::<B>(&wtxn, meta, meta_key::SCHEMA_VERSION)? {
             None => {
-                meta.put(
-                    &mut wtxn,
+                wtxn.put(
+                    meta,
                     meta_key::SCHEMA_VERSION,
                     &SCHEMA_VERSION.to_le_bytes(),
-                )
-                .map_err(StoreError::from_heed)?;
-                meta.put(
-                    &mut wtxn,
+                )?;
+                wtxn.put(
+                    meta,
                     meta_key::RECORD_VERSION,
                     &(vash_core::RECORD_VERSION as u32).to_le_bytes(),
-                )
-                .map_err(StoreError::from_heed)?;
-                meta.put(
-                    &mut wtxn,
+                )?;
+                wtxn.put(
+                    meta,
                     meta_key::SHARD_INDEX,
                     &(shard_index as u32).to_le_bytes(),
-                )
-                .map_err(StoreError::from_heed)?;
-                meta.put(
-                    &mut wtxn,
+                )?;
+                wtxn.put(
+                    meta,
                     meta_key::SHARD_COUNT,
                     &(shard_count as u32).to_le_bytes(),
-                )
-                .map_err(StoreError::from_heed)?;
+                )?;
             }
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) => {
@@ -174,7 +106,7 @@ impl LmdbEngine {
         // different environment: the data would still be on disk, taking up
         // space, but every read would miss. Refuse rather than silently lose
         // the cache.
-        if let Some(stored) = read_u32(&meta, &wtxn, meta_key::SHARD_COUNT)?
+        if let Some(stored) = read_u32::<B>(&wtxn, meta, meta_key::SHARD_COUNT)?
             && stored as usize != shard_count
         {
             return Err(StoreError::Corrupt(format!(
@@ -183,7 +115,7 @@ impl LmdbEngine {
                 config.path.display()
             )));
         }
-        if let Some(stored) = read_u32(&meta, &wtxn, meta_key::SHARD_INDEX)?
+        if let Some(stored) = read_u32::<B>(&wtxn, meta, meta_key::SHARD_INDEX)?
             && stored as usize != shard_index
         {
             return Err(StoreError::Corrupt(format!(
@@ -192,18 +124,18 @@ impl LmdbEngine {
             )));
         }
 
-        let epoch = read_u32(&meta, &wtxn, meta_key::EPOCH)?.unwrap_or(0);
+        let epoch = read_u32::<B>(&wtxn, meta, meta_key::EPOCH)?.unwrap_or(0);
         // Resume past the last reserved block: anything below the persisted
         // watermark may already have been handed out before an unclean
         // shutdown, so the whole block is skipped rather than risk reuse.
-        let cas_start = read_u64(&meta, &wtxn, meta_key::CAS_WATERMARK)?.unwrap_or(0);
+        let cas_start = read_u64::<B>(&wtxn, meta, meta_key::CAS_WATERMARK)?.unwrap_or(0);
 
         // The whole tag table lives in RAM: it is small, and the read path
         // consults it on every tagged record.
         let registry = TagRegistry::new(config.max_tags);
         let mut loaded = Vec::new();
-        for entry in tag_meta.iter(&wtxn).map_err(StoreError::from_heed)? {
-            let (name, raw) = entry.map_err(StoreError::from_heed)?;
+        for entry in wtxn.range(tag_meta, FULL)? {
+            let (name, raw) = entry?;
             let Some((id, generation)) = crate::tags::decode_entry(raw) else {
                 return Err(StoreError::Corrupt(format!(
                     "tag registry entry for {name:?} is {} bytes, expected {}",
@@ -216,27 +148,12 @@ impl LmdbEngine {
         let tag_count = loaded.len();
         registry.load_from(loaded);
 
-        wtxn.commit().map_err(StoreError::from_heed)?;
+        wtxn.commit()?;
 
         // After the commit above, so the file is at its final length and
-        // nothing warmed here is about to be rewritten.
-        //
-        // Failure is logged and ignored on purpose: a map that could not be
-        // warmed serves every request correctly and merely faults on the way,
-        // which is exactly what every deployment before this flag existed did.
-        // Refusing to start over a performance measure would be the worse
-        // trade.
-        let mut warmed = crate::prefault::Warmed::default();
-        if config.prefault {
-            // How far LMDB has ever written, which on Linux is the only thing
-            // separating the data from a sparse file the size of the whole map.
-            // See `prefault` — getting this wrong is expensive and silent.
-            let high_water = (env.info().last_page_number as u64 + 1) * env.stat().page_size as u64;
-            match crate::prefault::prefault(&config.path, high_water, config.lock_map) {
-                Ok(result) => warmed = result,
-                Err(err) => warn!(%err, "could not prefault the map; serving without it"),
-            }
-        }
+        // nothing warmed here is about to be rewritten. Best-effort by
+        // contract — see [`Backend::warm`].
+        let warmed = backend.warm(config);
 
         info!(
             path = %config.path.display(),
@@ -251,7 +168,7 @@ impl LmdbEngine {
         );
 
         Ok(Self {
-            env,
+            backend,
             main,
             exp,
             tagidx,
@@ -282,23 +199,24 @@ impl LmdbEngine {
         self.map_locked
     }
 
-    pub fn write_txn(&self) -> Result<RwTxn<'_>> {
-        self.env.write_txn().map_err(StoreError::from_heed)
+    pub fn write_txn(&self) -> Result<B::RwTxn<'_>> {
+        self.backend.write_txn()
     }
 
     /// Opens a read transaction, recording how long it stays open.
     ///
     /// The recording is one relaxed store here and another when the returned
     /// guard drops — see [`crate::readers`] for why it is a slot per thread
-    /// rather than a registry, and why LMDB cannot answer the question itself.
+    /// rather than a registry, and why the engine cannot answer the question
+    /// itself.
     ///
     /// The instant it opened is kept on the transaction, because the reads that
     /// follow need the same number for their liveness check and were each
     /// reading the clock a second time to get it.
-    pub fn read_txn(&self) -> Result<TrackedTxn<'_>> {
+    pub fn read_txn(&self) -> Result<TrackedTxn<'_, B>> {
         let opened_at_ms = self.now_ms();
         let guard = self.reader_ages.open(opened_at_ms);
-        let txn = self.env.read_txn().map_err(StoreError::from_heed)?;
+        let txn = self.backend.read_txn()?;
         Ok(TrackedTxn {
             txn,
             _guard: guard,
@@ -307,16 +225,12 @@ impl LmdbEngine {
     }
 
     pub fn sync(&self) -> Result<()> {
-        self.env.force_sync().map_err(StoreError::from_heed)
+        self.backend.sync()
     }
 
-    /// Closes the environment, blocking until LMDB has fully released it.
-    ///
-    /// Dropping an `Env` only schedules the close. LMDB keeps a process-wide
-    /// registry of open environments and refuses to reopen a path still in it,
-    /// so anything that reopens a database in-process has to wait for this.
+    /// Releases the environment, blocking if the engine needs it.
     pub fn close(self) {
-        self.env.prepare_for_closing().wait();
+        self.backend.close();
     }
 }
 
@@ -327,13 +241,13 @@ impl LmdbEngine {
 /// than leaving it to the caller is what guarantees the two have the same
 /// lifetime: a guard dropped early would under-report, and one dropped late
 /// would report a reader that had already gone.
-pub struct TrackedTxn<'e> {
-    txn: RoTxn<'e, WithTls>,
+pub struct TrackedTxn<'e, B: Backend> {
+    txn: B::RoTxn<'e>,
     _guard: crate::readers::ReaderGuard<'e>,
     opened_at_ms: u64,
 }
 
-impl TrackedTxn<'_> {
+impl<B: Backend> TrackedTxn<'_, B> {
     /// Unix milliseconds at which this transaction opened.
     ///
     /// **This is the "now" a read judges expiry against**, rather than the
@@ -354,8 +268,8 @@ impl TrackedTxn<'_> {
     }
 }
 
-impl<'e> std::ops::Deref for TrackedTxn<'e> {
-    type Target = RoTxn<'e, WithTls>;
+impl<'e, B: Backend> std::ops::Deref for TrackedTxn<'e, B> {
+    type Target = B::RoTxn<'e>;
 
     fn deref(&self) -> &Self::Target {
         &self.txn

@@ -5,8 +5,16 @@ pub enum StoreError {
     #[error(transparent)]
     Core(#[from] CoreError),
 
-    #[error("lmdb: {0}")]
-    Lmdb(#[from] heed::Error),
+    /// The storage engine refused an operation.
+    ///
+    /// Carries the engine's message rather than its error type: the type is
+    /// per-engine, and the only distinction any caller in this crate draws is
+    /// [`Self::CapacityFull`], which each backend maps for itself. Keeping the
+    /// message as a `String` is also what makes this variant `Clone` — see
+    /// [`StoreError::clone_shallow`], which used to have to downgrade an LMDB
+    /// failure to `Corrupt` because `heed::Error` is not.
+    #[error("engine: {0}")]
+    Engine(String),
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -42,16 +50,16 @@ pub enum StoreError {
 impl StoreError {
     /// Whether this failure leaves the write transaction unusable.
     ///
-    /// LMDB invalidates a transaction as soon as one of its operations fails —
-    /// a full map being the common case — and every later call on it returns
-    /// `MDB_BAD_TXN`. The writer has to abort the whole batch at that point
-    /// rather than carry on and report a confusing secondary error.
+    /// A copy-on-write B-tree invalidates a transaction as soon as one of its
+    /// operations fails — a full map being the common case — and every later
+    /// call on it fails too. The writer has to abort the whole batch at that
+    /// point rather than carry on and report a confusing secondary error.
     ///
-    /// Validation failures are different: they are rejected before LMDB is
-    /// touched, so the transaction is still good and the rest of the batch can
-    /// proceed.
+    /// Validation failures are different: they are rejected before the engine
+    /// is touched, so the transaction is still good and the rest of the batch
+    /// can proceed.
     pub(crate) fn poisons_transaction(&self) -> bool {
-        matches!(self, Self::Lmdb(_) | Self::CapacityFull)
+        matches!(self, Self::Engine(_) | Self::CapacityFull)
     }
 
     /// Whether this failure means the store is out of room, and so calls for
@@ -62,9 +70,10 @@ impl StoreError {
 
     /// A copy suitable for fanning one failure out to every caller in a batch.
     ///
-    /// `heed::Error` is not `Clone`, so an LMDB failure keeps its message but
-    /// loses its type. The variants callers act on — `CapacityFull` above all —
-    /// are preserved exactly.
+    /// Every variant a caller acts on survives intact. Only [`Self::Io`] cannot
+    /// be cloned, and it is the one that never reaches a batch: the engine's own
+    /// failures arrive as [`Self::Engine`], which carries a `String` precisely
+    /// so this stays lossless.
     pub(crate) fn clone_shallow(&self) -> Self {
         match self {
             Self::CapacityFull => Self::CapacityFull,
@@ -74,16 +83,8 @@ impl StoreError {
             Self::Unsupported(what) => Self::Unsupported(what),
             Self::Core(e) => Self::Core(e.clone()),
             Self::Corrupt(detail) => Self::Corrupt(detail.clone()),
+            Self::Engine(detail) => Self::Engine(detail.clone()),
             other => Self::Corrupt(other.to_string()),
-        }
-    }
-
-    /// Maps LMDB's `MDB_MAP_FULL` onto the dedicated capacity variant so callers
-    /// do not have to pattern-match on heed internals.
-    pub(crate) fn from_heed(err: heed::Error) -> Self {
-        match err {
-            heed::Error::Mdb(heed::MdbError::MapFull) => Self::CapacityFull,
-            other => Self::Lmdb(other),
         }
     }
 }

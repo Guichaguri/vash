@@ -1,21 +1,21 @@
-//! LMDB operations, with no threading of their own.
+//! Storage operations, with no threading of their own.
 //!
 //! Every write method takes the transaction it should act in, so the writer
 //! thread can pack many of them into one commit (see [`crate::writer`]). Keeping
 //! the transaction out of this layer is what makes group commit possible
 //! without duplicating the operations.
+//!
+//! Nothing here names an engine: the operations are expressed against
+//! [`crate::backend`], which is what lets one set of them serve any backend.
 
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use heed::types::Bytes as HeedBytes;
-use heed::{AnyTls, Database, Env, RoTxn, WithTls};
 use vash_core::Clock;
 
 use crate::StoreStats;
-use crate::error::{Result, StoreError};
+use crate::backend::{Backend, LmdbBackend, ReadTxn};
+use crate::error::Result;
 use crate::tags::TagRegistry;
-
-pub(crate) type Db = Database<HeedBytes, HeedBytes>;
 
 /// How close the store is to full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,7 +52,14 @@ impl Pressure {
     }
 }
 
-/// One LMDB environment and everything derived from it.
+/// The store as it was before a second backend was conceivable.
+///
+/// Everything outside this crate — the benchmarks, the examples — names this,
+/// and nothing outside this crate should have to care which engine is
+/// underneath. `LmdbStore` in [`crate::lmdb`] is the same idea one layer up.
+pub type LmdbEngine = Engine<LmdbBackend>;
+
+/// One storage environment and everything derived from it.
 ///
 /// The fields are `pub(crate)` rather than private because the operations that
 /// act on them live in sibling modules — [`crate::env`], [`crate::read`],
@@ -62,15 +69,19 @@ impl Pressure {
 /// widening. The boundary that matters is still the crate: nothing outside
 /// `vash-store` can reach past the [`Store`] trait.
 ///
+/// Generic over the engine, and the generic stops at `VashStore<B>`: the server
+/// holds an `Arc<dyn Store>`, so nothing above this crate is parameterised. See
+/// [`crate::backend`].
+///
 /// [`Store`]: crate::Store
-pub struct LmdbEngine {
-    pub(crate) env: Env<WithTls>,
-    pub(crate) main: Db,
-    pub(crate) exp: Db,
-    pub(crate) tagidx: Db,
-    pub(crate) tag_meta: Db,
-    pub(crate) jobs: Db,
-    pub(crate) meta: Db,
+pub struct Engine<B: Backend> {
+    pub(crate) backend: B,
+    pub(crate) main: B::Db,
+    pub(crate) exp: B::Db,
+    pub(crate) tagidx: B::Db,
+    pub(crate) tag_meta: B::Db,
+    pub(crate) jobs: B::Db,
+    pub(crate) meta: B::Db,
     pub(crate) clock: Clock,
     pub(crate) epoch: AtomicU32,
     pub(crate) cas_next: AtomicU64,
@@ -89,7 +100,7 @@ pub struct LmdbEngine {
     pub(crate) map_locked: bool,
 }
 
-impl LmdbEngine {
+impl<B: Backend> Engine<B> {
     #[inline]
     pub fn now_ms(&self) -> u64 {
         self.clock.now_ms()
@@ -114,37 +125,51 @@ impl LmdbEngine {
         &self.tags
     }
 
+    /// Every sub-database, for the operations that treat them as a set.
+    ///
+    /// One place to add the seventh, rather than six call sites to remember.
+    pub(crate) fn all_dbs(&self) -> [B::Db; 6] {
+        [
+            self.main,
+            self.exp,
+            self.tagidx,
+            self.tag_meta,
+            self.jobs,
+            self.meta,
+        ]
+    }
+
     /// Bytes genuinely occupied, excluding pages on the free list.
     ///
-    /// **Not** `last_page_number`. LMDB never returns freed pages to the OS nor
-    /// lowers its high-water mark â€” a deleted record's pages go onto a free
-    /// list for reuse â€” so a high-water measure only ever rises. Using it for
-    /// the capacity watermarks meant pressure could never fall, and the evictor
+    /// **Not** the high-water mark. Neither engine returns freed pages to the OS
+    /// nor lowers that mark â€” a deleted record's pages go onto a free list for
+    /// reuse â€” so a high-water measure only ever rises. Using it for the
+    /// capacity watermarks meant pressure could never fall, and the evictor
     /// would keep going until the cache was empty.
     ///
     /// Summed from the sub-databases' own page counts, which is exactly the
     /// non-free total, and works inside the caller's transaction rather than
     /// needing one of its own.
-    pub fn used_bytes_in(&self, txn: &RoTxn<'_, AnyTls>) -> Result<u64> {
-        let page_size = self.env.stat().page_size as u64;
+    pub fn used_bytes_in(&self, txn: &impl ReadTxn<B>) -> Result<u64> {
+        self.used_bytes_at(txn, self.backend.info().page_size)
+    }
+
+    /// [`Self::used_bytes_in`] against an [`EnvInfo`] the caller already has.
+    ///
+    /// Exists so the callers that need both halves of `info()` take one
+    /// snapshot rather than two — this runs once per commit, on the write path.
+    fn used_bytes_at(&self, txn: &impl ReadTxn<B>, page_size: u64) -> Result<u64> {
         let mut pages = 0u64;
-        for db in [
-            &self.main,
-            &self.exp,
-            &self.tagidx,
-            &self.tag_meta,
-            &self.jobs,
-            &self.meta,
-        ] {
-            let stat = db.stat(txn).map_err(StoreError::from_heed)?;
-            pages += stat.branch_pages as u64 + stat.leaf_pages as u64 + stat.overflow_pages as u64;
+        for db in self.all_dbs() {
+            pages += txn.db_stat(db)?.pages;
         }
         Ok(pages * page_size)
     }
 
     /// Fraction of the map in use, the input to the capacity watermarks.
-    pub fn utilisation_in(&self, txn: &RoTxn<'_, AnyTls>) -> Result<f64> {
-        Ok(self.used_bytes_in(txn)? as f64 / self.env.info().map_size as f64)
+    pub fn utilisation_in(&self, txn: &impl ReadTxn<B>) -> Result<f64> {
+        let info = self.backend.info();
+        Ok(self.used_bytes_at(txn, info.page_size)? as f64 / info.map_size as f64)
     }
 
     /// Current capacity pressure, as last measured by the writer's maintenance
@@ -159,25 +184,15 @@ impl LmdbEngine {
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
-        let info = self.env.info();
-        let stat = self.env.stat();
+        let info = self.backend.info();
         let rtxn = self.read_txn()?;
 
-        let entries = self
-            .main
-            .stat(&rtxn)
-            .map_err(StoreError::from_heed)?
-            .entries as u64;
-        let expiry_entries = self.exp.stat(&rtxn).map_err(StoreError::from_heed)?.entries as u64;
-        let tag_index_entries = self
-            .tagidx
-            .stat(&rtxn)
-            .map_err(StoreError::from_heed)?
-            .entries as u64;
-        let pending_reclaims = self.pending_jobs(&rtxn)?;
+        let entries = rtxn.db_stat(self.main)?.entries;
+        let expiry_entries = rtxn.db_stat(self.exp)?.entries;
+        let tag_index_entries = rtxn.db_stat(self.tagidx)?.entries;
+        let pending_reclaims = self.pending_jobs(&*rtxn)?;
 
-        let used_bytes = self.used_bytes_in(&rtxn)?;
-        let _ = stat;
+        let used_bytes = self.used_bytes_at(&*rtxn, info.page_size)?;
 
         Ok(StoreStats {
             entries,
@@ -185,14 +200,14 @@ impl LmdbEngine {
             tag_index_entries,
             tags: self.tags.len() as u64,
             pending_reclaims,
-            map_size: info.map_size as u64,
+            map_size: info.map_size,
             used_bytes,
             utilisation: used_bytes as f64 / info.map_size as f64,
-            readers_in_use: info.number_of_readers,
-            max_readers: info.maximum_number_of_readers,
+            readers_in_use: info.readers_in_use,
+            max_readers: info.max_readers,
             epoch: self.epoch(),
             oldest_reader_age_ms: self.reader_ages.oldest_age_ms(self.now_ms()),
-            // Owned by the writer thread, merged in by `LmdbStore::stats`.
+            // Owned by the writer thread, merged in by `VashStore::stats`.
             ..StoreStats::default()
         })
     }

@@ -45,11 +45,11 @@
 //! never earlier, and the record's exact timestamp is what the read path
 //! checks.
 
-use heed::RwTxn;
 use vash_core::RecordRef;
 
 use crate::SweepStats;
-use crate::engine::LmdbEngine;
+use crate::backend::{Backend, FULL, ReadTxn, WriteTxn};
+use crate::engine::Engine;
 use crate::error::{Result, StoreError};
 use crate::reclaim;
 
@@ -134,13 +134,13 @@ enum Victims {
     Anything,
 }
 
-impl LmdbEngine {
+impl<B: Backend> Engine<B> {
     /// Reclaims up to `budget` expired records.
     ///
     /// Walks the expiry index from the front and stops at the first bucket in
     /// the future, so the cost is proportional to what has actually expired.
     /// When nothing is due this is a single cursor seek.
-    pub fn sweep(&self, wtxn: &mut RwTxn, budget: usize) -> Result<SweepStats> {
+    pub fn sweep(&self, wtxn: &mut B::RwTxn<'_>, budget: usize) -> Result<SweepStats> {
         self.drain_expiry_index(wtxn, budget, Victims::ExpiredOnly)
     }
 
@@ -156,26 +156,25 @@ impl LmdbEngine {
     /// Deliberately not LRU. Tracking recency means writing on every read, which
     /// on a single-writer engine would put every GET behind the write queue.
     /// See plan Â§6.
-    pub fn evict(&self, wtxn: &mut RwTxn, budget: usize) -> Result<SweepStats> {
+    pub fn evict(&self, wtxn: &mut B::RwTxn<'_>, budget: usize) -> Result<SweepStats> {
         self.drain_expiry_index(wtxn, budget, Victims::Anything)
     }
 
     fn drain_expiry_index(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut B::RwTxn<'_>,
         budget: usize,
         accept: Victims,
     ) -> Result<SweepStats> {
         let now_ms = self.now_ms();
         let mut stats = SweepStats::default();
 
-        // Collected up front because LMDB will not let the cursor and the
-        // deletes share the transaction cleanly. `budget` bounds the memory.
+        // Collected up front because the scan borrows the transaction the
+        // deletes need mutably. `budget` bounds the memory.
         let mut victims: Vec<([u8; crate::expiry::EXPIRY_KEY_LEN], Vec<u8>)> = Vec::new();
         {
-            let iter = self.exp.iter(wtxn).map_err(StoreError::from_heed)?;
-            for entry in iter {
-                let (index_key, user_key) = entry.map_err(StoreError::from_heed)?;
+            for entry in wtxn.range(self.exp, FULL)? {
+                let (index_key, user_key) = entry?;
                 let Some((bucket, _)) = crate::expiry::decode_key(index_key) else {
                     return Err(StoreError::Corrupt(format!(
                         "expiry index key is {} bytes, expected {}",
@@ -211,11 +210,7 @@ impl LmdbEngine {
         for (index_key, user_key) in victims {
             let (entry_bucket, _) = crate::expiry::decode_key(&index_key).expect("validated above");
 
-            match self
-                .main
-                .get(wtxn, &user_key)
-                .map_err(StoreError::from_heed)?
-            {
+            match wtxn.get(self.main, &user_key)? {
                 Some(blob) => {
                     let record = RecordRef::parse(blob)?;
                     // What makes a stale entry harmless: if the record's
@@ -236,13 +231,9 @@ impl LmdbEngine {
                     if take {
                         let tag_ids: Vec<u32> =
                             record.tags.iter().map(|t| t.tag_id.get()).collect();
-                        self.main
-                            .delete(wtxn, &user_key)
-                            .map_err(StoreError::from_heed)?;
+                        wtxn.delete(self.main, &user_key)?;
                         for tag_id in tag_ids {
-                            self.tagidx
-                                .delete(wtxn, &reclaim::index_key(tag_id, &user_key))
-                                .map_err(StoreError::from_heed)?;
+                            wtxn.delete(self.tagidx, &reclaim::index_key(tag_id, &user_key))?;
                         }
                         stats.reclaimed += 1;
                     } else {
@@ -252,9 +243,7 @@ impl LmdbEngine {
                 None => stats.stale += 1,
             }
 
-            self.exp
-                .delete(wtxn, &index_key)
-                .map_err(StoreError::from_heed)?;
+            wtxn.delete(self.exp, &index_key)?;
         }
 
         Ok(stats)

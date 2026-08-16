@@ -1,22 +1,31 @@
 //! Storage adapter.
 //!
-//! Everything here sits behind the [`Store`] trait. That boundary is what keeps
-//! the LMDB decision reversible: `libmdbx` (an LMDB fork with better write
-//! behaviour and a growable map) is a contained swap if benchmarks demand it,
-//! and it is what lets the server be tested against an in-memory fake.
+//! **There are two seams here, and they do different jobs.**
 //!
-//! Both claims are **checked** rather than asserted. The server is built against
-//! `Arc<dyn Store>`, and [`memory::MemoryStore`] — behind the `testing` feature —
-//! is a second implementation that `crates/vash-server/tests/store_seam.rs`
-//! drives the whole stack over. A caller that reaches past the trait stops
-//! compiling.
+//! [`Store`] keeps the storage out of the *server*: `vash-server` is built
+//! against `Arc<dyn Store>`, and [`memory::MemoryStore`] — behind the `testing`
+//! feature — is a second implementation that
+//! `crates/vash-server/tests/store_seam.rs` drives the whole stack over, with
+//! no environment opened and no file on disk.
+//!
+//! [`backend::Backend`] keeps the *engine* decision reversible, and it is
+//! deliberately much lower down. `Store` has 27 methods sitting on top of the
+//! record format, the expiry index, the tag registry, group commit, the sweeper
+//! and the evictor — none of which are engine-specific, so a second engine
+//! implemented there would fork all of it. What is genuinely engine-specific is
+//! about a hundred call sites across ten shapes, and that is what `Backend`
+//! covers. See `docs/mdbx-proposal.md`.
+//!
+//! Both claims are **checked** rather than asserted: a caller that reaches past
+//! either trait stops compiling.
 //!
 //! The trait is **synchronous on purpose**. Reads can page-fault and writes
 //! block on the writer queue, so callers must run these on a thread that is
 //! allowed to block — never on an async runtime's worker. See plan §9.
 //!
-//! Internally the crate is three layers:
+//! Internally the crate is four layers:
 //!
+//! - [`backend`] — the engine itself, and the only place that names one.
 //! - [`engine`] — the environment handle, with each operation in the module
 //!   that owns the layout it walks: `env` opens it, `read` reads records,
 //!   `apply` writes them, and the sweeper, reclaimer, tag writes and listing
@@ -24,9 +33,11 @@
 //!   [`tags`] and `listing`.
 //! - [`writer`] — the single writer thread, packing operations into shared
 //!   commits and running the expiry sweeper in the same transaction.
-//! - [`lmdb`] — the [`Store`] implementation composing the two.
+//! - [`lmdb`] — the [`Store`] implementation composing the rest, and where the
+//!   engine parameter stops.
 
 mod apply;
+pub mod backend;
 pub mod config;
 pub mod engine;
 mod env;
@@ -50,10 +61,11 @@ mod writer;
 use vash_core::{BatchGuard, ExpireGuard, Key, Listing, Set, Value, ValueRef};
 
 pub use apply::Written;
+pub use backend::{Backend, LmdbBackend, ReadTxn, WriteTxn};
 pub use config::{Durability, EvictionConfig, StoreConfig, WriteConfig};
 pub use engine::Pressure;
 pub use error::{Result, StoreError};
-pub use lmdb::LmdbStore;
+pub use lmdb::{LmdbStore, VashStore};
 
 /// A [`Store::submit_set_many`] in flight.
 ///

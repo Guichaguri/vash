@@ -1,6 +1,7 @@
 //! The record operations the writer thread applies.
 //!
-//! Every function here takes the caller's `RwTxn` rather than opening one, which
+//! Every function here takes the caller's write transaction rather than opening
+//! one, which
 //! is what lets [`crate::writer`] pack many of them into a single commit. None
 //! of them spawns anything, blocks on anything, or knows that a writer thread
 //! exists.
@@ -24,11 +25,11 @@ use vash_core::{
     TtlChange, Value, arith, encode_record, patch_cas, patch_expiry, record::NEVER, validate_value,
 };
 
-use crate::engine::{LmdbEngine, Pressure};
+use crate::engine::{Engine, Pressure};
 use crate::error::{Result, StoreError};
 use crate::reclaim;
 
-use heed::RwTxn;
+use crate::backend::{Backend, ReadTxn, WriteTxn};
 
 /// A record encoded and ready to store, still missing its CAS token.
 ///
@@ -153,7 +154,7 @@ pub struct SetApplied {
     pub previous: Option<Value>,
 }
 
-impl LmdbEngine {
+impl<B: Backend> Engine<B> {
     pub fn prepare_set(&self, set: &Set<'_>, tags: Vec<TagRef>) -> Result<PreparedSet> {
         // Refused here, on the caller's thread, rather than after a trip
         // through the write queue: there is no point encoding a record and
@@ -200,13 +201,11 @@ impl LmdbEngine {
     /// Allocates the next CAS token, extending the durable reservation when the
     /// current block runs out. Called only from the writer thread, whose single
     /// transaction serialises it.
-    fn next_cas(&self, wtxn: &mut RwTxn) -> Result<u64> {
+    fn next_cas(&self, wtxn: &mut B::RwTxn<'_>) -> Result<u64> {
         let counter = self.cas_next.fetch_add(1, Ordering::Relaxed) + 1;
         if counter >= self.cas_watermark.load(Ordering::Relaxed) {
             let watermark = counter + CAS_BLOCK;
-            self.meta
-                .put(wtxn, meta_key::CAS_WATERMARK, &watermark.to_le_bytes())
-                .map_err(StoreError::from_heed)?;
+            wtxn.put(self.meta, meta_key::CAS_WATERMARK, &watermark.to_le_bytes())?;
             self.cas_watermark.store(watermark, Ordering::Relaxed);
         }
 
@@ -239,12 +238,12 @@ impl LmdbEngine {
     /// nothing about them depends on the write that follows.
     fn displace(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut B::RwTxn<'_>,
         key: &[u8],
         want_value: bool,
         keep_expiry_row: bool,
     ) -> Result<Displaced> {
-        let Some(blob) = self.main.get(wtxn, key).map_err(StoreError::from_heed)? else {
+        let Some(blob) = wtxn.get(self.main, key)? else {
             return Ok(Displaced::default());
         };
         let record = RecordRef::parse(blob)?;
@@ -286,7 +285,12 @@ impl LmdbEngine {
     ///
     /// The half of [`Self::displace`] that reads nothing, so a caller holding
     /// [`IndexRows`] from its own read can reach it without a second lookup.
-    fn clear_index_rows(&self, wtxn: &mut RwTxn, key: &[u8], rows: &IndexRows) -> Result<()> {
+    fn clear_index_rows(
+        &self,
+        wtxn: &mut B::RwTxn<'_>,
+        key: &[u8],
+        rows: &IndexRows,
+    ) -> Result<()> {
         self.clear_expiry_row(wtxn, key, rows.expires_at_ms)?;
         self.clear_tag_rows(wtxn, key, rows)
     }
@@ -298,21 +302,22 @@ impl LmdbEngine {
     /// overwrite that stays in the same bucket writes the identical index key,
     /// so deleting it and putting it back is pure churn — and that churn was
     /// most of the cost of a write. See [`crate::expiry`].
-    fn clear_expiry_row(&self, wtxn: &mut RwTxn, key: &[u8], expires_at_ms: u64) -> Result<()> {
+    fn clear_expiry_row(
+        &self,
+        wtxn: &mut B::RwTxn<'_>,
+        key: &[u8],
+        expires_at_ms: u64,
+    ) -> Result<()> {
         // Every record is indexed, including those that never expire, so the
         // delete is unconditional too.
         let index_key = crate::expiry::encode_key(expires_at_ms, key, self.bucket_granularity_ms);
-        self.exp
-            .delete(wtxn, &index_key)
-            .map_err(StoreError::from_heed)?;
+        wtxn.delete(self.exp, &index_key)?;
         Ok(())
     }
 
-    fn clear_tag_rows(&self, wtxn: &mut RwTxn, key: &[u8], rows: &IndexRows) -> Result<()> {
+    fn clear_tag_rows(&self, wtxn: &mut B::RwTxn<'_>, key: &[u8], rows: &IndexRows) -> Result<()> {
         for tag_id in &rows.tag_ids {
-            self.tagidx
-                .delete(wtxn, &reclaim::index_key(*tag_id, key))
-                .map_err(StoreError::from_heed)?;
+            wtxn.delete(self.tagidx, &reclaim::index_key(*tag_id, key))?;
         }
         Ok(())
     }
@@ -322,7 +327,7 @@ impl LmdbEngine {
     /// Every conditional write is judged against what a *client* would see, so
     /// an expired-but-unswept record counts as absent. Otherwise `add` would
     /// fail against a key that reads as a miss.
-    fn live_record<'t>(&self, wtxn: &'t RwTxn, key: &[u8]) -> Result<Option<RecordRef<'t>>> {
+    fn live_record<'t>(&self, wtxn: &'t B::RwTxn<'_>, key: &[u8]) -> Result<Option<RecordRef<'t>>> {
         Ok(self.read_for_update(wtxn, key)?.and_then(Found::live))
     }
 
@@ -334,8 +339,8 @@ impl LmdbEngine {
     /// still on disk and still owns index rows it must clear. A caller building
     /// a [`PreRead`] has to come through here, or a write over an expired record
     /// leaves that record's expiry and tag rows behind.
-    fn read_for_update<'t>(&self, wtxn: &'t RwTxn, key: &[u8]) -> Result<Option<Found<'t>>> {
-        let Some(blob) = self.main.get(wtxn, key).map_err(StoreError::from_heed)? else {
+    fn read_for_update<'t>(&self, wtxn: &'t B::RwTxn<'_>, key: &[u8]) -> Result<Option<Found<'t>>> {
+        let Some(blob) = wtxn.get(self.main, key)? else {
             return Ok(None);
         };
         let record = RecordRef::parse(blob)?;
@@ -351,7 +356,7 @@ impl LmdbEngine {
     /// Returns `Ok(None)` when the guard rejected the write.
     pub fn apply_conditional_set(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut B::RwTxn<'_>,
         prepared: &mut PreparedSet,
         mode: SetMode,
     ) -> Result<Written> {
@@ -513,7 +518,7 @@ impl LmdbEngine {
     /// would be a real cost for a cosmetic gain.
     fn rewrite(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut B::RwTxn<'_>,
         key: &[u8],
         tags: Vec<TagRef>,
         meta: RecordMeta,
@@ -550,7 +555,7 @@ impl LmdbEngine {
     /// now instead of leaving it for the sweeper.
     pub fn apply_expire(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut B::RwTxn<'_>,
         key: &[u8],
         ttl: TtlChange,
         guard: ExpireGuard,
@@ -637,7 +642,7 @@ impl LmdbEngine {
     /// around them.
     pub fn apply_arithmetic(
         &self,
-        wtxn: &mut RwTxn,
+        wtxn: &mut B::RwTxn<'_>,
         op: &Arithmetic<'_>,
     ) -> Result<Option<Applied>> {
         let key = op.key.as_bytes();
@@ -703,7 +708,7 @@ impl LmdbEngine {
     /// the memory map. The Redis adapter used to copy it out to the network tier,
     /// concatenate there and ship the result back, so appending one byte to a
     /// megabyte moved two megabytes between the tiers.
-    pub fn apply_append(&self, wtxn: &mut RwTxn, key: &[u8], suffix: &[u8]) -> Result<u64> {
+    pub fn apply_append(&self, wtxn: &mut B::RwTxn<'_>, key: &[u8], suffix: &[u8]) -> Result<u64> {
         let existing = self.live_record(wtxn, key)?;
 
         let (combined, tags, mc_flags, expires_at_ms) = match &existing {
@@ -741,7 +746,11 @@ impl LmdbEngine {
         Ok(combined.len() as u64)
     }
 
-    pub fn apply_set(&self, wtxn: &mut RwTxn, prepared: &mut PreparedSet) -> Result<SetApplied> {
+    pub fn apply_set(
+        &self,
+        wtxn: &mut B::RwTxn<'_>,
+        prepared: &mut PreparedSet,
+    ) -> Result<SetApplied> {
         let cas = self.next_cas(wtxn)?;
         patch_cas(&mut prepared.record, cas)?;
 
@@ -771,9 +780,7 @@ impl LmdbEngine {
             }
         };
 
-        self.main
-            .put(wtxn, &prepared.key, &prepared.record)
-            .map_err(StoreError::from_heed)?;
+        wtxn.put(self.main, &prepared.key, &prepared.record)?;
 
         // **The displaced entry is only in the way if the record changed
         // bucket.** When it did not, the key below is byte-identical to the one
@@ -798,18 +805,14 @@ impl LmdbEngine {
         // `expiry::NEVER_BUCKET`), so they go only after everything with a TTL.
         let index_key =
             crate::expiry::encode_key(expires_at_ms, &prepared.key, self.bucket_granularity_ms);
-        self.exp
-            .put(wtxn, &index_key, &prepared.key)
-            .map_err(StoreError::from_heed)?;
+        wtxn.put(self.exp, &index_key, &prepared.key)?;
 
         for tag in &prepared.tags {
-            self.tagidx
-                .put(
-                    wtxn,
-                    &reclaim::index_key(tag.tag_id.get(), &prepared.key),
-                    &prepared.key,
-                )
-                .map_err(StoreError::from_heed)?;
+            wtxn.put(
+                self.tagidx,
+                &reclaim::index_key(tag.tag_id.get(), &prepared.key),
+                &prepared.key,
+            )?;
         }
 
         Ok(SetApplied {
@@ -821,12 +824,12 @@ impl LmdbEngine {
     /// Returns whether the key was live before the delete. A record that has
     /// expired but not yet been swept is already invisible to clients, so
     /// removing it counts as a miss even though it frees a row.
-    pub fn apply_delete(&self, wtxn: &mut RwTxn, key: &[u8]) -> Result<bool> {
+    pub fn apply_delete(&self, wtxn: &mut B::RwTxn<'_>, key: &[u8]) -> Result<bool> {
         // `displace` already reads the record and judges its liveness, on the
         // way to clearing its index rows. Asking it rather than repeating the
         // lookup halves the B-tree descents a delete costs.
         let displaced = self.displace(wtxn, key, false, false)?;
-        self.main.delete(wtxn, key).map_err(StoreError::from_heed)?;
+        wtxn.delete(self.main, key)?;
 
         Ok(displaced.live)
     }
@@ -836,11 +839,11 @@ impl LmdbEngine {
     /// LMDB values are immutable blobs, so this rewrites the record â€” the value
     /// is copied within the transaction. That is the cost of `TOUCH` being a
     /// bandwidth optimisation rather than a storage one.
-    pub fn apply_touch(&self, wtxn: &mut RwTxn, key: &[u8], ttl_secs: u32) -> Result<bool> {
+    pub fn apply_touch(&self, wtxn: &mut B::RwTxn<'_>, key: &[u8], ttl_secs: u32) -> Result<bool> {
         let now_ms = self.now_ms();
         let epoch = self.epoch();
 
-        let Some(blob) = self.main.get(wtxn, key).map_err(StoreError::from_heed)? else {
+        let Some(blob) = wtxn.get(self.main, key)? else {
             return Ok(false);
         };
         let record = RecordRef::parse(blob)?;
@@ -888,17 +891,15 @@ impl LmdbEngine {
     /// closes the MVCC window: a read transaction opened before this commit
     /// still sees the old snapshot, and comparing those records against the new
     /// epoch is what stops them being served.
-    pub fn apply_flush(&self, wtxn: &mut RwTxn) -> Result<u32> {
+    pub fn apply_flush(&self, wtxn: &mut B::RwTxn<'_>) -> Result<u32> {
         let epoch = self.epoch().wrapping_add(1);
-        self.meta
-            .put(wtxn, meta_key::EPOCH, &epoch.to_le_bytes())
-            .map_err(StoreError::from_heed)?;
+        wtxn.put(self.meta, meta_key::EPOCH, &epoch.to_le_bytes())?;
 
-        self.main.clear(wtxn).map_err(StoreError::from_heed)?;
-        self.exp.clear(wtxn).map_err(StoreError::from_heed)?;
-        self.tagidx.clear(wtxn).map_err(StoreError::from_heed)?;
+        wtxn.clear(self.main)?;
+        wtxn.clear(self.exp)?;
+        wtxn.clear(self.tagidx)?;
         // Their index entries are gone, so the jobs have nothing left to walk.
-        self.jobs.clear(wtxn).map_err(StoreError::from_heed)?;
+        wtxn.clear(self.jobs)?;
 
         // Tag registrations survive: a flush empties the data, it does not
         // un-declare the tags, and their generations must keep advancing.
