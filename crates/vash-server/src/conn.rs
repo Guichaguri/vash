@@ -486,6 +486,23 @@ async fn drain<S: Copy + Send + 'static>(
             "every measured byte belongs to exactly one run"
         );
 
+        // **Splitting only pays when the reads have somewhere better to go.**
+        // With `inline_reads` off a read run takes the same blocking pool an
+        // `Other` run does, so peeling the writes out of a mixed block buys
+        // nothing for them and fragments what used to be a single hop into
+        // several. Measured on the default configuration, a 1:9 pipelined
+        // workload fell from 147,180 to 85,521 ops/s that way. Collapsing to one
+        // run restores exactly the old route; a block that is *only* writes is
+        // already one run and still takes the awaited path.
+        if !state.inline_reads && runs.len() > 1 {
+            let whole = measured.complete;
+            runs.clear();
+            runs.push(Run {
+                len: whole,
+                kind: RunKind::Other,
+            });
+        }
+
         // **Each run goes to the tier that suits it, in order.** Order is what
         // makes this safe: a client may pipeline a write and then a read of the
         // same key, and running the runs in sequence answers them in sequence.

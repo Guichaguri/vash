@@ -1043,7 +1043,7 @@ Recorded so they do not get proposed again:
 | ~~6~~ | §9 `lazy` durability | done | **1.7–4.5× on writes**, and the queue wait with it | **measured** |
 | ~~7~~ | §10 adaptive group-commit wait | tried, reverted | neutral to negative; the shard cap fixes it better | **measured** |
 | 8 | §7 RAM write-back tier | a milestone | **not the bottleneck**; revisit only if the device becomes the limit again | measured against, see §7 |
-| 9 | §14 split a block into runs | a day | **2.11x on a 1:9 workload**, measured as a bound | **measured** as a bound, unbuilt |
+| ~~9~~ | §14 split a block into runs | done | **1.96x on 1:9, 2.39x on 1:3**, uniform rows unchanged | **measured** |
 | 10 | §15 skip the redundant expiry put | an hour | commit is 54% of CPU and this is one of its two B-tree inserts | decomposed, unbuilt |
 
 **What changed since this table was written.** The writes row is no longer the
@@ -1088,7 +1088,8 @@ and any of this work should inherit it:
 
 ## 14. The next one: a block is dispatched whole, and mixed blocks lose both fast paths
 
-**Status: proposed, and the prize is measured rather than modelled.**
+**Status: shipped. The prize was measured before building it, and the build
+collected 1.96x of a 2.11x bound.**
 
 Every fast path this document has added is decided **per block**, all or nothing.
 `measure_resp` computes `all_reads` and `all_writes` by `&=` across every command
@@ -1167,6 +1168,47 @@ alternate — which is why the acceptance criterion is a sweep and not one row.
 toward the 336,392 bound, *and* the 0:1 and 1:0 rows do not regress — this change
 adds bookkeeping to the uniform blocks that are today's best case, and that is
 where it can both pay for itself and lose.
+
+### What it measured
+
+`inline_reads`, pipeline 16, medians of three alternating rounds:
+
+| ratio | before | runs | |
+|---|---:|---:|---:|
+| 0:1 | 767,836 | 766,001 | 1.00x |
+| 1:99 | 460,455 | 606,244 | **1.32x** |
+| 1:19 | 213,410 | 338,777 | **1.59x** |
+| 1:9 | 153,182 | 299,750 | **1.96x** |
+| 1:3 | 100,220 | 239,184 | **2.39x** |
+| 1:0 | 166,766 | 166,252 | 1.00x |
+
+**Both halves of the criterion held.** The 1:9 row reached 299,750 against a
+bound of 336,392 — 89% of what perfectly homogeneous blocks achieved — and the
+mixed rows improve monotonically with how mixed they are, which is the signature
+the mechanism predicts.
+
+The uniform rows took a second pass to call. Three rounds put 0:1 at 0.95x, which
+would have failed the criterion; five further alternating rounds put it at 1.00x
+and 1.00x. The per-build spread on that row is about 18%, so three rounds could
+not resolve a 5% claim — worth recording because the first pass looked like a
+real regression and stating the criterion in advance is what forced the second
+pass rather than a shrug.
+
+### What shipped
+
+`measure` returns runs rather than two booleans, and `drain` walks them in order.
+Two details carry their weight:
+
+- **Pool-bound runs are merged.** Consecutive runs that would both take the
+  blocking pool become one hop, so a block that gains nothing from splitting pays
+  nothing for it. With `inline_reads` off that includes read runs, which is why
+  the default configuration is unaffected rather than slightly worse.
+- **The run buffer lives on the connection.** Measuring a block allocates nothing
+  once a connection has seen its widest mix, and a uniform block still measures
+  to exactly one run — the case the 1.00x rows above are protecting.
+
+Ordering is what makes it correct, and the tests that already covered a read
+seeing the writes before it in the same block now cross a run boundary to do so.
 
 **Risks.** `drain` is the function that already cost pipelined reads 6.7× once by
 growing a future it never polled (§8), so the awaited run must stay boxed and the
