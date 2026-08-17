@@ -832,6 +832,34 @@ Worth recording separately: **an under-sized `dp_limit` aborts the process**
 rather than failing gracefully — `SIGABRT` at 32 pages. That is a good reason
 not to expose it as a configuration knob.
 
+**Page size does nothing either, in either direction.** This was the last
+structural lever rather than a threshold — libmdbx can set it at creation and
+LMDB cannot change it at all, so it was the one place the two engines could have
+been given genuinely different geometry. Writes, mdbx medians: 530,665 at 4 KiB,
+559,863 at 8 KiB, 559,221 at 16 KiB, 489,708 at 32 KiB — the middle two sit
+inside the 4 KiB row's own spread, so only the 32 KiB decline is real.
+
+Reads needed more care, because the read section runs long enough that the
+machine drifts between invocations: LMDB, which ignores the setting, moved 16%
+across two runs on its own. The ratio within each run is the noise-controlled
+number:
+
+| read row | 4 KiB | 8 KiB | 16 KiB |
+|---|---|---|---|
+| `get`, 1t | 0.96 | 0.97 | 0.88 |
+| `get_with`, 1t | 0.96 | 0.96 | 0.95 |
+| `get`, 4t | 0.95 | 0.88 | 0.96 |
+| `get_with`, 4t | 0.94 | 0.95 | 0.96 |
+| `get`, 8t | 0.97 | 0.88 | 0.94 |
+| `get_with`, 8t | 1.20 | 1.01 | 1.00 |
+
+There is no trend: mdbx sits at 0.88–0.97 of LMDB whatever the page size, and
+the spread between page sizes is no wider than the spread within a single row.
+That is not surprising once stated — these reads are served warm from the page
+cache, so page size is changing B-tree fanout rather than I/O size, and at
+1 KiB values the difference across this range is at most one level of the tree.
+One pointer chase does not show up against a page-cache hit.
+
 Two other levers measured nothing. `MDBX_WRITEMAP` — which mdbx permits under a
 no-sync mode and LMDB forbids — made both engines *worse* on Linux, reproducing
 [performance-proposals.md](performance-proposals.md) §6's finding that it is
