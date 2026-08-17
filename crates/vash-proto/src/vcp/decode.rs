@@ -365,7 +365,11 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
 
         Opcode::GetMany => {
             let mut cursor = Cursor::new(body);
-            Command::GetMany(decode_key_list(&mut cursor).map_err(|(s, d)| fail(s, d))?.into())
+            Command::GetMany(
+                decode_key_list(&mut cursor)
+                    .map_err(|(s, d)| fail(s, d))?
+                    .into(),
+            )
         }
 
         Opcode::DeleteMany => {
