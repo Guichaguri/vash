@@ -16,11 +16,13 @@ pub mod resp;
 pub mod scan;
 pub mod state;
 pub mod stats;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 use vash_store::{Store, StoreHandle};
@@ -31,6 +33,14 @@ pub use state::ServerState;
 /// A bound, running server.
 pub struct Server {
     listener: TcpListener,
+    /// The TLS listener, when `tls.listen` asked for one.
+    ///
+    /// Not gated on the feature: without it, `Config::validate` refuses a
+    /// configuration that would fill this, so it is permanently `None` and the
+    /// accept arm below waits forever on nothing.
+    tls: Option<TcpListener>,
+    #[cfg(feature = "tls")]
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     admin: Option<TcpListener>,
     state: Arc<ServerState>,
     config: Config,
@@ -198,6 +208,28 @@ impl Server {
             "listening"
         );
 
+        // Built before either listener binds, so a certificate that will not
+        // parse stops startup rather than surfacing as a handshake failure on
+        // the first client.
+        #[cfg(feature = "tls")]
+        let tls_acceptor = match config.tls.enabled() {
+            false => None,
+            true => Some(tls::acceptor(&config.tls).with_context(|| {
+                format!("loading the TLS certificate for {}", config.tls.listen)
+            })?),
+        };
+
+        let tls = match config.tls.enabled() {
+            false => None,
+            true => {
+                let listener = TcpListener::bind(&config.tls.listen)
+                    .await
+                    .with_context(|| format!("binding the TLS port on {}", config.tls.listen))?;
+                info!(addr = %listener.local_addr()?, "listening for TLS");
+                Some(listener)
+            }
+        };
+
         // Bound here rather than in `serve` so a port clash fails startup, and
         // so tests can read the assigned port before anything is served.
         // Nothing is announced here: `admin::serve` already logs the bound
@@ -214,6 +246,9 @@ impl Server {
 
         Ok(Self {
             listener,
+            tls,
+            #[cfg(feature = "tls")]
+            tls_acceptor,
             admin,
             pre_auth: Arc::new(Semaphore::new(state.auth.limits.max_connections)),
             state,
@@ -225,6 +260,15 @@ impl Server {
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// The TLS port, when one was configured. `None` otherwise.
+    ///
+    /// Separate from [`Server::local_addr`] for the same reason that one
+    /// exists: a configured port of 0 is a request, not an answer, and a test
+    /// or a benchmark has to be told which port it got.
+    pub fn tls_addr(&self) -> Option<std::net::SocketAddr> {
+        self.tls.as_ref().and_then(|l| l.local_addr().ok())
     }
 
     pub fn admin_addr(&self) -> Option<std::net::SocketAddr> {
@@ -243,6 +287,9 @@ impl Server {
     ) -> anyhow::Result<()> {
         let Self {
             listener,
+            tls,
+            #[cfg(feature = "tls")]
+            tls_acceptor,
             admin,
             state,
             config,
@@ -283,8 +330,8 @@ impl Server {
 
         loop {
             tokio::select! {
-                result = listener.accept() => {
-                    let (stream, peer) = match result {
+                result = accept_any(&listener, &tls) => {
+                    let (stream, peer, encrypted) = match result {
                         Ok(pair) => pair,
                         Err(e) => {
                             // Per-connection accept errors (a peer that
@@ -333,9 +380,40 @@ impl Server {
                     // the connection an operator running `stats conns` is
                     // usually looking for.
                     let registered = conn_state.connections.open(peer);
+                    // Cloned per connection, which is an `Arc` bump: the
+                    // acceptor is shared configuration, not per-session state.
+                    #[cfg(feature = "tls")]
+                    let acceptor = tls_acceptor.clone();
+                    #[cfg(feature = "tls")]
+                    let handshake_timeout =
+                        std::time::Duration::from_millis(config.tls.handshake_timeout_ms);
                     tokio::spawn(async move {
                         let id = registered.id;
-                        if let Err(e) = conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping, pre_auth_permit, registered).await {
+                        // Cache traffic is small and latency-sensitive; Nagle
+                        // would batch a reply against the next one and add up
+                        // to 40ms for nothing — and on a TLS connection it
+                        // would batch handshake flights too, which is where it
+                        // hurts most. Set here rather than in `conn::handle`,
+                        // which no longer knows it holds a socket.
+                        let _ = stream.set_nodelay(true);
+                        let result = if encrypted {
+                            serve_encrypted(
+                                stream,
+                                #[cfg(feature = "tls")]
+                                acceptor,
+                                #[cfg(feature = "tls")]
+                                handshake_timeout,
+                                Arc::clone(&conn_state),
+                                read_buffer,
+                                stopping,
+                                pre_auth_permit,
+                                registered,
+                            )
+                            .await
+                        } else {
+                            conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping, pre_auth_permit, registered).await
+                        };
+                        if let Err(e) = result {
                             debug!(%peer, error = %e, "connection ended with an error");
                         }
                         conn_state.connections.close(id);
@@ -407,6 +485,76 @@ impl Server {
 
         Ok(())
     }
+}
+
+/// Accepts from the plaintext listener, the TLS one, or whichever answers
+/// first.
+///
+/// Both arms are cancel-safe — `accept` is, and `pending` trivially is — which
+/// is what lets this sit inside the `select!` that also watches for shutdown.
+async fn accept_any(
+    plain: &TcpListener,
+    tls: &Option<TcpListener>,
+) -> std::io::Result<(TcpStream, std::net::SocketAddr, bool)> {
+    match tls {
+        None => plain.accept().await.map(|(s, peer)| (s, peer, false)),
+        Some(tls) => tokio::select! {
+            result = plain.accept() => result.map(|(s, peer)| (s, peer, false)),
+            result = tls.accept() => result.map(|(s, peer)| (s, peer, true)),
+        },
+    }
+}
+
+/// Completes the handshake, then serves the session with the same loop a
+/// plaintext connection gets.
+///
+/// The handshake runs here, inside the spawned task and *after* the connection
+/// and pre-auth permits have been taken, rather than in the accept loop: it is
+/// the most expensive thing an unauthenticated stranger can ask this server to
+/// do, so it belongs inside the budget M9 built for exactly that, and a slow
+/// one must not stall every other pending accept.
+// Eight, because it hands `conn::handle` everything a plaintext connection
+// gets plus the two it needs to finish a handshake first. Bundling them into a
+// struct would move the argument list rather than shorten it.
+#[expect(clippy::too_many_arguments)]
+// `stream` and the state are unused in a build without the feature, where this
+// function is unreachable but still has to compile.
+#[cfg_attr(not(feature = "tls"), allow(unused_variables))]
+async fn serve_encrypted(
+    stream: TcpStream,
+    #[cfg(feature = "tls")] acceptor: Option<tokio_rustls::TlsAcceptor>,
+    #[cfg(feature = "tls")] handshake_timeout: std::time::Duration,
+    state: Arc<ServerState>,
+    read_buffer: usize,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    pre_auth: Option<tokio::sync::OwnedSemaphorePermit>,
+    registered: Arc<connections::ConnInfo>,
+) -> std::io::Result<()> {
+    #[cfg(feature = "tls")]
+    {
+        let acceptor = acceptor.expect("a TLS listener without an acceptor");
+        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+            Ok(Ok(stream)) => {
+                conn::handle(stream, state, read_buffer, shutdown, pre_auth, registered).await
+            }
+            // A failed handshake is a client-side configuration problem far
+            // more often than an attack — the wrong CA, an expired
+            // certificate, a plaintext client on the wrong port — and it is
+            // invisible from the client side, which sees only a closed socket.
+            Ok(Err(e)) => {
+                debug!(error = %e, "TLS handshake failed");
+                Ok(())
+            }
+            Err(_) => {
+                debug!(timeout = ?handshake_timeout, "TLS handshake timed out");
+                Ok(())
+            }
+        }
+    }
+    // Unreachable: `Config::validate` refuses `tls.listen` in a build without
+    // the feature, so nothing ever binds the listener that leads here.
+    #[cfg(not(feature = "tls"))]
+    Ok(())
 }
 
 /// Reloads the credential table on `SIGHUP`.

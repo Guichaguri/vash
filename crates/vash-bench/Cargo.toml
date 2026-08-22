@@ -9,17 +9,39 @@ publish = false
 [dependencies]
 vash-core.workspace = true
 vash-proto.workspace = true
-vash-server.workspace = true
+# With `tls`, so the embedded server in the load generator can bring up a TLS
+# listener and both sides of the comparison run through the same harness the
+# README's numbers came from. The shipped server still has the feature off.
+vash-server = { workspace = true, features = ["tls"] }
 
 anyhow.workspace = true
 bytes.workspace = true
 tempfile = "3"
 tokio.workspace = true
 
+# TLS, for Phase 0 of docs/tls-proposal.md: `examples/tls_spike.rs` measures
+# handshakes and encryption in isolation, and `--tls` on the load generator
+# points the end-to-end workloads at the server's TLS port. Ordinary
+# dependencies rather than dev ones because the load generator is a `[[bin]]`,
+# which cannot see dev-dependencies. Nothing here is reachable from the shipped
+# server binary — this crate is `publish = false` and depends on no one.
+#
+# Both providers are linked and chosen at run time: the spike's own finding is
+# that neither needs extra build tooling, so which one ships is a measurement
+# rather than a packaging constraint.
+rustls = { version = "0.23", default-features = false, features = ["ring", "aws-lc-rs", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "aws-lc-rs", "tls12", "logging"] }
+rustls-pemfile = "2"
+# `aws_lc_rs` rather than the default `ring` backend because ring cannot
+# generate RSA keys, and the RSA leaf is half of what the handshake table is
+# comparing.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+
 [dev-dependencies]
 divan = "0.1"
 vash-store.workspace = true
 xxhash-rust.workspace = true
+
 
 [[bench]]
 name = "hot_path"
@@ -32,3 +54,7 @@ harness = false
 [[bin]]
 name = "load"
 path = "src/load.rs"
+
+[[example]]
+name = "tls_spike"
+path = "examples/tls_spike.rs"

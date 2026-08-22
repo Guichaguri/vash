@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use vash_proto::vcp::{FrameLen, Opcode, encode_request, encode_set_body};
 
@@ -49,6 +49,12 @@ struct Options {
     keys: u64,
     workload: Workload,
     shards: usize,
+    /// Drive the server's TLS port instead of its plaintext one.
+    tls: bool,
+    /// PEM of the CA that signed the server's certificate.
+    tls_ca: Option<String>,
+    /// The name the certificate is expected to carry.
+    tls_name: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,6 +107,9 @@ impl Options {
             keys: 100_000,
             workload: Workload::Get,
             shards: 0,
+            tls: false,
+            tls_ca: None,
+            tls_name: "localhost".into(),
         };
 
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -122,6 +131,12 @@ impl Options {
                 "--keys" => options.keys = value().parse().expect("a number"),
                 "--workload" => options.workload = Workload::parse(&value()),
                 "--shards" => options.shards = value().parse().expect("a number"),
+                "--tls" => {
+                    options.tls = true;
+                    i -= 1; // takes no value
+                }
+                "--tls-ca" => options.tls_ca = Some(value()),
+                "--tls-name" => options.tls_name = value(),
                 "--help" | "-h" => {
                     println!(
                         "load [--addr HOST:PORT] [--workload get|set|mixed] [--connections N]\n     \
@@ -257,7 +272,7 @@ impl Inbound {
     }
 
     /// Waits for one whole frame and returns it, consuming it from the buffer.
-    async fn next_frame(&mut self, stream: &mut TcpStream) -> std::io::Result<&[u8]> {
+    async fn next_frame<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> std::io::Result<&[u8]> {
         loop {
             match vash_proto::vcp::peek_frame_len(self.pending()) {
                 FrameLen::Complete(len) => {
@@ -296,7 +311,7 @@ impl Inbound {
     }
 }
 
-async fn handshake(stream: &mut TcpStream) -> std::io::Result<()> {
+async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(&vash_core::PROTOCOL_VERSION.to_le_bytes());
     body.extend_from_slice(&0u16.to_le_bytes());
@@ -314,19 +329,79 @@ async fn handshake(stream: &mut TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Everything a connection needs, so that a worker does not have to know
+/// whether it is speaking TLS.
+///
+/// The stream is boxed in *both* modes, deliberately: a `dyn` call per read is
+/// a cost the plaintext run should pay too, or the comparison would be
+/// measuring the box rather than the cryptography.
+trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+#[derive(Clone)]
+struct Connector {
+    addr: String,
+    tls: Option<(
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    )>,
+}
+
+impl Connector {
+    fn new(options: &Options, addr: String) -> anyhow::Result<Self> {
+        if !options.tls {
+            return Ok(Self { addr, tls: None });
+        }
+
+        let mut roots = rustls::RootCertStore::empty();
+        let ca = options
+            .tls_ca
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--tls needs --tls-ca pointing at the issuing CA"))?;
+        let file = std::fs::File::open(ca)?;
+        for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(file)) {
+            roots.add(cert?)?;
+        }
+
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let name = rustls::pki_types::ServerName::try_from(options.tls_name.clone())?;
+        Ok(Self {
+            addr,
+            tls: Some((
+                tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)),
+                name,
+            )),
+        })
+    }
+
+    async fn connect(&self) -> std::io::Result<Box<dyn Duplex>> {
+        let stream = TcpStream::connect(&self.addr).await?;
+        stream.set_nodelay(true)?;
+        match &self.tls {
+            None => Ok(Box::new(stream)),
+            Some((connector, name)) => Ok(Box::new(connector.connect(name.clone(), stream).await?)),
+        }
+    }
+}
+
 /// One connection's share of the load.
 ///
 /// Returns the operations it completed, how many of those were hits, and its
 /// latency histogram.
 async fn worker(
-    addr: String,
+    connector: Connector,
     options: Arc<OptionsShared>,
     id: u64,
     stop: Arc<AtomicBool>,
     started: Arc<tokio::sync::Barrier>,
 ) -> std::io::Result<(u64, u64, Histogram)> {
-    let mut stream = TcpStream::connect(&addr).await?;
-    stream.set_nodelay(true)?;
+    let mut stream = connector.connect().await?;
     handshake(&mut stream).await?;
 
     let mut histogram = Histogram::new();
@@ -405,10 +480,9 @@ struct OptionsShared {
 /// A GET benchmark against an empty store measures the miss path, which is
 /// faster and completely uninteresting — so this runs first and the hit rate is
 /// reported afterwards to prove it worked.
-async fn populate(addr: &str, keys: u64, value: &[u8]) -> std::io::Result<()> {
+async fn populate(connector: &Connector, keys: u64, value: &[u8]) -> std::io::Result<()> {
     const BATCH: u64 = 256;
-    let mut stream = TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
+    let mut stream = connector.connect().await?;
     handshake(&mut stream).await?;
 
     let mut inbound = Inbound::new();
@@ -431,9 +505,43 @@ async fn populate(addr: &str, keys: u64, value: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Issues a CA and a `localhost` leaf into `dir`, for the embedded server's
+/// TLS listener.
+///
+/// A benchmark wants one command, not a certificate-management exercise, so
+/// the run mints its own throwaway PKI and trusts exactly it. Nothing here
+/// resembles how a deployment should get a certificate — see
+/// `docs/tls-proposal.md` §10.
+fn issue_pki(dir: &std::path::Path) -> anyhow::Result<(String, String, String)> {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+    let mut ca_params = CertificateParams::new(Vec::new())?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.clone().self_signed(&ca_key)?;
+
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+    let leaf = CertificateParams::new(vec!["localhost".to_string()])?
+        .signed_by(&leaf_key, &rcgen::Issuer::new(ca_params, ca_key))?;
+
+    let ca_path = dir.join("ca.pem");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&ca_path, ca.pem())?;
+    // Leaf first, then the issuer: the order a chain is read in.
+    std::fs::write(&cert_path, format!("{}{}", leaf.pem(), ca.pem()))?;
+    std::fs::write(&key_path, leaf_key.serialize_pem())?;
+
+    Ok((
+        ca_path.display().to_string(),
+        cert_path.display().to_string(),
+        key_path.display().to_string(),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let options = Options::parse();
+    let mut options = Options::parse();
 
     // An embedded server unless one was named. Convenient, and honest as long
     // as it is reported: the generator and the server share these cores, so the
@@ -452,9 +560,24 @@ async fn main() -> anyhow::Result<()> {
             if options.shards > 0 {
                 config.store.shards = options.shards;
             }
+            if options.tls {
+                let (ca, cert, key) = issue_pki(dir.path())?;
+                config.tls.listen = "127.0.0.1:0".into();
+                config.tls.cert = cert.into();
+                config.tls.key = key.into();
+                options.tls_ca = Some(ca);
+            }
 
             let server = vash_server::Server::bind(config).await?;
-            let addr = server.local_addr()?.to_string();
+            // The TLS port when the run asked for one, so that `--tls` against
+            // the embedded server needs no second argument.
+            let addr = match options.tls {
+                true => server
+                    .tls_addr()
+                    .ok_or_else(|| anyhow::anyhow!("the TLS listener did not bind"))?
+                    .to_string(),
+                false => server.local_addr()?.to_string(),
+            };
             let handle = tokio::spawn(server.serve(std::future::pending::<()>()));
             (addr, Some((handle, dir)))
         }
@@ -471,10 +594,15 @@ async fn main() -> anyhow::Result<()> {
         options.duration.as_secs(),
         addr,
     );
+    if options.tls {
+        println!("over TLS\n");
+    }
+
+    let connector = Connector::new(&options, addr.clone())?;
 
     if options.workload.reads() {
         let started = Instant::now();
-        populate(&addr, options.keys, &value).await?;
+        populate(&connector, options.keys, &value).await?;
         println!(
             "populated {} keys in {:.2?} ({:.0} writes/s)",
             options.keys,
@@ -497,7 +625,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = Vec::with_capacity(options.connections);
     for id in 0..options.connections as u64 {
         tasks.push(tokio::spawn(worker(
-            addr.clone(),
+            connector.clone(),
             Arc::clone(&shared),
             id,
             Arc::clone(&stop),

@@ -37,11 +37,25 @@ tracing-subscriber.workspace = true
 
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
+# TLS termination, off by default. `ring` rather than rustls' default
+# `aws-lc-rs` provider on the Phase 0 measurement in docs/tls-proposal.md:
+# both build with no extra tooling on both of this project's toolchains, but
+# aws-lc-sys falls back to its no-assembly build when it cannot find cmake, and
+# that build is roughly half the handshake rate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
 [features]
 # Builds the libmdbx backend into the binary, making `store.backend = "mdbx"`
 # a valid configuration. Off by default: it compiles and links a second C
 # library. See `docs/mdbx-proposal.md`.
 mdbx = ["vash-store/mdbx"]
+# Compiles TLS termination into the binary, making `tls.listen` a valid
+# configuration. Off by default: a deployment that does not want TLS should not
+# link a TLS stack. A `tls.listen` in a build without this is refused at
+# startup rather than quietly served in the clear — see `Config::validate`.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 # Off by default, against plan §2, which expected 10-20% from it on
 # allocation-heavy connection handling. Measured on this workload it is worth
 # nothing: 1.13M against 1.11M ops/s on 64-byte GETs and 537k against 540k on

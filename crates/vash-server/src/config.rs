@@ -16,6 +16,7 @@ pub struct Config {
     pub store: StoreConfig,
     pub protocol: ProtocolConfig,
     pub auth: AuthConfig,
+    pub tls: TlsConfig,
     pub cluster: ClusterConfig,
     pub observability: ObservabilityConfig,
 }
@@ -356,6 +357,49 @@ impl Default for AuthConfig {
     }
 }
 
+/// TLS termination on a second listener.
+///
+/// A separate port rather than an upgrade on the cache port, so that closing
+/// `server.listen` is what makes a deployment encrypted-only — a socket that
+/// does not exist is a stronger statement than a policy flag. See
+/// `docs/tls-proposal.md` §3.2.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TlsConfig {
+    /// Where the TLS listener binds. Empty means there is not one, which is
+    /// the default — the empty string for "do not bind" is what
+    /// `observability.admin_listen` already uses.
+    pub listen: String,
+    /// PEM certificate chain, leaf first.
+    pub cert: PathBuf,
+    /// PEM private key, PKCS#8 or SEC1.
+    pub key: PathBuf,
+    /// How long a handshake may take before the connection is dropped.
+    ///
+    /// Below `auth.timeout_ms` on purpose: a handshake is a fixed number of
+    /// round trips, so a peer that cannot finish one in three seconds is not
+    /// going to, and it is holding a pre-auth slot while it tries.
+    pub handshake_timeout_ms: u64,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            listen: String::new(),
+            cert: PathBuf::new(),
+            key: PathBuf::new(),
+            handshake_timeout_ms: 3_000,
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Whether a TLS listener was asked for.
+    pub fn enabled(&self) -> bool {
+        !self.listen.is_empty()
+    }
+}
+
 /// Peers, and how tag invalidation reaches them.
 ///
 /// Nodes are otherwise shared-nothing: no replication, no consensus, no
@@ -663,6 +707,31 @@ impl Config {
              or reads will fail with MDB_READERS_FULL under load",
             self.store.max_readers,
             self.server.max_blocking_threads
+        );
+
+        // A configuration that asks for TLS in a binary that cannot serve it
+        // must stop startup. Downgrading to plaintext would leave an operator
+        // believing traffic is encrypted when it is not, which is the worst
+        // failure available here — the same reason `store.backend = "mdbx"` is
+        // refused rather than quietly swapped for LMDB.
+        #[cfg(not(feature = "tls"))]
+        anyhow::ensure!(
+            !self.tls.enabled(),
+            "tls.listen is set, but this binary was built without the `tls` feature and \
+             cannot terminate TLS. Rebuild with `--features tls`, or clear tls.listen — \
+             it will not fall back to serving that port in the clear"
+        );
+        anyhow::ensure!(
+            !self.tls.enabled()
+                || !(self.tls.cert.as_os_str().is_empty() || self.tls.key.as_os_str().is_empty()),
+            "tls.listen is set but tls.cert or tls.key is empty; a TLS listener with no \
+             certificate has nothing to present"
+        );
+        anyhow::ensure!(
+            self.tls.enabled()
+                || (self.tls.cert.as_os_str().is_empty() && self.tls.key.as_os_str().is_empty()),
+            "tls.cert or tls.key is set but tls.listen is empty, so nothing will serve them. \
+             Set tls.listen, or clear both"
         );
 
         // Peers are ordinary VCP clients on the ordinary port, so enabling auth

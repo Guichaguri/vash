@@ -47,6 +47,41 @@ rejected.
 
 ---
 
+> **Phase 0 has run. Three of this document's cost claims did not survive it,
+> and it found a deadlock that blocks phase 1.**
+> Measured on both toolchains, five repeats, in
+> [benchmarks.md](benchmarks.md#what-tls-costs):
+>
+> 1. **[§4.2](#42-the-crypto-provider-and-what-it-does-to-the-build) was wrong
+>    about the build.** Neither provider needs `cmake` or NASM — both build
+>    unattended on Windows MSVC and on `rust:1.92-alpine` with only `musl-dev`.
+>    But `aws-lc-sys` reaches that outcome by *silently* falling back to a
+>    no-assembly build (`Building with: CC`, `cargo:rustc-cfg=universal`) that
+>    runs at roughly half speed. `ring` is still the recommendation; every
+>    reason given for it was wrong.
+> 2. **[§8.1](#81-the-handshake-is-the-number-everyone-quotes-and-the-wrong-one-to-watch)
+>    was right to call "~1 ms" pessimistic, and wrong about what to watch.**
+>    A full P-256 handshake is 308 µs of server CPU on Windows and 528 on musl;
+>    RSA-2048 is 804 and 1,133. Resumption erases the gap between them, because
+>    what it skips is the signature.
+> 3. **[§8.2](#82-the-bulk-cipher-is-the-number-to-watch) got the arithmetic
+>    right and the framing wrong.** 1.86 GiB/s per core at 4 KiB is the "whole
+>    core of AES-GCM" it predicted — but at 64 bytes a TLS record costs 336 ns
+>    regardless of its contents, so small values are charged per *reply*, not
+>    per byte. End to end, TLS costs a third of throughput at 1 KiB and above,
+>    costs nothing measurable in closed-loop latency (p50 0.330 ms against
+>    0.329), and at 64 bytes on musl it is 68% *faster* than plaintext.
+> 4. **Phase 0 also found a deadlock, and it blocks phase 1.** Over TLS, a
+>    single `write_all` above ~256 KiB hangs, deterministically, where
+>    plaintext does not: both ends write a whole batch before reading any of
+>    it, and TLS removes the socket-buffer slack that keeps that pattern alive.
+>    See [§8.4](#84-the-deadlock-phase-0-found).
+>
+> The rest of this document is kept as written, including the parts the
+> measurements went on to contradict.
+
+---
+
 ## 1. What TLS is for here
 
 auth.md §1 drew the line and this document stays on its side of it.
@@ -218,22 +253,29 @@ Windows, where the benchmarks are run.
 
 | | `aws-lc-rs` (rustls default) | `ring` |
 |---|---|---|
-| **Build deps added** | `cmake`, and NASM on Windows MSVC unless the prebuilt-nasm path works | A C compiler, which `heed` already requires for LMDB |
-| **Alpine image** | Add `cmake` (and likely `clang`) to the `apk add` line | Expected to need no Dockerfile change |
-| **Windows dev** | The friction is here, and this repo develops on Windows | Expected to need nothing |
+| **Build deps added** | ~~`cmake`, and NASM on Windows MSVC~~ **none — measured** | A C compiler, which `heed` already requires for LMDB |
+| **Alpine image** | ~~Add `cmake`~~ **no Dockerfile change** | No Dockerfile change |
+| **Windows dev** | ~~The friction is here~~ **no friction; builds unattended** | Nothing |
+| **What actually happens** | Falls back to a no-assembly build, quietly: 749 µs per P-256 handshake against `ring`'s 308 | Its ordinary pre-generated assembly |
 | **FIPS path** | Yes, later, without a rewrite | No |
-| **Verdict** | The right end state | **The right Phase 0 default** |
+| **Verdict** | Needs `cmake` to be *worth* having, not to build | **Chosen — measured** |
 
-**Recommendation: start on `ring`, keep the provider a one-line choice, and
-re-open it if FIPS is ever asked for.** The provider is selected by installing a
-`CryptoProvider` when the config is built, so this is genuinely a line, not an
-architecture.
+**Phase 0 correction.** Every "expected" above was wrong, and the conclusion
+survived anyway. `aws-lc-sys` 0.44 does not fail without `cmake`; it prints
+`Building with: CC`, sets `cargo:rustc-cfg=universal`, and produces a portable
+C build with no AES-NI-tuned assembly. A build that is silently half-speed is a
+worse failure mode than one that stops, and it is the reason to prefer the
+provider whose fast path is its only path.
 
-Every "expected" in that table is a claim this document has not tested, and
-they are the first thing Phase 0 must actually *try* rather than reason about.
+**Recommendation, now measured: `ring`.** The provider is selected by handing a
+`CryptoProvider` to the config builder, so this stays a line rather than an
+architecture — and a deployment that needs FIPS should add `cmake` to its build
+and take `aws-lc-rs` properly, rather than getting the `universal` build by
+accident.
+
 The mdbx spike found that every Rust wrapper hardcoded a flag that cost 56× on
-reads, and it found that by building it, not by reading about it. Assume the
-same is possible here.
+reads, and it found that by building it rather than by reading about it. The
+same held here.
 
 ### 4.3 Protocol versions
 
@@ -453,6 +495,21 @@ one signature and one key agreement — but the shape of the objection is right:
 it is the most expensive thing in connection setup by orders of magnitude, and
 an unauthenticated party controls how often it happens.
 
+**Measured (Phase 0), server-side CPU per handshake, one thread:**
+
+| leaf | resumed | Windows | musl |
+|---|---|---:|---:|
+| ECDSA P-256 | no | 308 µs | 528 µs |
+| ECDSA P-256 | yes | 298 µs | 476 µs |
+| RSA-2048 | no | 804 µs | 1,133 µs |
+| RSA-2048 | yes | 297 µs | 448 µs |
+
+So "~1 ms" was right for RSA and about 3× pessimistic for P-256, and point 2
+below turns out to matter more than point 1: **resumption erases the difference
+between the two key algorithms entirely**, because what it skips is the
+signature. Twelve threads buy about 5×, not 12× — six physical cores, and this
+arithmetic does not share one well.
+
 Three things make it survivable, in descending order of importance:
 
 1. **Connections are pooled.** A handshake amortised over a connection that
@@ -478,6 +535,30 @@ framed into TLS records and encrypted. AES-GCM with AES-NI runs on the order of
 workload TLS is plausibly **a whole core of additional CPU**, on a four-core
 measurement box.
 
+**Measured (Phase 0).** The arithmetic holds: one core encrypts 1.86 GiB/s at
+4 KiB records on Windows, 1.79 on musl, which is the "whole core" this section
+predicted. The framing was wrong, and this is the finding worth keeping:
+
+| record | Windows | ns per record | musl | ns per record |
+|---:|---:|---:|---:|---:|
+| 64 B | 0.18 GiB/s | 336 | 0.12 GiB/s | 504 |
+| 1 KiB | 1.17 GiB/s | 818 | 1.16 GiB/s | 822 |
+| 16 KiB | 2.28 GiB/s | 6,699 | 2.19 GiB/s | 6,961 |
+
+**A 64-byte reply costs about what a 1 KiB reply costs**, because a record's
+fixed cost — header, nonce, tag, and the call around them — dominates until the
+payload is a kilobyte. A cache serving small values is charged per reply, not
+per byte, which is the opposite of what this section assumed when it named
+bandwidth as the thing to watch.
+
+End to end, with the load generator pointed at a real TLS listener: **63–68% of
+plaintext throughput at 1 KiB and 4 KiB on both platforms**, 91% at 64 bytes on
+Windows, and — reproducibly, five repeats — **168% at 64 bytes on musl**, where
+rustls' record buffering appears to hand the server larger read blocks than the
+plaintext path does. Closed-loop latency does not move at all: p50 0.330 ms
+against 0.329. The full tables are in
+[benchmarks.md](benchmarks.md#what-tls-costs).
+
 That is not an argument against doing it. It is an argument that:
 
 - the headline throughput numbers must be **re-measured with TLS on** and
@@ -488,10 +569,12 @@ That is not an argument against doing it. It is an argument that:
 - `SET` at 40,000 ops/s is bounded by the storage engine and should barely
   move, which is worth stating so nobody attributes a write regression to TLS.
 
-### 8.3 What Phase 0 must measure
+### 8.3 What Phase 0 measured
 
 Following the mdbx spike's discipline — build it, measure it, and let the
-measurements contradict this document:
+measurements contradict this document. All five ran; the answers are in
+[benchmarks.md](benchmarks.md#what-tls-costs) and summarised at the top of this
+document:
 
 | # | Question | How |
 |---|---|---|
@@ -501,6 +584,13 @@ measurements contradict this document:
 | 4 | p50/p99 delta on the closed-loop latency table | Same harness, same table shape as README |
 | 5 | Binary size and build time delta with the feature on | `ls -l`, `cargo build --timings` |
 
+**Answers:** (1) both providers build unattended on both toolchains, and
+`aws-lc-rs` does it by going no-assembly — §4.2. (2) 308 µs per full P-256
+handshake on Windows, 804 for RSA-2048, resumption erasing the gap — §8.1.
+(3) and (4) 63–68% of plaintext throughput at 1 KiB and above, no measurable
+latency change, and one result nobody predicted — §8.2. (5) +1.05 MiB of
+binary (2.84 → 3.95 MB) and ten seconds of crate rebuild.
+
 Run it with the same discipline benchmarks.md already demands: five repeats,
 both platforms, ranges reported — run-to-run variance on this harness is around
 ±25%, so a single pair of numbers proves nothing.
@@ -509,6 +599,48 @@ If (3) shows more than the arithmetic in §8.2 predicts, the record size and the
 write path are the first suspects — `write_all` of a whole reply buffer
 (`conn.rs:229`) is already the right shape for TLS, one record per reply batch,
 but that should be confirmed rather than assumed.
+
+### 8.4 The deadlock Phase 0 found
+
+**The measurement that could not be taken is the most important thing in this
+section.** Over TLS, a single `write_all` of more than roughly 256 KiB
+deadlocks, deterministically, where the same write over plaintext does not:
+
+| one batch | plaintext | TLS |
+|---|---:|---:|
+| 32 × 4 KiB = 128 KiB | 2,911 ops/s | 2,163 ops/s |
+| 64 × 4 KiB = 256 KiB | 2,483 ops/s | **hangs** |
+| 256 × 4 KiB = 1 MiB | 4,157 ops/s | **hangs** |
+
+Both ends of this project write a whole batch before reading any of it — the
+load generator sends its pipeline and then collects the replies; `conn::handle`
+reads a block, executes it, and writes the whole reply buffer before returning
+to the read. That is a write-write deadlock waiting for a batch large enough,
+and **plaintext has been surviving it on borrowed room**: the kernel's socket
+buffers absorb what the peer has not read yet. TLS buffers on both sides and
+spends that slack.
+
+Three consequences, in order:
+
+1. **Phase 1 cannot ship without fixing it.** A cache that stalls forever on a
+   large pipelined batch is worse than one that does not speak TLS. The fix is
+   to read and write concurrently rather than in sequence — splitting the
+   stream, or writing under a `select!` that keeps draining — and it belongs in
+   `conn::handle` and in the load generator alike.
+2. **The plaintext path has the same latent bug.** It is not reachable at the
+   batch sizes this server produces today, because the reply to a `SET` is ten
+   bytes and the buffers cover it. That is a property of the workload, not a
+   guarantee, and it should be fixed once for both paths rather than worked
+   around for one.
+3. **The 4 KiB TLS throughput number is unknown, not bad.** On musl, where the
+   default buffers are larger, the same run completes at 63% of plaintext. On
+   Windows it does not complete at all.
+
+This is exactly what Phase 0 is for. The proposal argued in §5.4 that TLS "is a
+property of the socket, and this server's layering means that is all it has to
+be" — and that is still true of dispatch, the store and the parsers. It was not
+true of the connection loop's I/O discipline, and nothing short of running it
+would have said so.
 
 ---
 
@@ -607,8 +739,8 @@ hatch is real, in which case this is what it costs, or it should be struck from
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **0** | Spike: provider choice on both toolchains, handshake rate, throughput and latency deltas at three value sizes | Numbers in `benchmarks.md`, five repeats, both platforms — and this document corrected wherever they contradict it |
-| **1** | Server-side: `conn::handle` generic, `set_nodelay` moved, `[tls]` config, the second listener, handshake timeout inside the pre-auth budget, `ssl_enabled`, `stats conns`, the five metrics | A real `redis-cli --tls` and a real memcached client with TLS drive the server unchanged; plaintext and TLS ports serve the same store concurrently; a `tls.listen` in a non-`tls` build refuses to start |
+| **0** ✅ | Spike: provider choice on both toolchains, handshake rate, throughput and latency deltas at three value sizes | **Done.** Numbers in [benchmarks.md](benchmarks.md#what-tls-costs), five repeats, both platforms; §4.2, §8.1 and §8.2 corrected against them; one deadlock found (§8.4) |
+| **1** | **First: fix §8.4's write-write deadlock, on both paths.** Then server-side: `conn::handle` generic, `set_nodelay` moved, `[tls]` config, the second listener, handshake timeout inside the pre-auth budget, `ssl_enabled`, `stats conns`, the five metrics | A 1 MiB pipelined batch completes over TLS on both platforms; a real `redis-cli --tls` and a real memcached client with TLS drive the server unchanged; plaintext and TLS ports serve the same store concurrently; a `tls.listen` in a non-`tls` build refuses to start |
 | **2** | Client-side: `vash_client` `Stream` enum, `cluster.tls`, SNI and the IP-peer override | A three-node cluster converges over TLS, including a peer that was down; a bad CA is logged as a configuration error and not as unreachability |
 | **3** | mTLS: `client_auth = "required"`, `mtls:` credential rows, `Identity` from the certificate, `stats conns` showing it | `auth.required = true` is satisfied by a certificate alone; a certificate whose name is not in the table is refused; removing a row and sending `SIGHUP` locks that client out without a restart |
 | **4** | Operations: SIGHUP certificate reload, the expiry metric, the runbook — issuing, rotating, closing the plaintext port, and what each failure looks like from the client side | A certificate renewed under the running server is picked up with no dropped connection; `operations.md` covers the four handshake failure modes by symptom |

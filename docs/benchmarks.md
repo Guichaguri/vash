@@ -905,6 +905,192 @@ decision rests on the writes anyway.
 
 ---
 
+## What TLS costs
+
+Phase 0 of [tls-proposal.md](tls-proposal.md), which proposed TLS and costed it
+from the literature rather than from this box. These are the measurements that
+were supposed to confirm that arithmetic. Two of them contradict it and one of
+them found a deadlock.
+
+Three harnesses, because the question has three shapes:
+
+```bash
+cargo run --release -p vash-bench --example tls_spike            # handshakes and encryption, in isolation
+cargo run --release -p vash-bench --bin load -- --tls            # end to end, against the TLS port
+cargo build --release -p vash-server --features tls              # what the feature costs to ship
+```
+
+One i7-9750H (6 cores / 12 threads): Windows 11 native, and Alpine musl in a
+container on the same machine — the same pair, and the same
+[caveat](#what-this-cannot-tell-you), as the engine comparison above. **Five
+repeats, medians reported with the full range.** `rustls` 0.23.43, TLS 1.3
+only, an ECDSA P-256 leaf under a P-256 CA unless a row says otherwise.
+
+### The build, which was supposed to be the easy part
+
+The proposal assumed `aws-lc-rs` would need `cmake` and NASM and that `ring`
+would need nothing, and recommended `ring` on that basis. Neither half is true.
+`cmake`, `nasm` and `perl` are absent from both toolchains here, and **both
+providers built anyway** — 33s and 96s on Windows, 44s and 115s on musl.
+
+The reason is in `aws-lc-sys`'s build log, and it is worse than a build
+failure:
+
+```
+cargo:warning=Building with: CC
+cargo:rustc-cfg=universal
+```
+
+That is the fallback path: no cmake, so no assembly, so no AES-NI-tuned code —
+a portable C build that compiles anywhere and runs at about half speed. It does
+not warn that it is slower. It does not fail. **The recommendation survives and
+the reasoning does not**: `ring` is still right, not because `aws-lc-rs` cannot
+be built here but because what gets built here is not the `aws-lc-rs` anyone
+means when they benchmark it.
+
+### Handshakes
+
+Microseconds of server CPU per handshake, one thread, both ends driven in
+memory. The socket version of this measured the Windows ephemeral port table
+instead — thousands of connect-and-close cycles a second exhaust it, and each
+one sits in `TIME_WAIT` for two minutes.
+
+| leaf | resumed | Windows `ring` | Windows `aws-lc-rs` | musl `ring` | musl `aws-lc-rs` |
+|---|---|---:|---:|---:|---:|
+| ECDSA P-256 | no | **308 µs** | 749 µs | 528 µs | 621 µs |
+| ECDSA P-256 | yes | 298 µs | 813 µs | 476 µs | 493 µs |
+| RSA-2048 | no | 804 µs | 1,283 µs | 1,133 µs | 1,176 µs |
+| RSA-2048 | yes | 297 µs | 720 µs | 448 µs | 449 µs |
+
+Four things fall out:
+
+1. **auth.md §3.7's "~1 ms" was right for RSA and 3× pessimistic for P-256.**
+   The certificate's key algorithm is the whole variable, and it is chosen when
+   the certificate is issued, not in any configuration file this project owns.
+2. **Resumption erases the difference** — 297 µs for a resumed RSA handshake
+   against 804 µs for a full one — because what resumption skips is the
+   signature. A deployment stuck on RSA gets most of P-256's benefit from
+   tickets alone.
+3. **`ring` beats the no-assembly `aws-lc-rs` by 2.4× on Windows** and by 18% on
+   musl. This is the build finding above, priced.
+4. **Twelve threads buy about 5×, not 12×** (15,587/s against 3,245/s on
+   Windows for full P-256): six physical cores, and public-key arithmetic does
+   not share one well.
+
+### Encryption, by record size
+
+What one core turns into TLS records, with no socket in the path. One record
+per write, because that is what a reply becomes.
+
+| record | Windows GiB/s | ns/record | musl GiB/s | ns/record |
+|---:|---:|---:|---:|---:|
+| 64 B | 0.18 | 336 | 0.12 | 504 |
+| 256 B | 0.57 | 418 | 0.40 | 593 |
+| 1 KiB | 1.17 | 818 | 1.16 | 822 |
+| 4 KiB | 1.86 | 2,053 | 1.79 | 2,132 |
+| 16 KiB | 2.28 | 6,699 | 2.19 | 6,961 |
+
+**The proposal's arithmetic was sound and its framing was wrong.** It predicted
+"a whole core of AES-GCM" at 4 KiB and 1.4 GB/s, and 1.86 GiB/s per core is
+exactly that. But the cost that matters at cache value sizes is not per byte:
+at 64 bytes a record costs 336 ns whatever is in it, so a 64-byte reply pays
+about the same as a 1 KiB one. **Small values are charged per reply, not per
+byte** — and small values are what a cache mostly serves.
+
+### End to end
+
+`GET`, 16 connections, pipeline 128, 20,000 keys, 10 seconds. Medians of five,
+ranges in brackets, TLS as a percentage of plaintext.
+
+| workload | platform | plaintext | TLS | |
+|---|---|---:|---:|---:|
+| 64 B | Windows | 1,908,884 [1.87–2.00M] | 1,739,063 [1.68–1.87M] | **91%** |
+| 64 B | musl | 154,615 [151–177k] | 260,303 [224–274k] | **168%** |
+| 1 KiB | Windows | 1,386,542 [1.16–1.47M] | 875,503 [600–917k] | **63%** |
+| 1 KiB | musl | 194,488 [191–217k] | 132,626 [121–139k] | **68%** |
+| 4 KiB | Windows | 182,979 [137–216k] (n=10) | *did not complete* | — |
+| 4 KiB | musl | 149,262 [142–153k] | 94,380 [65–100k] | **63%** |
+| `SET` 1 KiB | Windows | 43,034 [42.4–45.9k] | 36,604 [29.7–41.0k] (n=4) | 85% |
+| `SET` 1 KiB | musl | 59,974 [58.6–65.7k] | 52,092 [51.7–54.3k] | 87% |
+
+Closed loop, 8 connections, one request in flight:
+
+| platform | plaintext | TLS | p50 |
+|---|---:|---:|---|
+| Windows | 19,335 ops/s | 18,262 (n=4) | 0.328 → 0.346 ms |
+| musl | 13,461 ops/s | 13,624 | 0.329 → 0.330 ms |
+
+**Latency does not move.** At one request in flight the round trip is the whole
+cost and the cryptography disappears into it — 0.330 ms against 0.329 on musl,
+which is not a difference. Anyone whose concern is p99 can stop reading here.
+
+**Throughput moves, by about a third, once values are big enough to pay per
+byte** — 63–68% at 1 KiB and 4 KiB, on both platforms, which is the most stable
+number in this section.
+
+**And at 64 bytes on musl, TLS is 68% *faster* than plaintext.** That is not a
+typo and it reproduced across five repeats in both directions. The likely
+mechanism is batching: rustls buffers into records, so a pipelined client's
+requests arrive in bigger reads and the server measures fewer, larger blocks —
+on a platform where syscalls are expensive enough for that to outweigh 336 ns
+of cryptography per record. It is not chased further here, and it is the one
+row in this section that should not be trusted until it is.
+
+The absolute musl numbers are an order of magnitude below the Windows ones
+(154k against 1.9M) and should not be read as a platform comparison: this is a
+container on a WSL2 VM, both ends of the benchmark are inside it, and the
+[caveat](#what-this-cannot-tell-you) about loopback applies with interest. The
+TLS/plaintext *ratio* within a platform is what transfers.
+
+### The deadlock, which is why one cell above is empty
+
+**Over TLS, a single `write_all` of more than about 256 KiB deadlocks.** It is
+deterministic, and plaintext at the same sizes never does:
+
+```bash
+# hangs, every time
+cargo run --release -p vash-bench --bin load -- --tls --workload set \
+  --value-bytes 4096 --connections 1 --pipeline 64 --duration 3
+```
+
+| one batch | plaintext | TLS |
+|---|---:|---:|
+| 32 × 4 KiB = 128 KiB | 2,911 ops/s | 2,163 ops/s |
+| 64 × 4 KiB = 256 KiB | 2,483 ops/s | **hangs** |
+| 128 × 4 KiB = 512 KiB | 4,724 ops/s | **hangs** |
+| 256 × 4 KiB = 1 MiB | 4,157 ops/s | **hangs** |
+
+Both ends write a whole batch before reading any of it — the load generator
+sends its pipeline and then collects replies; the server reads a block,
+executes it, and writes the whole reply buffer. That is a write-write deadlock
+waiting for a large enough batch, and plaintext survives it only because the
+kernel's socket buffers are big enough to absorb what the other side has not
+read yet. TLS adds its own buffering on both sides and removes that slack.
+
+It explains three things that looked like separate problems: the 4 KiB TLS
+column that cannot be filled, one `SET` and one closed-loop repeat that timed
+out, and an earlier run that hung at exactly `--keys 20000 --value-bytes 1024`,
+where the populate pass writes 256 × 1 KiB — 256 KiB, sitting precisely on the
+threshold.
+
+**This is a defect in the spike, not a property of TLS**, and it has to be
+fixed before any of the TLS work ships: a cache that stalls forever on a large
+pipelined batch is worse than one that does not speak TLS. The fix is for
+phase 1 — read and write concurrently rather than in sequence, on both ends —
+and until it lands the 4 KiB TLS number is unknown rather than bad.
+
+### What the feature costs to ship
+
+| | without `tls` | with `tls` |
+|---|---:|---:|
+| `vash-server.exe` | 2,843,648 B | 3,948,032 B (+39%) |
+| crate rebuild | 53 s | 63 s |
+
+A megabyte of binary and ten seconds of build, which is the cheapest number in
+this section and the argument for the feature flag staying a feature flag.
+
+---
+
 ## What to take from all of this
 
 **Reads are where vash now leads.** Closed loop with `resident_mode`, `GET` is

@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 use vash_proto::memcached::{self, Outcome, ProtocolError};
 use vash_proto::vcp::{FrameLen, peek_frame_len};
@@ -26,8 +25,14 @@ const PRE_AUTH_MAX_BUFFERED: usize = 4096;
 ///
 /// The dialect is settled by the first byte and never revisited — see
 /// [`vash_proto::detect`].
-pub async fn handle(
-    mut stream: TcpStream,
+///
+/// Generic over the stream rather than taking a `TcpStream`, so that the same
+/// loop serves a plaintext socket and a TLS session — the whole of what TLS
+/// costs this module. Monomorphised rather than boxed: the read below runs
+/// once per syscall on every connection, and a vtable there would be paid
+/// forever to save a type parameter.
+pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     state: Arc<ServerState>,
     read_buffer: usize,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -39,10 +44,6 @@ pub async fn handle(
     // accept loop removes it.
     registered: std::sync::Arc<crate::connections::ConnInfo>,
 ) -> std::io::Result<()> {
-    // Cache traffic is small and latency-sensitive; Nagle would batch a reply
-    // against the next one and add up to 40ms for nothing.
-    stream.set_nodelay(true)?;
-
     let mut read_buf = BytesMut::with_capacity(read_buffer);
     let mut write_buf: Vec<u8> = Vec::with_capacity(read_buffer);
     // Held for the life of the connection so measuring a block allocates
