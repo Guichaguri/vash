@@ -112,7 +112,8 @@ impl Server {
             &config.cluster,
             Arc::clone(&store),
             Arc::new(metrics::ClusterMetrics::default()),
-        );
+        )
+        .context("starting the cluster tier")?;
 
         // Loaded before the listener binds: a credential file that will not
         // parse must stop startup, not surface as a refusal on the first

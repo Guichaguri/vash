@@ -43,6 +43,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -77,6 +78,12 @@ struct Peer {
     /// authenticate like any other. Startup refuses a clustered node that has
     /// auth required and no credential here.
     credential: Option<vash_client::Credential>,
+    /// How to verify this peer's certificate, when peers are dialled over TLS.
+    ///
+    /// Per peer rather than per cluster because the name being verified is
+    /// per peer — the CA is shared, the name is not.
+    #[cfg(feature = "tls")]
+    tls: Option<vash_client::TlsConfig>,
     tx: mpsc::Sender<PeerMessage>,
 }
 
@@ -111,11 +118,18 @@ impl Cluster {
     /// Starts the peer connections and the gossip timer.
     ///
     /// Must be called from within the tokio runtime that will serve traffic.
+    /// Starts the peer tasks.
+    ///
+    /// Fallible since M12: with `cluster.tls` the CA bundle is read here, and
+    /// a bundle that will not parse has to stop startup. The alternative is a
+    /// node that comes up healthy and fails every exchange, which reports as
+    /// its peers being unreachable — pointing an operator at the network
+    /// instead of at the file they mistyped.
     pub fn start(
         config: &ClusterConfig,
         store: Arc<dyn Store>,
         metrics: Arc<ClusterMetrics>,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         let mode = ClusterMode::from(config.delete_by_tag);
         let fanout_timeout = Duration::from_millis(config.fanout_timeout_ms);
         let (shutdown, _) = watch::channel(false);
@@ -129,10 +143,27 @@ impl Cluster {
 
         for addr in &config.peers {
             let (tx, rx) = mpsc::channel(config.queue_depth);
+            #[cfg(feature = "tls")]
+            let tls = match config.tls {
+                false => None,
+                true => {
+                    let name = config.tls_name_for(addr);
+                    Some(
+                        vash_client::TlsConfig::new(&config.tls_ca, &name).with_context(|| {
+                            format!(
+                                "building the TLS configuration for peer {addr} (verifying the                                  name {name:?} against {}). Peers named by IP need either                                  certificates with IP SANs or cluster.tls_server_name",
+                                config.tls_ca.display()
+                            )
+                        })?,
+                    )
+                }
+            };
             let peer = Arc::new(Peer {
                 addr: addr.clone(),
                 reachable: AtomicBool::new(false),
                 credential: credential.clone(),
+                #[cfg(feature = "tls")]
+                tls,
                 tx,
             });
             tasks.push(tokio::spawn(peer_loop(
@@ -165,14 +196,14 @@ impl Cluster {
 
         metrics.peers_configured(peers.len() as u64);
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             mode,
             peers,
             fanout_timeout,
             metrics,
             shutdown,
             tasks: std::sync::Mutex::new(tasks),
-        })
+        }))
     }
 
     /// Whether this node propagates invalidations, which is what the `CLUSTER`
@@ -406,6 +437,15 @@ async fn try_exchange(
     for attempt in 0..2 {
         if client.is_none() {
             let connecting = async {
+                #[cfg(feature = "tls")]
+                if let Some(tls) = &peer.tls {
+                    return vash_client::Client::connect_tls(
+                        &peer.addr,
+                        peer.credential.as_ref(),
+                        tls,
+                    )
+                    .await;
+                }
                 match &peer.credential {
                     Some(credential) => {
                         vash_client::Client::connect_with(&peer.addr, credential).await

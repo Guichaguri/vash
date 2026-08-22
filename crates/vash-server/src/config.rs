@@ -434,6 +434,29 @@ pub struct ClusterConfig {
     /// itself healthy. Startup refuses that configuration.
     pub auth_name: String,
     pub auth_secret: String,
+    /// Dial peers over TLS rather than in the clear.
+    ///
+    /// Peers are ordinary VCP clients on the cache port, so this is the client
+    /// half of the same feature `[tls]` serves — and it is why an in-process
+    /// terminator was chosen over a sidecar: peers dial *out*, and a fronting
+    /// proxy would leave this traffic unprotected. It needs the `tls` feature
+    /// and a peer list pointed at the other nodes' TLS ports.
+    pub tls: bool,
+    /// PEM bundle of the CA that issued the peers' certificates.
+    ///
+    /// Required when `tls` is set. There is deliberately no fallback to the
+    /// platform roots: these are internal names with an internal CA, and a
+    /// silent fallback would be a way to trust the wrong issuer.
+    pub tls_ca: PathBuf,
+    /// The name peers' certificates must carry, when it is not the host in
+    /// `peers`.
+    ///
+    /// `peers` holds `host:port` strings, so the name is already there when
+    /// nodes are named by DNS. It is *not* there when they are named by IP: an
+    /// address has no name in it, and a certificate can only match one via an
+    /// IP SAN. Set this to the name one shared certificate carries, or issue
+    /// certificates with IP SANs and leave it empty.
+    pub tls_server_name: String,
 }
 
 impl Default for ClusterConfig {
@@ -446,11 +469,30 @@ impl Default for ClusterConfig {
             queue_depth: 1_024,
             auth_name: String::new(),
             auth_secret: String::new(),
+            tls: false,
+            tls_ca: PathBuf::new(),
+            tls_server_name: String::new(),
         }
     }
 }
 
 impl ClusterConfig {
+    /// The name to verify a peer's certificate against.
+    ///
+    /// The explicit override when there is one, otherwise the host out of the
+    /// peer address — which is the right answer whenever peers are named by
+    /// DNS, and the reason the override exists whenever they are not.
+    pub fn tls_name_for(&self, addr: &str) -> String {
+        if !self.tls_server_name.is_empty() {
+            return self.tls_server_name.clone();
+        }
+        // Rsplit, so an IPv6 literal's colons do not confuse the port split.
+        match addr.rsplit_once(':') {
+            Some((host, _port)) => host.trim_matches(['[', ']']).to_string(),
+            None => addr.to_string(),
+        }
+    }
+
     /// What peer connections should present, if anything.
     pub fn credential(&self) -> Option<(&str, &str)> {
         if self.auth_secret.is_empty() {
@@ -732,6 +774,19 @@ impl Config {
                 || (self.tls.cert.as_os_str().is_empty() && self.tls.key.as_os_str().is_empty()),
             "tls.cert or tls.key is set but tls.listen is empty, so nothing will serve them. \
              Set tls.listen, or clear both"
+        );
+
+        // Same rule as `tls.listen`, for the same reason: a node told to reach
+        // its peers over TLS by a binary that cannot must stop, not fall back
+        // to gossiping tag generations in the clear.
+        #[cfg(not(feature = "tls"))]
+        anyhow::ensure!(
+            !self.cluster.tls,
+            "cluster.tls is set, but this binary was built without the `tls` feature.              Rebuild with `--features tls`, or clear cluster.tls — it will not fall back              to dialling peers in the clear"
+        );
+        anyhow::ensure!(
+            !self.cluster.tls || !self.cluster.tls_ca.as_os_str().is_empty(),
+            "cluster.tls is set but cluster.tls_ca is empty. Peers are verified against an              explicit CA; there is no fallback to the platform roots, because these are              internal names issued by an internal authority"
         );
 
         // Peers are ordinary VCP clients on the ordinary port, so enabling auth

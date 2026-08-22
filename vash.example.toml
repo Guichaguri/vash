@@ -487,6 +487,30 @@ queue_depth = 1024
 auth_name = ""
 auth_secret = ""
 
+
+# Reach peers over TLS. Peers are ordinary VCP clients on the cache port, so
+# this is the client half of [tls] — and it is why termination is in-process
+# rather than a sidecar: peers dial *out*, and a proxy in front of each node
+# would leave this traffic in the clear. Point `peers` at the other nodes' TLS
+# ports when you turn it on, and build with `--features tls`.
+tls = false
+
+# PEM bundle of the CA that issued the peers' certificates. Required when tls
+# is set: peers are verified against an explicit CA, with no fallback to the
+# platform roots, because these are internal names issued by an internal
+# authority and a silent fallback is a way to trust the wrong one.
+tls_ca = ""
+
+# The name peers' certificates must carry, when it is not the host in `peers`.
+#
+# `peers` holds host:port strings, so the name is already there when nodes are
+# named by DNS. It is *not* there when they are named by IP — an address has no
+# name in it, and a certificate can only match one through an IP SAN. Set this
+# to the name a shared certificate carries, or issue per-node certificates with
+# IP SANs and leave it empty. Getting it wrong looks like a handshake failure,
+# which the log reports as a configuration error rather than as an unreachable
+# peer.
+tls_server_name = ""
 [observability]
 log_format = "pretty"   # or "json"
 log_level = "info"      # overridden by RUST_LOG when set

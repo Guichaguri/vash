@@ -55,7 +55,11 @@ mdbx = ["vash-store/mdbx"]
 # configuration. Off by default: a deployment that does not want TLS should not
 # link a TLS stack. A `tls.listen` in a build without this is refused at
 # startup rather than quietly served in the clear — see `Config::validate`.
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+# `vash-client/tls` too: cluster peers are ordinary VCP clients, so the client
+# half is what carries peer traffic over TLS. One feature rather than two,
+# because a server that terminates TLS but gossips in the clear is not a
+# configuration anybody wants.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "vash-client/tls"]
 # Off by default, against plan §2, which expected 10-20% from it on
 # allocation-heavy connection handling. Measured on this workload it is worth
 # nothing: 1.13M against 1.11M ops/s on 64-byte GETs and 537k against 540k on

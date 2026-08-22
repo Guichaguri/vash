@@ -13,6 +13,21 @@ bytes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+# Optional, and `ring` for the reason docs/tls-proposal.md §4.2 records: both
+# providers build unattended on both of this project's toolchains, but
+# aws-lc-sys reaches that by silently falling back to a no-assembly build that
+# halves the handshake rate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[features]
+# Lets a client dial a TLS listener. Off by default so a caller that does not
+# want TLS does not link a TLS stack — the same bargain the server's feature
+# makes. Without it `TlsConfig` does not exist and `connect_tls` is not
+# offered, rather than existing and failing at runtime.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 

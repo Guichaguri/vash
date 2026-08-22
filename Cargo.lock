@@ -1699,8 +1699,11 @@ name = "vash-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "rustls",
+ "rustls-pemfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "vash-core",
  "vash-proto",
 ]

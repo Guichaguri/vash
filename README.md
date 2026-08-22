@@ -52,7 +52,7 @@ Run with `--ephemeral` to start from an empty database, or
 | Cluster tag invalidation | Working — fan-out plus anti-entropy, see [Clustering](#clustering) |
 | `LIST_KEYS`, `LIST_TAGS` | Working — administrative, cursor-paged, glob-filtered, **off unless enabled** |
 | Authentication | Working — credential table, all three dialects, **off unless enabled** |
-| TLS | Working — TLS 1.3 on a second port, **off unless enabled**, and needs `--features tls`. Client certificates and cluster-peer TLS are not built |
+| TLS | Working — TLS 1.3 on a second port, including cluster peers, **off unless enabled**, and needs `--features tls`. `redis-cli --tls` and memcached TLS clients work unchanged. Client certificates are not built |
 
 The legacy memcached **binary** protocol (magic `0x80`) is not implemented and
 will not be: upstream deprecated it in favour of the meta commands.

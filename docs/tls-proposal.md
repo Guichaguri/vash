@@ -758,22 +758,34 @@ hatch is real, in which case this is what it costs, or it should be struck from
 |---|---|---|
 | **0** ✅ | Spike: provider choice on both toolchains, handshake rate, throughput and latency deltas at three value sizes | **Done.** Numbers in [benchmarks.md](benchmarks.md#what-tls-costs), five repeats, both platforms; §4.2, §8.1 and §8.2 corrected against them; one deadlock found (§8.4) |
 | **1** ✅ | The flush of §8.4, then server-side: `conn::handle` generic, `set_nodelay` moved, `[tls]` config, the second listener, handshake timeout inside the pre-auth budget, `ssl_enabled` per connection, `vash_tls` in `stats conns`, four metrics (the certificate-expiry gauge is phase 4, with the reload it belongs to) | **Done.** A 1 MiB pipelined batch completes over TLS in both directions (`tests/tls.rs`); plaintext and TLS ports serve one store concurrently; `ssl_enabled` answers per connection; a `tls.listen` in a non-`tls` build refuses to start. Third-party clients are *not* yet verified — see the note under the table |
-| **2** | Client-side: `vash_client` `Stream` enum, `cluster.tls`, SNI and the IP-peer override | A three-node cluster converges over TLS, including a peer that was down; a bad CA is logged as a configuration error and not as unreachability |
+| **2** ✅ | Client-side: `vash_client` `Stream` enum and `TlsConfig`, `cluster.tls`, the name override for IP-named peers — plus phase 1's carried interoperability criterion | **Done.** A three-node cluster converges over TLS, including a peer that was down when the invalidation happened; a bad CA surfaces as `ClientError::Tls` rather than as unreachability, and an unreadable one stops startup. Third-party clients verified — see below |
 | **3** | mTLS: `client_auth = "required"`, `mtls:` credential rows, `Identity` from the certificate, `stats conns` showing it | `auth.required = true` is satisfied by a certificate alone; a certificate whose name is not in the table is refused; removing a row and sending `SIGHUP` locks that client out without a restart |
 | **4** | Operations: SIGHUP certificate reload, the expiry metric, the runbook — issuing, rotating, closing the plaintext port, and what each failure looks like from the client side | A certificate renewed under the running server is picked up with no dropped connection; `operations.md` covers the four handshake failure modes by symptom |
 
 Phase 1 is the one with value on its own. Phases 2–4 are each worth doing and
 none of them is worth blocking phase 1 on.
 
-**One phase-1 exit criterion is not met.** "A real `redis-cli --tls` and a real
-memcached client with TLS drive the server unchanged" has not been tested: no
-such client is installed on the development machine, and the suite in
-`tests/tls.rs` drives the server with a `rustls` client of our own instead.
-That proves the termination works and proves nothing about interoperability —
-`redis-cli --tls` needs a `tls-port`-shaped configuration and a CA path, and
-the memcached ASCII clients that support TLS are a small subset. It is carried
-into phase 2, where the client work makes a real third-party client necessary
-anyway.
+**Phase 1's carried criterion is now met**, in phase 2, with containers rather
+than local installs. Against a server holding both ports open, certificate from
+`cargo run -p vash-server --example gen_cert`:
+
+```bash
+docker run --rm -v ./certs:/certs:ro redis:7-alpine   redis-cli --tls --cacert /certs/ca.pem -h host.docker.internal -p 11312 PING
+
+docker run --rm -v ./certs:/certs:ro python:3.12-alpine sh -c   "pip install -q pymemcache && python /app/test.py"   # pymemcache with an ssl_context
+```
+
+`redis-cli` 7.4.10 drove `PING`, `SET`/`GET`, `INCR`, `DEL` and a RESP3 `HELLO`
+over TLS unchanged. `pymemcache` drove `set`/`get`, `add`, `incr`, `gets`/`cas`,
+`delete` and `stats settings` over TLS unchanged. Two things worth recording
+from that run:
+
+- **`ssl_enabled` was confirmed per connection by a third party**: `yes` on the
+  TLS port and `no` on the plaintext one, from the same client in the same
+  process, which is the §10 claim checked by something that is not our code.
+- **`SETEX` is not implemented** — `redis-cli` gets `ERR unknown command`. That
+  is a command-coverage gap, not a TLS one: it answers identically on the
+  plaintext port. `SET … EX` and `MSETEX` are what exist.
 
 ---
 

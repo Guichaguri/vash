@@ -400,11 +400,36 @@ A few things worth knowing before you issue the certificate:
 - **The admin port is not covered.** `/metrics` carries no keys or values;
   bind it to loopback.
 
+**Clients need no changes.** `redis-cli --tls --cacert ca.pem` and a
+`pymemcache` client with an `ssl_context` both drive the TLS port unchanged;
+the dialect is still settled by the first byte, after the handshake. For a
+throwaway certificate to try it with:
+
+```bash
+cargo run -p vash-server --example gen_cert -- ./certs
+```
+
+**Cluster peers get it too**, since a peer is an ordinary VCP client:
+
+```toml
+[cluster]
+peers = ["node2.internal:11312", "node3.internal:11312"]
+tls = true
+tls_ca = "/etc/vash/ca.pem"
+# Only when peers are named by IP, which no certificate can match without an
+# IP SAN. Set it to the name a shared certificate carries.
+tls_server_name = ""
+```
+
+A CA that does not match is reported as a configuration error rather than as
+an unreachable peer, and one that cannot be read stops startup — the failure an
+operator would otherwise chase through the network.
+
 What it costs, measured on both platforms: nothing detectable in closed-loop
 latency, and roughly 10–25% of pipelined throughput depending on value size.
 [benchmarks.md](benchmarks.md#what-tls-costs) has the tables; the design, and
-what is deliberately not built yet — client certificates, cluster peers over
-TLS, certificate reload — is in [tls-proposal.md](tls-proposal.md).
+what is deliberately not built yet — client certificates and certificate
+reload — is in [tls-proposal.md](tls-proposal.md).
 
 ---
 

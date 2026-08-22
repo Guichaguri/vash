@@ -34,12 +34,144 @@ pub enum ClientError {
 
     #[error("server speaks protocol version {server}, client speaks {client}")]
     VersionMismatch { server: u16, client: u16 },
+
+    /// The TLS handshake did not complete.
+    ///
+    /// Separate from [`ClientError::Io`] on purpose, and it is the whole
+    /// reason this variant exists: an unknown CA, a certificate that does not
+    /// carry the name being dialled, one that has expired — these are
+    /// configuration errors that a caller must not report as a peer being
+    /// down. The cluster relies on the distinction to log a bad CA as the
+    /// mistake it is rather than marking a healthy node unreachable forever.
+    #[cfg(feature = "tls")]
+    #[error("TLS handshake failed: {0}")]
+    Tls(String),
+}
+
+#[cfg(feature = "tls")]
+impl ClientError {
+    fn tls(error: std::io::Error) -> Self {
+        Self::Tls(error.to_string())
+    }
 }
 
 pub type Result<T, E = ClientError> = std::result::Result<T, E>;
 
+/// What the client is talking over.
+///
+/// An enum rather than a type parameter on [`Client`], which is the opposite
+/// of the choice the server made for `conn::handle`. The reason is the API:
+/// `Client` is public and the cluster holds an `Option<Client>` per peer, so a
+/// type parameter would spread from here into the peer tasks, the cluster's
+/// error type and every caller — to save one branch per syscall on a client
+/// that does one request at a time. The branch is free beside the syscall; the
+/// churn is not.
+enum Stream {
+    Plain(TcpStream),
+    // Boxed because the TLS session is far larger than a socket, and this enum
+    // is as big as its widest variant in every `Client` that exists.
+    #[cfg(feature = "tls")]
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl Stream {
+    async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => {
+                s.write_all(bytes).await?;
+                // A no-op on a socket, and mandatory on a TLS session: see the
+                // note below and `vash_server::conn`.
+                s.flush().await
+            }
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => {
+                s.write_all(bytes).await?;
+                // Not hygiene. `write_all` on a TLS stream means the session
+                // accepted the bytes, not that they reached the socket; an
+                // unflushed tail sits as ciphertext inside `rustls` while both
+                // ends wait on reads. That is the hang recorded in
+                // `docs/tls-proposal.md` §8.4.
+                s.flush().await
+            }
+        }
+    }
+
+    async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read_buf(buf).await,
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => s.read_buf(buf).await,
+        }
+    }
+}
+
+/// How a client verifies the server it dials.
+///
+/// Built once and shared: parsing a CA bundle and constructing a `rustls`
+/// configuration is not per-connection work, and the cluster reconnects to a
+/// peer every time one goes away.
+#[cfg(feature = "tls")]
+#[derive(Clone)]
+pub struct TlsConfig {
+    config: std::sync::Arc<rustls::ClientConfig>,
+    /// The name the certificate has to carry.
+    ///
+    /// Separate from the address because they are different things whenever a
+    /// peer is named by IP: `10.0.0.5:11312` has no name in it, and a
+    /// certificate cannot carry one for it unless it was issued with an IP
+    /// SAN. This is the override for that case.
+    server_name: rustls::pki_types::ServerName<'static>,
+}
+
+#[cfg(feature = "tls")]
+impl TlsConfig {
+    /// Trusts `ca` — a PEM bundle — and expects the server to present
+    /// `server_name`.
+    ///
+    /// The CA is required rather than optional. The deployments this is for
+    /// issue their own: a cache reached over a private network by an internal
+    /// name is not getting a WebPKI certificate, and an `Option` here would
+    /// mean either bundling a root store this crate has no business carrying,
+    /// or a `None` that trusts nothing and fails every handshake.
+    pub fn new(ca: &std::path::Path, server_name: &str) -> Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        let file = std::fs::File::open(ca)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut added = 0;
+        for cert in rustls_pemfile::certs(&mut reader) {
+            roots
+                .add(cert?)
+                .map_err(|_| ClientError::Protocol("the CA bundle holds a bad certificate"))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(ClientError::Protocol(
+                "the CA bundle contains no certificate",
+            ));
+        }
+
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| ClientError::Protocol("TLS 1.3 is not available in this build"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+            .map_err(|_| {
+                ClientError::Protocol("the TLS server name is not a valid DNS name or IP")
+            })?;
+
+        Ok(Self {
+            config: std::sync::Arc::new(config),
+            server_name,
+        })
+    }
+}
+
 pub struct Client {
-    stream: TcpStream,
+    stream: Stream,
     buf: BytesMut,
     next_id: u32,
     info: ServerInfo,
@@ -69,7 +201,7 @@ impl Credential {
 impl Client {
     /// Connects and completes the handshake.
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self> {
-        Self::connect_inner(addr, None).await
+        Self::connect_inner(addr, None, None).await
     }
 
     /// Connects, completes the handshake, and authenticates before returning.
@@ -78,15 +210,53 @@ impl Client {
     /// dead server — which is what lets the cluster log a bad peer credential
     /// as the configuration error it is rather than as unreachability.
     pub async fn connect_with(addr: impl ToSocketAddrs, credential: &Credential) -> Result<Self> {
-        Self::connect_inner(addr, Some(credential)).await
+        Self::connect_inner(addr, Some(credential), None).await
+    }
+
+    /// Connects over TLS, verifying the server against `tls`.
+    ///
+    /// The credential is optional and orthogonal: a deployment can use a
+    /// certificate to protect the wire and a credential to say who is asking,
+    /// which is the pairing docs/auth.md §1 always said mattered. Client
+    /// certificates — where the certificate *is* the identity — are §7 of the
+    /// proposal and not built.
+    #[cfg(feature = "tls")]
+    pub async fn connect_tls(
+        addr: impl ToSocketAddrs,
+        credential: Option<&Credential>,
+        tls: &TlsConfig,
+    ) -> Result<Self> {
+        Self::connect_inner(addr, credential, Some(tls)).await
     }
 
     async fn connect_inner(
         addr: impl ToSocketAddrs,
         credential: Option<&Credential>,
+        #[cfg(feature = "tls")] tls: Option<&TlsConfig>,
+        #[cfg(not(feature = "tls"))] _tls: Option<&()>,
     ) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
+
+        #[cfg(feature = "tls")]
+        let stream = match tls {
+            None => Stream::Plain(stream),
+            Some(tls) => {
+                let connector =
+                    tokio_rustls::TlsConnector::from(std::sync::Arc::clone(&tls.config));
+                // A handshake failure is a configuration error far more often
+                // than a dead peer — an unknown CA, a name the certificate
+                // does not carry — so it must not come back as `Io` and be
+                // read as unreachability. See `ClientError::Tls`.
+                let stream = connector
+                    .connect(tls.server_name.clone(), stream)
+                    .await
+                    .map_err(ClientError::tls)?;
+                Stream::Tls(Box::new(stream))
+            }
+        };
+        #[cfg(not(feature = "tls"))]
+        let stream = Stream::Plain(stream);
 
         let mut client = Self {
             stream,

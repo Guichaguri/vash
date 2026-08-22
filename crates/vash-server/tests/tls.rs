@@ -395,3 +395,312 @@ async fn stats_conns_marks_encrypted_connections() {
          appear: {flags:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2: cluster peers over TLS
+// ---------------------------------------------------------------------------
+
+/// A cluster whose nodes reach each other over TLS.
+///
+/// Peers are listed by `127.0.0.1:port`, which is deliberately the awkward
+/// case: an address carries no name, so the certificate cannot match one
+/// unless it was issued with an IP SAN. `cluster.tls_server_name` is the
+/// override for exactly that, and this exercises it.
+/// One running node: the handle that stops it, and the task serving it.
+struct Node {
+    shutdown: oneshot::Sender<()>,
+    serving: JoinHandle<anyhow::Result<()>>,
+}
+
+struct TlsCluster {
+    plain_addrs: Vec<SocketAddr>,
+    tls_addrs: Vec<SocketAddr>,
+    cert: PathBuf,
+    key: PathBuf,
+    ca: PathBuf,
+    nodes: Vec<Option<Node>>,
+    /// One per node, kept so a stopped node can come back to the same
+    /// database, plus the PKI directory at the end.
+    dirs: Vec<TempDir>,
+}
+
+impl TlsCluster {
+    async fn start(size: usize) -> Self {
+        // One CA and one `localhost` certificate for every node: a shared
+        // certificate is the deployment `tls_server_name` exists for.
+        let pki_dir = tempfile::tempdir().unwrap();
+        let (cert, key, _) = issue(pki_dir.path());
+        // `issue` writes the chain leaf-first with the CA appended, so the
+        // chain file doubles as the CA bundle a client verifies against.
+        let ca = cert.clone();
+
+        // Reserve the ports before anything starts: every node's peer list
+        // names the others, so the addresses have to exist first.
+        let mut held = Vec::new();
+        for _ in 0..size * 2 {
+            held.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        }
+        let addrs: Vec<SocketAddr> = held.iter().map(|l| l.local_addr().unwrap()).collect();
+        drop(held);
+        let (plain_addrs, tls_addrs) = addrs.split_at(size);
+
+        let mut dirs = Vec::new();
+        for _ in 0..size {
+            dirs.push(tempfile::tempdir().unwrap());
+        }
+        // The PKI directory has to outlive the nodes, which read it at boot
+        // and — for the CA — on every peer connection.
+        dirs.push(pki_dir);
+
+        let mut cluster = Self {
+            plain_addrs: plain_addrs.to_vec(),
+            tls_addrs: tls_addrs.to_vec(),
+            cert,
+            key,
+            ca,
+            nodes: (0..size).map(|_| None).collect(),
+            dirs,
+        };
+        for index in 0..size {
+            cluster.spawn(index).await;
+        }
+        cluster
+    }
+
+    /// Starts (or restarts) one node against its own database directory.
+    async fn spawn(&mut self, index: usize) {
+        let size = self.tls_addrs.len();
+        let peers: Vec<String> = self
+            .tls_addrs
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, addr)| addr.to_string())
+            .collect();
+
+        let mut config = Config::default();
+        config.server.listen = self.plain_addrs[index];
+        config.store.path = self.dirs[index].path().join("db");
+        config.store.map_size_mb = 64;
+        config.store.shards = 1;
+        config.observability.admin_listen = String::new();
+        config.tls.listen = self.tls_addrs[index].to_string();
+        config.tls.cert = self.cert.clone();
+        config.tls.key = self.key.clone();
+        config.cluster.peers = peers;
+        config.cluster.tls = true;
+        config.cluster.tls_ca = self.ca.clone();
+        // The peers are IPs, so the name has to come from here.
+        config.cluster.tls_server_name = "localhost".into();
+        config.cluster.gossip_interval_ms = 100;
+        config.cluster.fanout_timeout_ms = 1_000;
+        let _ = size;
+
+        let server = Server::bind(config).await.expect("binding a TLS node");
+        let (tx, rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve(async {
+                    let _ = rx.await;
+                })
+                .await
+        });
+        self.nodes[index] = Some(Node {
+            shutdown: tx,
+            serving: handle,
+        });
+    }
+
+    fn tls_config(&self) -> vash_client::TlsConfig {
+        vash_client::TlsConfig::new(&self.ca, "localhost").expect("client TLS config")
+    }
+
+    async fn client(&self, index: usize) -> vash_client::Client {
+        vash_client::Client::connect_tls(&self.tls_addrs[index], None, &self.tls_config())
+            .await
+            .expect("connecting to a node over TLS")
+    }
+
+    async fn stop(&mut self, index: usize) {
+        if let Some(node) = self.nodes[index].take() {
+            drop(node.shutdown);
+            let _ = tokio::time::timeout(DEADLINE, node.serving).await;
+        }
+    }
+}
+
+/// The phase 2 exit criterion: invalidation converges across three nodes with
+/// every peer connection encrypted.
+#[tokio::test]
+async fn invalidation_converges_across_a_tls_cluster() {
+    let mut cluster = TlsCluster::start(3).await;
+
+    // Each node holds its own key under a shared tag, which is the case a
+    // single-node invalidation gets wrong.
+    for index in 0..3 {
+        let mut client = cluster.client(index).await;
+        client
+            .set_tagged(
+                format!("node{index}-article").as_bytes(),
+                b"body",
+                0,
+                &[b"homepage".as_slice()],
+            )
+            .await
+            .expect("writing a tagged key over TLS");
+    }
+
+    cluster
+        .client(0)
+        .await
+        .delete_by_tag(b"homepage")
+        .await
+        .expect("invalidating over TLS");
+
+    // Fan-out is asynchronous, so this is a convergence assertion rather than
+    // an immediate one.
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        let mut converged = true;
+        for index in 0..3 {
+            let mut client = cluster.client(index).await;
+            if client
+                .get(format!("node{index}-article").as_bytes())
+                .await
+                .expect("reading over TLS")
+                .is_some()
+            {
+                converged = false;
+            }
+        }
+        if converged {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the invalidation never reached every node over TLS"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    for index in 0..3 {
+        cluster.stop(index).await;
+    }
+}
+
+/// A bad CA is a configuration error, and has to read as one.
+///
+/// This is the failure the `ClientError::Tls` variant exists for: without it a
+/// handshake rejection arrives as an `Io` error and a node reports its peers
+/// as unreachable, pointing an operator at the network instead of at the file
+/// they mistyped.
+#[tokio::test]
+async fn a_ca_that_does_not_match_is_refused_as_configuration() {
+    let server = TestServer::start().await;
+
+    // A perfectly valid CA, for somebody else's certificate.
+    let other = tempfile::tempdir().unwrap();
+    let (wrong_ca, _, _) = issue(other.path());
+
+    let tls = vash_client::TlsConfig::new(&wrong_ca, "localhost").expect("a parseable CA");
+    let error = match vash_client::Client::connect_tls(&server.tls, None, &tls).await {
+        Err(error) => error,
+        Ok(_) => panic!("a certificate from an unknown CA must not be accepted"),
+    };
+
+    assert!(
+        matches!(error, vash_client::ClientError::Tls(_)),
+        "a handshake rejection must be distinguishable from a dead peer, or the cluster \
+         reports a misconfigured CA as unreachability: {error:?}"
+    );
+}
+
+/// An unreadable CA file stops startup rather than surfacing later as every
+/// peer being unreachable.
+#[tokio::test]
+async fn a_cluster_with_an_unreadable_ca_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.server.listen = "127.0.0.1:0".parse().unwrap();
+    config.store.path = dir.path().join("db");
+    config.store.map_size_mb = 64;
+    config.store.shards = 1;
+    config.observability.admin_listen = String::new();
+    config.cluster.peers = vec!["127.0.0.1:1".into()];
+    config.cluster.tls = true;
+    config.cluster.tls_ca = dir.path().join("nothing-here.pem");
+    config.cluster.tls_server_name = "localhost".into();
+
+    let error = match Server::bind(config).await {
+        Err(error) => error,
+        Ok(_) => panic!("a missing CA must stop startup"),
+    };
+    let chain = format!("{error:#}");
+    assert!(
+        chain.contains("nothing-here.pem") || chain.contains("cluster"),
+        "the error has to name what could not be read: {chain}"
+    );
+}
+
+/// The other half of the phase 2 criterion: a peer that was *down* when the
+/// invalidation happened still converges once it comes back.
+///
+/// Fan-out cannot reach a node that is not listening, so this is anti-entropy's
+/// job — and anti-entropy runs over the same encrypted peer connections. A node
+/// that came back would otherwise keep serving keys the rest of the cluster has
+/// already invalidated, which is the failure mode that is invisible until
+/// somebody reads stale data.
+#[tokio::test]
+async fn a_peer_that_was_down_converges_over_tls() {
+    let mut cluster = TlsCluster::start(3).await;
+
+    for index in 0..3 {
+        let mut client = cluster.client(index).await;
+        client
+            .set_tagged(
+                format!("node{index}-article").as_bytes(),
+                b"body",
+                0,
+                &[b"homepage".as_slice()],
+            )
+            .await
+            .expect("writing a tagged key over TLS");
+    }
+
+    // Node 2 misses the invalidation entirely.
+    cluster.stop(2).await;
+
+    cluster
+        .client(0)
+        .await
+        .delete_by_tag(b"homepage")
+        .await
+        .expect("invalidating while a peer is down");
+
+    cluster.spawn(2).await;
+
+    // It has its old database back, so the key is still there until gossip
+    // tells it otherwise.
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        let served = cluster
+            .client(2)
+            .await
+            .get(b"node2-article")
+            .await
+            .expect("reading from the restarted node over TLS")
+            .is_some();
+        if !served {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "anti-entropy never reached the restarted node over TLS"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    for index in 0..3 {
+        cluster.stop(index).await;
+    }
+}
