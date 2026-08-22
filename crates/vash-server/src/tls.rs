@@ -13,8 +13,10 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
+use rustls::pki_types::UnixTime;
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{Auth, Identity};
@@ -99,6 +101,75 @@ pub fn acceptor(config: &TlsConfig) -> anyhow::Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(server)))
 }
 
+/// The acceptor in use, swappable while the server is running.
+///
+/// A whole acceptor behind a lock rather than a `ResolvesServerCert` reading a
+/// swapped key: rebuilding is a file read and a parse, it happens on a signal
+/// rather than per handshake, and this way *every* part of the configuration a
+/// reload could change — the chain, the key, the client CA — is replaced
+/// together instead of only the pieces a resolver can reach.
+///
+/// Read once per accepted connection, which is a read lock against a signal
+/// that arrives approximately never. Existing connections are untouched: a
+/// session holds the parameters it handshook with, so a reload cannot
+/// interrupt traffic in flight.
+#[derive(Clone)]
+pub struct Reloadable {
+    acceptor: Arc<std::sync::RwLock<TlsAcceptor>>,
+}
+
+impl Reloadable {
+    pub fn new(acceptor: TlsAcceptor) -> Self {
+        Self {
+            acceptor: Arc::new(std::sync::RwLock::new(acceptor)),
+        }
+    }
+
+    /// The acceptor to hand the next connection.
+    pub fn current(&self) -> TlsAcceptor {
+        // Cheap: `TlsAcceptor` is an `Arc` inside, so this clones a pointer
+        // and drops the lock before the handshake starts.
+        self.acceptor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn replace(&self, acceptor: TlsAcceptor) {
+        *self
+            .acceptor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = acceptor;
+    }
+}
+
+/// Reads the chain and reports when it expires, for the gauge.
+///
+/// Failure here is never fatal — a certificate the server is already serving
+/// with is not made unusable by our inability to date it — so this logs and
+/// reports `0` rather than refusing to start.
+pub fn record_expiry(config: &TlsConfig, metrics: &crate::metrics::ServerMetrics) {
+    let expiry = read_chain(&config.cert)
+        .ok()
+        .and_then(|chain| expiry(&chain));
+    match expiry {
+        Some(at) => {
+            metrics.tls_cert_expires_at(at.as_secs());
+            tracing::info!(
+                unix_seconds = at.as_secs(),
+                "the TLS certificate chain is valid until"
+            );
+        }
+        None => {
+            metrics.tls_cert_expires_at(0);
+            tracing::warn!(
+                cert = %config.cert.display(),
+                "could not determine when the TLS certificate expires; it may already have.                  vash_tls_cert_expiry_timestamp_seconds reports 0"
+            );
+        }
+    }
+}
+
 /// Resolves a verified client certificate to the identity that holds it.
 ///
 /// The chain is already verified by the time this runs — `rustls` refused the
@@ -128,4 +199,101 @@ pub fn identity_for(
         };
         parsed.verify_is_valid_for_subject_name(&name).is_ok()
     })
+}
+
+/// Ten years. The upper bound of the search below, and a ceiling on what the
+/// gauge will report: nothing issues a certificate longer than this, and a
+/// deployment that somehow has one does not need an expiry alert.
+const MAX_LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+/// When this chain stops verifying, as a Unix timestamp.
+///
+/// `None` when it does not verify *now* — an expired certificate, one not yet
+/// valid, or a chain that does not lead to its own last element. The caller
+/// logs that; there is no sensible number for it.
+///
+/// # Why this is a search and not a field read
+///
+/// The obvious implementation reads `notAfter` off the leaf, and the obvious
+/// way to do that is `x509-parser` — which would add eight crates to a binary
+/// that exists to serve a cache, on the one code path that faces strangers,
+/// to read a single field. `webpki` is already here verifying the chain, and
+/// it takes the time as a parameter, so asking it *when* the answer changes
+/// costs no dependency at all.
+///
+/// It also answers a slightly better question. `notAfter` on the leaf is not
+/// when the deployment breaks if an intermediate expires first; the boundary
+/// found here is the whole chain's, which is what an operator wants to be
+/// alerted about.
+///
+/// Roughly thirty verifications, at a few tens of microseconds each, once at
+/// startup and once per reload. Never on a request path.
+pub fn expiry(chain: &[rustls::pki_types::CertificateDer<'static>]) -> Option<UnixTime> {
+    let (leaf, intermediates) = chain.split_first()?;
+    let parsed = webpki::EndEntityCert::try_from(leaf).ok()?;
+
+    // The last certificate in the chain is the anchor. For a self-contained
+    // chain that is the CA; for one that stops at an intermediate it is that
+    // intermediate, and the boundary found is still the first expiry along the
+    // path we can see.
+    let anchor_der = chain.last()?;
+    let anchor = webpki::anchor_from_trusted_cert(anchor_der).ok()?;
+    let anchors = [anchor];
+    // An anchor that is also the leaf must not appear as its own intermediate.
+    let intermediates = match intermediates.is_empty() {
+        true => &[][..],
+        false => &intermediates[..intermediates.len() - 1],
+    };
+
+    let verifies_at = |at: UnixTime| {
+        parsed
+            .verify_for_usage(
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .all,
+                &anchors,
+                intermediates,
+                at,
+                webpki::KeyUsage::server_auth(),
+                None,
+                None,
+            )
+            .is_ok()
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    if !verifies_at(UnixTime::since_unix_epoch(now)) {
+        return None;
+    }
+
+    // Invariant: `good` verifies and `bad` does not. Halve until they are a
+    // second apart, and `good` is the last second the chain is usable.
+    let mut good = now.as_secs();
+    let mut bad = now.as_secs() + MAX_LIFETIME.as_secs();
+    if verifies_at(UnixTime::since_unix_epoch(Duration::from_secs(bad))) {
+        // Longer-lived than the ceiling. Report the ceiling rather than
+        // searching further: the difference does not change any decision.
+        return Some(UnixTime::since_unix_epoch(Duration::from_secs(bad)));
+    }
+    while bad - good > 1 {
+        let middle = good + (bad - good) / 2;
+        if verifies_at(UnixTime::since_unix_epoch(Duration::from_secs(middle))) {
+            good = middle;
+        } else {
+            bad = middle;
+        }
+    }
+    Some(UnixTime::since_unix_epoch(Duration::from_secs(good)))
+}
+
+/// Reads the certificate chain alone, for [`expiry`].
+pub fn read_chain(
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    rustls_pemfile::certs(&mut BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("reading {}", path.display()))
 }

@@ -460,6 +460,15 @@ Three things to know:
   be absent identifies nobody. A client that presents none is refused by the
   handshake, before any protocol byte is read.
 
+**Rotating a certificate does not need a restart** on Unix: write the new files
+over the old paths and send `SIGHUP`. Connections already open keep working —
+a TLS session holds what it handshook with — and the swap applies to the next
+handshake. A reload that fails keeps the certificate in use rather than taking
+the listener down. Alert on
+`vash_tls_cert_expiry_timestamp_seconds - time() < 7 * 86400`;
+[operations.md](operations.md#running-with-tls) is the runbook, including what
+each kind of handshake failure looks like from both ends.
+
 What it costs, measured on both platforms: nothing detectable in closed-loop
 latency, and roughly 10–25% of pipelined throughput depending on value size.
 [benchmarks.md](benchmarks.md#what-tls-costs) has the tables; the design, and

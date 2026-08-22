@@ -448,6 +448,12 @@ pub struct ServerMetrics {
     /// operator sees when a new service has been issued a certificate but not
     /// yet added to the table, which is the ordinary rollout mistake.
     pub tls_identity_rejected: AtomicU64,
+    /// When the certificate chain in use stops verifying, as a Unix timestamp.
+    ///
+    /// `0` means it does not verify *now* — expired, not yet valid, or a chain
+    /// that does not lead to its own anchor. That is deliberately the same
+    /// value as "the epoch": any alert worth writing fires on both.
+    pub tls_cert_expiry: AtomicU64,
     /// How long completed handshakes took.
     pub tls_handshake_latency: Histogram,
 
@@ -495,6 +501,7 @@ impl Default for ServerMetrics {
             tls_handshake_rejected: AtomicU64::new(0),
             tls_handshake_timeouts: AtomicU64::new(0),
             tls_identity_rejected: AtomicU64::new(0),
+            tls_cert_expiry: AtomicU64::new(0),
             tls_handshake_latency: Histogram::default(),
             auth_ok: AtomicU64::new(0),
             auth_failed: AtomicU64::new(0),
@@ -553,6 +560,12 @@ impl ServerMetrics {
 
     pub fn tls_identity_rejected(&self) {
         self.tls_identity_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records when the certificate now in use expires. Called at startup and
+    /// on every reload, never on a request path.
+    pub fn tls_cert_expires_at(&self, unix_seconds: u64) {
+        self.tls_cert_expiry.store(unix_seconds, Ordering::Relaxed);
     }
 
     pub fn auth_ok(&self) {
@@ -775,6 +788,17 @@ pub fn render_prometheus(
     server
         .tls_handshake_latency
         .render(&mut out, "vash_tls_handshake_seconds", "");
+
+    // A timestamp rather than a remaining duration, which is the convention
+    // every other exporter of this follows — the alert is written as
+    // `vash_tls_cert_expiry_timestamp_seconds - time() < 7 * 86400`, and a
+    // gauge that counted down would go stale between scrapes instead.
+    metric!(
+        "vash_tls_cert_expiry_timestamp_seconds",
+        "gauge",
+        "When the certificate chain in use stops verifying. 0 means it does          not verify now — expired, not yet valid, or an incomplete chain.",
+        load(&server.tls_cert_expiry).to_string(),
+    );
 
     metric!(
         "vash_commands_total",

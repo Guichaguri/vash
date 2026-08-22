@@ -45,24 +45,10 @@ reached a parser — so authentication decides who may *use* the cache, not who
 may read it in flight. Turning it on adds a layer; it does not replace the
 firewall rule. See [auth.md](auth.md) for the design and the rollout.
 
-**What covers the wire is TLS**, on a second port, in a binary built with
-`--features tls`:
-
-```toml
-[tls]
-listen = "0.0.0.0:11312"
-cert = "/etc/vash/cert.pem"   # PEM chain, leaf first
-key = "/etc/vash/key.pem"
-```
-
-Both ports serve the same store, so a rollout moves clients across one at a
-time and then empties `server.listen`. Watch `vash_tls` in `stats conns`, or
-`vash_tls_connections_active` against `vash_connections_active`, to see what is
-still arriving in the clear. Prefer an ECDSA P-256 certificate: the server
-signs once per full handshake, and that is 308µs against RSA-2048's 804µs —
-see [benchmarks.md](benchmarks.md#what-tls-costs). A `tls.listen` in a binary
-built without the feature refuses to start rather than serving that port
-unencrypted. The design is in [tls-proposal.md](tls-proposal.md).
+**What covers the wire is TLS**, on a second port. Turning it on, rotating a
+certificate, closing the plaintext port and reading a failed handshake are all
+below, under [Running with TLS](#running-with-tls). The design is in
+[tls-proposal.md](tls-proposal.md).
 
 **The admin port serves nothing until you name an address**, with
 `observability.admin_listen` or `--admin-listen 127.0.0.1:9090`. It has no
@@ -220,6 +206,127 @@ configurations qualify — ext4 with `data=ordered`, XFS, ZFS. If yours reorders
 writes, you have `ephemeral`'s risk without `ephemeral`'s wipe, and should set
 `durability = "relaxed"`.
 
+## Running with TLS
+
+Off by default, and it needs a binary built with `--features tls`. A
+`tls.listen` in one built without it refuses to start rather than serving that
+port in the clear.
+
+### Issuing a certificate
+
+Whatever already issues your internal certificates should issue this one. Two
+properties matter:
+
+- **The name clients dial must be in a Subject Alternative Name.** Not the
+  Common Name — nothing here consults it, and neither does anything else made
+  in the last decade.
+- **Prefer ECDSA P-256 over RSA-2048.** The server signs once per full
+  handshake: 308 µs against 804 µs, measured
+  ([benchmarks](benchmarks.md#what-tls-costs)). It is fixed when the
+  certificate is issued and no setting can undo it later.
+
+For a throwaway certificate to try it with — development only, no revocation,
+no trust chain to anything:
+
+```bash
+cargo run -p vash-server --example gen_cert -- ./certs
+```
+
+### Turning it on
+
+```toml
+[tls]
+listen = "0.0.0.0:11312"
+cert = "/etc/vash/cert.pem"   # PEM chain, leaf first, then intermediates
+key = "/etc/vash/key.pem"     # PKCS#8 or SEC1
+```
+
+Both ports now serve the same store, which is what makes the rollout gradual:
+
+1. Turn on the TLS listener. Nothing else changes; the plaintext port keeps
+   serving.
+2. Move clients across one at a time. Watch `vash_tls_connections_active`
+   against `vash_connections_active`, or `stats conns`, whose `vash_tls`
+   column says per connection what is still arriving in the clear.
+3. When they agree, empty `server.listen` and restart. **That** is what makes
+   the deployment encrypted-only — a socket that does not exist is a stronger
+   statement than a policy flag.
+
+Cluster peers are ordinary clients, so they need the same treatment: point
+`cluster.peers` at the other nodes' TLS ports and set `cluster.tls`, with
+`cluster.tls_ca`. Peers named by IP need `cluster.tls_server_name`, because an
+address carries no name for a certificate to match.
+
+### Rotating a certificate
+
+Write the new files over the old paths and send `SIGHUP`:
+
+```bash
+systemctl reload vash        # or: kill -HUP $(pidof vash-server)
+```
+
+One signal reloads the credential table and the certificate together, because
+they rotate together. What happens:
+
+- **Connections already open are untouched.** A TLS session holds the
+  parameters it handshook with; the swap applies to the next handshake. No
+  traffic is interrupted, and there is no drain.
+- **A reload that fails keeps what is running.** A half-written file during a
+  renewal logs an error and changes nothing — the listener does not go down for
+  a bad file.
+- `vash_tls_cert_expiry_timestamp_seconds` updates, which is how you confirm
+  the new certificate is the one in use.
+
+**On Windows there is no `SIGHUP`**, so rotation there means a restart.
+
+### Alert on the expiry
+
+```
+vash_tls_cert_expiry_timestamp_seconds - time() < 7 * 86400
+```
+
+A timestamp rather than a countdown, which is what every other exporter of this
+does. **`0` means the chain does not verify right now** — expired, not yet
+valid, or missing an intermediate — and the expression above fires on that too,
+which is the intent.
+
+### When a handshake fails
+
+**They are logged at `debug`.** At the default level a failed handshake is
+silent, because an open port collects unsuccessful connections and logging each
+one at `info` is how you stop reading logs. The metric is the signal:
+
+```
+vash_tls_handshake_failures_total{reason="rejected"}     # the client refused ours, or we refused theirs
+vash_tls_handshake_failures_total{reason="timeout"}      # opened a socket, never finished
+vash_tls_handshake_failures_total{reason="no_identity"}  # a valid certificate matching no credential row
+```
+
+For the detail, run with `RUST_LOG=vash_server=debug`. What each failure looks
+like from both ends, measured with `redis-cli`:
+
+| What is wrong | The client sees | The server logs (`debug`) |
+|---|---|---|
+| Client does not know the CA, or has the wrong one | `SSL_connect failed: certificate verify failed` | `TLS handshake failed error=received fatal alert: UnknownCA` |
+| Plaintext client on the TLS port | `Protocol error, got "\x15" as reply type byte` — the `\x15` is a TLS alert record | `TLS handshake failed error=received corrupt message of type InvalidContentType` |
+| TLS client on the plaintext port | `SSL_connect failed: unexpected eof while reading` | `closing connection: unrecognised protocol` |
+| Name not in the certificate's SANs | `SSL_connect failed: certificate verify failed`, naming the host | nothing — the client rejects it before the server learns why |
+| Client certificate required, none presented | connection closed after the handshake appears to succeed | `TLS handshake failed` |
+| Client certificate valid, subject in no `mtls:` row | connection closed with no error | `closing a TLS connection: the client certificate matches no credential row` |
+
+The last two are the mTLS pair, and the difference matters: the first is a
+client that was never issued a certificate, the second is one that was, but
+which this deployment has not been told about — the ordinary rollout mistake.
+`vash_tls_handshake_failures_total{reason="no_identity"}` counts only the
+second.
+
+Two of these are symmetrical and easy to confuse. **A client speaking plaintext
+to the TLS port** gets a protocol error mentioning `\x15`, because what it is
+reading is a TLS alert. **A client speaking TLS to the plaintext port** gets an
+unexpected EOF, because the server's dialect detection saw `0x16`, recognised
+nothing, and closed. Check which port the client is pointed at before anything
+else.
+
 ## Monitoring
 
 `/metrics` (Prometheus), `/health` and `/stats` (JSON) on the admin port, which
@@ -238,6 +345,8 @@ up but not doing its job, which is what a load balancer needs to know.
 | `vash_errors_total{class="overloaded"}` | The write queue is full | The writer is saturated: shard, or slow down |
 | `vash_cluster_last_exchange_age_ms` > a few gossip intervals | This node is drifting from its peers | Check peer reachability |
 | `vash_cluster_peers_reachable` < `vash_cluster_peers` | A peer is down; its invalidations are not arriving | Check that node |
+| `vash_tls_cert_expiry_timestamp_seconds - time() < 7 * 86400` | The certificate expires within a week, or (at `0`) does not verify now | Renew and `SIGHUP`. This is the one that takes the port down at a predictable time if ignored |
+| `vash_tls_handshake_failures_total{reason="no_identity"}` rising | A client holds a valid certificate that matches no `mtls:` row — usually a service issued a certificate but not added to the credential file | Add the row and `SIGHUP`, or find out whose certificate it is |
 
 ### Watch, but do not alert
 

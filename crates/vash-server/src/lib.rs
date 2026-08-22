@@ -40,7 +40,7 @@ pub struct Server {
     /// accept arm below waits forever on nothing.
     tls: Option<TcpListener>,
     #[cfg(feature = "tls")]
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_acceptor: Option<tls::Reloadable>,
     admin: Option<TcpListener>,
     state: Arc<ServerState>,
     config: Config,
@@ -215,9 +215,13 @@ impl Server {
         #[cfg(feature = "tls")]
         let tls_acceptor = match config.tls.enabled() {
             false => None,
-            true => Some(tls::acceptor(&config.tls).with_context(|| {
-                format!("loading the TLS certificate for {}", config.tls.listen)
-            })?),
+            true => {
+                let acceptor = tls::acceptor(&config.tls).with_context(|| {
+                    format!("loading the TLS certificate for {}", config.tls.listen)
+                })?;
+                tls::record_expiry(&config.tls, &state.metrics);
+                Some(tls::Reloadable::new(acceptor))
+            }
         };
 
         let tls = match config.tls.enabled() {
@@ -272,6 +276,17 @@ impl Server {
         self.tls.as_ref().and_then(|l| l.local_addr().ok())
     }
 
+    /// The swappable TLS acceptor, when there is a TLS listener.
+    ///
+    /// Exposed so a test can drive the swap `SIGHUP` performs without the
+    /// signal, which does not exist on every platform this builds for. It is
+    /// also the seam an embedder would use to reload on something other than a
+    /// signal — a file watch, or a control endpoint.
+    #[cfg(feature = "tls")]
+    pub fn tls_reloadable(&self) -> Option<tls::Reloadable> {
+        self.tls_acceptor.clone()
+    }
+
     pub fn admin_addr(&self) -> Option<std::net::SocketAddr> {
         self.admin.as_ref().and_then(|l| l.local_addr().ok())
     }
@@ -321,9 +336,13 @@ impl Server {
         // Joined before the store is closed below: a detached task holding an
         // `Arc<ServerState>` would keep the LMDB environment open past
         // shutdown.
-        let reload_task = spawn_credential_reload(
+        let reload_task = spawn_reload(
             Arc::clone(&state),
             config.auth.clone(),
+            #[cfg(feature = "tls")]
+            config.tls.clone(),
+            #[cfg(feature = "tls")]
+            tls_acceptor.clone(),
             conn_stopped.clone(),
         );
 
@@ -383,8 +402,10 @@ impl Server {
                     let registered = conn_state.connections.open(peer);
                     // Cloned per connection, which is an `Arc` bump: the
                     // acceptor is shared configuration, not per-session state.
+                    // Read per connection, so a reload takes effect on the
+                    // next handshake without touching the ones in flight.
                     #[cfg(feature = "tls")]
-                    let acceptor = tls_acceptor.clone();
+                    let acceptor = tls_acceptor.as_ref().map(tls::Reloadable::current);
                     #[cfg(feature = "tls")]
                     let handshake_timeout =
                         std::time::Duration::from_millis(config.tls.handshake_timeout_ms);
@@ -646,9 +667,11 @@ async fn serve_encrypted(
 /// start on a bad file is right, because nothing is serving yet; swapping in an
 /// empty table because someone truncated the file mid-edit is not.
 #[cfg(unix)]
-fn spawn_credential_reload(
+fn spawn_reload(
     state: Arc<ServerState>,
     config: config::AuthConfig,
+    #[cfg(feature = "tls")] tls_config: config::TlsConfig,
+    #[cfg(feature = "tls")] tls_acceptor: Option<tls::Reloadable>,
     mut stopping: tokio::sync::watch::Receiver<bool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -657,7 +680,7 @@ fn spawn_credential_reload(
         Ok(stream) => stream,
         Err(e) => {
             // Not fatal: the server works, it just cannot be told to reload.
-            error!(error = %e, "could not listen for SIGHUP; credential reload is disabled");
+            error!(error = %e, "could not listen for SIGHUP; reload is disabled");
             return None;
         }
     };
@@ -665,13 +688,38 @@ fn spawn_credential_reload(
     Some(tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = hangup.recv() => match auth::Auth::load(&config) {
-                    Ok(reloaded) => {
-                        state.auth.replace(reloaded);
-                        info!("reloaded the credential table");
+                _ = hangup.recv() => {
+                    match auth::Auth::load(&config) {
+                        Ok(reloaded) => {
+                            state.auth.replace(reloaded);
+                            info!("reloaded the credential table");
+                        }
+                        Err(e) => error!(error = %format!("{e:#}"), "credential reload failed; keeping the table in use"),
                     }
-                    Err(e) => error!(error = %format!("{e:#}"), "credential reload failed; keeping the table in use"),
-                },
+
+                    // One signal reloads both, because they rotate together:
+                    // an operator renewing a certificate and adding the
+                    // service that uses it should not have to know which
+                    // signal does which.
+                    #[cfg(feature = "tls")]
+                    if let Some(holder) = &tls_acceptor {
+                        match tls::acceptor(&tls_config) {
+                            Ok(acceptor) => {
+                                holder.replace(acceptor);
+                                tls::record_expiry(&tls_config, &state.metrics);
+                                info!("reloaded the TLS certificate");
+                            }
+                            // Keeping the old certificate is the whole point:
+                            // a half-written file during a renewal must not
+                            // take the listener down, and the server carries
+                            // on with what it already had.
+                            Err(e) => error!(
+                                error = %format!("{e:#}"),
+                                "TLS certificate reload failed; keeping the one in use"
+                            ),
+                        }
+                    }
+                }
                 _ = stopping.changed() => return,
             }
         }
@@ -681,9 +729,11 @@ fn spawn_credential_reload(
 /// Windows has no `SIGHUP`. Rotation there means a restart, which is what the
 /// two-step rollout already tolerates.
 #[cfg(not(unix))]
-fn spawn_credential_reload(
+fn spawn_reload(
     _state: Arc<ServerState>,
     _config: config::AuthConfig,
+    #[cfg(feature = "tls")] _tls_config: config::TlsConfig,
+    #[cfg(feature = "tls")] _tls_acceptor: Option<tls::Reloadable>,
     _stopping: tokio::sync::watch::Receiver<bool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     None

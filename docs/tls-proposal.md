@@ -708,16 +708,23 @@ and has nothing else.
 | `tls_handshake_failures_total{reason}` | Expired cert, unknown CA, no shared version, timeout — four different operator actions, and they must not be one counter |
 | `tls_handshake_seconds` | A histogram, beside the M10 latency ones |
 | `tls_connections`, beside plaintext connections | The rollout gauge: this is how an operator knows it is safe to close the plain port |
-| `tls_cert_expiry_seconds` | The one metric that prevents the outage everybody eventually has. A gauge, alerted well before zero |
+| `vash_tls_cert_expiry_timestamp_seconds` | The one metric that prevents the outage everybody eventually has. A *timestamp*, not a countdown — the convention every other exporter follows, so the standard alert expression works. `0` means the chain does not verify now, and the same alert fires on it |
 
 **Certificate reload on SIGHUP**, reusing the credential reload that already
-exists (`spawn_credential_reload`, `lib.rs:424`). Certificates expire every 90
-days under ACME; a cache that must be restarted to pick up a renewal will
-eventually not be restarted in time. Mechanically this is a certificate
-resolver reading an `Arc` that the existing reload task swaps, and a reload that
-fails to parse must **keep the old certificate and log loudly** rather than
-leave the listener with none — the same shape the credential reload already
-uses.
+exists. Certificates expire every 90 days under ACME; a cache that must be
+restarted to pick up a renewal will eventually not be restarted in time.
+
+*As built:* one signal reloads both, because they rotate together — an operator
+renewing a certificate and adding the service that uses it should not have to
+know which signal does which. The swap is a whole `TlsAcceptor` behind a lock
+rather than the certificate resolver sketched here: rebuilding is a file read
+and a parse on a signal that arrives approximately never, and this way every
+part of the configuration a reload could change — chain, key, client CA — is
+replaced together instead of only the pieces a resolver can reach. It is read
+once per accepted connection, so **an established session is untouched**: it
+holds the parameters it handshook with, and a reload cannot interrupt traffic
+in flight. A reload that fails keeps the old certificate and logs, which is the
+behaviour that matters during a renewal that writes a file in two steps.
 
 ---
 
@@ -760,10 +767,23 @@ hatch is real, in which case this is what it costs, or it should be struck from
 | **1** ✅ | The flush of §8.4, then server-side: `conn::handle` generic, `set_nodelay` moved, `[tls]` config, the second listener, handshake timeout inside the pre-auth budget, `ssl_enabled` per connection, `vash_tls` in `stats conns`, four metrics (the certificate-expiry gauge is phase 4, with the reload it belongs to) | **Done.** A 1 MiB pipelined batch completes over TLS in both directions (`tests/tls.rs`); plaintext and TLS ports serve one store concurrently; `ssl_enabled` answers per connection; a `tls.listen` in a non-`tls` build refuses to start. Third-party clients are *not* yet verified — see the note under the table |
 | **2** ✅ | Client-side: `vash_client` `Stream` enum and `TlsConfig`, `cluster.tls`, the name override for IP-named peers — plus phase 1's carried interoperability criterion | **Done.** A three-node cluster converges over TLS, including a peer that was down when the invalidation happened; a bad CA surfaces as `ClientError::Tls` rather than as unreachability, and an unreadable one stops startup. Third-party clients verified — see below |
 | **3** ✅ | mTLS: `client_auth = "required"`, `mtls:` credential rows, `Identity` from the certificate, `vash_auth_method` in `stats conns`. **`identity_from = "cn"` was dropped** — see below | **Done.** `auth.required` is satisfied by a certificate alone, with no `AUTH` and no secret anywhere; a certificate the CA signed for a name nobody claims is refused; a client with no certificate is refused by the handshake; removing a row drops the identity from the reloaded table. Verified with `redis-cli --cert/--key` and `pymemcache` with a client `ssl_context` |
-| **4** | Operations: SIGHUP certificate reload, the expiry metric, the runbook — issuing, rotating, closing the plaintext port, and what each failure looks like from the client side | A certificate renewed under the running server is picked up with no dropped connection; `operations.md` covers the four handshake failure modes by symptom |
+| **4** ✅ | Operations: `SIGHUP` reloads the certificate beside the credential table, an expiry gauge, and the runbook | **Done.** A certificate replaced under a running server is served to the next handshake while an established session keeps working; `operations.md` has six failure modes by symptom, measured from both ends rather than guessed, and the alert expressions. `SIGHUP` itself is Unix-only, so the tests drive the swap the signal performs |
 
 Phase 1 is the one with value on its own. Phases 2–4 are each worth doing and
 none of them is worth blocking phase 1 on.
+
+**On the expiry gauge, which §10 asked for without saying how.** Reading
+`notAfter` means an X.509 parser, and the obvious one — `x509-parser` — brings
+eight crates into a binary that exists to serve a cache, on the code path that
+faces strangers, for a single field. `webpki` is already linked to verify the
+chain and it takes the time as a parameter, so the boundary can be found by
+asking it *when the answer changes*: about thirty verifications, once at
+startup and once per reload, never on a request path. It also answers a
+slightly better question — the first expiry anywhere along the chain, rather
+than the leaf's, which is what actually takes the port down. The gauge is named
+`..._timestamp_seconds` rather than `..._seconds` because it reports an
+absolute time, which is the convention the ecosystem's alert expressions
+assume.
 
 **Phase 1's carried criterion is now met**, in phase 2, with containers rather
 than local installs. Against a server holding both ports open, certificate from

@@ -56,7 +56,10 @@ struct TestServer {
     plain: SocketAddr,
     tls: SocketAddr,
     ca: rustls::pki_types::CertificateDer<'static>,
-    _dir: TempDir,
+    cert: PathBuf,
+    key: PathBuf,
+    reloadable: Option<vash_server::tls::Reloadable>,
+    dir: TempDir,
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -75,12 +78,13 @@ impl TestServer {
         config.store.shards = 1;
         config.observability.admin_listen = String::new();
         config.tls.listen = "127.0.0.1:0".into();
-        config.tls.cert = cert;
-        config.tls.key = key;
+        config.tls.cert = cert.clone();
+        config.tls.key = key.clone();
 
         let server = Server::bind(config).await.expect("binding");
         let plain = server.local_addr().unwrap();
         let tls = server.tls_addr().expect("a TLS listener");
+        let reloadable = server.tls_reloadable();
         let (tx, rx) = oneshot::channel();
         let handle = tokio::spawn(async move {
             server
@@ -94,10 +98,36 @@ impl TestServer {
             plain,
             tls,
             ca,
-            _dir: dir,
+            cert,
+            key,
+            reloadable,
+            dir,
             shutdown: Some(tx),
             handle: Some(handle),
         }
+    }
+
+    fn dir_path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    fn cert_path(&self) -> PathBuf {
+        self.cert.clone()
+    }
+
+    /// The configuration a reload reads, pointing at the same paths the server
+    /// was started with — which is what a renewal writes over.
+    fn tls_config_for_reload(&self) -> vash_server::config::TlsConfig {
+        vash_server::config::TlsConfig {
+            listen: self.tls.to_string(),
+            cert: self.cert.clone(),
+            key: self.key.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn acceptor(&self) -> &vash_server::tls::Reloadable {
+        self.reloadable.as_ref().expect("a TLS listener")
     }
 
     /// A client that trusts exactly the CA this server was issued from, so a
@@ -1071,4 +1101,224 @@ async fn a_client_with_no_certificate_is_refused() {
         refused,
         "a connection with no client certificate must not be served"
     );
+}
+
+/// The expiry probe finds the real boundary, not an approximation of one.
+///
+/// `rcgen` is told exactly when the certificate stops being valid, so the
+/// search has a known right answer to hit.
+#[test]
+fn expiry_finds_the_certificates_notafter() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+
+    // Ninety days, which is what ACME issues.
+    let not_after = std::time::SystemTime::now() + Duration::from_secs(90 * 24 * 60 * 60);
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut leaf = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    leaf.not_after = not_after.into();
+    let cert = leaf
+        .signed_by(&leaf_key, &rcgen::Issuer::new(ca_params, ca_key))
+        .unwrap();
+
+    let chain = vec![cert.der().clone(), ca.der().clone()];
+    let found = vash_server::tls::expiry(&chain).expect("a valid chain has an expiry");
+
+    let expected = not_after
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        found.as_secs().abs_diff(expected) <= 1,
+        "the search must land on notAfter: found {}, expected {expected}",
+        found.as_secs()
+    );
+}
+
+/// An expired chain has no expiry to report, and must not be reported as
+/// expiring at some arbitrary point in the future.
+#[test]
+fn an_expired_certificate_has_no_expiry() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut leaf = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    leaf.not_before = (std::time::SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 2)).into();
+    leaf.not_after = (std::time::SystemTime::now() - Duration::from_secs(60 * 60)).into();
+    let cert = leaf
+        .signed_by(&leaf_key, &rcgen::Issuer::new(ca_params, ca_key))
+        .unwrap();
+
+    let chain = vec![cert.der().clone(), ca.der().clone()];
+    assert!(
+        vash_server::tls::expiry(&chain).is_none(),
+        "an expired chain has no usable expiry"
+    );
+}
+
+/// Phase 4's exit criterion: a certificate renewed under the running server is
+/// picked up, and the connections already open are not disturbed.
+///
+/// `SIGHUP` itself is Unix-only, so what this drives is the swap the signal
+/// performs. That is the half worth testing: the signal is three lines, and
+/// the question that matters is whether replacing the acceptor takes effect on
+/// the next handshake without touching a session in flight.
+#[tokio::test]
+async fn a_renewed_certificate_is_picked_up_without_dropping_a_connection() {
+    let server = TestServer::start().await;
+
+    // A connection established under the old certificate, kept open across
+    // the reload and used again afterwards.
+    let mut existing = server.connect_tls().await;
+    existing.hello().await;
+    existing.set(b"before:reload", b"value").await;
+
+    // Re-issue into the same paths, as a renewal would.
+    let (cert, key, new_ca) = issue(server.dir_path());
+    assert_eq!(cert, server.cert_path(), "the renewal must land in place");
+    let _ = key;
+
+    let reloaded = vash_server::tls::acceptor(&server.tls_config_for_reload())
+        .expect("the renewed certificate must load");
+    server.acceptor().replace(reloaded);
+
+    // The connection opened before the swap keeps working: a TLS session holds
+    // the parameters it handshook with, so nothing about it changed.
+    let (status, body) = existing.get(b"before:reload").await;
+    assert_eq!(
+        status,
+        Status::Ok,
+        "an established session survives a reload"
+    );
+    assert!(body.ends_with(b"value"));
+    existing.set(b"after:reload", b"still here").await;
+
+    // A new connection gets the new certificate, and the old CA no longer
+    // verifies it — which is what says the swap actually happened.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(new_ca).unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+
+    let stream = TcpStream::connect(server.tls).await.expect("connecting");
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let stream = tokio::time::timeout(
+        DEADLINE,
+        tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, stream),
+    )
+    .await
+    .expect("the handshake timed out")
+    .expect("the renewed certificate must be served to new connections");
+
+    let mut fresh = Conn::new(stream);
+    fresh.hello().await;
+    let (status, body) = fresh.get(b"after:reload").await;
+    assert_eq!(status, Status::Ok);
+    assert!(body.ends_with(b"still here"));
+}
+
+/// The expiry gauge is what an operator actually sees, so it is checked the
+/// way they would see it: scraped off `/metrics`.
+///
+/// This is the metric §10 called "the one that prevents the outage everybody
+/// eventually has", and a gauge that is wired up wrong is indistinguishable
+/// from a certificate that never expires.
+#[tokio::test]
+async fn metrics_report_when_the_certificate_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key, _) = issue(dir.path());
+
+    let mut config = Config::default();
+    config.server.listen = "127.0.0.1:0".parse().unwrap();
+    config.store.path = dir.path().join("db");
+    config.store.map_size_mb = 64;
+    config.store.shards = 1;
+    config.observability.admin_listen = "127.0.0.1:0".into();
+    config.tls.listen = "127.0.0.1:0".into();
+    config.tls.cert = cert;
+    config.tls.key = key;
+
+    let server = Server::bind(config).await.expect("binding");
+    let admin = server.admin_addr().expect("an admin endpoint");
+    let (tx, rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        server
+            .serve(async {
+                let _ = rx.await;
+            })
+            .await
+    });
+
+    let mut stream = TcpStream::connect(admin).await.expect("connecting");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .expect("writing");
+    // Read until the connection closes, which the admin endpoint does after
+    // one response — but bounded, so a hang fails the test instead of it.
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&chunk[..n]);
+                    // The body is self-delimiting enough for a test: once the
+                    // gauge is in what arrived, there is nothing left to wait
+                    // for.
+                    if raw
+                        .windows(38)
+                        .any(|w| w == b"vash_tls_cert_expiry_timestamp_seconds")
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("scraping timed out");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("vash_tls_cert_expiry_timestamp_seconds "))
+        .unwrap_or_else(|| {
+            panic!(
+                "the expiry gauge is not exported:
+{text}"
+            )
+        });
+    let seconds: u64 = line
+        .rsplit(' ')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("unparseable gauge: {line}"));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        seconds > now,
+        "a certificate issued moments ago must expire in the future: {seconds} vs {now}"
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(DEADLINE, handle).await;
 }
