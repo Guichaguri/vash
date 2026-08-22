@@ -318,6 +318,8 @@ server.
 | `<id>:secs_since_last_cmd` | now minus the connection's last command |
 | `<id>:vash_dialect` | `vcp`, `memcached` or `resp` |
 | `<id>:vash_authenticated` | `yes` / `no` |
+| `<id>:vash_tls` | `yes` / `no` — whether this connection arrived on the TLS port and completed a handshake. The rollout's progress bar: an operator closing the plaintext port needs to see, per connection, what is still arriving in the clear |
+| `<id>:vash_auth_method` | `none`, `password` or `certificate` — *how* the identity was established. During an mTLS rollout the question is not whether a client authenticated but which mechanism it used, and no aggregate can say which connection is still using a password |
 
 `<id>` is a monotonic connection id, not a file descriptor. Upstream's is an fd
 and is reused as fds are; a client correlating two `stats conns` calls is better

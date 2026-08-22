@@ -380,6 +380,28 @@ pub struct TlsConfig {
     /// round trips, so a peer that cannot finish one in three seconds is not
     /// going to, and it is holding a pre-auth slot while it tries.
     pub handshake_timeout_ms: u64,
+    /// Whether clients must present a certificate, and be identified by it.
+    ///
+    /// There is deliberately no "optional": a certificate that may be absent
+    /// identifies nobody, and a mode where half the connections have an
+    /// identity is one an operator cannot reason about. Ask for nothing, or
+    /// require and verify.
+    pub client_auth: ClientAuth,
+    /// PEM bundle of the CA that issued the client certificates. Required when
+    /// `client_auth` is `required`.
+    pub client_ca: PathBuf,
+}
+
+/// Whether the server asks clients for a certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientAuth {
+    /// Ask for nothing. Clients authenticate with a credential, or not at all.
+    #[default]
+    None,
+    /// Refuse any connection that does not present a certificate this server's
+    /// `client_ca` issued, and whose subject is not in the credential table.
+    Required,
 }
 
 impl Default for TlsConfig {
@@ -389,6 +411,8 @@ impl Default for TlsConfig {
             cert: PathBuf::new(),
             key: PathBuf::new(),
             handshake_timeout_ms: 3_000,
+            client_auth: ClientAuth::None,
+            client_ca: PathBuf::new(),
         }
     }
 }

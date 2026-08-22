@@ -43,6 +43,14 @@ pub struct ConnInfo {
     /// thing an operator closing the plaintext port has to be able to check,
     /// and nothing else in the server can answer it per connection.
     tls: AtomicBool,
+    /// Whether the identity came from a client certificate rather than an
+    /// `AUTH` command.
+    ///
+    /// Reported beside `vash_authenticated` rather than folded into it: during
+    /// an mTLS rollout the question is not whether a client authenticated but
+    /// *how*, and an aggregate cannot say which connection is still using a
+    /// password.
+    certificate_identity: AtomicBool,
     /// Milliseconds since the registry's epoch, at the last command.
     last_command_ms: AtomicU64,
 }
@@ -79,6 +87,22 @@ impl ConnInfo {
 
     pub fn is_tls(&self) -> bool {
         self.tls.load(Ordering::Relaxed)
+    }
+
+    /// Records that the TLS handshake, not an `AUTH` command, said who this
+    /// is.
+    pub fn authenticated_by_certificate(&self) {
+        self.certificate_identity.store(true, Ordering::Relaxed);
+    }
+
+    fn auth_method(&self) -> &'static str {
+        if self.certificate_identity.load(Ordering::Relaxed) {
+            "certificate"
+        } else if self.authenticated.load(Ordering::Relaxed) {
+            "password"
+        } else {
+            "none"
+        }
     }
 
     fn dialect_name(&self) -> &'static str {
@@ -127,6 +151,7 @@ impl Registry {
             dialect: AtomicU8::new(UNDETECTED),
             authenticated: AtomicBool::new(false),
             tls: AtomicBool::new(false),
+            certificate_identity: AtomicBool::new(false),
             last_command_ms: AtomicU64::new(self.epoch.elapsed().as_millis() as u64),
         });
         self.lock().insert(info.id, Arc::clone(&info));
@@ -197,6 +222,7 @@ impl Registry {
                         "no".into()
                     },
                 ),
+                (format!("{id}:vash_auth_method"), info.auth_method().into()),
             ]);
         }
 

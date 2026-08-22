@@ -45,6 +45,12 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
+# Named directly, though rustls already pulls it in, because mTLS needs one
+# thing from it that rustls does not re-export: matching a name against a
+# certificate's Subject Alternative Names, with the wildcard rules that go
+# with it. The alternative was an X.509 parser of our own or a second one as a
+# dependency, to re-derive what the library verifying the chain already knows.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"], optional = true }
 
 [features]
 # Builds the libmdbx backend into the binary, making `store.backend = "mdbx"`
@@ -59,7 +65,7 @@ mdbx = ["vash-store/mdbx"]
 # half is what carries peer traffic over TLS. One feature rather than two,
 # because a server that terminates TLS but gossips in the clear is not a
 # configuration anybody wants.
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "vash-client/tls"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki", "vash-client/tls"]
 # Off by default, against plan §2, which expected 10-20% from it on
 # allocation-heavy connection handling. Measured on this workload it is worth
 # nothing: 1.13M against 1.11M ops/s on 64-byte GETs and 537k against 540k on

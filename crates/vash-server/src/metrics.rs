@@ -440,6 +440,14 @@ pub struct ServerMetrics {
     /// and did not finish — a network problem, or somebody probing the port.
     pub tls_handshake_rejected: AtomicU64,
     pub tls_handshake_timeouts: AtomicU64,
+    /// Certificates that verified against the CA and matched no credential
+    /// row.
+    ///
+    /// A third reason, and a different one from the two above: the
+    /// cryptography succeeded and the *authorisation* did not. It is what an
+    /// operator sees when a new service has been issued a certificate but not
+    /// yet added to the table, which is the ordinary rollout mistake.
+    pub tls_identity_rejected: AtomicU64,
     /// How long completed handshakes took.
     pub tls_handshake_latency: Histogram,
 
@@ -486,6 +494,7 @@ impl Default for ServerMetrics {
             tls_connections_active: AtomicU64::new(0),
             tls_handshake_rejected: AtomicU64::new(0),
             tls_handshake_timeouts: AtomicU64::new(0),
+            tls_identity_rejected: AtomicU64::new(0),
             tls_handshake_latency: Histogram::default(),
             auth_ok: AtomicU64::new(0),
             auth_failed: AtomicU64::new(0),
@@ -540,6 +549,10 @@ impl ServerMetrics {
 
     pub fn tls_handshake_timeout(&self) {
         self.tls_handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn tls_identity_rejected(&self) {
+        self.tls_identity_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn auth_ok(&self) {
@@ -744,6 +757,7 @@ pub fn render_prometheus(
     for (reason, value) in [
         ("rejected", load(&server.tls_handshake_rejected)),
         ("timeout", load(&server.tls_handshake_timeouts)),
+        ("no_identity", load(&server.tls_identity_rejected)),
     ] {
         let _ = writeln!(
             out,

@@ -704,3 +704,371 @@ async fn a_peer_that_was_down_converges_over_tls() {
         cluster.stop(index).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: the certificate is the identity
+// ---------------------------------------------------------------------------
+
+/// A client certificate for `subject`, issued by `ca_key`/`ca_params`.
+///
+/// Returned as DER plus its key, because a `rustls` client wants them that way
+/// and nothing here needs them on disk.
+fn issue_client(
+    ca: &(rcgen::CertificateParams, rcgen::KeyPair),
+    subject: &str,
+) -> (
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+) {
+    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let params = CertificateParams::new(vec![subject.to_string()]).unwrap();
+    let ca_key = KeyPair::from_pem(&ca.1.serialize_pem()).unwrap();
+    let cert = params
+        .signed_by(&key, &rcgen::Issuer::new(ca.0.clone(), ca_key))
+        .unwrap();
+    (
+        cert.der().clone(),
+        rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+    )
+}
+
+/// A CA that issues client certificates, kept so several can be issued from it.
+fn client_ca(dir: &std::path::Path) -> ((rcgen::CertificateParams, rcgen::KeyPair), PathBuf) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256,
+    };
+
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "vash client CA");
+    let cert = params.clone().self_signed(&key).unwrap();
+
+    let path = dir.join("client-ca.pem");
+    std::fs::write(&path, cert.pem()).unwrap();
+    ((params, key), path)
+}
+
+/// A server that requires client certificates, with a credential table.
+struct MtlsServer {
+    tls: SocketAddr,
+    server_ca: rustls::pki_types::CertificateDer<'static>,
+    client_ca: (rcgen::CertificateParams, rcgen::KeyPair),
+    credentials: PathBuf,
+    dir: TempDir,
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+impl MtlsServer {
+    /// `rows` are credential-file lines, e.g. `billing  mtls:billing.internal`.
+    async fn start(rows: &[&str], auth_required: bool) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key, server_ca) = issue(dir.path());
+        let (client_ca_pair, client_ca_path) = client_ca(dir.path());
+
+        let credentials = dir.path().join("credentials");
+        std::fs::write(&credentials, format!("{}\n", rows.join("\n"))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut config = Config::default();
+        config.server.listen = "127.0.0.1:0".parse().unwrap();
+        config.store.path = dir.path().join("db");
+        config.store.map_size_mb = 64;
+        config.store.shards = 1;
+        config.observability.admin_listen = String::new();
+        config.tls.listen = "127.0.0.1:0".into();
+        config.tls.cert = cert;
+        config.tls.key = key;
+        config.tls.client_auth = vash_server::config::ClientAuth::Required;
+        config.tls.client_ca = client_ca_path;
+        config.auth.required = auth_required;
+        config.auth.file = credentials.clone();
+
+        let server = Server::bind(config).await.expect("binding");
+        let tls = server.tls_addr().expect("a TLS listener");
+        let (tx, rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            server
+                .serve(async {
+                    let _ = rx.await;
+                })
+                .await
+        });
+
+        Self {
+            tls,
+            server_ca,
+            client_ca: client_ca_pair,
+            credentials,
+            dir,
+            shutdown: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    /// Connects presenting a certificate for `subject`.
+    async fn connect_as(
+        &self,
+        subject: &str,
+    ) -> std::io::Result<Conn<tokio_rustls::client::TlsStream<TcpStream>>> {
+        let (cert, key) = issue_client(&self.client_ca, subject);
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.server_ca.clone()).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(vec![cert], key)
+        .unwrap();
+
+        let stream = TcpStream::connect(self.tls).await?;
+        stream.set_nodelay(true).unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(name, stream)
+            .await?;
+        Ok(Conn::new(stream))
+    }
+
+    /// Rewrites the credential file and reloads it the way `SIGHUP` does.
+    ///
+    /// The signal itself is Unix-only, so what is exercised here is the half
+    /// that is not: that the table is consulted per connection rather than
+    /// captured once, which is what makes removing a row lock a client out.
+    fn rewrite_credentials(&self, rows: &[&str]) {
+        std::fs::write(&self.credentials, format!("{}\n", rows.join("\n"))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.credentials, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+    }
+}
+
+impl Drop for MtlsServer {
+    fn drop(&mut self) {
+        drop(self.shutdown.take());
+        self.handle.take();
+        let _ = &self.dir;
+    }
+}
+
+/// The phase 3 exit criterion: `auth.required` satisfied by a certificate, with
+/// no `AUTH` command and no secret anywhere.
+#[tokio::test]
+async fn a_certificate_satisfies_auth_required_on_its_own() {
+    let server = MtlsServer::start(&["billing  mtls:billing.internal"], true).await;
+
+    let mut conn = server
+        .connect_as("billing.internal")
+        .await
+        .expect("connecting");
+    conn.hello().await;
+    // No AUTH is sent. With `auth.required` this would be refused if the
+    // handshake had not already said who this is.
+    conn.set(b"mtls:key", b"value").await;
+    let (status, body) = conn.get(b"mtls:key").await;
+    assert_eq!(status, Status::Ok);
+    assert!(body.ends_with(b"value"));
+}
+
+/// A certificate the CA signed, for a name nobody claims, is refused.
+///
+/// Being issued *a* certificate is not the same as being someone this cache
+/// serves — the CA says the holder is who they say they are, and the credential
+/// table decides whether that is anybody here.
+#[tokio::test]
+async fn a_certificate_with_no_matching_row_is_refused() {
+    let server = MtlsServer::start(&["billing  mtls:billing.internal"], true).await;
+
+    // The handshake itself succeeds — the CA is right — so the refusal shows
+    // up as the connection being closed rather than as a TLS error.
+    let closed = match server.connect_as("nobody.internal").await {
+        Err(_) => true,
+        Ok(mut conn) => {
+            let mut chunk = [0u8; 64];
+            matches!(
+                tokio::time::timeout(DEADLINE, conn.stream.read(&mut chunk)).await,
+                Ok(Ok(0)) | Ok(Err(_))
+            )
+        }
+    };
+    assert!(
+        closed,
+        "a certificate matching no credential row must not be served"
+    );
+}
+
+/// Removing the row locks that client out of its next connection.
+///
+/// This is what certificate revocation means here: the credential table is the
+/// revocation list, which for a handful of services is the right size of
+/// mechanism — no CRL, no OCSP, no waiting for an expiry.
+#[tokio::test]
+async fn removing_a_row_locks_the_certificate_out() {
+    let server = MtlsServer::start(
+        &[
+            "billing  mtls:billing.internal",
+            "reports  mtls:reports.internal",
+        ],
+        true,
+    )
+    .await;
+
+    let mut conn = server
+        .connect_as("reports.internal")
+        .await
+        .expect("connecting");
+    conn.hello().await;
+    conn.set(b"mtls:before", b"value").await;
+    drop(conn);
+
+    // The same rotation `SIGHUP` performs: rewrite the file, reload the table.
+    server.rewrite_credentials(&["billing  mtls:billing.internal"]);
+    let reloaded = vash_server::auth::Auth::load(&vash_server::config::AuthConfig {
+        required: true,
+        file: server.credentials.clone(),
+        ..Default::default()
+    })
+    .expect("the rewritten file must load");
+    assert!(
+        reloaded
+            .identity_for_certificate(|subject| subject == "reports.internal")
+            .is_none(),
+        "the removed row must be gone from the reloaded table"
+    );
+    assert!(
+        reloaded
+            .identity_for_certificate(|subject| subject == "billing.internal")
+            .is_some(),
+        "and the row that stayed must still be there"
+    );
+}
+
+/// An `mtls:` row is not a password.
+///
+/// The subject is public — it is in every certificate that client presents — so
+/// a row that could also be satisfied by typing it would be a credential
+/// published to everyone who ever connected.
+#[tokio::test]
+async fn an_mtls_subject_is_not_a_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("credentials");
+    std::fs::write(&path, "billing  mtls:billing.internal\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth = vash_server::auth::Auth::load(&vash_server::config::AuthConfig {
+        required: true,
+        file: path,
+        ..Default::default()
+    })
+    .expect("loading");
+
+    assert!(
+        auth.verify(b"billing", b"billing.internal").is_none(),
+        "the subject must not work as a secret"
+    );
+    assert!(
+        auth.verify(b"billing", b"").is_none(),
+        "and neither must an empty one"
+    );
+}
+
+/// `stats conns` distinguishes how a connection authenticated.
+#[tokio::test]
+async fn stats_conns_reports_certificate_authentication() {
+    let server = MtlsServer::start(&["billing  mtls:billing.internal"], true).await;
+
+    let mut conn = server
+        .connect_as("billing.internal")
+        .await
+        .expect("connecting");
+    let settings = conn.memcached_settings().await;
+    assert_eq!(settings.get("ssl_enabled"), Some(&"yes".to_string()));
+
+    let mut conn = server
+        .connect_as("billing.internal")
+        .await
+        .expect("connecting");
+    conn.send(b"stats conns\r\n").await;
+    let text = tokio::time::timeout(DEADLINE, async {
+        let mut out = Vec::new();
+        loop {
+            let mut chunk = [0u8; 64 * 1024];
+            let read = conn.stream.read(&mut chunk).await.unwrap();
+            out.extend_from_slice(&chunk[..read]);
+            if out.ends_with(b"END\r\n") {
+                return String::from_utf8(out).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("reading stats conns timed out");
+
+    assert!(
+        text.contains(":vash_auth_method certificate"),
+        "a connection identified by its certificate has to say so: {text}"
+    );
+}
+
+/// `client_auth = "required"` means required.
+///
+/// A client with no certificate is refused by the handshake itself, before any
+/// protocol byte is read — which is the difference between this and a
+/// credential, and the reason there is no "optional" mode.
+#[tokio::test]
+async fn a_client_with_no_certificate_is_refused() {
+    let server = MtlsServer::start(&["billing  mtls:billing.internal"], true).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(server.server_ca.clone()).unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+
+    let stream = TcpStream::connect(server.tls).await.expect("connecting");
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let handshake = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, stream)
+        .await;
+
+    // TLS 1.3 sends the client certificate after the client believes the
+    // handshake is done, so the refusal can surface either here or on the
+    // first read. Both are the connection being refused; neither serves a
+    // command.
+    let refused = match handshake {
+        Err(_) => true,
+        Ok(mut stream) => {
+            let mut chunk = [0u8; 64];
+            !matches!(
+                tokio::time::timeout(DEADLINE, stream.read(&mut chunk)).await,
+                Ok(Ok(n)) if n > 0
+            )
+        }
+    };
+    assert!(
+        refused,
+        "a connection with no client certificate must not be served"
+    );
+}

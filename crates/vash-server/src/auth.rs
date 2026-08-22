@@ -135,12 +135,20 @@ impl ConnAuth {
 }
 
 /// One row of the credential table.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Credential {
     mechanism: Mechanism,
     /// A digest for [`Mechanism::Plain`]; the key itself for
     /// [`Mechanism::HmacSha256`].
     value: [u8; 32],
+    /// The certificate subject this row accepts, for an `mtls:` row.
+    ///
+    /// `Some` exactly when the row is satisfied by the TLS handshake instead
+    /// of by an `AUTH` command. Such a row holds no secret at all: the subject
+    /// is public, and what proves the client owns it is a certificate chain
+    /// the configured CA signed. Presenting the subject as a password gets
+    /// nowhere, because [`Auth::verify`] only ever looks at `value`.
+    subject: Option<Box<str>>,
 }
 
 /// The credential table, plus whether it is being enforced.
@@ -183,6 +191,7 @@ impl Auth {
                     DEFAULT_NAME.as_bytes().into(),
                     Credential {
                         mechanism: Mechanism::Plain,
+                        subject: None,
                         value: sha256(secret),
                     },
                 );
@@ -214,6 +223,7 @@ impl Auth {
             Credential {
                 mechanism: Mechanism::Plain,
                 value: sha256(secret),
+                subject: None,
             },
         );
         Self { required, table }
@@ -234,11 +244,47 @@ impl Auth {
         !self.table.is_empty()
     }
 
+    /// Finds the identity whose `mtls:` subject `matches` accepts.
+    ///
+    /// The predicate is supplied by the caller rather than evaluated here, and
+    /// that is the seam: matching a name against a certificate is X.509 work —
+    /// SAN entries, wildcard rules, encodings — and this module has no
+    /// business knowing any of it. `crate::tls` hands in a closure backed by
+    /// `webpki`; this walks the rows.
+    ///
+    /// Linear in the number of `mtls:` rows, once per connection. The table is
+    /// a handful of services, and each candidate costs a certificate parse, so
+    /// an index would trade a real cost for an imaginary one.
+    pub fn identity_for_certificate(&self, matches: impl Fn(&str) -> bool) -> Option<Identity> {
+        for (name, credential) in &self.table {
+            let Some(subject) = &credential.subject else {
+                continue;
+            };
+            if matches(subject) {
+                return Some(Identity(
+                    String::from_utf8_lossy(name)
+                        .into_owned()
+                        .into_boxed_str()
+                        .into(),
+                ));
+            }
+        }
+        None
+    }
+
     /// Verifies a `PLAIN` attempt. `None` on any failure, deliberately without
     /// saying which — an error that distinguishes an unknown name from a bad
     /// secret confirms which names exist.
     pub fn verify(&self, name: &[u8], secret: &[u8]) -> Option<Identity> {
         let credential = self.table.get(name)?;
+        if credential.subject.is_some() {
+            // An `mtls:` row is satisfied by a handshake, never by a password.
+            // Its subject is public, so without this a client could
+            // authenticate as that identity by typing its own certificate's
+            // name — the same trap `hmac-sha256-key` rows are guarded against
+            // below, for the same reason.
+            return None;
+        }
         if credential.mechanism != Mechanism::Plain {
             // The stored value is a raw HMAC key. Accepting it here would make
             // it a password.
@@ -484,7 +530,28 @@ fn parse_credential(field: &str) -> anyhow::Result<Credential> {
         "sha256" => Ok(Credential {
             mechanism: Mechanism::Plain,
             value: parse_hex32(value)?,
+            subject: None,
         }),
+
+        // A certificate subject rather than a secret. The row says "whoever
+        // presents a certificate for this name, issued by tls.client_ca, is
+        // this identity" — so there is nothing here to keep secret and nothing
+        // to hash.
+        "mtls" => {
+            ensure!(
+                !value.is_empty(),
+                "`mtls:` needs a certificate subject, e.g. `mtls:billing.svc.internal`"
+            );
+            ensure!(
+                !value.contains(char::is_whitespace),
+                "an `mtls:` subject cannot contain whitespace: {value:?}"
+            );
+            Ok(Credential {
+                mechanism: Mechanism::Plain,
+                value: [0u8; 32],
+                subject: Some(value.into()),
+            })
+        }
 
         // The format defines it, the mechanism that would consume it does not
         // exist yet, and a row that can never authenticate is worse than one
@@ -650,6 +717,7 @@ mod tests {
             Credential {
                 mechanism: Mechanism::HmacSha256,
                 value: key,
+                subject: None,
             },
         );
         let auth = Auth {

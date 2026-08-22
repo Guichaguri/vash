@@ -759,7 +759,7 @@ hatch is real, in which case this is what it costs, or it should be struck from
 | **0** ✅ | Spike: provider choice on both toolchains, handshake rate, throughput and latency deltas at three value sizes | **Done.** Numbers in [benchmarks.md](benchmarks.md#what-tls-costs), five repeats, both platforms; §4.2, §8.1 and §8.2 corrected against them; one deadlock found (§8.4) |
 | **1** ✅ | The flush of §8.4, then server-side: `conn::handle` generic, `set_nodelay` moved, `[tls]` config, the second listener, handshake timeout inside the pre-auth budget, `ssl_enabled` per connection, `vash_tls` in `stats conns`, four metrics (the certificate-expiry gauge is phase 4, with the reload it belongs to) | **Done.** A 1 MiB pipelined batch completes over TLS in both directions (`tests/tls.rs`); plaintext and TLS ports serve one store concurrently; `ssl_enabled` answers per connection; a `tls.listen` in a non-`tls` build refuses to start. Third-party clients are *not* yet verified — see the note under the table |
 | **2** ✅ | Client-side: `vash_client` `Stream` enum and `TlsConfig`, `cluster.tls`, the name override for IP-named peers — plus phase 1's carried interoperability criterion | **Done.** A three-node cluster converges over TLS, including a peer that was down when the invalidation happened; a bad CA surfaces as `ClientError::Tls` rather than as unreachability, and an unreadable one stops startup. Third-party clients verified — see below |
-| **3** | mTLS: `client_auth = "required"`, `mtls:` credential rows, `Identity` from the certificate, `stats conns` showing it | `auth.required = true` is satisfied by a certificate alone; a certificate whose name is not in the table is refused; removing a row and sending `SIGHUP` locks that client out without a restart |
+| **3** ✅ | mTLS: `client_auth = "required"`, `mtls:` credential rows, `Identity` from the certificate, `vash_auth_method` in `stats conns`. **`identity_from = "cn"` was dropped** — see below | **Done.** `auth.required` is satisfied by a certificate alone, with no `AUTH` and no secret anywhere; a certificate the CA signed for a name nobody claims is refused; a client with no certificate is refused by the handshake; removing a row drops the identity from the reloaded table. Verified with `redis-cli --cert/--key` and `pymemcache` with a client `ssl_context` |
 | **4** | Operations: SIGHUP certificate reload, the expiry metric, the runbook — issuing, rotating, closing the plaintext port, and what each failure looks like from the client side | A certificate renewed under the running server is picked up with no dropped connection; `operations.md` covers the four handshake failure modes by symptom |
 
 Phase 1 is the one with value on its own. Phases 2–4 are each worth doing and
@@ -786,6 +786,28 @@ from that run:
 - **`SETEX` is not implemented** — `redis-cli` gets `ERR unknown command`. That
   is a command-coverage gap, not a TLS one: it answers identically on the
   plaintext port. `SET … EX` and `MSETEX` are what exist.
+
+Phase 3 was checked the same way, against a server with `auth.required = true`,
+`client_auth = "required"` and one `mtls:` row:
+
+```bash
+redis-cli --tls --cacert /certs/ca.pem   --cert /certs/client.pem --key /certs/client-key.pem   -h host.docker.internal -p 11322 SET k v      # OK — no AUTH sent
+redis-cli --tls --cacert /certs/ca.pem -h host.docker.internal -p 11322 PING
+                                                # Error: Server closed the connection
+```
+
+`pymemcache` with `ssl_context.load_cert_chain(...)` behaves the same on the
+memcached dialect, which is the claim §5.4 makes about all three getting it at
+once — checked rather than asserted.
+
+**§7's `identity_from = "cn"` is not built, and should not be.** Matching on
+the Common Name was deprecated by RFC 6125 and abandoned by the browsers a
+decade ago; everything that issues certificates puts the name in a Subject
+Alternative Name. Supporting it would have meant adding an X.509 parser to read
+a field nothing should be using — where SAN matching is something `webpki`,
+already in the tree to verify the chain, does correctly including the wildcard
+rules. A certificate whose name is only in its CN does not authenticate, and
+that is the intended answer.
 
 ---
 

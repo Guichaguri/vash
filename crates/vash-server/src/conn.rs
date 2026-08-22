@@ -43,6 +43,10 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     // This connection's row in `stats conns`. Held for its whole life; the
     // accept loop removes it.
     registered: std::sync::Arc<crate::connections::ConnInfo>,
+    // Who the TLS handshake said this is, when client certificates are in use.
+    // `None` for every plaintext connection and for a TLS one that presented
+    // nothing — those authenticate with an `AUTH` command or not at all.
+    identity: Option<crate::auth::Identity>,
 ) -> std::io::Result<()> {
     let mut read_buf = BytesMut::with_capacity(read_buffer);
     let mut write_buf: Vec<u8> = Vec::with_capacity(read_buffer);
@@ -58,6 +62,18 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     // Likewise per connection: authentication is a property of this socket, and
     // it dies with it.
     let mut conn_auth = ConnAuth::default();
+    // A certificate identity is established before the first byte of protocol,
+    // so the connection starts authenticated and never sends `AUTH`. It may
+    // still send one — re-authenticating as somebody else is allowed, and is
+    // how a pooled connection follows a rotation.
+    if let Some(identity) = identity {
+        conn_auth.succeed(identity);
+        registered.authenticated();
+        // Released now rather than after the first command: this connection
+        // has presented something, so it is no longer one of the unidentified
+        // ones the pre-auth budget exists to cap.
+        pre_auth = None;
+    }
     // Fixed for the life of the connection: it arrived on one port or the
     // other and cannot change ports.
     let mut encrypted = registered.is_tls();

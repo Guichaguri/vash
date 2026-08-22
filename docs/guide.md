@@ -425,6 +425,41 @@ A CA that does not match is reported as a configuration error rather than as
 an unreachable peer, and one that cannot be read stops startup — the failure an
 operator would otherwise chase through the network.
 
+### Client certificates
+
+A certificate can be the identity, instead of a credential:
+
+```toml
+[tls]
+client_auth = "required"
+client_ca = "/etc/vash/client-ca.pem"   # not the CA that issued this server
+```
+
+with a row per client in the credential file:
+
+```
+billing-api  mtls:billing-api.svc.internal
+```
+
+Then `auth.required = true` is satisfied with no secrets distributed anywhere:
+the credential file is a list of names, and what proves a client owns one is a
+certificate the client CA signed. `redis-cli --cert … --key …` and a
+`pymemcache` client with `load_cert_chain` both work unchanged; `stats conns`
+reports `vash_auth_method certificate` for them.
+
+Three things to know:
+
+- **Only Subject Alternative Names are matched.** A name that appears only in
+  the Common Name does not authenticate — CN matching was deprecated by
+  RFC 6125, and everything that issues certificates puts the name in a SAN.
+- **The credential table is the revocation list.** Removing a row locks that
+  client out of its next connection. There is no CRL and no OCSP; for a handful
+  of services this is the right size of mechanism, and it takes effect on
+  `SIGHUP` rather than on a restart.
+- **`required` means required.** There is no "optional": a certificate that may
+  be absent identifies nobody. A client that presents none is refused by the
+  handshake, before any protocol byte is read.
+
 What it costs, measured on both platforms: nothing detectable in closed-loop
 latency, and roughly 10–25% of pipelined throughput depending on value size.
 [benchmarks.md](benchmarks.md#what-tls-costs) has the tables; the design, and

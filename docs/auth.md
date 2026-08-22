@@ -187,7 +187,7 @@ before a byte of protocol is read.
 |---|---|
 | **Pros** | The only option here that solves confidentiality and authentication together, which per §1 is the pairing that actually matters. Strong identity, revocable, expiring. Terminates in front of the protocol code, so all three dialects get it at once with no per-protocol work. `rustls` is mature. |
 | **Cons** | The handshake is real per-connection cost — measured at 308µs for a P-256 leaf and 804µs for RSA-2048, not the ~1 ms guessed here, but still orders of magnitude above everything else in connection setup. It breaks every plain memcached and Redis client unless the deployment keeps the plaintext port open beside it. Certificate lifecycle is the largest operational burden of any option here. |
-| **Verdict** | **Half built.** TLS itself shipped in M12 on a second port; client certificates and the `mtls:` credential row that would turn one into an `Identity` are specified in [tls-proposal.md](tls-proposal.md) §7 and not built. §5's design did keep it a wrapper around the connection rather than a change to it, which is why the server side was a type parameter and a listener. |
+| **Verdict** | **Built (M12).** `tls.client_auth = "required"` refuses anything without a certificate the configured client CA issued, and an `mtls:<subject>` row in this same table turns one into an `Identity` — so `required` is satisfied with no secret distributed at all. Matched by Subject Alternative Name; the Common Name is deliberately not consulted. §5's design did keep it a wrapper around the connection rather than a change to it, which is why the server side was a type parameter and a listener. |
 
 ### 3.8 Not authenticating at all
 
@@ -211,7 +211,7 @@ The status quo, and it deserves to be on the list rather than assumed away.
 | Bearer token (JWT) | token | issuer key | ~100 µs | no (needs a password slot) | Rejected — machinery ≫ problem |
 | Credential table | — | N verifiers | one lookup | yes | **Chosen** |
 | Mutable user database | — | LMDB / runtime | one lookup | yes | Rejected — wipeable, and cluster-incoherent |
-| mTLS | handshake | CA + certs | 308µs (P-256) | second port, plaintext stays | TLS shipped (M12); certificate *identity* specified, not built |
+| mTLS | handshake | CA + certs | 308µs (P-256) | second port, plaintext stays | **Chosen for deployments with a PKI** (M12) — an `mtls:` row, matched by SAN |
 | Nothing | — | — | 0 | yes | **Stays the default** |
 
 ---

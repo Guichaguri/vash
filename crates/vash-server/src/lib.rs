@@ -412,7 +412,7 @@ impl Server {
                             )
                             .await
                         } else {
-                            conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping, pre_auth_permit, registered).await
+                            conn::handle(stream, Arc::clone(&conn_state), read_buffer, stopping, pre_auth_permit, registered, None).await
                         };
                         if let Err(e) = result {
                             debug!(%peer, error = %e, "connection ended with an error");
@@ -488,6 +488,39 @@ impl Server {
     }
 }
 
+/// Which credential row the peer's certificate belongs to.
+///
+/// `Ok(None)` when client certificates were not asked for, which is the
+/// default and says nothing about the connection. `Err` when one was presented
+/// and matches no row — the caller closes the connection, because an
+/// unrecognised certificate is a client this deployment has not been told
+/// about.
+#[cfg(feature = "tls")]
+fn peer_identity(
+    state: &ServerState,
+    stream: &tokio_rustls::server::TlsStream<TcpStream>,
+) -> Result<Option<crate::auth::Identity>, String> {
+    let Some(certificate) = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+    else {
+        return Ok(None);
+    };
+
+    // Read once, here, rather than held across the connection: the table can
+    // be reloaded under a running server, and an identity resolved at the
+    // handshake is a decision made against the table as it was at that moment.
+    // Removing a row therefore locks the client out of its *next* connection,
+    // which is what `SIGHUP` rotation means for a certificate.
+    let auth = state.auth.current();
+    match tls::identity_for(&auth, certificate) {
+        Some(identity) => Ok(Some(identity)),
+        None => Err(String::from("<no matching mtls: row>")),
+    }
+}
+
 /// Accepts from the plaintext listener, the TLS one, or whichever answers
 /// first.
 ///
@@ -542,6 +575,29 @@ async fn serve_encrypted(
                 // settings` answers `ssl_enabled` correctly even for a client
                 // whose very first command is that question.
                 registered.tls_established();
+
+                // With `client_auth = "required"` rustls has already refused
+                // anything without a chain the configured CA signed, so a
+                // certificate here is trustworthy — the only question left is
+                // which row it belongs to. A certificate nobody claims is
+                // refused: it proves the holder was issued *a* certificate,
+                // which is not the same as being someone this cache serves.
+                let identity = match peer_identity(&state, &stream) {
+                    Ok(identity) => identity,
+                    Err(subject) => {
+                        state.metrics.tls_identity_rejected();
+                        debug!(
+                            %subject,
+                            "closing a TLS connection: the client certificate matches no                              credential row"
+                        );
+                        state.metrics.tls_closed();
+                        return Ok(());
+                    }
+                };
+                if identity.is_some() {
+                    registered.authenticated_by_certificate();
+                }
+
                 let result = conn::handle(
                     stream,
                     Arc::clone(&state),
@@ -549,6 +605,7 @@ async fn serve_encrypted(
                     shutdown,
                     pre_auth,
                     registered,
+                    identity,
                 )
                 .await;
                 state.metrics.tls_closed();

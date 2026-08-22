@@ -440,6 +440,34 @@ key = ""
 # while it fails to.
 handshake_timeout_ms = 3000
 
+# Client certificates: mTLS. "none" asks for nothing; "required" refuses any
+# connection that does not present a certificate `client_ca` issued *and* whose
+# name is in the credential file. There is deliberately no "optional" — a
+# certificate that may be absent identifies nobody.
+#
+# What this buys is `auth.required` satisfied with no secrets distributed at
+# all: the credential file becomes a list of names, and the secrets are
+# certificates a PKI already rotates and expires. A row looks like
+#
+#   billing-api  mtls:billing-api.svc.internal
+#
+# and is satisfied by a certificate carrying that name in a Subject Alternative
+# Name — never by a password, since the subject is public. Removing the row
+# locks that client out on its next connection, which is what revocation means
+# here: the credential table is the revocation list. There is no CRL and no
+# OCSP.
+#
+# Only SANs are matched. A certificate whose name is only in its Common Name
+# does not authenticate: CN matching was deprecated by RFC 6125 and everything
+# that issues certificates puts the name in a SAN.
+client_auth = "none"
+
+# PEM bundle of the CA that issued the client certificates. Required when
+# client_auth is "required". Keep it separate from the CA that issued this
+# server's own certificate, or anything holding a server certificate can
+# authenticate as a client.
+client_ca = ""
+
 [cluster]
 # Other nodes' cache ports. Nodes are otherwise shared-nothing — clients shard
 # the keyspace, nothing is replicated — and tag invalidation is the only thing
