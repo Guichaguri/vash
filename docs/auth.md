@@ -1,6 +1,7 @@
 # Authentication — design
 
-Status: **built (M9), off by default.** This document is to authentication what
+Status: **built (M9), off by default.** TLS arrived separately in M12, also
+off by default; §1 says what that does and does not change here. This document is to authentication what
 [plan.md](plan.md) is to the rest of the server: decision first, then the
 reasoning, then the rejected alternatives. Sections marked *as implemented*
 record where building it changed the design.
@@ -23,12 +24,21 @@ the diagram. The realistic attacker reaches the port but does not sit on the
 wire between a legitimate client and the server.
 
 **Out of scope, and this is the important one.** Authentication does not make
-the connection private. Without TLS — a v1 non-goal (plan.md §16) — every key
-and every value crosses the network in the clear. A party who can read the wire
-already has the data; hiding the password from them while streaming the payload
-past them protects the wrong thing. **The eavesdropper is TLS's problem, not
-authentication's**, and that single observation removes most of the pressure
-towards elaborate credential schemes (§3).
+the connection private. On a plaintext connection every key and every value
+crosses the network in the clear — and so does the credential itself. A party
+who can read the wire already has the data; hiding the password from them while
+streaming the payload past them protects the wrong thing. **The eavesdropper is
+TLS's problem, not authentication's**, and that single observation removes most
+of the pressure towards elaborate credential schemes (§3).
+
+*Since M12 that problem has an answer.* TLS terminates on a second port behind
+the `tls` feature ([tls-proposal.md](tls-proposal.md)), off by default like
+this. Nothing in this document changes because of it — the mechanism chosen
+below is still the right one, and is still what a memcached or Redis client can
+speak — but the sentence "the wire observer is TLS's problem" now names
+something that exists. **Enabling authentication without TLS on an untrusted
+network buys one replay of the credential**, which is the pairing §3.7 always
+said mattered.
 
 **Also out of scope:** protecting one authenticated client from another. There
 is one keyspace, no namespaces (`SELECT` is a documented divergence), and
@@ -56,7 +66,8 @@ Five parts, each argued below:
    the number of rows.
 3. **Plaintext on the wire, hashed at rest** (§3.1–3.3). Not because it is the
    strongest option, but because memcached and Redis clients can send nothing
-   else, and because §1 says the wire observer is TLS's problem. A VCP-only
+   else, and because §1 says the wire observer is TLS's problem — which since
+   M12 is a problem with an answer rather than a deferral. A VCP-only
    challenge–response mechanism is *specified* (§6.3) and deliberately not built.
 4. **SHA-256, not a password KDF** (§3.2). The credential is machine-generated
    with ≥128 bits of entropy; a slow KDF buys nothing against that and turns
@@ -175,8 +186,8 @@ before a byte of protocol is read.
 | | |
 |---|---|
 | **Pros** | The only option here that solves confidentiality and authentication together, which per §1 is the pairing that actually matters. Strong identity, revocable, expiring. Terminates in front of the protocol code, so all three dialects get it at once with no per-protocol work. `rustls` is mature. |
-| **Cons** | Plan.md §16 makes TLS a v1 non-goal, and this document does not get to overturn that. The handshake is real per-connection cost (~1 ms and an allocation storm), which for a server measured in microseconds is a change in kind. It breaks every plain memcached and Redis client unless the deployment fronts them with a terminator. Certificate lifecycle is the largest operational burden of any option here. |
-| **Verdict** | Out of scope, and **the right long-term answer** for anyone who needs the wire protected. §5's design keeps it a wrapper around the connection rather than a change to it. |
+| **Cons** | The handshake is real per-connection cost — measured at 308µs for a P-256 leaf and 804µs for RSA-2048, not the ~1 ms guessed here, but still orders of magnitude above everything else in connection setup. It breaks every plain memcached and Redis client unless the deployment keeps the plaintext port open beside it. Certificate lifecycle is the largest operational burden of any option here. |
+| **Verdict** | **Half built.** TLS itself shipped in M12 on a second port; client certificates and the `mtls:` credential row that would turn one into an `Identity` are specified in [tls-proposal.md](tls-proposal.md) §7 and not built. §5's design did keep it a wrapper around the connection rather than a change to it, which is why the server side was a type parameter and a listener. |
 
 ### 3.8 Not authenticating at all
 
@@ -200,7 +211,7 @@ The status quo, and it deserves to be on the list rather than assumed away.
 | Bearer token (JWT) | token | issuer key | ~100 µs | no (needs a password slot) | Rejected — machinery ≫ problem |
 | Credential table | — | N verifiers | one lookup | yes | **Chosen** |
 | Mutable user database | — | LMDB / runtime | one lookup | yes | Rejected — wipeable, and cluster-incoherent |
-| mTLS | handshake | CA + certs | ~1 ms | needs a terminator | Out of scope; the right end state |
+| mTLS | handshake | CA + certs | 308µs (P-256) | second port, plaintext stays | TLS shipped (M12); certificate *identity* specified, not built |
 | Nothing | — | — | 0 | yes | **Stays the default** |
 
 ---
@@ -775,8 +786,8 @@ it against a credential-less server is an error (§8) rather than a cheerful
 
 ## 16. Non-goals
 
-Stated so they are not re-litigated: no TLS in this work (§3.7 — it is the
-right answer to a different question, and plan.md §16 owns the decision), no
+Stated so they are not re-litigated: no TLS in *this* work (§3.7 — it is the
+right answer to a different question, and it arrived on its own in M12), no
 SASL and no memcached binary protocol, no runtime credential mutation and no
 `ACL` command family, no per-key or per-command permissions, no roles in M9
 (§9), no OIDC/JWT/external identity provider, no authentication on the admin

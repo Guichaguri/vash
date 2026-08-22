@@ -1083,6 +1083,7 @@ checked as well as the code — and any result that survives only one run is not
 | **M8** | Listing: `LIST_KEYS`/`LIST_TAGS`, glob matching, cursor pagination, the `listing_enabled` gate and `LISTING` capability bit | Paging a sharded keyspace is linear, not quadratic, and returns every key present throughout the walk exactly once; no request holds a read txn past its scan budget; disabled by default, and the cursor and pattern are fuzzed |
 | **M9** | Authentication: credential table, `AUTH` in all three dialects, the pre-auth gate and abuse budget, peer credentials — designed in [auth.md](auth.md) | Real memcached and Redis clients authenticate unchanged; no command in any dialect executes unauthenticated; a cluster converges with auth required, and a node missing a peer credential refuses to start |
 | **M10** | Architecture remediation: atomic read-modify-write, one command boundary for all three dialects, a real `Store` seam, module cohesion, the promised observability — planned in [m10.md](m10.md) | `INCR` is atomic in every dialect; RESP is counted and mapped by the same code as the other two; a `Store` fake runs a server test; queue-wait and execution latency are separately visible |
+| **M12** | TLS: `rustls` behind a feature flag, termination on a second listener, the connection loop generic over its stream, `ssl_enabled` and `vash_tls` per connection — proposed and measured in [tls-proposal.md](tls-proposal.md) | Phase 0's numbers published and its wrong answers corrected; a 1 MiB pipelined batch completes over TLS in both directions; both ports serve one store; a `tls.listen` in a build without the feature refuses to start |
 
 ---
 
@@ -1096,6 +1097,7 @@ checked as well as the code — and any result that survives only one run is not
 | `map_size` is fixed at open and cannot grow while txns are live | Medium | Generous sizing (verified not preallocated, §11); capacity metrics and watermarks well before the map fills |
 | `MDB_WRITEMAP` unusable on Windows (measured, §11) | Low | `ephemeral` mode drops the flag on Windows; dev parity is otherwise unaffected |
 | Two hand-written parsers on untrusted input | High | Continuous fuzzing from M0; strict length caps before any allocation; no `unsafe` in the parsers |
+| Cache traffic is readable, and modifiable, on the wire | **Was High, now optional** | Should have been a row here from the start. TLS on a second port (M12) covers it; the credential M9 added is itself plaintext without it. Off by default, so a deployment that does not turn it on still carries the risk |
 | Memcached compat subtly wrong in ways clients notice | Medium | Differential testing against real memcached with real client libraries (§13) |
 | Tag fan-out silently drops invalidations during a partition | Medium | CRDT max-merge makes retries free; anti-entropy bounds staleness; `fanout_sync` for stricter needs |
 | Tag registry grows unboundedly if clients generate unique tags | Medium | Registry size metric; configurable cap with `BAD_REQUEST` past it; GC for tags with no live records |
@@ -1107,6 +1109,10 @@ checked as well as the code — and any result that survives only one run is not
 
 Stated so they do not get re-litigated: no replication, no consensus/Raft, no server-side proxy or
 sharding tier, **no UDP** (amplification vector), no Lua or server-side scripting, no pub/sub, no
-secondary indexes or query language beyond tags, no multi-key atomicity across shards, no TLS in v1
-(rustls behind a feature flag if a deployment needs it), no on-disk LRU (§6), and no legacy memcached
-binary protocol (§7).
+secondary indexes or query language beyond tags, no multi-key atomicity across shards, no on-disk LRU
+(§6), and no legacy memcached binary protocol (§7).
+
+**TLS was on this list and no longer is.** It shipped as `rustls` behind the `tls` feature, off by
+default, terminating on a second port — the escape hatch this section always named, cashed in
+[tls-proposal.md](tls-proposal.md) and measured in [benchmarks.md](benchmarks.md#what-tls-costs).
+Client certificates, cluster peers over TLS and certificate reload are not built.

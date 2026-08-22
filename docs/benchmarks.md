@@ -909,14 +909,16 @@ decision rests on the writes anyway.
 
 Phase 0 of [tls-proposal.md](tls-proposal.md), which proposed TLS and costed it
 from the literature rather than from this box. These are the measurements that
-were supposed to confirm that arithmetic. Two of them contradict it and one of
-them found a deadlock.
+were supposed to confirm that arithmetic. Two of them contradict it, one found
+a bug that invalidated a third of them, and the diagnosis of that bug was
+itself wrong the first time.
 
 Three harnesses, because the question has three shapes:
 
 ```bash
 cargo run --release -p vash-bench --example tls_spike            # handshakes and encryption, in isolation
 cargo run --release -p vash-bench --bin load -- --tls            # end to end, against the TLS port
+cargo test -p vash-server --features tls --test tls              # the regression tests for the stall below
 cargo build --release -p vash-server --features tls              # what the feature costs to ship
 ```
 
@@ -1002,82 +1004,95 @@ byte** — and small values are what a cache mostly serves.
 `GET`, 16 connections, pipeline 128, 20,000 keys, 10 seconds. Medians of five,
 ranges in brackets, TLS as a percentage of plaintext.
 
+**These are the post-fix numbers.** The first set taken here was measured
+against a server with the flush bug below and is retracted; what it was
+measuring is recorded after the table, because the shape of the error is worth
+keeping.
+
 | workload | platform | plaintext | TLS | |
 |---|---|---:|---:|---:|
-| 64 B | Windows | 1,908,884 [1.87–2.00M] | 1,739,063 [1.68–1.87M] | **91%** |
-| 64 B | musl | 154,615 [151–177k] | 260,303 [224–274k] | **168%** |
-| 1 KiB | Windows | 1,386,542 [1.16–1.47M] | 875,503 [600–917k] | **63%** |
-| 1 KiB | musl | 194,488 [191–217k] | 132,626 [121–139k] | **68%** |
-| 4 KiB | Windows | 182,979 [137–216k] (n=10) | *did not complete* | — |
-| 4 KiB | musl | 149,262 [142–153k] | 94,380 [65–100k] | **63%** |
-| `SET` 1 KiB | Windows | 43,034 [42.4–45.9k] | 36,604 [29.7–41.0k] (n=4) | 85% |
-| `SET` 1 KiB | musl | 59,974 [58.6–65.7k] | 52,092 [51.7–54.3k] | 87% |
+| 64 B | Windows | 1,578,004 [1.50–1.67M] | 1,409,905 [1.31–1.47M] | **89%** |
+| 64 B | musl | 186,720 [171–192k] | 302,655 [261–309k] | **162%** |
+| 1 KiB | Windows | 918,703 [885–923k] | 692,193 [642–731k] | **75%** |
+| 1 KiB | musl | 236,586 [227–248k] | 161,243 [160–192k] | **68%** |
+| 4 KiB | Windows | 274,387 [254–284k] | 259,304 [257–269k] | **95%** |
+| 4 KiB | musl | 190,144 [184–211k] | 109,362 [107–113k] | **58%** |
+| `SET` 1 KiB | Windows | 42,080 [33.3–45.9k] | 30,143 [27.4–33.5k] | 72% |
+| `SET` 1 KiB | musl | 54,464 [52.8–60.6k] | 35,736 [32.3–44.5k] | 66% |
 
 Closed loop, 8 connections, one request in flight:
 
 | platform | plaintext | TLS | p50 |
 |---|---:|---:|---|
-| Windows | 19,335 ops/s | 18,262 (n=4) | 0.328 → 0.346 ms |
-| musl | 13,461 ops/s | 13,624 | 0.329 → 0.330 ms |
+| Windows | 20,481 ops/s | 19,756 | 0.344 → 0.353 ms |
+| musl | 14,569 ops/s | 13,932 | 0.298 → 0.329 ms |
 
-**Latency does not move.** At one request in flight the round trip is the whole
-cost and the cryptography disappears into it — 0.330 ms against 0.329 on musl,
-which is not a difference. Anyone whose concern is p99 can stop reading here.
+**Latency barely moves.** At one request in flight the round trip is most of
+the cost and the cryptography disappears into it — 96% of plaintext throughput
+on both platforms, and a p50 that moves by hundredths of a millisecond. Anyone
+whose concern is p99 can stop reading here.
 
-**Throughput moves, by about a third, once values are big enough to pay per
-byte** — 63–68% at 1 KiB and 4 KiB, on both platforms, which is the most stable
-number in this section.
+**Throughput costs somewhere between nothing and a third, and the spread is
+wider than the platforms are apart.** 95% at 4 KiB on Windows against 58% on
+musl is not a story about TLS; it is the same [caveat](#what-this-cannot-tell-you)
+as everywhere else in this document — one of these is a native process pair on
+a fast loopback, the other is a container on a WSL2 VM where syscalls cost more
+and both ends compete for the same twelve threads.
 
-**And at 64 bytes on musl, TLS is 68% *faster* than plaintext.** That is not a
-typo and it reproduced across five repeats in both directions. The likely
-mechanism is batching: rustls buffers into records, so a pipelined client's
-requests arrive in bigger reads and the server measures fewer, larger blocks —
-on a platform where syscalls are expensive enough for that to outweigh 336 ns
-of cryptography per record. It is not chased further here, and it is the one
-row in this section that should not be trusted until it is.
+**At 64 bytes on musl, TLS is 62% *faster* than plaintext.** It reproduced
+across five repeats, before and after the fix, in both measurement rounds. The
+likely mechanism is batching: rustls buffers into records, so a pipelined
+client's requests arrive in bigger reads and the server measures fewer, larger
+blocks — worth more, on that platform, than 336 ns of cryptography per record.
+It has not been chased, and it remains the row here least worth trusting.
 
-The absolute musl numbers are an order of magnitude below the Windows ones
-(154k against 1.9M) and should not be read as a platform comparison: this is a
-container on a WSL2 VM, both ends of the benchmark are inside it, and the
-[caveat](#what-this-cannot-tell-you) about loopback applies with interest. The
-TLS/plaintext *ratio* within a platform is what transfers.
+**What the retracted numbers were measuring.** The first round reported 63% at
+1 KiB and could not fill the 4 KiB Windows cell at all, because writes were
+being stranded (below). Re-measured with one line fixed, 1 KiB went 63% → 75%
+and 4 KiB became 95%. Two smaller cautions come with that comparison: the
+plaintext column moved as well, by up to 27% on musl, which no flush can
+explain — the first musl round shared its host with hung processes left over
+from the Windows round, and `SET` here has a range wide enough (33–46k) that
+its ratio should be read as "somewhat worse", not as 72%.
 
-### The deadlock, which is why one cell above is empty
+### The stall, and why it was not what it looked like
 
-**Over TLS, a single `write_all` of more than about 256 KiB deadlocks.** It is
-deterministic, and plaintext at the same sizes never does:
-
-```bash
-# hangs, every time
-cargo run --release -p vash-bench --bin load -- --tls --workload set \
-  --value-bytes 4096 --connections 1 --pipeline 64 --duration 3
-```
+**Over TLS, a single `write_all` of more than about 256 KiB stopped the
+connection dead.** Deterministic, and plaintext at the same sizes never did:
 
 | one batch | plaintext | TLS |
 |---|---:|---:|
 | 32 × 4 KiB = 128 KiB | 2,911 ops/s | 2,163 ops/s |
-| 64 × 4 KiB = 256 KiB | 2,483 ops/s | **hangs** |
-| 128 × 4 KiB = 512 KiB | 4,724 ops/s | **hangs** |
-| 256 × 4 KiB = 1 MiB | 4,157 ops/s | **hangs** |
+| 64 × 4 KiB = 256 KiB | 2,483 ops/s | **hung** |
+| 128 × 4 KiB = 512 KiB | 4,724 ops/s | **hung** |
+| 256 × 4 KiB = 1 MiB | 4,157 ops/s | **hung** |
 
-Both ends write a whole batch before reading any of it — the load generator
-sends its pipeline and then collects replies; the server reads a block,
-executes it, and writes the whole reply buffer. That is a write-write deadlock
-waiting for a large enough batch, and plaintext survives it only because the
-kernel's socket buffers are big enough to absorb what the other side has not
-read yet. TLS adds its own buffering on both sides and removes that slack.
+This document first reported that as a write-write deadlock: both ends write a
+whole batch before reading any of it, and TLS spends the socket-buffer slack
+that plaintext survives on. It fit the threshold, it fit the plaintext/TLS
+split, and it was wrong.
 
-It explains three things that looked like separate problems: the 4 KiB TLS
-column that cannot be filled, one `SET` and one closed-loop repeat that timed
-out, and an earlier run that hung at exactly `--keys 20000 --value-bytes 1024`,
-where the populate pass writes 256 × 1 KiB — 256 KiB, sitting precisely on the
-threshold.
+Instrumenting both loops took twenty minutes and showed something the theory
+forbade: **nobody was blocked on a write.** The client had finished writing and
+was reading. The server was reading. Fifty-five replies were missing.
 
-**This is a defect in the spike, not a property of TLS**, and it has to be
-fixed before any of the TLS work ships: a cache that stalls forever on a large
-pipelined batch is worse than one that does not speak TLS. The fix is for
-phase 1 — read and write concurrently rather than in sequence, on both ends —
-and until it lands the 4 KiB TLS number is unknown rather than bad.
+**It was a missing flush.** `write_all` on a TLS stream means the session
+*accepted* the bytes, not that they reached the socket — if the socket was not
+writable for all of them, the remainder stays as ciphertext inside `rustls` and
+nothing sends it until something polls the write side again. Both ends then
+wait on reads for data that was accepted and never transmitted. Over a
+plaintext `TcpStream` `flush` is a no-op, which is why eleven milestones never
+needed one: the requirement arrives with the first buffered transport.
+
+Both ends needed it, and each was confirmed by removing it again: without the
+server's flush, `GET` hangs (large replies); without the client's, `SET` hangs
+(large requests). 256 KiB is simply where a write stops fitting in this
+platform's socket buffer, which is where a remainder first gets stranded — a
+symptom, not a limit on anything.
+
+`tests/tls.rs` now sends a 1 MiB batch in each direction under a timeout, so
+the regression fails a test in seconds rather than wedging a benchmark for an
+afternoon.
 
 ### What the feature costs to ship
 

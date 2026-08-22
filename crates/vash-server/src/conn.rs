@@ -58,6 +58,9 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     // Likewise per connection: authentication is a property of this socket, and
     // it dies with it.
     let mut conn_auth = ConnAuth::default();
+    // Fixed for the life of the connection: it arrived on one port or the
+    // other and cannot change ports.
+    let mut encrypted = registered.is_tls();
 
     let limits = state.auth.limits;
     let enforcing = state.auth.required();
@@ -169,14 +172,21 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 .await?
             }
             Protocol::Memcached => {
+                // The per-connection slot `drain` already carries — RESP uses
+                // it for the negotiated version — carries this dialect's one
+                // per-connection fact instead: whether the socket underneath
+                // is encrypted, which is what `stats settings` has to answer
+                // for `ssl_enabled`.
                 drain(
                     &state,
                     &mut conn_auth,
                     &mut read_buf,
                     &mut write_buf,
-                    &mut (),
+                    &mut encrypted,
                     measure_memcached,
-                    |state, conn, block, (), out| execute_memcached_block(state, conn, block, out),
+                    |state, conn, block, tls, out| {
+                        execute_memcached_block(state, conn, block, *tls, out)
+                    },
                     |_, _| {},
                     (!gated).then_some((
                         crate::dispatch::parse_memcached_writes as ParseWrites,
@@ -228,6 +238,16 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 .bytes_written
                 .fetch_add(write_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
             stream.write_all(&write_buf).await?;
+            // Mandatory, not hygiene. Over a plaintext socket this is a no-op,
+            // and the loop went without it for eleven milestones. Over TLS,
+            // `write_all` only means the session *accepted* the bytes: if the
+            // socket was not writable for all of them, the remainder sits as
+            // ciphertext inside `rustls` and this task then blocks on the read
+            // above, waiting for a request the client will not send because it
+            // is waiting for the reply still sitting in our buffer. That is
+            // the hang Phase 0 recorded as a write-write deadlock; it was
+            // this. See tls-proposal.md §8.4.
+            stream.flush().await?;
             write_buf.clear();
         }
         if !keep_going {

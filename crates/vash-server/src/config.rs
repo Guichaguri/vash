@@ -967,6 +967,48 @@ mod tests {
         Config::load(&path).expect("vash.example.toml must be a usable config");
     }
 
+    /// The one misconfiguration that could leave an operator believing traffic
+    /// is encrypted when it is not, so it must stop startup rather than warn.
+    #[test]
+    #[cfg(not(feature = "tls"))]
+    fn a_tls_listener_is_refused_in_a_build_that_cannot_serve_it() {
+        let mut config = Config::default();
+        config.tls.listen = "0.0.0.0:11312".into();
+        config.tls.cert = PathBuf::from("cert.pem");
+        config.tls.key = PathBuf::from("key.pem");
+
+        let error = config.validate().expect_err("must not start");
+        let message = format!("{error}");
+        assert!(
+            message.contains("`tls` feature"),
+            "the message has to name the feature, since the fix is a rebuild: {message}"
+        );
+        assert!(
+            message.contains("will not fall back"),
+            "and it has to say what it is *not* doing: {message}"
+        );
+    }
+
+    /// A certificate with nothing serving it, and a listener with no
+    /// certificate, are both configuration errors rather than defaults.
+    #[test]
+    fn a_half_configured_tls_section_is_refused() {
+        let mut config = Config::default();
+        config.tls.cert = PathBuf::from("cert.pem");
+        config.tls.key = PathBuf::from("key.pem");
+        assert!(
+            config.validate().is_err(),
+            "certificates with no listener serve nobody"
+        );
+
+        let mut config = Config::default();
+        config.tls.listen = "0.0.0.0:11312".into();
+        assert!(
+            config.validate().is_err(),
+            "a listener with no certificate has nothing to present"
+        );
+    }
+
     #[test]
     fn parses_a_partial_file_and_fills_the_rest_from_defaults() {
         let config: Config = toml::from_str(

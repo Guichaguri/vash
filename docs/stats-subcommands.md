@@ -192,7 +192,7 @@ nearly every field is a configuration value, and this server has configuration.
 | `temp_lru` | `no` |
 | `track_sizes` | `no` — see §10 |
 | `detail_enabled` | `no` — `stats detail` is not implemented (§9), so it is never anything else |
-| `ssl_enabled` | `no` — no TLS in v1 (plan §16); a client that checks before sending a credential must not be told otherwise |
+| `ssl_enabled` | Whether **this connection** is encrypted, not whether the server has a TLS listener. The two ports serve one store, so a client on the plaintext one that checks before sending a credential is told `no` even while TLS is up |
 | `proxy_enabled` | `no` |
 | `client_flags_size` | `4` — `mc_flags` is a `u32` |
 

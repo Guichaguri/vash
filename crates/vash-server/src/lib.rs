@@ -533,19 +533,38 @@ async fn serve_encrypted(
     #[cfg(feature = "tls")]
     {
         let acceptor = acceptor.expect("a TLS listener without an acceptor");
+        let started = std::time::Instant::now();
         match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
             Ok(Ok(stream)) => {
-                conn::handle(stream, state, read_buffer, shutdown, pre_auth, registered).await
+                state.metrics.tls_established(started.elapsed());
+                // Recorded before the first request is served, so `stats
+                // settings` answers `ssl_enabled` correctly even for a client
+                // whose very first command is that question.
+                registered.tls_established();
+                let result = conn::handle(
+                    stream,
+                    Arc::clone(&state),
+                    read_buffer,
+                    shutdown,
+                    pre_auth,
+                    registered,
+                )
+                .await;
+                state.metrics.tls_closed();
+                result
             }
             // A failed handshake is a client-side configuration problem far
             // more often than an attack — the wrong CA, an expired
             // certificate, a plaintext client on the wrong port — and it is
             // invisible from the client side, which sees only a closed socket.
+            // So it is counted by reason and logged with the cause.
             Ok(Err(e)) => {
+                state.metrics.tls_handshake_rejected();
                 debug!(error = %e, "TLS handshake failed");
                 Ok(())
             }
             Err(_) => {
+                state.metrics.tls_handshake_timeout();
                 debug!(timeout = ?handshake_timeout, "TLS handshake timed out");
                 Ok(())
             }

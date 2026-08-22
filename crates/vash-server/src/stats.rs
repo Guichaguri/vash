@@ -251,13 +251,13 @@ pub fn collect(state: &ServerState) -> Vec<(String, String)> {
 /// a question about the *cache*, so it travels as a `Command::Stats` through
 /// the shared boundary and comes back as [`collect`]. Everything else describes
 /// the server and is answered from configuration and metrics alone.
-pub fn section(state: &ServerState, section: StatsSection) -> Vec<(String, String)> {
+pub fn section(state: &ServerState, section: StatsSection, tls: bool) -> Vec<(String, String)> {
     match section {
         // Answered through the boundary; see the doc comment. Rendering the
         // general set here as well keeps a routing slip from producing an empty
         // reply that reads like an empty server.
         StatsSection::General => collect(state),
-        StatsSection::Settings => settings(state),
+        StatsSection::Settings => settings(state, tls),
         StatsSection::Items => items(state),
         StatsSection::Slabs => slabs(state),
         StatsSection::Conns => connections(state),
@@ -279,7 +279,7 @@ pub fn section(state: &ServerState, section: StatsSection) -> Vec<(String, Strin
 /// noting, since they are the reason this is more than a translation table:
 /// `flush_enabled` and `dump_enabled` gate precisely what `protocol.flush_enabled`
 /// and `protocol.listing_enabled` gate.
-fn settings(state: &ServerState) -> Vec<(String, String)> {
+fn settings(state: &ServerState, tls: bool) -> Vec<(String, String)> {
     let protocol = &state.protocol;
     let yes_no = |flag: bool| if flag { "yes" } else { "no" }.to_string();
 
@@ -319,9 +319,12 @@ fn settings(state: &ServerState) -> Vec<(String, String)> {
         ("track_sizes".into(), "no".into()),
         // `stats detail` is not implemented, so it is never enabled.
         ("detail_enabled".into(), "no".into()),
-        // No TLS in v1 (plan §16). A client that checks this before sending a
-        // credential must not be told otherwise.
-        ("ssl_enabled".into(), "no".into()),
+        // Answered for *this* connection, not for the server. The two ports
+        // serve one store, so a client on the plaintext one that checks this
+        // before sending a credential must be told "no" even while the TLS
+        // listener is up — which is the whole reason this is threaded down
+        // here rather than read off the configuration.
+        ("ssl_enabled".into(), yes_no(tls)),
         ("proxy_enabled".into(), "no".into()),
         // `mc_flags` is a `u32`.
         ("client_flags_size".into(), "4".into()),

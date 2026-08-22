@@ -67,6 +67,12 @@ default = []
 
 [dev-dependencies]
 tempfile = "3"
+# The TLS suite drives the server with a real rustls client and needs a
+# certificate to do it. Dev-only, and the suite itself is `#![cfg(feature =
+# "tls")]` — without the feature these compile and nothing uses them.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 # The in-memory `Store`, so the server can be tested against something that is
 # not LMDB. A dev-dependency only: nothing in the shipped binary can reach it.
 vash-store = { workspace = true, features = ["testing"] }

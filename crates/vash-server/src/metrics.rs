@@ -424,6 +424,24 @@ pub struct ServerMetrics {
     pub connections_total: AtomicU64,
     pub connections_active: AtomicU64,
     pub connections_rejected: AtomicU64,
+    /// Handshakes that completed, and connections currently holding one.
+    ///
+    /// `tls_connections_active` against `connections_active` is the rollout's
+    /// progress bar: an operator may close the plaintext port when the two
+    /// agree. Kept beside the connection counters because that comparison is
+    /// the only reason either exists.
+    pub tls_handshakes: AtomicU64,
+    pub tls_connections_active: AtomicU64,
+    /// Handshakes that did not complete, split by which way they failed.
+    ///
+    /// Two counters rather than one, because they are two different operator
+    /// actions: `rejected` is almost always a certificate or CA mismatch and
+    /// is fixed on the client, while `timeout` is a peer that opened a socket
+    /// and did not finish — a network problem, or somebody probing the port.
+    pub tls_handshake_rejected: AtomicU64,
+    pub tls_handshake_timeouts: AtomicU64,
+    /// How long completed handshakes took.
+    pub tls_handshake_latency: Histogram,
 
     /// Successful authentications, failed ones, and commands refused for want
     /// of one.
@@ -464,6 +482,11 @@ impl Default for ServerMetrics {
             connections_total: AtomicU64::new(0),
             connections_active: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
+            tls_handshakes: AtomicU64::new(0),
+            tls_connections_active: AtomicU64::new(0),
+            tls_handshake_rejected: AtomicU64::new(0),
+            tls_handshake_timeouts: AtomicU64::new(0),
+            tls_handshake_latency: Histogram::default(),
             auth_ok: AtomicU64::new(0),
             auth_failed: AtomicU64::new(0),
             auth_refused: AtomicU64::new(0),
@@ -496,6 +519,27 @@ impl ServerMetrics {
 
     pub fn connection_rejected(&self) {
         self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A handshake completed. The connection is encrypted from here.
+    pub fn tls_established(&self, elapsed: std::time::Duration) {
+        self.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+        self.tls_connections_active.fetch_add(1, Ordering::Relaxed);
+        self.tls_handshake_latency.observe(elapsed);
+    }
+
+    /// An encrypted connection closed. Only called for one that got as far as
+    /// completing its handshake, so this can never take the gauge negative.
+    pub fn tls_closed(&self) {
+        self.tls_connections_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn tls_handshake_rejected(&self) {
+        self.tls_handshake_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn tls_handshake_timeout(&self) {
+        self.tls_handshake_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn auth_ok(&self) {
@@ -676,6 +720,48 @@ pub fn render_prometheus(
         "Connections refused because the limit was reached.",
         load(&server.connections_rejected).to_string(),
     );
+    metric!(
+        "vash_tls_handshakes_total",
+        "counter",
+        "TLS handshakes completed.",
+        load(&server.tls_handshakes).to_string(),
+    );
+    metric!(
+        "vash_tls_connections_active",
+        "gauge",
+        "Encrypted connections currently open. Equal to vash_connections_active          when nothing is arriving in the clear, which is what makes closing the          plaintext port safe.",
+        load(&server.tls_connections_active).to_string(),
+    );
+
+    // Split by reason, because the two are different operator actions: a
+    // rejection is a certificate the client would not accept, a timeout is a
+    // peer that never finished.
+    let _ = writeln!(
+        out,
+        "# HELP vash_tls_handshake_failures_total Handshakes that did not complete, by reason."
+    );
+    let _ = writeln!(out, "# TYPE vash_tls_handshake_failures_total counter");
+    for (reason, value) in [
+        ("rejected", load(&server.tls_handshake_rejected)),
+        ("timeout", load(&server.tls_handshake_timeouts)),
+    ] {
+        let _ = writeln!(
+            out,
+            "vash_tls_handshake_failures_total{{reason=\"{reason}\"}} {value}"
+        );
+    }
+
+    // The family declares its own type and help once; `render` emits only the
+    // series beneath it, the same arrangement `vash_command_seconds` uses.
+    let _ = writeln!(
+        out,
+        "# HELP vash_tls_handshake_seconds Time to complete a TLS handshake,          which is the most expensive thing an unauthenticated peer can ask for."
+    );
+    let _ = writeln!(out, "# TYPE vash_tls_handshake_seconds histogram");
+    server
+        .tls_handshake_latency
+        .render(&mut out, "vash_tls_handshake_seconds", "");
+
     metric!(
         "vash_commands_total",
         "counter",

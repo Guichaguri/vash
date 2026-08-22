@@ -35,6 +35,14 @@ pub struct ConnInfo {
     /// owns the connection, and read only by `stats conns`.
     dialect: AtomicU8,
     authenticated: AtomicBool,
+    /// Whether this connection arrived on the TLS port and completed a
+    /// handshake.
+    ///
+    /// Written once by the accept path before the connection is served, read
+    /// only by `stats conns` — the same discipline as `dialect`. It is the one
+    /// thing an operator closing the plaintext port has to be able to check,
+    /// and nothing else in the server can answer it per connection.
+    tls: AtomicBool,
     /// Milliseconds since the registry's epoch, at the last command.
     last_command_ms: AtomicU64,
 }
@@ -61,6 +69,16 @@ impl ConnInfo {
 
     pub fn authenticated(&self) {
         self.authenticated.store(true, Ordering::Relaxed);
+    }
+
+    /// Records that this connection is encrypted. Called once, after the
+    /// handshake completes and before any request is served.
+    pub fn tls_established(&self) {
+        self.tls.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_tls(&self) -> bool {
+        self.tls.load(Ordering::Relaxed)
     }
 
     fn dialect_name(&self) -> &'static str {
@@ -108,6 +126,7 @@ impl Registry {
             peer,
             dialect: AtomicU8::new(UNDETECTED),
             authenticated: AtomicBool::new(false),
+            tls: AtomicBool::new(false),
             last_command_ms: AtomicU64::new(self.epoch.elapsed().as_millis() as u64),
         });
         self.lock().insert(info.id, Arc::clone(&info));
@@ -161,6 +180,18 @@ impl Registry {
                 (
                     format!("{id}:vash_authenticated"),
                     if info.authenticated.load(Ordering::Relaxed) {
+                        "yes".into()
+                    } else {
+                        "no".into()
+                    },
+                ),
+                // The rollout's only honest progress bar: an operator about to
+                // close `server.listen` needs to know whether anything is
+                // still arriving in the clear, and no aggregate can say which
+                // client it is.
+                (
+                    format!("{id}:vash_tls"),
+                    if info.is_tls() {
                         "yes".into()
                     } else {
                         "no".into()

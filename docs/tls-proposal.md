@@ -68,14 +68,17 @@ rejected.
 >    right and the framing wrong.** 1.86 GiB/s per core at 4 KiB is the "whole
 >    core of AES-GCM" it predicted — but at 64 bytes a TLS record costs 336 ns
 >    regardless of its contents, so small values are charged per *reply*, not
->    per byte. End to end, TLS costs a third of throughput at 1 KiB and above,
->    costs nothing measurable in closed-loop latency (p50 0.330 ms against
->    0.329), and at 64 bytes on musl it is 68% *faster* than plaintext.
-> 4. **Phase 0 also found a deadlock, and it blocks phase 1.** Over TLS, a
->    single `write_all` above ~256 KiB hangs, deterministically, where
->    plaintext does not: both ends write a whole batch before reading any of
->    it, and TLS removes the socket-buffer slack that keeps that pattern alive.
->    See [§8.4](#84-the-deadlock-phase-0-found).
+>    per byte. End to end (re-measured after the fix below): 96% of plaintext
+>    throughput closed-loop on both platforms, 75–95% pipelined on Windows,
+>    58–68% on musl, and at 64 bytes on musl TLS is 62% *faster* than
+>    plaintext.
+> 4. **Phase 0 also found a hang, and phase 1 fixed it.** Over TLS, a single
+>    `write_all` above ~256 KiB stopped the connection dead. Phase 0 diagnosed
+>    a write-write deadlock and was wrong: it is a **missing flush**, because
+>    `write_all` on a TLS stream only means the session accepted the bytes.
+>    One line on each end. The correction, and why the wrong answer was
+>    convincing, is in [§8.4](#84-the-hang-phase-0-found-and-what-it-actually-was)
+>    — and it invalidated every TLS throughput number Phase 0 published.
 >
 > The rest of this document is kept as written, including the parts the
 > measurements went on to contradict.
@@ -600,47 +603,61 @@ write path are the first suspects — `write_all` of a whole reply buffer
 (`conn.rs:229`) is already the right shape for TLS, one record per reply batch,
 but that should be confirmed rather than assumed.
 
-### 8.4 The deadlock Phase 0 found
+### 8.4 The hang Phase 0 found, and what it actually was
 
-**The measurement that could not be taken is the most important thing in this
-section.** Over TLS, a single `write_all` of more than roughly 256 KiB
-deadlocks, deterministically, where the same write over plaintext does not:
+**Phase 0 recorded this as a write-write deadlock. That diagnosis was wrong,
+and it is worth keeping the correction rather than the conclusion.**
+
+The symptom was real and deterministic: over TLS, a single `write_all` of more
+than roughly 256 KiB stopped the connection dead, where plaintext at the same
+sizes never did.
 
 | one batch | plaintext | TLS |
 |---|---:|---:|
 | 32 × 4 KiB = 128 KiB | 2,911 ops/s | 2,163 ops/s |
-| 64 × 4 KiB = 256 KiB | 2,483 ops/s | **hangs** |
-| 256 × 4 KiB = 1 MiB | 4,157 ops/s | **hangs** |
+| 64 × 4 KiB = 256 KiB | 2,483 ops/s | **hung** |
+| 256 × 4 KiB = 1 MiB | 4,157 ops/s | **hung** |
 
-Both ends of this project write a whole batch before reading any of it — the
-load generator sends its pipeline and then collects the replies; `conn::handle`
-reads a block, executes it, and writes the whole reply buffer before returning
-to the read. That is a write-write deadlock waiting for a batch large enough,
-and **plaintext has been surviving it on borrowed room**: the kernel's socket
-buffers absorb what the peer has not read yet. TLS buffers on both sides and
-spends that slack.
+The explanation offered — that both ends write a whole batch before reading any
+of it, and that TLS spends the socket-buffer slack plaintext survives on — was
+plausible, fit the threshold, and was not what was happening. Instrumenting
+both loops showed the client had *finished* writing and was reading, the server
+was reading, and 55 replies were missing. Nobody was blocked on a write at all.
 
-Three consequences, in order:
+**It was a missing flush.** `write_all` on a TLS stream means the session
+*accepted* the bytes, not that they reached the socket: if the socket was not
+writable for all of them, the remainder stays as ciphertext inside `rustls`, and
+nothing sends it until something polls the write side again. Both ends then wait
+on reads for data that was accepted and never transmitted. Over a plaintext
+`TcpStream` `flush` is a no-op, which is why eleven milestones of this server
+never needed one — the requirement arrives with the first buffered transport.
 
-1. **Phase 1 cannot ship without fixing it.** A cache that stalls forever on a
-   large pipelined batch is worse than one that does not speak TLS. The fix is
-   to read and write concurrently rather than in sequence — splitting the
-   stream, or writing under a `select!` that keeps draining — and it belongs in
-   `conn::handle` and in the load generator alike.
-2. **The plaintext path has the same latent bug.** It is not reachable at the
-   batch sizes this server produces today, because the reply to a `SET` is ten
-   bytes and the buffers cover it. That is a property of the workload, not a
-   guarantee, and it should be fixed once for both paths rather than worked
-   around for one.
-3. **The 4 KiB TLS throughput number is unknown, not bad.** On musl, where the
-   default buffers are larger, the same run completes at 63% of plaintext. On
-   Windows it does not complete at all.
+The fix is one line on each side, and both are load-bearing: removing the
+server's flush hangs `GET` (large replies), removing the client's hangs
+`SET` (large requests). `conn::handle` flushes after its reply buffer;
+`vash-bench`'s load generator flushes after its batch.
 
-This is exactly what Phase 0 is for. The proposal argued in §5.4 that TLS "is a
-property of the socket, and this server's layering means that is all it has to
-be" — and that is still true of dispatch, the store and the parsers. It was not
-true of the connection loop's I/O discipline, and nothing short of running it
-would have said so.
+Three things follow, and the middle one is the reason this section still
+exists:
+
+1. **The threshold was a symptom, not a cause.** 256 KiB is where a write stops
+   fitting in the socket buffer on this platform, which is where a remainder
+   first gets stranded. It is not a limit on anything.
+2. **The published throughput numbers were measurements of the bug.** Every TLS
+   figure Phase 0 reported was taken with writes intermittently stranded until
+   some later write flushed them. Re-measured on both platforms after the fix,
+   1 KiB pipelined `GET` went from 63% of plaintext to 75% on Windows, and
+   4 KiB — the cell that could not be filled at all — is 95%.
+   [benchmarks.md](benchmarks.md#what-tls-costs) carries the corrected tables
+   and says what the retracted ones were measuring.
+3. **The plaintext path was never at risk**, so there is no latent bug to fix
+   there. The earlier claim that there was one followed from the wrong
+   mechanism.
+
+This is what Phase 0 is for, and the lesson is narrower than "measure": the
+hang was reproducible in one command, and *reasoning* about it produced a
+confident, well-argued, wrong answer that survived being written into two
+documents. Twenty minutes of `eprintln` in both loops produced the right one.
 
 ---
 
@@ -740,13 +757,23 @@ hatch is real, in which case this is what it costs, or it should be struck from
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0** ✅ | Spike: provider choice on both toolchains, handshake rate, throughput and latency deltas at three value sizes | **Done.** Numbers in [benchmarks.md](benchmarks.md#what-tls-costs), five repeats, both platforms; §4.2, §8.1 and §8.2 corrected against them; one deadlock found (§8.4) |
-| **1** | **First: fix §8.4's write-write deadlock, on both paths.** Then server-side: `conn::handle` generic, `set_nodelay` moved, `[tls]` config, the second listener, handshake timeout inside the pre-auth budget, `ssl_enabled`, `stats conns`, the five metrics | A 1 MiB pipelined batch completes over TLS on both platforms; a real `redis-cli --tls` and a real memcached client with TLS drive the server unchanged; plaintext and TLS ports serve the same store concurrently; a `tls.listen` in a non-`tls` build refuses to start |
+| **1** ✅ | The flush of §8.4, then server-side: `conn::handle` generic, `set_nodelay` moved, `[tls]` config, the second listener, handshake timeout inside the pre-auth budget, `ssl_enabled` per connection, `vash_tls` in `stats conns`, four metrics (the certificate-expiry gauge is phase 4, with the reload it belongs to) | **Done.** A 1 MiB pipelined batch completes over TLS in both directions (`tests/tls.rs`); plaintext and TLS ports serve one store concurrently; `ssl_enabled` answers per connection; a `tls.listen` in a non-`tls` build refuses to start. Third-party clients are *not* yet verified — see the note under the table |
 | **2** | Client-side: `vash_client` `Stream` enum, `cluster.tls`, SNI and the IP-peer override | A three-node cluster converges over TLS, including a peer that was down; a bad CA is logged as a configuration error and not as unreachability |
 | **3** | mTLS: `client_auth = "required"`, `mtls:` credential rows, `Identity` from the certificate, `stats conns` showing it | `auth.required = true` is satisfied by a certificate alone; a certificate whose name is not in the table is refused; removing a row and sending `SIGHUP` locks that client out without a restart |
 | **4** | Operations: SIGHUP certificate reload, the expiry metric, the runbook — issuing, rotating, closing the plaintext port, and what each failure looks like from the client side | A certificate renewed under the running server is picked up with no dropped connection; `operations.md` covers the four handshake failure modes by symptom |
 
 Phase 1 is the one with value on its own. Phases 2–4 are each worth doing and
 none of them is worth blocking phase 1 on.
+
+**One phase-1 exit criterion is not met.** "A real `redis-cli --tls` and a real
+memcached client with TLS drive the server unchanged" has not been tested: no
+such client is installed on the development machine, and the suite in
+`tests/tls.rs` drives the server with a `rustls` client of our own instead.
+That proves the termination works and proves nothing about interoperability —
+`redis-cli --tls` needs a `tls-port`-shaped configuration and a CA path, and
+the memcached ASCII clients that support TLS are a small subset. It is carried
+into phase 2, where the client work makes a real third-party client necessary
+anyway.
 
 ---
 

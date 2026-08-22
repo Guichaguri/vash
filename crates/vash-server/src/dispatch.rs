@@ -276,6 +276,7 @@ pub fn execute_memcached_block(
     state: &ServerState,
     conn: &mut ConnAuth,
     block: &[u8],
+    tls: bool,
     out: &mut Vec<u8>,
 ) -> Closing {
     use vash_proto::memcached::{Outcome, ProtocolError, parse};
@@ -310,7 +311,7 @@ pub fn execute_memcached_block(
                 }
 
                 flush_memcached(state, &mut batch, out);
-                if execute_memcached(state, conn, &parsed, out) == Closing::Yes {
+                if execute_memcached(state, conn, &parsed, tls, out) == Closing::Yes {
                     // `quit`: nothing after it on this connection matters.
                     return Closing::Yes;
                 }
@@ -388,6 +389,11 @@ pub fn execute_memcached(
     state: &ServerState,
     conn: &mut ConnAuth,
     parsed: &vash_proto::memcached::Parsed<'_>,
+    // `tls`: whether *this* connection is encrypted. `stats settings` reports
+    // it as `ssl_enabled`, per connection rather than per server, because the
+    // two ports serve one store: a client on the plaintext one must not be
+    // told the cache is encrypted because some other port is.
+    tls: bool,
     out: &mut Vec<u8>,
 ) -> Closing {
     use vash_proto::memcached::encode as mc;
@@ -425,7 +431,7 @@ pub fn execute_memcached(
         && *section != vash_proto::memcached::encode::StatsSection::General
     {
         state.metrics.other();
-        mc::stat_lines(out, &crate::stats::section(state, *section));
+        mc::stat_lines(out, &crate::stats::section(state, *section, tls));
         out.extend_from_slice(b"END\r\n");
         return Closing::No;
     }

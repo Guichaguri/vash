@@ -51,6 +51,8 @@ Run with `--ephemeral` to start from an empty database, or
 | Metrics and admin endpoints | Working — `/metrics`, `/health`, `/stats` |
 | Cluster tag invalidation | Working — fan-out plus anti-entropy, see [Clustering](#clustering) |
 | `LIST_KEYS`, `LIST_TAGS` | Working — administrative, cursor-paged, glob-filtered, **off unless enabled** |
+| Authentication | Working — credential table, all three dialects, **off unless enabled** |
+| TLS | Working — TLS 1.3 on a second port, **off unless enabled**, and needs `--features tls`. Client certificates and cluster-peer TLS are not built |
 
 The legacy memcached **binary** protocol (magic `0x80`) is not implemented and
 will not be: upstream deprecated it in favour of the meta commands.
@@ -549,11 +551,29 @@ then set `auth.file` and, once every client and peer is rolled,
 `auth.required = true`. It works in all three protocols: `AUTH` over VCP,
 Redis's `AUTH`/`HELLO … AUTH`, and memcached's ASCII mechanism.
 
-**Bind the port to a private network either way.** Without TLS every key and
-value crosses the wire in the clear, so authentication decides who may use the
-cache rather than who may read it in flight. [docs/auth.md](docs/auth.md) has
-the design, the threat model, and why the credential is stored as a plain
-SHA-256 digest rather than run through a password KDF.
+**Bind the port to a private network either way.** A credential decides who
+may use the cache rather than who may read it in flight.
+[docs/auth.md](docs/auth.md) has the design, the threat model, and why the
+credential is stored as a plain SHA-256 digest rather than run through a
+password KDF.
+
+**TLS is what covers the wire**, on a second port, in a binary built with
+`--features tls`:
+
+```toml
+[tls]
+listen = "0.0.0.0:11312"
+cert = "/etc/vash/cert.pem"
+key = "/etc/vash/key.pem"
+```
+
+Both ports serve the same store, so a rollout moves clients across and then
+empties `server.listen`; `stats conns` shows which connections are still in the
+clear. It costs nothing measurable in closed-loop latency and 10-25% of
+pipelined throughput — [docs/benchmarks.md](docs/benchmarks.md#what-tls-costs)
+has the numbers, [docs/tls-proposal.md](docs/tls-proposal.md) the design and
+what is not built yet. Authentication over a plaintext connection sends the
+credential in the clear, so the two features belong together.
 
 ## Development
 

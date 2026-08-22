@@ -363,10 +363,10 @@ resp_enabled = true
 #
 # The network boundary stays the primary control — a firewall rule stops a party
 # who never sends a byte, where a credential only stops them after they have
-# reached a parser. This adds a layer, it does not replace one. And it does not
-# make the connection private: without TLS every key and value crosses the
-# network in the clear, so an eavesdropper already has the data. See
-# docs/auth.md §1.
+# reached a parser. This adds a layer, it does not replace one. And on its own
+# it does not make the connection private: unless the [tls] section below is
+# configured, every key and value — and this credential — crosses the network
+# in the clear, so an eavesdropper already has the data. See docs/auth.md §1.
 #
 # Rolling it out is two steps, because enforcement is separate from the table:
 #   1. set `file` and leave `required = false`. AUTH is answered, nothing is
@@ -400,6 +400,45 @@ max_attempts = 3     # failed attempts before the connection is closed
 # server.max_connections. Without it the pre-auth budget is the whole
 # connection budget.
 max_unauthenticated_connections = 0
+
+[tls]
+# Encryption on the wire, on a second port. Off by default, and it needs a
+# binary built with `--features tls` — a `listen` here in a build without it
+# refuses to start rather than quietly serving that port in the clear.
+#
+# This is the half authentication does not cover. A credential decides who may
+# *use* the cache; without TLS every key and value, and the credential itself,
+# crosses the network in the clear, so a party on the wire already has the
+# data. See docs/tls-proposal.md §1, and docs/auth.md §1 for the split.
+#
+# A second port rather than an upgrade on the cache port, which is Redis's
+# `tls-port` model: it means closing `server.listen` is what makes a deployment
+# encrypted-only, and a socket that does not exist is a stronger statement than
+# a policy flag. Rolling it out is the same two steps as auth:
+#   1. set `listen`, `cert` and `key`. Both ports serve the same store; move
+#      clients and peers across one at a time, watching `stats conns` for the
+#      `vash_tls` column and `vash_tls_connections_active` against
+#      `vash_connections_active`.
+#   2. when nothing is left in the clear, empty `server.listen`.
+listen = ""                  # e.g. "0.0.0.0:11312"; empty means no TLS listener
+
+# PEM certificate chain, leaf first, then any intermediates. PEM private key,
+# PKCS#8 or SEC1. Both are read once at startup: a certificate that will not
+# parse stops the server rather than surfacing as a handshake failure on the
+# first client.
+#
+# Prefer an ECDSA P-256 leaf over RSA-2048. The server signs once per full
+# handshake, and measured on this project's own hardware that is 308us against
+# 804 — a choice made when the certificate is issued and not fixable later in
+# this file. See docs/benchmarks.md#what-tls-costs.
+cert = ""
+key = ""
+
+# How long a handshake may take before the connection is dropped. Below
+# auth.timeout_ms on purpose: a handshake is a fixed number of round trips, and
+# a peer that cannot finish one in three seconds is holding a pre-auth slot
+# while it fails to.
+handshake_timeout_ms = 3000
 
 [cluster]
 # Other nodes' cache ports. Nodes are otherwise shared-nothing — clients shard

@@ -319,6 +319,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> std::io
     let mut frame = Vec::new();
     encode_request(&mut frame, Opcode::Hello, 0, &body);
     stream.write_all(&frame).await?;
+    stream.flush().await?;
 
     let mut inbound = Inbound::new();
     let reply = inbound.next_frame(stream).await?;
@@ -444,6 +445,7 @@ async fn worker(
             }
         }
         stream.write_all(&out).await?;
+        stream.flush().await?;
 
         for _ in 0..batch {
             let reply = inbound.next_frame(&mut stream).await?;
@@ -496,6 +498,9 @@ async fn populate(connector: &Connector, keys: u64, value: &[u8]) -> std::io::Re
             encode_request(&mut out, Opcode::Set, i as u32, &body);
         }
         stream.write_all(&out).await?;
+        // See the note in `vash_server::conn`: over TLS an unflushed tail sits
+        // in the session and the peer waits for bytes that were never sent.
+        stream.flush().await?;
         for _ in 0..batch {
             inbound.next_frame(&mut stream).await?;
         }

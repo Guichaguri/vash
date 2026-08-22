@@ -45,6 +45,7 @@ records are evicted when that fills. Nothing here is a system of record.
 | **Write throughput** | Group commit across independent shards: batches form on their own from whatever queued during the previous commit, with no added delay. |
 | **Clustering** | Independent nodes, no replication and no consensus. Only tag invalidation crosses node boundaries, by fan-out plus anti-entropy gossip. |
 | **Authentication** | Optional, off by default; credentials in a separate file, reloadable with `SIGHUP` on Unix. |
+| **TLS** | Optional, off by default, and a build feature: termination on a second port beside the plaintext one, so a rollout can move clients across before closing the old port. TLS 1.3 only. |
 | **Observability** | Prometheus `/metrics`, plus `/health` and `/stats`, on a separate admin port that stays closed until you name an address. |
 | **Deployment** | One static binary. systemd unit and a `scratch` container image included. |
 
@@ -321,8 +322,10 @@ which it is.
 
 Off by default: with `auth.required = false`, anyone who can reach the cache
 port can read and write any key. **Bind the port to a private network
-regardless** — there is no TLS, so authentication decides who may *use* the
-cache, not who may read it in flight.
+regardless** — a credential decides who may *use* the cache, not who may read
+it in flight. What covers the wire is [TLS](#tls), which is also off by
+default and which the credential needs: over a plaintext connection the secret
+itself crosses in the clear.
 
 Generate a credential:
 
@@ -359,6 +362,49 @@ implement), Redis `AUTH` / `HELLO … AUTH`, VCP `AUTH`. In a container,
 `SIGHUP` re-reads the file on Unix; on Windows, rotation means a restart.
 
 Design and rollout: [auth.md](auth.md).
+
+---
+
+## TLS
+
+Off by default, and it needs a binary built with the feature:
+
+```bash
+cargo build --release --features tls
+```
+
+Then a second port, beside the plaintext one:
+
+```toml
+[tls]
+listen = "0.0.0.0:11312"
+cert = "/etc/vash/cert.pem"   # PEM chain, leaf first, then intermediates
+key = "/etc/vash/key.pem"     # PKCS#8 or SEC1
+```
+
+Both ports serve the same store, which is what makes the rollout gradual: move
+clients and peers across one at a time, then empty `server.listen` when
+nothing is left in the clear. `stats conns` reports `vash_tls` per connection
+and `/metrics` exports `vash_tls_connections_active` beside
+`vash_connections_active`, which is how you know it is safe to close.
+
+A few things worth knowing before you issue the certificate:
+
+- **Prefer ECDSA P-256 over RSA-2048.** The server signs once per full
+  handshake: 308µs against 804µs, measured. It is fixed when the certificate is
+  issued and no setting here can undo it.
+- **TLS 1.3 only.** There is no cipher-suite configuration, because `rustls`
+  has none worth turning off.
+- **A `tls.listen` in a build without `--features tls` refuses to start.** It
+  will not fall back to serving that port unencrypted.
+- **The admin port is not covered.** `/metrics` carries no keys or values;
+  bind it to loopback.
+
+What it costs, measured on both platforms: nothing detectable in closed-loop
+latency, and roughly 10–25% of pipelined throughput depending on value size.
+[benchmarks.md](benchmarks.md#what-tls-costs) has the tables; the design, and
+what is deliberately not built yet — client certificates, cluster peers over
+TLS, certificate reload — is in [tls-proposal.md](tls-proposal.md).
 
 ---
 

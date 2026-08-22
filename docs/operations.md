@@ -41,10 +41,28 @@ tag's generation.
 
 **Bind it to a private network regardless.** A network boundary stops a party
 who never sends a byte, where a credential only stops them after they have
-reached a parser, and without TLS every key and value crosses the wire in the
-clear either way — so authentication decides who may *use* the cache, not who
+reached a parser — so authentication decides who may *use* the cache, not who
 may read it in flight. Turning it on adds a layer; it does not replace the
 firewall rule. See [auth.md](auth.md) for the design and the rollout.
+
+**What covers the wire is TLS**, on a second port, in a binary built with
+`--features tls`:
+
+```toml
+[tls]
+listen = "0.0.0.0:11312"
+cert = "/etc/vash/cert.pem"   # PEM chain, leaf first
+key = "/etc/vash/key.pem"
+```
+
+Both ports serve the same store, so a rollout moves clients across one at a
+time and then empties `server.listen`. Watch `vash_tls` in `stats conns`, or
+`vash_tls_connections_active` against `vash_connections_active`, to see what is
+still arriving in the clear. Prefer an ECDSA P-256 certificate: the server
+signs once per full handshake, and that is 308µs against RSA-2048's 804µs —
+see [benchmarks.md](benchmarks.md#what-tls-costs). A `tls.listen` in a binary
+built without the feature refuses to start rather than serving that port
+unencrypted. The design is in [tls-proposal.md](tls-proposal.md).
 
 **The admin port serves nothing until you name an address**, with
 `observability.admin_listen` or `--admin-listen 127.0.0.1:9090`. It has no
