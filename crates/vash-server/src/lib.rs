@@ -11,6 +11,9 @@ pub mod config;
 pub mod conn;
 pub mod connections;
 pub mod dispatch;
+/// The memcached dialects. One of three siblings beside [`resp`] and [`vcp`],
+/// all of which meet at [`dispatch`].
+pub mod memcached;
 pub mod metrics;
 pub mod resp;
 pub mod scan;
@@ -18,6 +21,7 @@ pub mod state;
 pub mod stats;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod vcp;
 
 use std::sync::Arc;
 

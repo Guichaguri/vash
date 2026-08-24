@@ -8,7 +8,8 @@ use vash_proto::vcp::{FrameLen, peek_frame_len};
 use vash_proto::{Protocol, detect};
 
 use crate::auth::ConnAuth;
-use crate::dispatch::{Closing, execute_memcached_block};
+use crate::dispatch::Closing;
+use crate::memcached::execute_memcached_block;
 use crate::state::ServerState;
 
 /// Most bytes an unauthenticated connection may have buffered, or ask the
@@ -194,7 +195,7 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     &mut (),
                     |buf, runs| measure_vcp(buf, gated, runs),
                     |state, conn, block, (), out| {
-                        crate::dispatch::execute_vcp_block(state, conn, block, out)
+                        crate::vcp::execute_vcp_block(state, conn, block, out)
                     },
                     |_, _| {},
                     None,
@@ -220,7 +221,7 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     },
                     |_, _| {},
                     may_write.then_some((
-                        crate::dispatch::parse_memcached_writes as ParseWrites,
+                        crate::memcached::parse_memcached_writes as ParseWrites,
                         crate::metrics::Dialect::Memcached,
                         memcached::encode::STORED,
                     )),
