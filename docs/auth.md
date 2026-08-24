@@ -47,6 +47,16 @@ equally trusted, and the existing `flush_enabled`/`listing_enabled` gates stay
 exactly as they are — they limit what *anyone* may do, which is a different
 control from who may connect.
 
+*Half of that changed in M13.* Roles ([roles-proposal.md](roles-proposal.md))
+bound what one authenticated identity may **do**, so "every authenticated client
+is equally trusted" is no longer true — a row can be given `read` and not
+`flush`. What has *not* changed is the sentence before it: roles do not
+partition the keyspace, so protecting one client's **keys** from another is
+still out of scope and still wants two caches rather than two roles. The
+`flush_enabled`/`listing_enabled` gates are also unchanged, and are now ANDed
+with the identity's roles — server first, so a disabled command answers
+identically to everyone.
+
 ---
 
 ## 2. Decision
@@ -264,7 +274,7 @@ template it.
 |---|---|
 | `name` | 1–64 bytes of `[A-Za-z0-9_.-]`. No colon and no whitespace, so both splits are unambiguous. Duplicates are a startup error, not last-one-wins. |
 | `algorithm:value` | One of the two below. The algorithm is **always** present; there is no default and a bare value is refused. |
-| trailing `key=value` | Reserved. None are defined; an unknown one is a startup error, so the field cannot be silently ignored the day `role=` exists (§9). |
+| trailing `key=value` | `roles=<list>` since M13 ([roles-proposal.md](roles-proposal.md) §4); every other key is still a startup error rather than an ignored field. That refusal is why roles needed no capability bit: a file using `roles=` cannot load into a server that would not enforce it. |
 
 Blank lines and lines whose **first non-whitespace character** is `#` are
 skipped. `#` is a comment marker and nothing else — it never appears inside a
@@ -672,6 +682,16 @@ any authenticated client can already invalidate any tag, so the marginal
 authority a peer credential would fence off is small, and the check is one enum
 comparison to add later. Not built; noted so the shape does not preclude it.
 
+*Built in M13, and the shape did not preclude it — see
+[roles-proposal.md](roles-proposal.md).* A peer row carries `roles=peer`, which
+authorises `TAG_SYNC` and nothing else, so a peer secret that leaks out of a
+node's config is no longer a full cache credential. Point 1 above gained a
+second half: a node whose `cluster.auth_name` names a row that exists and lacks
+`peer` also refuses to start, because that misconfiguration fails in exactly the
+shape this section warns about. What the column turned out to need was a *set*
+rather than one name — a web tier needs `read` and `write`, and one role per
+credential would have recreated the problem one compound name at a time.
+
 ---
 
 ## 10. The admin port
@@ -695,6 +715,7 @@ required = false                    # enforcement; credentials may exist while t
 file = ""                           # path to the credential file (§4)
 # or VASH_AUTH_SECRET in the environment for a single `default` identity
 timeout_ms = 5000                   # drop a connection that has not authenticated (§12)
+# default_roles = ["read"]           # what a row with no `roles=` gets; unset is every role
 max_attempts = 3                    # failures on one connection before it is closed
 max_unauthenticated_connections = 0 # 0 = a tenth of server.max_connections
 
@@ -789,8 +810,10 @@ it against a credential-less server is an error (§8) rather than a cheerful
 Stated so they are not re-litigated: no TLS in *this* work (§3.7 — it is the
 right answer to a different question, and it arrived on its own in M12), no
 SASL and no memcached binary protocol, no runtime credential mutation and no
-`ACL` command family, no per-key or per-command permissions, no roles in M9
-(§9), no OIDC/JWT/external identity provider, no authentication on the admin
+`ACL` command family, no per-key permissions, and no roles in M9
+(§9 — they arrived in M13, designed in
+[roles-proposal.md](roles-proposal.md), and §9's `role` column is now a
+`roles=` field), no OIDC/JWT/external identity provider, no authentication on the admin
 port (§10), no per-connection rate limiting beyond the pre-auth budget (§12),
 and no lockout of an identity across connections — an attacker who can trigger
 a lockout has a denial of service instead of a break-in, which is not a trade

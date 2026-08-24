@@ -100,7 +100,7 @@ pub enum Dialect {
 impl Dialect {
     pub const ALL: [Dialect; 3] = [Dialect::Vcp, Dialect::Memcached, Dialect::Resp];
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Vcp => "vcp",
             Self::Memcached => "memcached",
@@ -191,7 +191,7 @@ impl CommandKind {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Hello => "hello",
             Self::Ping => "ping",
@@ -466,6 +466,19 @@ pub struct ServerMetrics {
     pub auth_ok: AtomicU64,
     pub auth_failed: AtomicU64,
     pub auth_refused: AtomicU64,
+    /// Commands refused because the identity lacked a role, one counter per
+    /// role.
+    ///
+    /// **Not folded into `auth_refused`.** That one counts commands refused for
+    /// want of *authentication*, and an alert that cannot tell "nobody rolled
+    /// their credential" from "someone's role set is wrong" is an alert that
+    /// gets muted. Split by role rather than by identity because the
+    /// cardinality is fixed at six, where an identity label is unbounded.
+    ///
+    /// A command missing two roles counts once under each, which is what makes
+    /// the sum answer "how much authority is being asked for and refused"
+    /// rather than "how many commands failed".
+    pub auth_denied: [AtomicU64; crate::auth::Roles::COUNT],
     /// Connections dropped for not authenticating inside `auth.timeout_ms`, and
     /// refused because the unauthenticated-connection budget was full.
     pub auth_timeouts: AtomicU64,
@@ -506,6 +519,7 @@ impl Default for ServerMetrics {
             auth_ok: AtomicU64::new(0),
             auth_failed: AtomicU64::new(0),
             auth_refused: AtomicU64::new(0),
+            auth_denied: std::array::from_fn(|_| AtomicU64::new(0)),
             auth_timeouts: AtomicU64::new(0),
             auth_capacity_rejected: AtomicU64::new(0),
             commands_total: AtomicU64::new(0),
@@ -578,6 +592,15 @@ impl ServerMetrics {
 
     pub fn auth_refused(&self) {
         self.auth_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a denial under every role that was missing.
+    pub fn auth_denied(&self, missing: crate::auth::Roles) {
+        for (index, _, role) in crate::auth::Roles::INDEXED {
+            if missing.allows(role) {
+                self.auth_denied[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn auth_timeout(&self) {
@@ -799,6 +822,42 @@ pub fn render_prometheus(
         "When the certificate chain in use stops verifying. 0 means it does          not verify now — expired, not yet valid, or an incomplete chain.",
         load(&server.tls_cert_expiry).to_string(),
     );
+
+    metric!(
+        "vash_auth_ok_total",
+        "counter",
+        "Successful authentications.",
+        load(&server.auth_ok).to_string(),
+    );
+    metric!(
+        "vash_auth_failed_total",
+        "counter",
+        "Rejected credentials.",
+        load(&server.auth_failed).to_string(),
+    );
+    metric!(
+        "vash_auth_refused_total",
+        "counter",
+        "Commands refused because the connection had not authenticated.",
+        load(&server.auth_refused).to_string(),
+    );
+
+    // Split by role, and kept apart from `vash_auth_refused_total`: that one is
+    // "nobody rolled their credential", this one is "someone's role set is
+    // wrong", and an alert that cannot tell them apart gets muted. A command
+    // missing two roles counts once under each.
+    let _ = writeln!(
+        out,
+        "# HELP vash_auth_denied_total Commands refused because the identity lacked a role."
+    );
+    let _ = writeln!(out, "# TYPE vash_auth_denied_total counter");
+    for (index, role, _) in crate::auth::Roles::INDEXED {
+        let _ = writeln!(
+            out,
+            "vash_auth_denied_total{{role=\"{role}\"}} {}",
+            load(&server.auth_denied[index])
+        );
+    }
 
     metric!(
         "vash_commands_total",

@@ -401,6 +401,34 @@ max_attempts = 3     # failed attempts before the connection is closed
 # connection budget.
 max_unauthenticated_connections = 0
 
+# What a credential row with no `roles=` field is granted.
+#
+# A row can name what it may do — read, write, invalidate, list, flush, peer —
+# and every command needs one of them:
+#
+#   web          sha256:8c21…  roles=read,write
+#   invalidator  sha256:44de…  roles=invalidate
+#   peer         sha256:9b07…  roles=peer
+#
+# Generate one with `vash-server auth-gen billing-api --roles read,write`.
+# See docs/roles-proposal.md §2 for what each rung fences off, and why there is
+# no `delete` role (a writer deletes any key it can name with a one-second TTL).
+#
+# **Leave this key commented to keep today's behaviour.** Unset means every
+# role, including ones added in later versions — which is what keeps a
+# credential file written before roles existed working unchanged. Spelling the
+# six names out instead means *exactly* those six, so a seventh added later
+# would be withheld from every bare row on upgrade. Absence is permissive,
+# presence is exact.
+#
+# Narrow it once every row that needs more than the floor has its own `roles=`:
+# from then on a row somebody adds without thinking is least-privilege rather
+# than most. `[]` grants a bare row nothing at all — it authenticates and is
+# then refused everything, and startup names those rows so it is not discovered
+# one denial at a time.
+#
+# default_roles = ["read"]
+
 [tls]
 # Encryption on the wire, on a second port. Off by default, and it needs a
 # binary built with `--features tls` — a `listen` here in a build without it

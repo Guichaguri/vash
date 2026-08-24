@@ -89,14 +89,20 @@ enum Subcommand {
         /// Identity the credential is for.
         #[arg(default_value = vash_server::auth::DEFAULT_NAME)]
         name: String,
+
+        /// What the identity may do, comma-separated: read, write, invalidate,
+        /// list, flush, peer. Omitted, the row inherits `auth.default_roles`,
+        /// which is every role unless configured otherwise.
+        #[arg(long)]
+        roles: Option<String>,
     },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if let Some(Subcommand::AuthGen { name }) = &cli.command {
-        return auth_gen(name);
+    if let Some(Subcommand::AuthGen { name, roles }) = &cli.command {
+        return auth_gen(name, roles.as_deref());
     }
 
     let mut config = match &cli.config {
@@ -180,8 +186,8 @@ fn main() -> anyhow::Result<()> {
 /// it is ever displayed. Nothing is written to disk here — where the secret
 /// goes is the operator's business, and a tool that helpfully saved it would be
 /// putting a plaintext credential somewhere nobody asked for.
-fn auth_gen(name: &str) -> anyhow::Result<()> {
-    let (secret, line) = vash_server::auth::generate(name)?;
+fn auth_gen(name: &str, roles: Option<&str>) -> anyhow::Result<()> {
+    let (secret, line) = vash_server::auth::generate(name, roles)?;
     eprintln!("secret for {name} (shown once, store it in your secret manager):\n{secret}\n");
     println!("{line}");
     Ok(())

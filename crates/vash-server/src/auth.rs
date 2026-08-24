@@ -34,6 +34,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, bail, ensure};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tracing::{info, warn};
 
 /// The identity a credential-less deployment, a bare `VASH_AUTH_SECRET`, and
 /// Redis's one-argument `AUTH` all resolve to.
@@ -52,6 +53,198 @@ pub const SECRET_ENV: &str = "VASH_AUTH_SECRET";
 pub const MIN_SECRET_LEN: usize = 16;
 
 const MAX_NAME_LEN: usize = 64;
+
+/// The authority a credential carries, as a bitset.
+///
+/// A bitset rather than a set of enums because the check runs once per command,
+/// on a value the connection already holds: `allows` is an AND and a compare,
+/// with no lock, no map probe and no allocation. See `docs/roles-proposal.md`
+/// §5.
+///
+/// The roles are rungs of *blast radius*, not a classification of what a
+/// command does to storage — `DELETE_BY_TAG` is a write in the storage sense
+/// and is its own rung here, because it destroys keys the caller cannot name.
+/// There is deliberately no `delete` role: an identity with [`Roles::WRITE`]
+/// deletes any key it can name by writing it with a one-second TTL, so the role
+/// would fence off nothing while documenting a boundary the server cannot
+/// enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Roles(u8);
+
+impl Roles {
+    /// Authorises nothing. What a row inherits when `auth.default_roles` is set
+    /// to the empty list.
+    pub const NONE: Self = Self(0);
+    /// `GET`, `GET_MANY`, and the deadline queries. Gates commands that return
+    /// a stored **value**.
+    pub const READ: Self = Self(0x01);
+    /// Changes one named key at a time.
+    pub const WRITE: Self = Self(0x02);
+    /// `DELETE_BY_TAG`.
+    pub const INVALIDATE: Self = Self(0x04);
+    /// The listings, in every dialect that has one.
+    pub const LIST: Self = Self(0x08);
+    /// `FLUSH` and memcached's `flush_all`.
+    pub const FLUSH: Self = Self(0x10);
+    /// `TAG_SYNC` — a cluster peer's authority, and only that.
+    pub const PEER: Self = Self(0x20);
+
+    /// What the three fused commands need: they return a stored value *and*
+    /// write. See [`roles_for_command`].
+    pub const READ_WRITE: Self = Self(Self::READ.0 | Self::WRITE.0);
+
+    /// What `auth.default_roles` is when unset: everything, now and in later
+    /// versions.
+    ///
+    /// Every bit rather than the six defined ones, and that is the whole of the
+    /// compatibility promise: a credential file written before roles existed
+    /// grants a seventh role added in a future version, where an operator who
+    /// enumerated all six today would not. Absence is permissive, presence is
+    /// exact — the same asymmetry the `roles=` field itself has.
+    pub const UNRESTRICTED: Self = Self(u8::MAX);
+
+    /// How many roles this build defines. The width of the per-role counters.
+    pub const COUNT: usize = 6;
+
+    /// The roles in wire and rendering order, with their names.
+    const NAMED: [(Self, &'static str); Self::COUNT] = [
+        (Self::READ, "read"),
+        (Self::WRITE, "write"),
+        (Self::INVALIDATE, "invalidate"),
+        (Self::LIST, "list"),
+        (Self::FLUSH, "flush"),
+        (Self::PEER, "peer"),
+    ];
+
+    /// The roles with their counter index and label, for the metrics family.
+    pub const INDEXED: [(usize, &'static str, Self); Self::COUNT] = [
+        (0, "read", Self::READ),
+        (1, "write", Self::WRITE),
+        (2, "invalidate", Self::INVALIDATE),
+        (3, "list", Self::LIST),
+        (4, "flush", Self::FLUSH),
+        (5, "peer", Self::PEER),
+    ];
+
+    /// Whether this set satisfies everything `needed` asks for.
+    ///
+    /// Takes a set rather than one role so the commands that need two are one
+    /// call at each gate instead of a special case at each of them.
+    #[inline]
+    pub fn allows(self, needed: Roles) -> bool {
+        self.0 & needed.0 == needed.0
+    }
+
+    /// What `needed` asks for and this set does not have. For the denial log,
+    /// which has to name the role an operator should add.
+    #[inline]
+    pub fn missing(self, needed: Roles) -> Roles {
+        Roles(needed.0 & !self.0)
+    }
+
+    #[inline]
+    pub fn union(self, other: Roles) -> Roles {
+        Roles(self.0 | other.0)
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The bitset as it travels in the `AUTH` reply body.
+    #[inline]
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// The names of the roles present, comma-separated.
+    ///
+    /// An unrestricted identity renders as the six this build knows, which is
+    /// an honest answer to "what can this connection do here" even though the
+    /// stored value also covers roles that do not exist yet.
+    pub fn to_names(self) -> String {
+        if self.is_empty() {
+            return "none".into();
+        }
+        let mut out = String::new();
+        for (role, name) in Self::NAMED {
+            if self.allows(role) {
+                if !out.is_empty() {
+                    out.push(',');
+                }
+                out.push_str(name);
+            }
+        }
+        out
+    }
+
+    /// Parses one role name.
+    fn from_name(name: &str) -> Option<Self> {
+        Self::NAMED
+            .iter()
+            .find(|(_, known)| *known == name)
+            .map(|(role, _)| *role)
+    }
+
+    /// Parses a comma-separated list, as it appears in `roles=` and in
+    /// `auth.default_roles`.
+    ///
+    /// Every failure is an error rather than a skipped name, under the rule the
+    /// loader already has: a credential file must never half-load. A typo that
+    /// reads as a *smaller* grant is exactly as dangerous as one that reads as
+    /// a larger one — it silently breaks a working client instead.
+    pub fn parse_list(list: &str) -> anyhow::Result<Self> {
+        ensure!(
+            !list.is_empty(),
+            "the role list is empty. Omit `roles=` to inherit auth.default_roles, or delete \
+             the row if it should authorise nothing — an empty list reads at a glance like the \
+             field being absent while meaning the opposite"
+        );
+
+        let mut roles = Self::NONE;
+        for name in list.split(',') {
+            let role = Self::from_name(name).with_context(|| {
+                format!(
+                    "unknown role {name:?}. Known: {}",
+                    Self::NAMED
+                        .iter()
+                        .map(|(_, n)| *n)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            ensure!(!roles.allows(role), "role {name:?} is listed twice");
+            roles = roles.union(role);
+        }
+        Ok(roles)
+    }
+
+    /// Parses `auth.default_roles`, where the empty list is meaningful.
+    ///
+    /// `None` — the key unset — is [`Roles::UNRESTRICTED`]; `Some([])` is
+    /// [`Roles::NONE`], the fail-safe form of "every row must state its own
+    /// authority".
+    pub fn parse_default(configured: Option<&[String]>) -> anyhow::Result<Self> {
+        let Some(names) = configured else {
+            return Ok(Self::UNRESTRICTED);
+        };
+        if names.is_empty() {
+            return Ok(Self::NONE);
+        }
+        Self::parse_list(&names.join(",")).context("in auth.default_roles")
+    }
+}
+
+impl std::fmt::Display for Roles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_names())
+    }
+}
 
 /// Which VCP mechanism a credential can satisfy.
 ///
@@ -83,11 +276,30 @@ impl Mechanism {
 /// Cheap to clone because it crosses a `spawn_blocking` boundary with the rest
 /// of the connection's state on every batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Identity(Arc<str>);
+pub struct Identity {
+    name: Arc<str>,
+    /// Resolved once, here, and never looked up again.
+    ///
+    /// Carrying the set rather than the row's name is what keeps the per-command
+    /// check off the credential table: looking the row up per command would put
+    /// the `RwLock<Arc<Auth>>` and a map probe on every `GET`, on a cacheline
+    /// every connection thread shares, to answer a question that cannot change
+    /// for the life of the identity.
+    ///
+    /// The consequence, and it is the same one a rotated secret has: editing a
+    /// row's `roles=` and reloading affects the *next* authentication, not a
+    /// connection already holding this.
+    roles: Roles,
+}
 
 impl Identity {
     pub fn name(&self) -> &str {
-        &self.0
+        &self.name
+    }
+
+    #[inline]
+    pub fn roles(&self) -> Roles {
+        self.roles
     }
 }
 
@@ -149,6 +361,17 @@ struct Credential {
     /// the configured CA signed. Presenting the subject as a password gets
     /// nowhere, because [`Auth::verify`] only ever looks at `value`.
     subject: Option<Box<str>>,
+    /// What this identity may do, resolved at load.
+    ///
+    /// Held as a concrete set rather than an `Option` the check has to unwrap:
+    /// by the time the table is live, an inherited set and a written one are
+    /// indistinguishable, which is what keeps `auth.default_roles` confined to
+    /// the loader.
+    roles: Roles,
+    /// Whether `roles` came from `auth.default_roles` rather than from a
+    /// `roles=` field. Kept only so startup can report which rows took the
+    /// default — see [`Auth::load`].
+    inherited: bool,
 }
 
 /// The credential table, plus whether it is being enforced.
@@ -163,6 +386,24 @@ pub struct Auth {
     table: HashMap<Box<[u8]>, Credential>,
 }
 
+/// Resolves `auth.default_roles` into every row that omitted `roles=`, and
+/// reports which rows those were.
+///
+/// Split out from [`Auth::load`] so the resolution is testable without a
+/// config, and because it is the one place the default is read: below this
+/// line nothing knows whether a set was inherited or written.
+fn resolve_defaults(table: &mut HashMap<Box<[u8]>, Credential>, default: Roles) -> Vec<String> {
+    let mut inherited = Vec::new();
+    for (name, credential) in table.iter_mut() {
+        if credential.inherited {
+            credential.roles = default;
+            inherited.push(String::from_utf8_lossy(name).into_owned());
+        }
+    }
+    inherited.sort();
+    inherited
+}
+
 impl Auth {
     /// Builds the table from a credential file, the environment, or neither.
     ///
@@ -170,8 +411,9 @@ impl Auth {
     pub fn load(config: &crate::config::AuthConfig) -> anyhow::Result<Self> {
         let from_env = std::env::var_os(SECRET_ENV);
         let has_file = !config.file.as_os_str().is_empty();
+        let default_roles = Roles::parse_default(config.default_roles.as_deref())?;
 
-        let table = match (has_file, from_env) {
+        let mut table = match (has_file, from_env) {
             (true, Some(_)) => bail!(
                 "both auth.file and {SECRET_ENV} are set; use one or the other so it is \
                  unambiguous which credentials the server is running with"
@@ -193,12 +435,41 @@ impl Auth {
                         mechanism: Mechanism::Plain,
                         subject: None,
                         value: sha256(secret),
+                        // A bare row like any other, so it takes
+                        // `auth.default_roles` too. This is the only way the
+                        // single-secret deployment can restrict its one
+                        // identity, and it costs a special case rather than
+                        // adding one.
+                        roles: Roles::UNRESTRICTED,
+                        inherited: true,
                     },
                 );
                 table
             }
             (false, None) => HashMap::new(),
         };
+
+        let inherited = resolve_defaults(&mut table, default_roles);
+        if !inherited.is_empty() {
+            if default_roles.is_empty() {
+                // A row that authenticates and is then refused everything is
+                // confusing to debug from the client side, so the rows are
+                // named here rather than left to be discovered one denial at a
+                // time. This is what `auth.require_roles` was for, without the
+                // boot failure — see docs/roles-proposal.md §15.
+                warn!(
+                    rows = %inherited.join(", "),
+                    "auth.default_roles is empty and these credentials have no `roles=`; \
+                     they can authenticate and will then be refused every command"
+                );
+            } else {
+                info!(
+                    rows = inherited.len(),
+                    roles = %default_roles,
+                    "credentials without `roles=` inherit auth.default_roles"
+                );
+            }
+        }
 
         // Enforcement with an empty table locks everyone out, including peers.
         // Refusing to start is the only failure mode an operator cannot miss.
@@ -217,6 +488,12 @@ impl Auth {
     /// A table with one generated-looking credential, for tests.
     #[cfg(test)]
     pub fn for_test(required: bool, name: &str, secret: &[u8]) -> Self {
+        Self::for_test_with_roles(required, name, secret, Roles::UNRESTRICTED)
+    }
+
+    /// As [`Auth::for_test`], for the role gates.
+    #[cfg(test)]
+    pub fn for_test_with_roles(required: bool, name: &str, secret: &[u8], roles: Roles) -> Self {
         let mut table = HashMap::new();
         table.insert(
             name.as_bytes().into(),
@@ -224,6 +501,8 @@ impl Auth {
                 mechanism: Mechanism::Plain,
                 value: sha256(secret),
                 subject: None,
+                roles,
+                inherited: false,
             },
         );
         Self { required, table }
@@ -261,15 +540,25 @@ impl Auth {
                 continue;
             };
             if matches(subject) {
-                return Some(Identity(
-                    String::from_utf8_lossy(name)
+                return Some(Identity {
+                    name: String::from_utf8_lossy(name)
                         .into_owned()
                         .into_boxed_str()
                         .into(),
-                ));
+                    roles: credential.roles,
+                });
             }
         }
         None
+    }
+
+    /// The roles a named row carries, for the startup checks that have to look
+    /// one up without authenticating as it — see [`crate::check_peer_role`].
+    ///
+    /// `None` when the row does not exist, which the caller reports differently
+    /// from a row that exists and lacks a role.
+    pub fn roles_of(&self, name: &[u8]) -> Option<Roles> {
+        self.table.get(name).map(|credential| credential.roles)
     }
 
     /// Verifies a `PLAIN` attempt. `None` on any failure, deliberately without
@@ -296,12 +585,13 @@ impl Auth {
         // Comparing the secrets directly would leak the length of the shared
         // prefix, which on a LAN is a real attack rather than a theoretical one.
         if presented.ct_eq(&credential.value).into() {
-            Some(Identity(
-                String::from_utf8_lossy(name)
+            Some(Identity {
+                name: String::from_utf8_lossy(name)
                     .into_owned()
                     .into_boxed_str()
                     .into(),
-            ))
+                roles: credential.roles,
+            })
         } else {
             None
         }
@@ -385,6 +675,95 @@ impl AuthState {
         // in flight is judged by one side or the other, never by half of each.
         self.required.store(auth.required(), Ordering::Relaxed);
         *current = Arc::new(auth);
+    }
+}
+
+/// The roles a command needs, and the authority every gate defers to.
+///
+/// **Exhaustive on purpose.** A new [`vash_core::Command`] variant fails to
+/// compile until it is classified here — the same discipline
+/// `Command::inline_safe` documents, and for a sharper reason. Falling through
+/// to the wrong answer there stalls a runtime worker; falling through here
+/// hands out authority.
+///
+/// Lives in the server rather than in `vash-core` so the storage tier still
+/// never learns that authorization exists. Exhaustiveness works across the
+/// crate boundary regardless.
+pub fn roles_for_command(command: &vash_core::Command<'_>) -> Roles {
+    use vash_core::Command as C;
+
+    match command {
+        // Connection maintenance and introspection, with no storage effect.
+        // `STATS` and `CLUSTER` disclose counters, settings and peer addresses
+        // — the same disclosure `/stats` on the admin port makes — and gating
+        // them would break client libraries that call `stats` on connect. See
+        // docs/roles-proposal.md §2.
+        C::Hello { .. } | C::Ping | C::Stats | C::Version | C::Quit | C::Cluster => Roles::NONE,
+
+        // Returns a stored value, or stored metadata the caller did not supply.
+        C::Get { .. } | C::GetMany(_) | C::Deadline { .. } | C::Deadlines(_) => Roles::READ,
+
+        // `SET … GET` is the disclosing form: the flag exists to report the
+        // value that was displaced, so it needs `read` as well. A plain `SET`
+        // does not, and the existence side channel of a guarded write — a
+        // refused `NX` — is not fenced off, because a write that cannot report
+        // its own outcome is not a write.
+        C::Set(set) => {
+            if set.return_previous {
+                Roles::READ_WRITE
+            } else {
+                Roles::WRITE
+            }
+        }
+
+        C::SetMany { .. }
+        | C::Delete { .. }
+        | C::DeleteMany(_)
+        | C::Touch { .. }
+        | C::Expire { .. }
+        | C::Append { .. } => Roles::WRITE,
+
+        // The fused commands, which hand back a stored value *and* write.
+        // Without `read` here, `roles=write` is a credential that reads every
+        // key it can name — `INCRBY 0` is a `GET` with extra steps.
+        C::GetAndTouch { .. } | C::Arithmetic(_) => Roles::READ_WRITE,
+
+        // Reaches keys the caller cannot name, resolving them from a registry
+        // it has no way to enumerate without `list`, and fans the result out to
+        // every node. Not reachable from `write`, which is why it is not folded
+        // into it.
+        C::DeleteByTag { .. } => Roles::INVALIDATE,
+
+        C::Flush => Roles::FLUSH,
+
+        // A peer's whole authority. `TAG_SYNC` sets a generation to any value,
+        // where `DELETE_BY_TAG` moves it by one.
+        C::TagSync { .. } => Roles::PEER,
+
+        C::ListKeys(_) | C::ListTags(_) => Roles::LIST,
+    }
+}
+
+/// The roles a VCP opcode needs, decided from the frame header alone.
+///
+/// A second mapping, and it exists because the VCP gate runs *before* the body
+/// is decoded — which is what keeps a refused command from driving a body
+/// parser, exactly as the pre-auth gate does. The two are kept from drifting by
+/// `the_opcode_and_command_mappings_agree`, not by hoping.
+pub fn roles_for_opcode(opcode: vash_proto::vcp::Opcode) -> Roles {
+    use vash_proto::vcp::Opcode as O;
+
+    match opcode {
+        O::Hello | O::Ping | O::Auth | O::Stats | O::Cluster => Roles::NONE,
+        O::Get | O::GetMany => Roles::READ,
+        O::Set | O::SetMany | O::Delete | O::DeleteMany | O::Touch => Roles::WRITE,
+        // VCP's arithmetic answers with the resulting value, like every other
+        // dialect's.
+        O::Arithmetic => Roles::READ_WRITE,
+        O::DeleteByTag => Roles::INVALIDATE,
+        O::Flush => Roles::FLUSH,
+        O::TagSync => Roles::PEER,
+        O::ListKeys | O::ListTags => Roles::LIST,
     }
 }
 
@@ -472,18 +851,28 @@ fn parse_line(line: &str, table: &mut HashMap<Box<[u8]>, Credential>) -> anyhow:
         .next()
         .context("expected `<name> <algorithm>:<value>`, but the line has only one field")?;
 
-    // Reserved rather than ignored: the day `role=` exists, a file written for
-    // a newer server must not load silently into an older one with the field
-    // dropped.
-    if let Some(extra) = fields.next() {
-        bail!(
-            "unknown trailing field {extra:?}. No `key=value` fields are defined yet; \
-             they are reserved"
-        );
+    // `roles=` is the first field to occupy the slot this loader reserved.
+    // Everything else stays refused rather than ignored, which is what stops a
+    // file written for a newer server loading silently into an older one with
+    // the field dropped — and it is why roles need no capability bit.
+    let mut roles = None;
+    for field in fields {
+        let Some(list) = field.strip_prefix("roles=") else {
+            bail!(
+                "unknown trailing field {field:?}. Defined: `roles=<list>`. \
+                 Others are reserved"
+            );
+        };
+        ensure!(roles.is_none(), "`roles=` is given twice");
+        roles = Some(Roles::parse_list(list)?);
     }
 
     validate_name(name)?;
-    let credential = parse_credential(credential)?;
+    let mut credential = parse_credential(credential)?;
+    if let Some(roles) = roles {
+        credential.roles = roles;
+        credential.inherited = false;
+    }
 
     // Last-one-wins on a duplicate would make which credential is live depend
     // on file order, which is not a thing anyone should have to know.
@@ -531,6 +920,8 @@ fn parse_credential(field: &str) -> anyhow::Result<Credential> {
             mechanism: Mechanism::Plain,
             value: parse_hex32(value)?,
             subject: None,
+            roles: Roles::UNRESTRICTED,
+            inherited: true,
         }),
 
         // A certificate subject rather than a secret. The row says "whoever
@@ -550,6 +941,8 @@ fn parse_credential(field: &str) -> anyhow::Result<Credential> {
                 mechanism: Mechanism::Plain,
                 value: [0u8; 32],
                 subject: Some(value.into()),
+                roles: Roles::UNRESTRICTED,
+                inherited: true,
             })
         }
 
@@ -595,14 +988,22 @@ fn parse_hex32(value: &str) -> anyhow::Result<[u8; 32]> {
 ///
 /// Returns `(secret, line)`. Generating rather than accepting a secret is what
 /// keeps the fast-hash argument in this module's header true in practice.
-pub fn generate(name: &str) -> anyhow::Result<(String, String)> {
+pub fn generate(name: &str, roles: Option<&str>) -> anyhow::Result<(String, String)> {
     validate_name(name)?;
+    // Validated here rather than left for the server to reject on the next
+    // start: a generated row is pasted into a file unread, and a typo in it
+    // would surface as a boot failure at the least convenient moment.
+    let roles = roles.map(Roles::parse_list).transpose()?;
 
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).context("reading from the system random source")?;
 
     let secret = hex(&secret);
-    let line = format!("{name}  sha256:{}", hex(&sha256(secret.as_bytes())));
+    let mut line = format!("{name}  sha256:{}", hex(&sha256(secret.as_bytes())));
+    if let Some(roles) = roles {
+        line.push_str("  roles=");
+        line.push_str(&roles.to_names());
+    }
     Ok((secret, line))
 }
 
@@ -718,6 +1119,8 @@ mod tests {
                 mechanism: Mechanism::HmacSha256,
                 value: key,
                 subject: None,
+                roles: Roles::UNRESTRICTED,
+                inherited: true,
             },
         );
         let auth = Auth {
@@ -738,7 +1141,7 @@ mod tests {
 
     #[test]
     fn a_generated_line_verifies_its_own_secret() {
-        let (secret, line) = generate("billing-api").unwrap();
+        let (secret, line) = generate("billing-api", None).unwrap();
         assert!(secret.len() >= MIN_SECRET_LEN);
 
         let auth = Auth {
@@ -749,9 +1152,250 @@ mod tests {
     }
 
     #[test]
+    fn a_row_carries_the_roles_it_names() {
+        let table = parse(&format!("{}  roles=read,list", digest_line("dash", SECRET))).unwrap();
+        let roles = table[b"dash".as_slice()].roles;
+        assert!(roles.allows(Roles::READ));
+        assert!(roles.allows(Roles::LIST));
+        assert!(!roles.allows(Roles::WRITE));
+        assert!(!roles.allows(Roles::FLUSH));
+        // A row that named its roles does not take the default.
+        assert!(!table[b"dash".as_slice()].inherited);
+    }
+
+    #[test]
+    fn a_bare_row_takes_the_default() {
+        let mut table = parse(&digest_line("legacy", SECRET)).unwrap();
+        assert!(table[b"legacy".as_slice()].inherited);
+
+        let inherited = resolve_defaults(&mut table, Roles::READ);
+        assert_eq!(inherited, vec!["legacy".to_string()]);
+        assert_eq!(table[b"legacy".as_slice()].roles, Roles::READ);
+    }
+
+    /// The compatibility promise, and the reason the unset default is every bit
+    /// rather than the six this build defines: a file written before roles
+    /// existed must not lose authority when the server gains a role.
+    #[test]
+    fn the_unset_default_covers_roles_that_do_not_exist_yet() {
+        let future = Roles::from_bits(0b0100_0000);
+
+        let unset = Roles::parse_default(None).unwrap();
+        assert!(unset.allows(future));
+
+        // An operator who enumerated today's six has said "exactly these".
+        let names: Vec<String> = Roles::NAMED.iter().map(|(_, n)| (*n).to_string()).collect();
+        let spelled_out = Roles::parse_default(Some(&names)).unwrap();
+        assert!(!spelled_out.allows(future));
+    }
+
+    #[test]
+    fn an_empty_default_is_distinct_from_an_absent_one() {
+        assert_eq!(Roles::parse_default(Some(&[])).unwrap(), Roles::NONE);
+        assert_eq!(Roles::parse_default(None).unwrap(), Roles::UNRESTRICTED);
+    }
+
+    #[test]
+    fn every_malformed_role_list_is_a_hard_error() {
+        let digest = hex(&sha256(SECRET.as_bytes()));
+        let cases: &[(&str, &str)] = &[
+            (
+                "n sha256:{d} roles=",
+                "an empty list reads like the field being absent",
+            ),
+            ("n sha256:{d} roles=admin", "no such role"),
+            (
+                "n sha256:{d} roles=read,admin",
+                "one bad name poisons the row",
+            ),
+            (
+                "n sha256:{d} roles=all",
+                "no `all` keyword: it would grant roles that do not exist yet",
+            ),
+            (
+                "n sha256:{d} roles=read,read",
+                "a duplicate is a typo, not an intent",
+            ),
+            (
+                "n sha256:{d} roles=read, write",
+                "the format is whitespace-delimited",
+            ),
+            ("n sha256:{d} roles=read roles=write", "two role fields"),
+            ("n sha256:{d} role=read", "the singular is not the field"),
+            ("n sha256:{d} scope=read", "still refused, still reserved"),
+        ];
+
+        for (line, why) in cases {
+            let line = line.replace("{d}", &digest);
+            assert!(
+                parse(&line).is_err(),
+                "expected {line:?} to be refused ({why})"
+            );
+        }
+    }
+
+    /// The three commands that hand back a stored value while writing. Without
+    /// `read` here, `roles=write` is a credential that reads every key it can
+    /// name.
+    #[test]
+    fn the_fused_commands_need_read_as_well_as_write() {
+        use vash_core::Command;
+
+        let key = vash_core::Key::new(b"k").unwrap();
+        let fused = [
+            Command::GetAndTouch {
+                keys: key.into(),
+                ttl_secs: 60,
+            },
+            Command::Arithmetic(vash_core::Arithmetic::counter(key, 1, false)),
+            Command::Set(vash_core::Set {
+                return_previous: true,
+                ..vash_core::Set::plain(key, b"v", 0)
+            }),
+        ];
+
+        for command in fused {
+            let needed = roles_for_command(&command);
+            assert!(
+                !Roles::WRITE.allows(needed),
+                "{command:?} must not be reachable with `write` alone"
+            );
+            assert!(Roles::READ_WRITE.allows(needed), "{command:?}");
+        }
+
+        // The plain form of the same write does not need `read`.
+        let plain = Command::Set(vash_core::Set::plain(key, b"v", 0));
+        assert!(Roles::WRITE.allows(roles_for_command(&plain)));
+    }
+
+    /// The VCP gate decides from the frame header, before the body is decoded,
+    /// so it reads a different mapping from every other gate. This is what
+    /// stops the two drifting.
+    #[test]
+    fn the_opcode_and_command_mappings_agree() {
+        use vash_core::Command;
+        use vash_proto::vcp::Opcode;
+
+        let key = vash_core::Key::new(b"k").unwrap();
+        let equivalents: Vec<(Opcode, Command<'_>)> = vec![
+            (
+                Opcode::Hello,
+                Command::Hello {
+                    protocol_version: 1,
+                },
+            ),
+            (Opcode::Ping, Command::Ping),
+            (Opcode::Cluster, Command::Cluster),
+            (Opcode::Get, Command::Get { key }),
+            (Opcode::GetMany, Command::GetMany(key.into())),
+            (
+                Opcode::Set,
+                Command::Set(vash_core::Set::plain(key, b"v", 0)),
+            ),
+            (
+                Opcode::SetMany,
+                Command::SetMany {
+                    sets: vec![vash_core::Set::plain(key, b"v", 0)],
+                    guard: vash_core::BatchGuard::Always,
+                },
+            ),
+            (Opcode::Delete, Command::Delete { key }),
+            (Opcode::DeleteMany, Command::DeleteMany(vec![key])),
+            (Opcode::Touch, Command::Touch { key, ttl_secs: 60 }),
+            (
+                Opcode::Arithmetic,
+                Command::Arithmetic(vash_core::Arithmetic::counter(key, 1, false)),
+            ),
+            (Opcode::DeleteByTag, Command::DeleteByTag { tag: b"t" }),
+            (Opcode::Flush, Command::Flush),
+            (
+                Opcode::TagSync,
+                Command::TagSync {
+                    full: true,
+                    entries: Vec::new(),
+                },
+            ),
+            (
+                Opcode::ListKeys,
+                Command::ListKeys(vash_core::ListRequest {
+                    limit: 10,
+                    cursor: b"",
+                    pattern: b"",
+                }),
+            ),
+            (
+                Opcode::ListTags,
+                Command::ListTags(vash_core::ListRequest {
+                    limit: 10,
+                    cursor: b"",
+                    pattern: b"",
+                }),
+            ),
+        ];
+
+        for (opcode, command) in &equivalents {
+            assert_eq!(
+                roles_for_opcode(*opcode),
+                roles_for_command(command),
+                "{opcode:?} and the command it decodes to disagree"
+            );
+        }
+    }
+
+    /// Every role gates something, and every command is reachable from some
+    /// role. A role nothing needs is one an operator can withhold with no
+    /// effect, which is worse than not having it at all.
+    #[test]
+    fn every_role_gates_something() {
+        use vash_core::Command;
+
+        let key = vash_core::Key::new(b"k").unwrap();
+        let commands = [
+            Command::Get { key },
+            Command::Set(vash_core::Set::plain(key, b"v", 0)),
+            Command::DeleteByTag { tag: b"t" },
+            Command::ListKeys(vash_core::ListRequest {
+                limit: 10,
+                cursor: b"",
+                pattern: b"",
+            }),
+            Command::Flush,
+            Command::TagSync {
+                full: true,
+                entries: Vec::new(),
+            },
+        ];
+
+        let reachable = commands.iter().fold(Roles::NONE, |acc, command| {
+            acc.union(roles_for_command(command))
+        });
+
+        for (_, name, role) in Roles::INDEXED {
+            assert!(reachable.allows(role), "no command needs `{name}`");
+        }
+    }
+
+    #[test]
+    fn a_generated_line_can_carry_roles() {
+        let (secret, line) = generate("worker", Some("invalidate")).unwrap();
+        let mut table = parse(&line).unwrap();
+        resolve_defaults(&mut table, Roles::NONE);
+
+        let auth = Auth {
+            required: true,
+            table,
+        };
+        let identity = auth.verify(b"worker", secret.as_bytes()).unwrap();
+        assert_eq!(identity.roles(), Roles::INVALIDATE);
+
+        // A typo is caught where the line is written, not at the next boot.
+        assert!(generate("worker", Some("invalidat")).is_err());
+    }
+
+    #[test]
     fn two_generated_secrets_differ() {
-        let (a, _) = generate("x").unwrap();
-        let (b, _) = generate("x").unwrap();
+        let (a, _) = generate("x", None).unwrap();
+        let (b, _) = generate("x", None).unwrap();
         assert_ne!(a, b);
     }
 }

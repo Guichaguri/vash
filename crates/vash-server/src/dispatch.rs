@@ -300,7 +300,7 @@ pub fn execute_memcached_block(
                     parsed.style,
                     vash_proto::memcached::encode::ResponseStyle::Storage
                 ) && let Some(set) = batchable(&parsed.command)
-                    && !(conn_gated(state, conn))
+                    && !(conn_gated(state, conn, &parsed.command))
                 {
                     if batch.holds(set.key) {
                         flush_memcached(state, &mut batch, out);
@@ -355,13 +355,32 @@ pub fn execute_memcached_block(
     Closing::No
 }
 
-/// Whether this connection still has to authenticate before it may write.
+/// Whether this connection may not simply execute a `set` — because it has yet
+/// to authenticate, or because its identity has no `write` role.
 ///
 /// A gated connection's `set` is refused rather than executed, and the refusal
-/// is [`execute_memcached_unauthenticated`]'s to render, so such a command must
-/// never reach the batch.
-fn conn_gated(state: &ServerState, conn: &ConnAuth) -> bool {
-    !conn.is_authenticated() && state.auth.required()
+/// belongs to [`execute_memcached_unauthenticated`] or to the role gate in
+/// [`execute_memcached`], so such a command must never reach the batch. This is
+/// the memcached half of the rule that the gate has to sit *ahead* of the
+/// batching, not inside `execute`: a batched write never passes through
+/// `execute` at all.
+fn conn_gated(state: &ServerState, conn: &ConnAuth, command: &Command<'_>) -> bool {
+    if !conn.is_authenticated() {
+        return state.auth.required();
+    }
+    !conn_roles(conn).allows(crate::auth::roles_for_command(command))
+}
+
+/// The roles this connection carries, or everything when it has no identity.
+///
+/// The fallback is only ever reached with `auth.required` off and nothing
+/// authenticated, which is the configuration where there is no identity to
+/// restrict — the server is not defending anything to begin with.
+#[inline]
+fn conn_roles(conn: &ConnAuth) -> crate::auth::Roles {
+    conn.identity()
+        .map(crate::auth::Identity::roles)
+        .unwrap_or(crate::auth::Roles::UNRESTRICTED)
 }
 
 /// Submits a held run of `set`s and writes `STORED` — or the failure — for each.
@@ -400,6 +419,30 @@ pub fn execute_memcached(
 
     if !conn.is_authenticated() && state.auth.required() {
         return execute_memcached_unauthenticated(state, conn, parsed, out);
+    }
+
+    // The role gate, in the same place and for the same reason: ahead of the
+    // batching above and of every execution path below, because two of those
+    // paths do not go through `execute`.
+    //
+    // `stats cachedump` and `lru_crawler metadump` are the exception the
+    // `Command` mapping cannot cover — they are response *styles* that reach
+    // the listing without a domain command — so they name `LIST` here, beside
+    // the `listing_gate` that already refuses them when enumeration is off.
+    let needed = match &parsed.style {
+        vash_proto::memcached::encode::ResponseStyle::Dump(_)
+        | vash_proto::memcached::encode::ResponseStyle::CacheDump(_) => crate::auth::Roles::LIST,
+        _ => crate::auth::roles_for_command(&parsed.command),
+    };
+    let roles = conn_roles(conn);
+    if !roles.allows(needed) {
+        deny(
+            state,
+            conn,
+            roles.missing(needed),
+            CommandKind::of(&parsed.command).name(),
+        );
+        return refuse_memcached(state, parsed, out, "unauthorized");
     }
 
     // A dump answers with as many lines as the keyspace has, which is more than
@@ -920,7 +963,10 @@ fn execute_frame_batched<'a>(
     // everything else, rather than `UNSUPPORTED`.
     if let Some(refused) = header_refusal(state, conn, frame) {
         flush_vcp(state, batch, out);
-        state.metrics.auth_refused();
+        match refused.missing {
+            Some(missing) => deny(state, conn, missing, OpcodeName(refused.opcode)),
+            None => state.metrics.auth_refused(),
+        }
         if !refused.no_reply {
             encode_error(
                 out,
@@ -1027,6 +1073,49 @@ fn execute_frame_batched<'a>(
     }
 }
 
+/// An opcode byte, rendered by name for the denial log.
+///
+/// Borrows the derived `Debug` rather than adding a fourth table of names to
+/// keep in step with the other three. Unknown bytes render as hex, which is
+/// only reachable through a path that does not refuse them.
+struct OpcodeName(u8);
+
+impl std::fmt::Display for OpcodeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match vash_proto::vcp::Opcode::from_u8(self.0) {
+            Some(opcode) => write!(f, "{opcode:?}"),
+            None => write!(f, "0x{:02x}", self.0),
+        }
+    }
+}
+
+/// Counts and logs one role denial.
+///
+/// Shared by all three dialects so a denial reads the same in the metrics and
+/// the log whichever wire it arrived on, and so the two cannot be updated
+/// apart.
+///
+/// **Logged at `warn`, and deliberately per denial rather than once per
+/// connection.** A wrong role set will not fix itself, so the temptation is to
+/// rate-limit it the way a peer's refusal is — but unlike that case the fix is
+/// a one-line edit, and the operator needs the command name to make it. The
+/// counter is what an alert reads; the log is what someone reads once, at the
+/// moment they narrow a row and something breaks.
+pub(crate) fn deny(
+    state: &ServerState,
+    conn: &ConnAuth,
+    missing: crate::auth::Roles,
+    command: impl std::fmt::Display,
+) {
+    state.metrics.auth_denied(missing);
+    warn!(
+        identity = conn.identity().map(crate::auth::Identity::name).unwrap_or("-"),
+        %command,
+        missing = %missing,
+        "refused a command this identity has no role for"
+    );
+}
+
 /// Enough of a refused frame's header to answer it.
 struct Refused {
     /// The raw byte, echoed so a client can correlate even when the server does
@@ -1034,11 +1123,25 @@ struct Refused {
     opcode: u8,
     request_id: u32,
     no_reply: bool,
+    /// The roles the identity was missing, when this is a role denial rather
+    /// than a pre-auth refusal. `None` means "has not authenticated".
+    ///
+    /// Both answer `UNAUTHORIZED` — auth.md §6.2 widened that status to
+    /// "refused by policy", which covers both — so this exists to keep the
+    /// *counters* apart, not the wire. An alert that cannot tell "nobody rolled
+    /// their credential" from "someone's role set is wrong" is an alert that
+    /// gets muted.
+    missing: Option<crate::auth::Roles>,
 }
 
-/// Whether a frame must be refused because the connection has not
-/// authenticated, decided from the twelve-byte header without touching the
-/// body.
+/// Whether a frame must be refused — for want of authentication, or for want of
+/// the roles the opcode needs — decided from the twelve-byte header without
+/// touching the body.
+///
+/// Both questions are answered here, in one place, because both have the same
+/// requirement: refuse before the body decoder runs. Checking roles on the
+/// **opcode** is what buys that for the second one, and it is why there is a
+/// mapping from `Opcode` beside the one from `Command`.
 ///
 /// **`HELLO` is in the pre-auth set and has to be**: first-byte detection
 /// requires a VCP connection to open with opcode `0x01`, so there is no way to
@@ -1051,9 +1154,6 @@ struct Refused {
 /// unauthenticated party `HELLO` already told them, and `/health` on the admin
 /// port is the liveness check an operator should be using.
 fn header_refusal(state: &ServerState, conn: &ConnAuth, frame: &[u8]) -> Option<Refused> {
-    if conn.is_authenticated() || !state.auth.required() {
-        return None;
-    }
     // Short of a header there is nothing to refuse *with* — no request id to
     // echo. The decoder below reports it as the malformed frame it is.
     if frame.len() < vash_proto::vcp::HEADER_LEN {
@@ -1061,15 +1161,45 @@ fn header_refusal(state: &ServerState, conn: &ConnAuth, frame: &[u8]) -> Option<
     }
 
     let opcode = frame[0];
-    if opcode == Opcode::Hello as u8 || opcode == Opcode::Auth as u8 {
-        return None;
+    let refused = |missing| {
+        Some(Refused {
+            opcode,
+            request_id: u32::from_le_bytes(frame[4..8].try_into().expect("four bytes")),
+            no_reply: frame[1] & vash_proto::vcp::flags::NO_REPLY != 0,
+            missing,
+        })
+    };
+
+    if !conn.is_authenticated() {
+        if !state.auth.required() {
+            // Nothing is enforced and nobody has authenticated, so there is no
+            // identity to check roles against either.
+            return None;
+        }
+        if opcode == Opcode::Hello as u8 || opcode == Opcode::Auth as u8 {
+            return None;
+        }
+        return refused(None);
     }
 
-    Some(Refused {
-        opcode,
-        request_id: u32::from_le_bytes(frame[4..8].try_into().expect("four bytes")),
-        no_reply: frame[1] & vash_proto::vcp::flags::NO_REPLY != 0,
-    })
+    // Authenticated, so the question becomes what this identity may do — and
+    // it is asked whether or not `auth.required` is set. An identity carries
+    // its roles from the moment it is established, which is what lets a client
+    // rolled during auth.md §15's step 2 experience its role set before
+    // enforcement is turned on.
+    let roles = conn
+        .identity()
+        .map(crate::auth::Identity::roles)
+        .unwrap_or(crate::auth::Roles::UNRESTRICTED);
+
+    // An unknown opcode is left to the decoder, which reports it as
+    // `UNSUPPORTED`. Refusing it here would be answering for a command this
+    // build does not have.
+    let needed = crate::auth::roles_for_opcode(vash_proto::vcp::Opcode::from_u8(opcode)?);
+    if roles.allows(needed) {
+        return None;
+    }
+    refused(Some(roles.missing(needed)))
 }
 
 /// Answers an `AUTH` frame.
@@ -1085,6 +1215,11 @@ fn execute_auth(
     out: &mut Vec<u8>,
 ) {
     state.metrics.other();
+
+    // The granted roles, echoed in the reply body on success. Empty on every
+    // failure — there is nothing to report about an identity that was not
+    // established.
+    let mut body = Vec::new();
 
     let status = match Mechanism::from_u8(auth.mechanism) {
         // Specified in docs/auth.md §6.3 and not built. `UNSUPPORTED` rather
@@ -1108,6 +1243,13 @@ fn execute_auth(
 
             match state.auth.current().verify(name, auth.secret) {
                 Some(identity) => {
+                    // One byte, and old clients are unaffected because VCP
+                    // frames are length-prefixed. It is what keeps the three
+                    // meanings of `UNAUTHORIZED` distinguishable client-side: a
+                    // client knows whether it authenticated, and now knows what
+                    // that authentication granted, so it can fail at startup
+                    // rather than at 3am on its first `FLUSH`.
+                    body.push(identity.roles().bits());
                     conn.succeed(identity);
                     state.metrics.auth_ok();
                     Status::Ok
@@ -1130,7 +1272,7 @@ fn execute_auth(
         }
     };
 
-    encode_response(out, Opcode::Auth, request_id, status, &[]);
+    encode_response(out, Opcode::Auth, request_id, status, &body);
 }
 
 /// Rewrites a decoded VCP request's TTLs from plain offsets into the overloaded

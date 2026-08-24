@@ -68,6 +68,44 @@ pub struct Server {
     store: Option<StoreHandle>,
 }
 
+/// Refuses to start when this node's own peer credential cannot send `TAG_SYNC`.
+///
+/// The failure this closes is the one auth.md §9 named and roles reopened in a
+/// new shape: a `cluster.auth_name` naming a row that exists but lacks
+/// [`auth::Roles::PEER`] gives a cluster where writes keep working, `TAG_SYNC`
+/// starts being refused, and invalidations quietly stop converging while every
+/// node reports itself healthy. Refusing to start is the only failure mode an
+/// operator cannot miss, and this costs one table lookup at boot.
+///
+/// **One-sided by necessity.** A node can inspect the credential it *presents*,
+/// not the row a peer will match it against, so a heterogeneous cluster can
+/// still be misconfigured on the far side. The runtime half covers that:
+/// `cluster::is_unauthorized` already classifies a peer's `UNAUTHORIZED` as a
+/// configuration error rather than unreachability, and a role denial arrives as
+/// the same status on the same path.
+///
+/// Silent when the row is absent from this node's table, which is not evidence
+/// of anything: the credential a node presents need not be one it also accepts.
+fn check_peer_role(config: &Config, credentials: &auth::Auth) -> anyhow::Result<()> {
+    if config.cluster.peers.is_empty() {
+        return Ok(());
+    }
+    let Some((name, _)) = config.cluster.credential() else {
+        return Ok(());
+    };
+    let Some(roles) = credentials.roles_of(name.as_bytes()) else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        roles.allows(auth::Roles::PEER),
+        "the credential {name:?} that cluster.auth_name presents has roles={roles}, which does \
+         not include `peer`. Peers exchange TAG_SYNC and nothing else, so this node would be \
+         refused by every peer and tag invalidation would stop converging across the cluster \
+         while every node still reported itself healthy. Add `roles=peer` to that row"
+    );
+    Ok(())
+}
+
 impl Server {
     /// Opens the store and binds the listener. Returns before accepting, so the
     /// caller can read [`Server::local_addr`] — which is what makes port 0 work
@@ -119,6 +157,7 @@ impl Server {
         // parse must stop startup, not surface as a refusal on the first
         // client.
         let credentials = auth::Auth::load(&config.auth)?;
+        check_peer_role(&config, &credentials)?;
         if credentials.required() {
             info!("authentication is required on the cache port");
         } else if credentials.configured() {

@@ -1,5 +1,10 @@
 # Roles — a proposal
 
+Status: **built (M13), and inert until a row says `roles=`.** Sections marked in
+*italics* record where building it changed the design — §6 counted the paths
+into storage wrong, and the property test found the missing one on its first
+run.
+
 [auth.md](auth.md) §16 lists "no per-command permissions, no roles in M9" among
 the non-goals, and §9 says why the omission was deliberate rather than an
 oversight: *"the credential table has room for a `role` column, and the case for
@@ -416,19 +421,30 @@ auth.md §1, the server is not defending anything anyway.
 **This is the section to get right.** The obvious home is
 `dispatch::execute` — "the single point every command passes through", as its
 own comment says. That comment is true of *counting* and false of execution.
-Three paths reach storage:
+**Four** paths reach storage. *This section said three when it was written; the
+property test in §13 found the fourth on the first run, which is the outcome
+that argument was for.*
 
 | Path | Reaches | Goes through `execute` |
 |---|---|---|
 | `dispatch::execute` | everything not below | — |
 | `dispatch::execute_get_into` | `GET` (all three dialects) | **No.** The fused read renders straight out of the store, which is why it exists. |
 | `SetBatch::flush` | pipelined `SET` runs (all three dialects) | **No** on the happy path — it calls `store.set_many` directly and only falls back to `execute` when the batch fails. |
+| `conn::handle`'s awaited write path | a whole block of plain writes (memcached and RESP) | **No, and not through any dialect's executor either.** `parse_memcached_writes` / `resp::parse_writes` decode the block themselves and submit it straight to the store. |
 
 So a role check inside `execute` would leave `GET` and pipelined `SET`
 ungated: the two hottest commands on the server, and precisely the two an
 attacker with a leaked `list`-only credential would reach for. The bypasses are
-not accidents — one is M10's fused read, the other is the batching that makes
-pipelining fast — and neither is going away.
+not accidents — one is M10's fused read, the others are the batching and the
+awaited path that make pipelining fast — and none is going away.
+
+The fourth is the one worth dwelling on, because it does not fit the rule the
+other three do. Those are all reached *from* a dialect executor, so gating the
+executor covers them. The awaited path is chosen in `conn::handle` **before**
+any executor runs, from a flag computed once per read — which is why it already
+carried a `gated` flag for authentication, and why roles need a second one
+beside it (`may_write`) rather than a check further in. A gate that runs after
+the routing decision is not a gate.
 
 The gate therefore goes where the **authentication** gate already goes, which is
 ahead of both bypasses in all three dialects. Three call sites, all of which
@@ -444,8 +460,17 @@ exist today:
    authentication and the note on `conn_gated` already says why both are needed:
    *"such a command must never reach the batch"*. It grows a `Command`
    parameter.
-3. **Redis** — `resp::refusal`, which is already the per-command policy point
-   and is already consulted by `batchable_set` before a `SET` can be held back.
+3. **Redis** — beside `resp::refusal`, which is already the per-command policy
+   point and is already consulted by `batchable_set` before a `SET` can be held
+   back. A sibling `denial` rather than an extension of it, because the two
+   answer different questions and are counted apart.
+4. **`conn::handle`** — the `may_write` flag above, beside the `gated` one.
+
+*Also corrected in building it:* Redis is gated on its **own** command enum, not
+on the domain command as this section originally said. `SCAN` and `DELBYTAG`
+never reach `translate`, and translating a `MSET` to ask a question about it
+allocates. So there are three mappings, not two, and three agreement tests
+rather than one.
 
 **The mapping is an exhaustive `match` on `vash_core::Command`**, written in
 `vash-server` beside the credential table rather than in `vash-core`: the
@@ -458,10 +483,12 @@ stalls a runtime worker; this one hands out authority.
 The VCP path checks an opcode and the other two check a parsed command, so
 there are two mappings that must agree. They are kept honest by a test that
 decodes every opcode and asserts the opcode's roles equal the decoded command's
-— not by hoping. (The three two-role commands in §2 have no VCP opcode:
-`GET_AND_TOUCH` and `ARITHMETIC`'s disclosing forms arrive over memcached and
-Redis, and `SET … GET` is Redis-only. The opcode table is therefore
-unambiguous.)
+— not by hoping. (Of the three two-role commands in §2, one does have a VCP
+opcode after all: `ARITHMETIC` answers with the resulting value in *every*
+dialect, this one included, so `0x14` needs `read` as well as `write`.
+`GET_AND_TOUCH` is memcached's and `SET … GET` is Redis's, so the opcode table
+stays unambiguous — but the reason is that those two have no opcode, not that
+the fused commands are a compatibility-dialect concern.)
 
 **Deferred to the same place as the enablement gates.** memcached's
 `stats cachedump` and `lru_crawler metadump` are `ResponseStyle` variants that
@@ -754,6 +781,16 @@ established once.
 | # | Scope | Exit criteria |
 |---|---|---|
 | **M13** | `Roles` bitset and the `roles=` field; the mapping from `Command` and from `Opcode`; the gate at the three existing authentication call sites; the `AUTH` reply body and `vash-client` exposure; `-NOPERM` and `CLIENT_ERROR unauthorized`; `auth.default_roles` and its resolution at load; the peer-role startup check; the denial counter, the `warn` log and `vash_roles` in `stats conns` | The property test proves no command in any dialect executes without its roles, **including pipelined batches and the fused `GET`**; a `roles=write` identity cannot read a value through `gat`, `incr`, or `SET … GET`; a three-node cluster converges with `roles=peer` and a node whose row lacks it refuses to start; every credential file that loads today loads unchanged with `default_roles` unset, and `default_roles` narrows exactly the rows that omitted `roles=`; a `roles=` file is refused by a build without the feature |
+
+**Delivered.** Three things the build settled that the design had guessed at:
+the fourth path into storage (§6), Redis gating on its own command enum rather
+than the domain one (§6), and VCP's `ARITHMETIC` needing `read` after all — this
+document had filed the fused commands as a compatibility-dialect concern, and
+the native protocol answers with the resulting value like every other dialect.
+Two limitations carried forward, both inherited rather than new: reload is Unix
+only, as M9 left it, and the `-NOPERM` message names the command *family* rather
+than the verb, because the RESP parser keeps no verb — `DECR` is refused as
+`incr`.
 
 Sequencing: the loader and the bitset first (they are testable with no server),
 then the `Command` mapping and its exhaustive match, then VCP (the dialect we

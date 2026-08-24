@@ -175,6 +175,38 @@ pub struct Client {
     buf: BytesMut,
     next_id: u32,
     info: ServerInfo,
+    roles: Option<Roles>,
+}
+
+/// The roles a server granted this connection, from the `AUTH` reply.
+///
+/// A bitset rather than a parsed set of names: the server sends one byte, and a
+/// client that does not recognise a bit should carry it rather than drop it.
+/// [`Roles::allows`] is enough to answer the question a client actually has,
+/// which is whether the call it is about to make will be refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Roles(u8);
+
+impl Roles {
+    pub const READ: Self = Self(0x01);
+    pub const WRITE: Self = Self(0x02);
+    pub const INVALIDATE: Self = Self(0x04);
+    pub const LIST: Self = Self(0x08);
+    pub const FLUSH: Self = Self(0x10);
+    pub const PEER: Self = Self(0x20);
+
+    pub fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Whether this set covers everything `needed` asks for.
+    pub fn allows(self, needed: Roles) -> bool {
+        self.0 & needed.0 == needed.0
+    }
 }
 
 /// What a client presents to a server that requires authentication.
@@ -262,6 +294,7 @@ impl Client {
             stream,
             buf: BytesMut::with_capacity(8 * 1024),
             next_id: 0,
+            roles: None,
             info: ServerInfo {
                 protocol_version: 0,
                 shards: 0,
@@ -309,6 +342,19 @@ impl Client {
         Ok(client)
     }
 
+    /// The roles the server granted, or `None` on a connection that never
+    /// authenticated.
+    ///
+    /// Worth checking at startup: a client that needs `flush` and was granted
+    /// `read` can say so where its configuration is wrong, rather than
+    /// discovering it on the one call that matters.
+    ///
+    /// An older server sends no body and this stays `None` — absence of an
+    /// answer, not an answer of "nothing".
+    pub fn roles(&self) -> Option<Roles> {
+        self.roles
+    }
+
     /// Sends `AUTH`. Replaces any identity the connection already had.
     pub async fn authenticate(&mut self, credential: &Credential) -> Result<()> {
         let mut body = Vec::with_capacity(4 + credential.name.len() + credential.secret.len());
@@ -320,8 +366,19 @@ impl Client {
         );
 
         match self.round_trip(Opcode::Auth, &body).await? {
-            (Status::Ok, _) => Ok(()),
-            (status, _) => Err(ClientError::Status(status)),
+            (Status::Ok, payload) => {
+                // One byte, and absent from a server too old to send it — the
+                // frame is length-prefixed, so this is a compatible addition in
+                // both directions.
+                self.roles = payload.first().copied().map(Roles::from_bits);
+                Ok(())
+            }
+            (status, _) => {
+                // A failed re-authentication leaves the connection's previous
+                // identity intact on the server, so the roles it reported are
+                // still what this connection has.
+                Err(ClientError::Status(status))
+            }
         }
     }
 

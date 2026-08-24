@@ -67,8 +67,8 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     // still send one — re-authenticating as somebody else is allowed, and is
     // how a pooled connection follows a rotation.
     if let Some(identity) = identity {
+        registered.authenticated(identity.roles());
         conn_auth.succeed(identity);
-        registered.authenticated();
         // Released now rather than after the first command: this connection
         // has presented something, so it is no longer one of the unidentified
         // ones the pre-auth budget exists to cap.
@@ -169,6 +169,23 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         // connection's write owes a refusal that only the dialect's own executor
         // can render, so the awaited path is withheld from it entirely.
         let gated = !conn_auth.is_authenticated() && state.auth.required();
+        // **The fourth path into storage.** The awaited write path decodes a run
+        // of plain writes and submits it to the store directly — it passes
+        // through neither `dispatch::execute` nor any dialect's executor, so it
+        // is a third bypass beside the fused read and `SetBatch`, and it has to
+        // be withheld from a connection whose writes owe a refusal. `gated`
+        // already withholds it for want of authentication; this withholds it for
+        // want of the `write` role, for exactly the same reason: the refusal is
+        // the executor's to word.
+        //
+        // Recomputed every iteration, so an `AUTH` that narrows the identity
+        // takes effect on the next read. Within one read it cannot go stale in
+        // the dangerous direction: a block carrying an `AUTH` is not a block of
+        // plain writes, so it never reaches this path to begin with.
+        let may_write = !gated
+            && conn_auth
+                .identity()
+                .is_none_or(|identity| identity.roles().allows(crate::auth::Roles::WRITE));
         let keep_going = match protocol.expect("set above") {
             Protocol::Vcp => {
                 drain(
@@ -204,7 +221,7 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         execute_memcached_block(state, conn, block, *tls, out)
                     },
                     |_, _| {},
-                    (!gated).then_some((
+                    may_write.then_some((
                         crate::dispatch::parse_memcached_writes as ParseWrites,
                         crate::metrics::Dialect::Memcached,
                         memcached::encode::STORED,
@@ -225,7 +242,7 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     // Redis answers a protocol error and *then* hangs up, so the
                     // client learns why instead of seeing a bare disconnect.
                     vash_proto::resp::encode::protocol_error,
-                    (!gated).then_some((
+                    may_write.then_some((
                         crate::resp::parse_writes as ParseWrites,
                         crate::metrics::Dialect::Resp,
                         vash_proto::resp::encode::OK,
@@ -239,8 +256,11 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         if pre_auth.is_some() && conn_auth.is_authenticated() {
             pre_auth = None;
         }
-        if conn_auth.is_authenticated() {
-            registered.authenticated();
+        if let Some(identity) = conn_auth.identity() {
+            // Re-reported per batch rather than once, because an `AUTH` on a
+            // live connection replaces the identity — and therefore the roles —
+            // and `stats conns` must not keep showing the previous one.
+            registered.authenticated(identity.roles());
         }
         // One relaxed store per batch of commands, into a word only this
         // connection writes — so `stats conns` gets an idle clock without the

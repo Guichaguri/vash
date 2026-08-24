@@ -457,9 +457,16 @@ async fn a_restarted_node_catches_up_on_invalidations_it_missed() {
 #[tokio::test]
 async fn invalidation_converges_across_a_cluster_that_authenticates() {
     let shared = tempfile::tempdir().unwrap();
-    let (secret, line) = vash_server::auth::generate("peer").unwrap();
+    // Two rows, because the deployment has two jobs. The peer credential
+    // can send `TAG_SYNC` and nothing else, which is the whole of a
+    // peer's authority — so the test's own writes need an identity of
+    // their own, and that separation is what is being checked as much as
+    // the convergence is.
+    let (secret, peer_line) = vash_server::auth::generate("peer", Some("peer")).unwrap();
+    let (app_secret, app_line) =
+        vash_server::auth::generate("app", Some("read,write,invalidate")).unwrap();
     let credentials = shared.path().join("credentials");
-    std::fs::write(&credentials, format!("{line}\n")).unwrap();
+    std::fs::write(&credentials, format!("{peer_line}\n{app_line}\n")).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -480,7 +487,7 @@ async fn invalidation_converges_across_a_cluster_that_authenticates() {
     })
     .await;
 
-    let credential = vash_client::Credential::new("peer", secret.clone());
+    let credential = vash_client::Credential::new("app", app_secret.clone());
 
     for index in 0..3 {
         cluster
@@ -527,7 +534,7 @@ async fn invalidation_converges_across_a_cluster_that_authenticates() {
 #[tokio::test]
 async fn an_unauthenticated_client_is_told_at_connect_time() {
     let dir = tempfile::tempdir().unwrap();
-    let (secret, line) = vash_server::auth::generate("app").unwrap();
+    let (secret, line) = vash_server::auth::generate("app", None).unwrap();
     let credentials = dir.path().join("credentials");
     std::fs::write(&credentials, format!("{line}\n")).unwrap();
     #[cfg(unix)]
@@ -1750,4 +1757,118 @@ async fn vcp_arithmetic_round_trips() {
     assert_eq!(applied.value, Number::Int(0), "the bound held it at zero");
     assert_eq!(applied.applied, Number::Int(0));
     assert!(!applied.wrote, "a skipped step writes nothing");
+}
+
+/// The failure roles reopen in a new shape: a peer credential that exists and
+/// cannot send `TAG_SYNC` gives a cluster where writes keep working,
+/// invalidations quietly stop converging, and every node still reports itself
+/// healthy. Refusing to start is the only failure mode an operator cannot miss.
+#[tokio::test]
+async fn a_node_whose_peer_credential_lacks_the_peer_role_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (secret, line) = vash_server::auth::generate("peer", Some("read,write")).unwrap();
+    let credentials = dir.path().join("credentials");
+    std::fs::write(&credentials, format!("{line}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut config = Config::default();
+    config.server.listen = "127.0.0.1:0".parse().unwrap();
+    config.store.path = dir.path().join("db");
+    config.store.map_size_mb = 64;
+    config.store.shards = 1;
+    config.auth.required = true;
+    config.auth.file = credentials.clone();
+    config.cluster.peers = vec!["127.0.0.1:9999".parse().unwrap()];
+    config.cluster.auth_name = "peer".into();
+    config.cluster.auth_secret = secret.clone();
+
+    let error = match Server::bind(config).await {
+        Err(error) => format!("{error:#}"),
+        Ok(_) => panic!("a node with a peer credential that cannot gossip must not start"),
+    };
+    assert!(
+        error.contains("does not include `peer`"),
+        "the refusal must name what is missing: {error}"
+    );
+
+    // The same node starts once the row can do the job.
+    let (secret, line) = vash_server::auth::generate("peer", Some("peer")).unwrap();
+    std::fs::write(&credentials, format!("{line}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut config = Config::default();
+    config.server.listen = "127.0.0.1:0".parse().unwrap();
+    config.store.path = dir.path().join("db2");
+    config.store.map_size_mb = 64;
+    config.store.shards = 1;
+    config.auth.required = true;
+    config.auth.file = credentials;
+    config.cluster.peers = vec!["127.0.0.1:9999".parse().unwrap()];
+    config.cluster.auth_name = "peer".into();
+    config.cluster.auth_secret = secret;
+    assert!(
+        Server::bind(config).await.is_ok(),
+        "the same node starts once the row can do the job"
+    );
+}
+
+/// A credential file written before roles existed has to keep loading, and keep
+/// authorising everything. This is the compatibility promise, end to end.
+#[tokio::test]
+async fn a_credential_file_without_roles_still_authorises_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (secret, line) = vash_server::auth::generate("app", None).unwrap();
+    assert!(
+        !line.contains("roles="),
+        "a bare row is what every file written before this feature looks like"
+    );
+    let credentials = dir.path().join("credentials");
+    std::fs::write(&credentials, format!("{line}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut config = Config::default();
+    config.server.listen = "127.0.0.1:0".parse().unwrap();
+    config.store.path = dir.path().join("db");
+    config.store.map_size_mb = 64;
+    config.store.shards = 1;
+    config.auth.required = true;
+    config.auth.file = credentials;
+    config.protocol.flush_enabled = true;
+    config.protocol.listing_enabled = true;
+
+    let server = Server::bind(config).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        server
+            .serve(async {
+                let _ = rx.await;
+            })
+            .await
+    });
+
+    let credential = vash_client::Credential::new("app", secret);
+    let mut client = Client::connect_with(addr, &credential).await.unwrap();
+
+    // One command from every rung, all of which this row must still reach.
+    client.set(b"k", b"v", 0).await.unwrap();
+    assert!(client.get(b"k").await.unwrap().is_some());
+    client.delete_by_tag(b"news").await.unwrap();
+    client.list_keys(10, b"", b"").await.unwrap();
+    client.flush().await.unwrap();
+
+    drop(tx);
+    let _ = handle.await;
 }

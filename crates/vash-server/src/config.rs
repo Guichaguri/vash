@@ -343,6 +343,20 @@ pub struct AuthConfig {
     /// `server.max_connections`, so the pre-auth budget is never the whole
     /// connection budget.
     pub max_unauthenticated_connections: usize,
+    /// What a credential row with no `roles=` field is granted.
+    ///
+    /// **Unset is not the same as spelling out every role.** `None` — the key
+    /// absent — means every role, *including ones added in later versions*,
+    /// which is what keeps every credential file written before roles existed
+    /// loading unchanged. An operator who writes the six names out has said
+    /// "exactly these six", and a seventh added later is withheld from every
+    /// bare row on upgrade. Absence is permissive, presence is exact.
+    ///
+    /// `Some([])` is the fail-safe form of "every row must state its own
+    /// authority": a bare row authenticates and is then refused everything,
+    /// and startup names those rows so it is not discovered one denial at a
+    /// time. See `docs/roles-proposal.md` §4.
+    pub default_roles: Option<Vec<String>>,
 }
 
 impl Default for AuthConfig {
@@ -353,6 +367,7 @@ impl Default for AuthConfig {
             timeout_ms: 5_000,
             max_attempts: 3,
             max_unauthenticated_connections: 0,
+            default_roles: None,
         }
     }
 }

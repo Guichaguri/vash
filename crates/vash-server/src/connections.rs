@@ -51,6 +51,13 @@ pub struct ConnInfo {
     /// *how*, and an aggregate cannot say which connection is still using a
     /// password.
     certificate_identity: AtomicBool,
+    /// The roles the identity carries, as the bitset `Roles` stores.
+    ///
+    /// Written once beside `authenticated`, read only by `stats conns`. An
+    /// operator about to narrow a row needs to know which live connections hold
+    /// that identity — the same question `vash_tls` answers for the TLS
+    /// rollout, and no aggregate can answer either.
+    roles: AtomicU8,
     /// Milliseconds since the registry's epoch, at the last command.
     last_command_ms: AtomicU64,
 }
@@ -75,7 +82,8 @@ impl ConnInfo {
         self.dialect.store(protocol as u8 + 1, Ordering::Relaxed);
     }
 
-    pub fn authenticated(&self) {
+    pub fn authenticated(&self, roles: crate::auth::Roles) {
+        self.roles.store(roles.bits(), Ordering::Relaxed);
         self.authenticated.store(true, Ordering::Relaxed);
     }
 
@@ -152,6 +160,7 @@ impl Registry {
             authenticated: AtomicBool::new(false),
             tls: AtomicBool::new(false),
             certificate_identity: AtomicBool::new(false),
+            roles: AtomicU8::new(0),
             last_command_ms: AtomicU64::new(self.epoch.elapsed().as_millis() as u64),
         });
         self.lock().insert(info.id, Arc::clone(&info));
@@ -223,6 +232,17 @@ impl Registry {
                     },
                 ),
                 (format!("{id}:vash_auth_method"), info.auth_method().into()),
+                (
+                    format!("{id}:vash_roles"),
+                    if info.authenticated.load(Ordering::Relaxed) {
+                        crate::auth::Roles::from_bits(info.roles.load(Ordering::Relaxed)).to_names()
+                    } else {
+                        // Not "none": an unauthenticated connection has no
+                        // identity, which is a different state from an identity
+                        // that was granted nothing.
+                        "-".into()
+                    },
+                ),
             ]);
         }
 
@@ -349,7 +369,7 @@ mod tests {
         };
 
         assert_eq!(authenticated(&registry).as_deref(), Some("no"));
-        info.authenticated();
+        info.authenticated(crate::auth::Roles::UNRESTRICTED);
         assert_eq!(authenticated(&registry).as_deref(), Some("yes"));
     }
 

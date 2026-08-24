@@ -32,8 +32,19 @@ impl TestServer {
     }
 
     async fn start_with(required: bool, tweak: impl FnOnce(&mut Config)) -> (Self, String) {
+        Self::start_with_roles(required, None, tweak).await
+    }
+
+    /// As [`TestServer::start_with`], with a `roles=` field on the credential.
+    /// `None` writes a bare row, which is what every file written before roles
+    /// existed looks like.
+    async fn start_with_roles(
+        required: bool,
+        roles: Option<&str>,
+        tweak: impl FnOnce(&mut Config),
+    ) -> (Self, String) {
         let dir = tempfile::tempdir().unwrap();
-        let (secret, line) = vash_server::auth::generate(NAME).unwrap();
+        let (secret, line) = vash_server::auth::generate(NAME, roles).unwrap();
         let credentials = write_credentials(dir.path(), &line);
 
         let mut config = Config::default();
@@ -165,9 +176,15 @@ impl Conn {
     }
 
     async fn auth(&mut self, mechanism: u8, name: &str, secret: &str) -> Status {
+        self.auth_full(mechanism, name, secret).await.0
+    }
+
+    /// The same, keeping the reply body — which on success is the granted role
+    /// bitset.
+    async fn auth_full(&mut self, mechanism: u8, name: &str, secret: &str) -> (Status, Vec<u8>) {
         let mut body = Vec::new();
         encode_auth_body(&mut body, mechanism, name.as_bytes(), secret.as_bytes());
-        self.vcp(Opcode::Auth, &body).await.0
+        self.vcp(Opcode::Auth, &body).await
     }
 
     async fn fill(&mut self, wanted: usize) {
@@ -402,11 +419,17 @@ async fn auth_takes_effect_inside_a_pipelined_block() {
     encode_request(&mut batch, Opcode::Ping, 2, &[]);
     conn.send(&batch).await;
 
-    conn.fill(HEADER_LEN * 2).await;
+    // The `AUTH` reply carries the granted roles, so the second frame does not
+    // start at `HEADER_LEN` — its offset has to come from the first body length.
+    conn.fill(HEADER_LEN).await;
     let first = Status::from_u16(u16::from_le_bytes([conn.buf[2], conn.buf[3]])).unwrap();
+    let first_body = u32::from_le_bytes(conn.buf[8..12].try_into().unwrap()) as usize;
+    let second_at = HEADER_LEN + first_body;
+
+    conn.fill(second_at + HEADER_LEN).await;
     let second = Status::from_u16(u16::from_le_bytes([
-        conn.buf[HEADER_LEN + 2],
-        conn.buf[HEADER_LEN + 3],
+        conn.buf[second_at + 2],
+        conn.buf[second_at + 3],
     ]))
     .unwrap();
 
@@ -847,4 +870,384 @@ async fn enforcement_without_credentials_refuses_to_start() {
     };
     let error = format!("{error:#}");
     assert!(error.contains("no credentials are configured"), "{error}");
+}
+
+// ---- Roles -----------------------------------------------------------------
+//
+// Authorization, over the same sockets. The tests that matter most are
+// [`pipelined_writes_are_gated`] and [`the_fused_read_is_gated`]: both cover a
+// path into storage that does **not** go through `dispatch::execute`, which is
+// where a role check would naturally but wrongly be put. See
+// `docs/roles-proposal.md` §6.
+
+/// The `AUTH` reply says what was granted, so a client can fail at startup
+/// rather than on the one call that matters.
+#[tokio::test]
+async fn the_auth_reply_names_the_granted_roles() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("read,list"), |_| {}).await;
+    let mut conn = server.connect().await;
+
+    conn.hello().await;
+    let (status, body) = conn.auth_full(0, NAME, &secret).await;
+    assert_eq!(status, Status::Ok);
+    assert_eq!(
+        body,
+        vec![0x01 | 0x08],
+        "the reply body carries the role bitset"
+    );
+
+    // A refused attempt reports nothing: there is no identity to describe.
+    let (status, body) = conn.auth_full(0, NAME, "wrong").await;
+    assert_eq!(status, Status::Unauthorized);
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn an_unrestricted_row_reports_every_bit() {
+    let (server, secret) = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    conn.hello().await;
+    let (_, body) = conn.auth_full(0, NAME, &secret).await;
+    assert_eq!(body, vec![0xff], "a row with no `roles=` is unrestricted");
+}
+
+#[tokio::test]
+async fn a_reader_is_refused_every_write_over_vcp() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("read"), |_| {}).await;
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    assert_eq!(conn.auth(0, NAME, &secret).await, Status::Ok);
+
+    // Reads are what it has.
+    assert_eq!(conn.vcp(Opcode::Get, b"k").await.0, Status::NotFound);
+
+    for opcode in [
+        Opcode::Set,
+        Opcode::Delete,
+        Opcode::Touch,
+        Opcode::SetMany,
+        Opcode::DeleteMany,
+        Opcode::DeleteByTag,
+        Opcode::Flush,
+        Opcode::TagSync,
+        Opcode::ListKeys,
+        Opcode::ListTags,
+        // Fused: it answers with the value it wrote, so `read` alone is not
+        // enough either.
+        Opcode::Arithmetic,
+    ] {
+        let (status, body) = conn.vcp(opcode, b"whatever-body-this-opcode-wants").await;
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "{opcode:?} was not refused to a reader"
+        );
+        // Refused from the header, so the body decoder never ran — the same
+        // property the pre-auth gate has.
+        assert!(body.is_empty(), "{opcode:?} leaked a refusal body");
+    }
+}
+
+/// The batching path never reaches `dispatch::execute`, so a gate placed there
+/// would let a pipelined run of writes through. This is that regression.
+#[tokio::test]
+async fn pipelined_writes_are_gated() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("read"), |_| {}).await;
+
+    // memcached: a run of plain `set`s is exactly what `SetBatch` holds back.
+    let mut conn = server.connect().await;
+    let block = format!("{NAME} {secret}");
+    conn.text(&format!("set {NAME} 0 0 {}\r\n{block}\r\n", block.len()))
+        .await;
+
+    conn.send(b"set a 0 0 1\r\nx\r\nset b 0 0 1\r\ny\r\nset c 0 0 1\r\nz\r\n")
+        .await;
+    let replies = conn.read_until("\r\n").await;
+    assert!(
+        replies.starts_with("CLIENT_ERROR unauthorized"),
+        "a pipelined run was executed for a reader: {replies:?}"
+    );
+
+    // And nothing landed: the writes must not have been applied and then
+    // reported as refused.
+    assert_eq!(conn.get_value("get a\r\n").await, "END\r\n");
+
+    // RESP: the same run, through the other batching path.
+    let mut conn = server.connect().await;
+    conn.send(&resp(&["AUTH", NAME, &secret])).await;
+    assert_eq!(conn.read_until("\r\n").await, "+OK\r\n");
+
+    let mut pipeline = resp(&["SET", "a", "1"]);
+    pipeline.extend_from_slice(&resp(&["SET", "b", "2"]));
+    conn.send(&pipeline).await;
+    let replies = conn.read_until("\r\n").await;
+    assert!(
+        replies.starts_with("-NOPERM"),
+        "a pipelined RESP run was executed for a reader: {replies:?}"
+    );
+}
+
+/// `GET` is served by `execute_get_into`, which renders straight out of the
+/// store without passing through `dispatch::execute` either.
+#[tokio::test]
+async fn the_fused_read_is_gated() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("write"), |_| {}).await;
+
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    assert_eq!(conn.auth(0, NAME, &secret).await, Status::Ok);
+    assert_eq!(
+        conn.vcp(Opcode::Get, b"k").await.0,
+        Status::Unauthorized,
+        "the fused read path must be gated too"
+    );
+
+    // The same command over RESP, which uses the same fused path.
+    let mut conn = server.connect().await;
+    conn.send(&resp(&["AUTH", NAME, &secret])).await;
+    assert_eq!(conn.read_until("\r\n").await, "+OK\r\n");
+    conn.send(&resp(&["GET", "k"])).await;
+    assert!(conn.read_until("\r\n").await.starts_with("-NOPERM"));
+}
+
+/// A writer that can read every key it can name is not a writer. The three
+/// fused commands are where that leak would be.
+#[tokio::test]
+async fn a_writer_cannot_read_through_a_fused_command() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("write"), |_| {}).await;
+    let mut conn = server.connect().await;
+
+    let block = format!("{NAME} {secret}");
+    conn.text(&format!("set {NAME} 0 0 {}\r\n{block}\r\n", block.len()))
+        .await;
+
+    // It can write.
+    assert_eq!(conn.text("set n 0 0 1\r\n7\r\n").await, "STORED\r\n");
+
+    // It cannot read the value back, by any of the three routes.
+    assert_eq!(
+        conn.text("get n\r\n").await,
+        "CLIENT_ERROR unauthorized\r\n"
+    );
+    assert_eq!(
+        conn.text("incr n 0\r\n").await,
+        "CLIENT_ERROR unauthorized\r\n",
+        "`incr n 0` is a `get` with extra steps"
+    );
+    assert_eq!(
+        conn.text("gat 60 n\r\n").await,
+        "CLIENT_ERROR unauthorized\r\n"
+    );
+}
+
+/// Redis's `SET … GET` is the third fused form, and the only one that changes
+/// what a command needs based on its arguments.
+#[tokio::test]
+async fn set_with_get_needs_read_as_well() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("write"), |_| {}).await;
+    let mut conn = server.connect().await;
+    conn.send(&resp(&["AUTH", NAME, &secret])).await;
+    assert_eq!(conn.read_until("\r\n").await, "+OK\r\n");
+
+    conn.send(&resp(&["SET", "k", "v"])).await;
+    assert_eq!(conn.read_until("\r\n").await, "+OK\r\n");
+
+    conn.send(&resp(&["SET", "k", "w", "GET"])).await;
+    let reply = conn.read_until("\r\n").await;
+    assert!(
+        reply.starts_with("-NOPERM"),
+        "SET … GET reports the displaced value: {reply:?}"
+    );
+}
+
+/// A reader must already know the key; a lister does not. That is the whole
+/// reason `list` is not folded into `read`.
+#[tokio::test]
+async fn listing_needs_list_and_not_read() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("read"), |config| {
+        config.protocol.listing_enabled = true;
+    })
+    .await;
+
+    let mut conn = server.connect().await;
+    let block = format!("{NAME} {secret}");
+    conn.text(&format!("set {NAME} 0 0 {}\r\n{block}\r\n", block.len()))
+        .await;
+
+    for command in ["lru_crawler metadump all\r\n", "stats cachedump 1 0\r\n"] {
+        assert_eq!(
+            conn.text(command).await,
+            "CLIENT_ERROR unauthorized\r\n",
+            "{command:?} is enumeration, not reading"
+        );
+    }
+}
+
+/// The server-wide switch is asked first, so a disabled command answers
+/// identically to every identity and a role denial cannot be used to probe what
+/// the server has turned on.
+#[tokio::test]
+async fn the_server_switch_is_checked_before_the_role() {
+    // `flush` granted, but the server has `FLUSH` switched off.
+    let (server, secret) = TestServer::start_with_roles(true, Some("read,flush"), |_| {}).await;
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    assert_eq!(conn.auth(0, NAME, &secret).await, Status::Ok);
+
+    assert_eq!(
+        conn.vcp(Opcode::Flush, &[]).await.0,
+        Status::Unauthorized,
+        "an identity with `flush` still cannot flush a server that has it disabled"
+    );
+}
+
+#[tokio::test]
+async fn flush_needs_its_own_role() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("read,write"), |config| {
+        config.protocol.flush_enabled = true;
+    })
+    .await;
+
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    assert_eq!(conn.auth(0, NAME, &secret).await, Status::Ok);
+    assert_eq!(conn.vcp(Opcode::Flush, &[]).await.0, Status::Unauthorized);
+
+    // memcached's spelling of the same command, through the other gate.
+    let mut conn = server.connect().await;
+    let block = format!("{NAME} {secret}");
+    conn.text(&format!("set {NAME} 0 0 {}\r\n{block}\r\n", block.len()))
+        .await;
+    assert_eq!(
+        conn.text("flush_all\r\n").await,
+        "CLIENT_ERROR unauthorized\r\n"
+    );
+}
+
+/// `TAG_SYNC` sets a generation to any value where `DELETE_BY_TAG` moves it by
+/// one, which is the authority a peer credential fences off.
+#[tokio::test]
+async fn tag_sync_needs_the_peer_role() {
+    let (server, secret) =
+        TestServer::start_with_roles(true, Some("read,write,invalidate"), |_| {}).await;
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    assert_eq!(conn.auth(0, NAME, &secret).await, Status::Ok);
+
+    assert_eq!(
+        conn.vcp(Opcode::TagSync, &[1, 0, 0, 0]).await.0,
+        Status::Unauthorized
+    );
+    // Invalidation it does have, and the two are separate rungs. The tag names
+    // nothing, so the answer is `NotFound` rather than `Ok` — what matters is
+    // that it reached the store instead of the gate.
+    assert_ne!(
+        conn.vcp(Opcode::DeleteByTag, b"t").await.0,
+        Status::Unauthorized
+    );
+}
+
+/// Rows that omit `roles=` take `auth.default_roles`, which is how an operator
+/// makes a forgotten field mean least privilege instead of most.
+#[tokio::test]
+async fn a_bare_row_takes_the_configured_default() {
+    let (server, secret) = TestServer::start_with_roles(true, None, |config| {
+        config.auth.default_roles = Some(vec!["read".into()]);
+    })
+    .await;
+
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    let (status, body) = conn.auth_full(0, NAME, &secret).await;
+    assert_eq!(status, Status::Ok);
+    assert_eq!(body, vec![0x01], "the bare row inherited `read`");
+
+    assert_eq!(conn.vcp(Opcode::Get, b"k").await.0, Status::NotFound);
+    assert_eq!(conn.vcp(Opcode::Set, b"k").await.0, Status::Unauthorized);
+}
+
+/// The fail-safe form of "every row must state its own authority": the row
+/// authenticates and is then refused everything.
+#[tokio::test]
+async fn an_empty_default_grants_nothing_to_a_bare_row() {
+    let (server, secret) = TestServer::start_with_roles(true, None, |config| {
+        config.auth.default_roles = Some(Vec::new());
+    })
+    .await;
+
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    let (status, body) = conn.auth_full(0, NAME, &secret).await;
+    assert_eq!(status, Status::Ok, "it still authenticates");
+    assert_eq!(body, vec![0x00]);
+    assert_eq!(conn.vcp(Opcode::Get, b"k").await.0, Status::Unauthorized);
+}
+
+/// An identity carries its roles from the moment it is established, whether or
+/// not enforcement is on — which is what lets a client rolled during the
+/// two-step rollout experience its role set before `auth.required` is flipped.
+#[tokio::test]
+async fn roles_apply_even_when_auth_is_not_required() {
+    let (server, secret) = TestServer::start_with_roles(false, Some("read"), |_| {}).await;
+    let mut conn = server.connect().await;
+    conn.hello().await;
+
+    // Unauthenticated, nothing is enforced: there is no identity to restrict,
+    // so a `DELETE` this credential could not have made is answered on its
+    // merits. The perversity is deliberate and bounded to exactly this window —
+    // with enforcement off the server is not defending anything anyway.
+    assert_ne!(
+        conn.vcp(Opcode::Delete, b"k").await.0,
+        Status::Unauthorized,
+        "with nothing authenticated and nothing enforced, there is no identity to restrict"
+    );
+
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    assert_eq!(conn.auth(0, NAME, &secret).await, Status::Ok);
+    assert_eq!(
+        conn.vcp(Opcode::Delete, b"k").await.0,
+        Status::Unauthorized,
+        "an identity is restricted by its roles even with enforcement off"
+    );
+}
+
+/// Ungated for any authenticated identity: they disclose counters and peer
+/// addresses, which `/stats` on the admin port already does, and gating them
+/// would break client libraries that call `stats` on connect.
+#[tokio::test]
+async fn introspection_needs_no_role() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("read"), |_| {}).await;
+
+    let mut conn = server.connect().await;
+    conn.hello().await;
+    assert_eq!(conn.auth(0, NAME, &secret).await, Status::Ok);
+    assert_eq!(conn.vcp(Opcode::Ping, &[]).await.0, Status::Ok);
+    assert_eq!(conn.vcp(Opcode::Cluster, &[]).await.0, Status::Ok);
+
+    let mut conn = server.connect().await;
+    let block = format!("{NAME} {secret}");
+    conn.text(&format!("set {NAME} 0 0 {}\r\n{block}\r\n", block.len()))
+        .await;
+    let stats = conn.get_value("stats\r\n").await;
+    assert!(stats.contains("STAT"), "stats must answer: {stats:?}");
+}
+
+/// `stats conns` is where an operator about to narrow a row looks to see which
+/// live connections hold that identity.
+#[tokio::test]
+async fn stats_conns_reports_the_roles_of_a_connection() {
+    let (server, secret) = TestServer::start_with_roles(true, Some("read,list"), |_| {}).await;
+    let mut conn = server.connect().await;
+
+    let block = format!("{NAME} {secret}");
+    conn.text(&format!("set {NAME} 0 0 {}\r\n{block}\r\n", block.len()))
+        .await;
+
+    let conns = conn.get_value("stats conns\r\n").await;
+    assert!(
+        conns.contains("vash_roles read,list"),
+        "expected the roles in `stats conns`: {conns:?}"
+    );
 }

@@ -117,7 +117,11 @@ thread:
    1970. Applied here rather than in the decoder because the translation needs
    the clock, and a decoder that reads the clock no longer round-trips against
    its encoder.
-3. `execute` runs the command and classifies the outcome for metrics.
+3. `execute` runs the command and classifies the outcome for metrics. Note what
+   is *not* here: the authentication and role gates both ran in step 0, from the
+   header. `execute` is not a choke point — the fused read, `SetBatch` and the
+   awaited write path in `conn::handle` all reach the store without it — so a
+   gate placed here would cover neither `GET` nor a pipelined `SET`.
 4. `encode_reply` on success, `encode_error` on failure.
 
 Decode failures split two ways, and the split is the whole robustness story:
@@ -256,6 +260,20 @@ It has a second effect worth stating: because the refusal happens before opcode
 recognition, an unknown or unimplemented opcode answers `UNAUTHORIZED` like
 everything else rather than `UNSUPPORTED`. An unauthenticated party therefore
 cannot enumerate which opcodes this build has.
+
+**The same path carries the role check** (M13,
+[roles-proposal.md](roles-proposal.md)). Once a connection *has* authenticated,
+`header_refusal` asks a second question — whether the identity's roles cover
+what this opcode needs — and refuses with the same `UNAUTHORIZED` (5) from the
+same header, before the body decoder runs. That is why the mapping it consults
+is keyed on `Opcode` rather than on the decoded `Command`: a gate that has to
+decode the body first has already given up the property this ordering exists
+for. The two mappings are held together by a test, not by discipline.
+
+The reply body of a successful `AUTH` carries the granted roles as one byte, so
+a client can tell the three meanings of `UNAUTHORIZED` apart — "authenticate",
+"not for you", and "not enabled here" — without a fourth status code. Frames are
+length-prefixed, so a client that ignores the body is unaffected.
 
 ### `STATS` (0x04)
 

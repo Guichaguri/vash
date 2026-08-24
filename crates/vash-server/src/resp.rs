@@ -117,6 +117,83 @@ pub fn execute_block(
     Closing::No
 }
 
+/// The roles a Redis command needs, and the name to put in its refusal.
+///
+/// A third mapping beside the ones on `Command` and `Opcode`, and it is here
+/// rather than reached through [`translate`] for two reasons: `SCAN` and
+/// `DELBYTAG` never reach translation — they are answered before the storage
+/// boundary — and translation allocates for the multi-key writes, which is not
+/// work a gate should do on every command. `the_resp_mapping_agrees_with_the_domain`
+/// keeps it honest against the authority in `auth::roles_for_command`.
+///
+/// The name is the command *family*: the parser keeps no verb, so `DECR` is
+/// refused as `incr` and `UNLINK` as `del`. Redis names the exact command; this
+/// names the one it collapsed onto, which is what the server has.
+fn roles_for(command: &Command<'_>) -> (crate::auth::Roles, &'static str) {
+    use crate::auth::Roles;
+
+    match command {
+        Command::Hello { .. } => (Roles::NONE, "hello"),
+        Command::Ping { .. } => (Roles::NONE, "ping"),
+        Command::Quit => (Roles::NONE, "quit"),
+        Command::Auth(_) => (Roles::NONE, "auth"),
+        // `INFO` is memcached's `stats` in another dialect, and ungated for the
+        // same reason: it discloses counters, and client libraries call it.
+        Command::Info { .. } => (Roles::NONE, "info"),
+
+        Command::Get { .. } => (Roles::READ, "get"),
+        Command::MGet { .. } => (Roles::READ, "mget"),
+        Command::Exists { .. } => (Roles::READ, "exists"),
+        Command::Type { .. } => (Roles::READ, "type"),
+        Command::Ttl { .. } => (Roles::READ, "ttl"),
+
+        // `SET … GET` reports the value it displaced, so it reads.
+        Command::Set(set) => (
+            if set.return_previous {
+                Roles::READ_WRITE
+            } else {
+                Roles::WRITE
+            },
+            "set",
+        ),
+        Command::MSet { .. } => (Roles::WRITE, "mset"),
+        Command::MSetEx { .. } => (Roles::WRITE, "msetex"),
+        Command::Delete { .. } => (Roles::WRITE, "del"),
+        Command::Append { .. } => (Roles::WRITE, "append"),
+        Command::Expire { .. } => (Roles::WRITE, "expire"),
+        Command::Persist { .. } => (Roles::WRITE, "persist"),
+
+        // Answers with the resulting value, and `INCRBY 0` is a `GET` with
+        // extra steps.
+        Command::Incr { .. } => (Roles::READ_WRITE, "incr"),
+        Command::IncrEx(_) => (Roles::READ_WRITE, "incrby"),
+
+        Command::DelByTag { .. } => (Roles::INVALIDATE, "delbytag"),
+        Command::Scan(_) => (Roles::LIST, "scan"),
+    }
+}
+
+/// Whether this command must be refused for want of a role, and what to say.
+///
+/// Separate from [`refusal`] because the two are different questions with
+/// different counters: that one is "has this connection authenticated", this is
+/// "may this identity do that". Redis draws the same distinction on the wire
+/// with `NOAUTH` against `NOPERM`.
+///
+/// Asked whenever an identity is present, including with `auth.required` off —
+/// an identity carries its roles from the moment it is established, which is
+/// what lets a client rolled during auth.md §15's step 2 experience its role
+/// set before enforcement is turned on.
+fn denial(conn: &ConnAuth, command: &Command<'_>) -> Option<(crate::auth::Roles, &'static str)> {
+    let identity = conn.identity()?;
+    let (needed, name) = roles_for(command);
+    let roles = identity.roles();
+    if roles.allows(needed) {
+        return None;
+    }
+    Some((roles.missing(needed), name))
+}
+
 /// A plain `SET` this block may hold back, already translated.
 ///
 /// Returns `None` for everything with a verdict to report — `NX`, `XX`, `GET` —
@@ -129,7 +206,10 @@ fn batchable_set<'a>(
     conn: &ConnAuth,
     command: &Command<'a>,
 ) -> Option<vash_core::Set<'a>> {
-    if !matches!(command, Command::Set(_)) || refusal(state, conn, command).is_some() {
+    if !matches!(command, Command::Set(_))
+        || refusal(state, conn, command).is_some()
+        || denial(conn, command).is_some()
+    {
         return None;
     }
     let translated = translate(command).ok()?;
@@ -255,6 +335,22 @@ fn execute(
         state.metrics.other();
         state.metrics.error(failure.class);
         encode::error(out, failure.code, failure.message);
+        return Closing::No;
+    }
+
+    // Authenticated, and the answer is still no. `-NOPERM` rather than VCP's
+    // reuse of `UNAUTHORIZED`, because real clients know the code and the
+    // alternative — "command disabled by configuration" — sends an operator to
+    // the wrong config file.
+    if let Some((missing, name)) = denial(conn, command) {
+        crate::dispatch::deny(state, conn, missing, name);
+        state.metrics.other();
+        state.metrics.error(ErrorClass::Client);
+        encode::error(
+            out,
+            "NOPERM",
+            &format!("this user has no permissions to run the '{name}' command"),
+        );
         return Closing::No;
     }
 
@@ -1237,6 +1333,71 @@ fn ttl_from_deadline(deadline_ms: i64, now: i64) -> u32 {
 mod tests {
     use super::*;
     use vash_proto::resp::command::{Credential, Set as RespSet};
+
+    /// The third mapping, against the authority in `auth::roles_for_command`.
+    ///
+    /// RESP is gated on its own command enum rather than on the domain one,
+    /// because `SCAN` and `DELBYTAG` never reach [`translate`] and translation
+    /// allocates for the multi-key writes — which is not work a gate should do
+    /// on every command. This is what stops the two drifting, and it reuses
+    /// [`storage_commands`] so a command added there is compared here too.
+    #[test]
+    fn the_resp_mapping_agrees_with_the_domain() {
+        for command in storage_commands() {
+            let (needed, name) = roles_for(&command);
+            let domain = translate(&command).expect("a storage command translates");
+            assert_eq!(
+                needed,
+                crate::auth::roles_for_command(&domain),
+                "`{name}` and the domain command it becomes disagree"
+            );
+        }
+    }
+
+    /// `SET … GET` is the only command whose roles depend on its arguments: the
+    /// flag exists to report the value it displaced, so it reads as well.
+    #[test]
+    fn set_with_get_is_the_one_command_whose_roles_depend_on_its_arguments() {
+        use crate::auth::Roles;
+
+        let set = |return_previous| {
+            Command::Set(RespSet {
+                key: b"k",
+                value: b"v",
+                condition: Condition::Always,
+                expiry: Expiry::Unset,
+                return_previous,
+                tagged: false,
+                tags: vec![],
+            })
+        };
+
+        assert_eq!(roles_for(&set(false)).0, Roles::WRITE);
+        assert_eq!(roles_for(&set(true)).0, Roles::READ_WRITE);
+    }
+
+    /// The two that never reach [`translate`], pinned by hand for that reason:
+    /// they are answered before the storage boundary, so the agreement test
+    /// cannot cover them.
+    #[test]
+    fn the_commands_that_bypass_translation_are_still_classified() {
+        use crate::auth::Roles;
+
+        assert_eq!(
+            roles_for(&Command::DelByTag { tags: vec![b"t"] }).0,
+            Roles::INVALIDATE
+        );
+        assert_eq!(
+            roles_for(&Command::Scan(vash_proto::resp::command::Scan {
+                token: 0,
+                pattern: b"",
+                count: 10,
+                only_strings: false,
+            }))
+            .0,
+            Roles::LIST
+        );
+    }
 
     /// Every Redis command that touches storage, in one place.
     ///
