@@ -5,20 +5,16 @@
 //! will receive. The client-library compatibility suite lives in
 //! `tests/compat/` and runs against both this server and a real memcached.
 
-use std::net::SocketAddr;
+mod common;
 
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use vash_server::{Config, Server};
+use vash_server::Config;
 
 struct TestServer {
-    addr: SocketAddr,
+    running: common::Running,
     _dir: TempDir,
-    shutdown: Option<oneshot::Sender<()>>,
-    handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl TestServer {
@@ -28,55 +24,23 @@ impl TestServer {
 
     async fn start_with(tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.server.listen = "127.0.0.1:0".parse().unwrap();
-        config.store.path = dir.path().join("db");
-        // The whole protocol suite runs against whichever engine this build
-        // carries, so `--features mdbx` re-runs it on the second one. See
-        // `crates/vash-store/tests/store.rs` for the same arrangement a layer
-        // down, and `docs/mdbx-proposal.md` for why the choice is per build.
-        #[cfg(feature = "mdbx")]
-        {
-            config.store.backend = vash_server::config::Backend::Mdbx;
-        }
-        config.store.map_size_mb = 64;
-        // Port 0: these run in parallel and would otherwise fight over 9090.
-        config.observability.admin_listen = "127.0.0.1:0".into();
+        let mut config = common::config(dir.path());
         tweak(&mut config);
-
-        let server = Server::bind(config).await.expect("binding");
-        let addr = server.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            server
-                .serve(async {
-                    let _ = rx.await;
-                })
-                .await
-        });
-
         Self {
-            addr,
+            running: common::start(config).await,
             _dir: dir,
-            shutdown: Some(tx),
-            handle: Some(handle),
         }
     }
 
     async fn connect(&self) -> Conn {
-        let stream = TcpStream::connect(self.addr).await.expect("connecting");
+        let stream = TcpStream::connect(self.running.addr)
+            .await
+            .expect("connecting");
         stream.set_nodelay(true).unwrap();
         Conn {
             stream,
             buf: Vec::new(),
         }
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        drop(self.shutdown.take());
-        self.handle.take();
     }
 }
 
@@ -737,7 +701,9 @@ async fn both_protocols_are_served_on_one_port() {
     mc.line("set shared 0 0 5\r\nvalue\r\n").await;
 
     // ...and a VCP client reads it back from the same store, same port.
-    let mut vcp = vash_client::Client::connect(server.addr).await.unwrap();
+    let mut vcp = vash_client::Client::connect(server.running.addr)
+        .await
+        .unwrap();
     let got = vcp.get(b"shared").await.unwrap().expect("a hit");
     assert_eq!(&got.data[..], b"value");
 
@@ -988,7 +954,7 @@ async fn stats_settings_reports_the_configuration_in_force() {
     assert_eq!(fields["client_flags_size"], "4");
 
     // The bound port, not the configured one — the test server asks for 0.
-    assert_eq!(fields["tcpport"], server.addr.port().to_string());
+    assert_eq!(fields["tcpport"], server.running.addr.port().to_string());
     assert_ne!(fields["tcpport"], "0", "port 0 is a request, not an answer");
 
     assert!(fields.contains_key("maxbytes"));

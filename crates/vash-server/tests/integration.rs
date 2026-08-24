@@ -3,29 +3,19 @@
 //! Nothing here stubs the storage engine or the transport. A test that passes
 //! against a fake proves the fake works.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tempfile::TempDir;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use vash_client::{Client, ClientError};
 use vash_proto::vcp::Status;
-use vash_server::{Config, Server};
+use vash_server::Config;
 
 struct TestServer {
-    addr: SocketAddr,
-    admin: Option<SocketAddr>,
+    running: common::Running,
     dir: TempDir,
-    /// Held so tests can inspect on-disk state directly — `entries()` is the
-    /// only way to tell the sweeper apart from the lazy read-path check.
-    ///
-    /// An `Option` because it must be released before the server shuts down:
-    /// the environment cannot close while another handle is outstanding.
-    store: Option<Arc<dyn vash_store::Store>>,
-    shutdown: Option<oneshot::Sender<()>>,
-    handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl TestServer {
@@ -39,75 +29,24 @@ impl TestServer {
     }
 
     async fn start_with(dir: TempDir, tweak: impl FnOnce(&mut Config)) -> Self {
-        let mut config = Config::default();
-        config.server.listen = "127.0.0.1:0".parse().unwrap();
-        config.store.path = dir.path().join("db");
-        // The whole protocol suite runs against whichever engine this build
-        // carries, so `--features mdbx` re-runs it on the second one. See
-        // `crates/vash-store/tests/store.rs` for the same arrangement a layer
-        // down, and `docs/mdbx-proposal.md` for why the choice is per build.
-        #[cfg(feature = "mdbx")]
-        {
-            config.store.backend = vash_server::config::Backend::Mdbx;
-        }
-        // Small enough to be cheap in CI, large enough for these tests.
-        config.store.map_size_mb = 64;
-        // Port 0: these run in parallel and would otherwise fight over 9090.
-        config.observability.admin_listen = "127.0.0.1:0".into();
+        let mut config = common::config(dir.path());
         tweak(&mut config);
-
-        let server = Server::bind(config).await.expect("binding the server");
-        let addr = server.local_addr().expect("reading the bound address");
-        let admin = server.admin_addr();
-        let store = Arc::clone(server.store());
-
-        let (tx, rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            server
-                .serve(async {
-                    let _ = rx.await;
-                })
-                .await
-        });
-
         Self {
-            addr,
-            admin,
+            running: common::start(config).await,
             dir,
-            store: Some(store),
-            shutdown: Some(tx),
-            handle: Some(handle),
         }
     }
 
     /// Fetches an admin endpoint, returning `(status code, body)`.
     async fn admin(&self, path: &str) -> (u16, String) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let addr = self.admin.expect("admin endpoint not bound");
-        let mut stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connecting");
-        stream
-            .write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes())
-            .await
-            .expect("writing");
-
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.expect("reading");
-        let text = String::from_utf8(raw).expect("responses are utf-8");
-
-        let code = text
-            .split(' ')
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .unwrap_or_else(|| panic!("no status code in {text:?}"));
-        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-        (code, body)
+        let addr = self.running.admin_addr.expect("admin endpoint not bound");
+        common::admin_get(addr, path).await
     }
 
     async fn client(&self) -> Client {
-        Client::connect(self.addr).await.expect("connecting")
+        Client::connect(self.running.addr)
+            .await
+            .expect("connecting")
     }
 
     fn db_path(&self) -> PathBuf {
@@ -120,9 +59,8 @@ impl TestServer {
     /// Read from the store because VCP does not report a remaining lifetime on
     /// the wire — the memcached `t` flag is the only way to ask over a socket.
     fn deadline_ms(&self, key: &[u8]) -> Option<u64> {
-        self.store
-            .as_ref()
-            .expect("store handle released")
+        self.running
+            .store()
             .get(vash_core::Key::new(key).expect("a valid key"))
             .expect("reading the key")
             .and_then(|value| value.expires_at_ms)
@@ -130,26 +68,17 @@ impl TestServer {
 
     /// Records currently on disk, including any the sweeper has not reached.
     fn entries(&self) -> u64 {
-        self.store
-            .as_ref()
-            .expect("store handle released")
+        self.running
+            .store()
             .stats()
             .expect("reading store stats")
             .entries
     }
 
-    /// Stops the server and waits for it to release the database.
+    /// Stops the server and waits for it to release the database, handing back
+    /// the directory so a caller can reopen it.
     async fn stop(mut self) -> TempDir {
-        // Must go first: the server closes the LMDB environment on shutdown,
-        // and cannot while this handle is alive.
-        drop(self.store.take());
-        drop(self.shutdown.take());
-        self.handle
-            .take()
-            .unwrap()
-            .await
-            .expect("server task panicked")
-            .expect("server returned an error");
+        self.running.stop().await;
         self.dir
     }
 }
@@ -230,7 +159,7 @@ impl TestCluster {
 
     /// A client that authenticates, for the clustered-with-auth test.
     async fn client_with(&self, index: usize, credential: &vash_client::Credential) -> Client {
-        Client::connect_with(self.node(index).addr, credential)
+        Client::connect_with(self.node(index).running.addr, credential)
             .await
             .expect("connecting")
     }
@@ -511,7 +440,9 @@ async fn invalidation_converges_across_a_cluster_that_authenticates() {
         .wait_for(
             "every authenticating node to stop serving the invalidated tag",
             async |node| {
-                let mut client = Client::connect_with(node.addr, &credential).await.unwrap();
+                let mut client = Client::connect_with(node.running.addr, &credential)
+                    .await
+                    .unwrap();
                 let mut gone = true;
                 for index in 0..3 {
                     gone &= client
@@ -550,7 +481,7 @@ async fn an_unauthenticated_client_is_told_at_connect_time() {
     })
     .await;
 
-    let Err(error) = Client::connect(server.addr).await else {
+    let Err(error) = Client::connect(server.running.addr).await else {
         panic!("connecting without a credential must fail at the handshake");
     };
     assert!(
@@ -560,7 +491,7 @@ async fn an_unauthenticated_client_is_told_at_connect_time() {
 
     // And the same address works with a credential.
     let credential = vash_client::Credential::new("app", secret);
-    let mut client = Client::connect_with(server.addr, &credential)
+    let mut client = Client::connect_with(server.running.addr, &credential)
         .await
         .unwrap();
     client.set(b"k", b"v", 0).await.unwrap();
@@ -1052,7 +983,7 @@ async fn concurrent_clients_do_not_interfere() {
 
     let mut tasks = Vec::new();
     for worker in 0..8u32 {
-        let addr = server.addr;
+        let addr = server.running.addr;
         tasks.push(tokio::spawn(async move {
             let mut client = Client::connect(addr).await.unwrap();
             for i in 0..50u32 {
@@ -1404,7 +1335,7 @@ async fn unknown_admin_routes_and_methods_are_refused() {
     let server = TestServer::start().await;
     assert_eq!(server.admin("/nope").await.0, 404);
 
-    let mut stream = tokio::net::TcpStream::connect(server.admin.unwrap())
+    let mut stream = tokio::net::TcpStream::connect(server.running.admin_addr.unwrap())
         .await
         .unwrap();
     stream
@@ -1456,7 +1387,9 @@ async fn garbage_input_closes_the_connection_without_killing_the_server() {
     let server = TestServer::start().await;
 
     // A frame header claiming an absurd body length.
-    let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(server.running.addr)
+        .await
+        .unwrap();
     let mut frame = vec![0x10u8, 0, 0, 0, 1, 0, 0, 0];
     frame.extend_from_slice(&u32::MAX.to_le_bytes());
     let _ = stream.write_all(&frame).await;
@@ -1786,7 +1719,7 @@ async fn a_node_whose_peer_credential_lacks_the_peer_role_refuses_to_start() {
     config.cluster.auth_name = "peer".into();
     config.cluster.auth_secret = secret.clone();
 
-    let error = match Server::bind(config).await {
+    let error = match vash_server::Server::bind(config).await {
         Err(error) => format!("{error:#}"),
         Ok(_) => panic!("a node with a peer credential that cannot gossip must not start"),
     };
@@ -1815,7 +1748,7 @@ async fn a_node_whose_peer_credential_lacks_the_peer_role_refuses_to_start() {
     config.cluster.auth_name = "peer".into();
     config.cluster.auth_secret = secret;
     assert!(
-        Server::bind(config).await.is_ok(),
+        vash_server::Server::bind(config).await.is_ok(),
         "the same node starts once the row can do the job"
     );
 }
@@ -1848,7 +1781,7 @@ async fn a_credential_file_without_roles_still_authorises_everything() {
     config.protocol.flush_enabled = true;
     config.protocol.listing_enabled = true;
 
-    let server = Server::bind(config).await.unwrap();
+    let server = vash_server::Server::bind(config).await.unwrap();
     let addr = server.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {

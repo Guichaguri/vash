@@ -5,24 +5,21 @@
 //! remembered to list, so an opcode added later without a gate fails here
 //! instead of shipping.
 
-use std::net::SocketAddr;
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use vash_proto::vcp::{HEADER_LEN, Opcode, Status, encode_auth_body, encode_request};
-use vash_server::{Config, Server};
+use vash_server::Config;
 
 const NAME: &str = "billing-api";
 
 struct TestServer {
-    addr: SocketAddr,
+    running: common::Running,
     _dir: TempDir,
-    shutdown: Option<oneshot::Sender<()>>,
-    handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl TestServer {
@@ -47,63 +44,33 @@ impl TestServer {
         let (secret, line) = vash_server::auth::generate(NAME, roles).unwrap();
         let credentials = write_credentials(dir.path(), &line);
 
-        let mut config = Config::default();
-        config.server.listen = "127.0.0.1:0".parse().unwrap();
-        config.store.path = dir.path().join("db");
-        // The whole protocol suite runs against whichever engine this build
-        // carries, so `--features mdbx` re-runs it on the second one. See
-        // `crates/vash-store/tests/store.rs` for the same arrangement a layer
-        // down, and `docs/mdbx-proposal.md` for why the choice is per build.
-        #[cfg(feature = "mdbx")]
-        {
-            config.store.backend = vash_server::config::Backend::Mdbx;
-        }
-        config.store.map_size_mb = 64;
+        let mut config = common::config(dir.path());
         // One LMDB environment rather than one per shard. Nothing here is about
         // sharding, and the suite runs in parallel against a finite pool of
         // thread-local slots — past it, `MDB_TLS_FULL`.
         config.store.shards = 1;
-        config.observability.admin_listen = "127.0.0.1:0".into();
         config.auth.required = required;
         config.auth.file = credentials;
         tweak(&mut config);
 
-        let server = Server::bind(config).await.expect("binding");
-        let addr = server.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            server
-                .serve(async {
-                    let _ = rx.await;
-                })
-                .await
-        });
-
         (
             Self {
-                addr,
+                running: common::start(config).await,
                 _dir: dir,
-                shutdown: Some(tx),
-                handle: Some(handle),
             },
             secret,
         )
     }
 
     async fn connect(&self) -> Conn {
-        let stream = TcpStream::connect(self.addr).await.expect("connecting");
+        let stream = TcpStream::connect(self.running.addr)
+            .await
+            .expect("connecting");
         stream.set_nodelay(true).unwrap();
         Conn {
             stream,
             buf: Vec::new(),
         }
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        drop(self.shutdown.take());
-        self.handle.take();
     }
 }
 
@@ -640,24 +607,11 @@ async fn redis_quit_works_before_auth() {
 #[tokio::test]
 async fn redis_says_so_when_no_credential_is_configured() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
-    config.server.listen = "127.0.0.1:0".parse().unwrap();
-    config.store.path = dir.path().join("db");
-    config.store.map_size_mb = 64;
-    config.observability.admin_listen = "127.0.0.1:0".into();
+    // No `auth.file` and no secret in the environment, which is the whole
+    // point of this one.
+    let running = common::start(common::config(dir.path())).await;
 
-    let server = Server::bind(config).await.unwrap();
-    let addr = server.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        server
-            .serve(async {
-                let _ = rx.await;
-            })
-            .await
-    });
-
-    let stream = TcpStream::connect(addr).await.unwrap();
+    let stream = TcpStream::connect(running.addr).await.unwrap();
     let mut conn = Conn {
         stream,
         buf: Vec::new(),
@@ -668,9 +622,6 @@ async fn redis_says_so_when_no_credential_is_configured() {
         "-ERR AUTH <password> called without any password configured for the default user. \
          Are you sure your configuration is correct?\r\n"
     );
-
-    drop(tx);
-    let _ = handle.await;
 }
 
 // ---- Memcached -------------------------------------------------------------
@@ -858,14 +809,10 @@ fn a_clustered_node_without_a_peer_credential_refuses_to_start() {
 #[tokio::test]
 async fn enforcement_without_credentials_refuses_to_start() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
-    config.server.listen = "127.0.0.1:0".parse().unwrap();
-    config.store.path = dir.path().join("db");
-    config.store.map_size_mb = 64;
-    config.observability.admin_listen = "127.0.0.1:0".into();
+    let mut config = common::config(dir.path());
     config.auth.required = true;
 
-    let Err(error) = Server::bind(config).await else {
+    let Err(error) = vash_server::Server::bind(config).await else {
         panic!("a server with auth required and no credentials must not start");
     };
     let error = format!("{error:#}");

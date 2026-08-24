@@ -10,6 +10,8 @@
 
 #![cfg(feature = "tls")]
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +23,7 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use vash_proto::vcp::{HEADER_LEN, Opcode, Status, encode_request, encode_set_body};
-use vash_server::{Config, Server};
+use vash_server::Server;
 
 /// Nothing here may hang. Every exchange runs under this, so a regression of
 /// the Phase 0 deadlock fails the suite in seconds instead of wedging CI.
@@ -53,15 +55,11 @@ fn issue(dir: &std::path::Path) -> (PathBuf, PathBuf, rustls::pki_types::Certifi
 }
 
 struct TestServer {
-    plain: SocketAddr,
-    tls: SocketAddr,
+    running: common::Running,
     ca: rustls::pki_types::CertificateDer<'static>,
     cert: PathBuf,
     key: PathBuf,
-    reloadable: Option<vash_server::tls::Reloadable>,
     dir: TempDir,
-    shutdown: Option<oneshot::Sender<()>>,
-    handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl TestServer {
@@ -69,42 +67,31 @@ impl TestServer {
         let dir = tempfile::tempdir().unwrap();
         let (cert, key, ca) = issue(dir.path());
 
-        let mut config = Config::default();
-        config.server.listen = "127.0.0.1:0".parse().unwrap();
-        config.store.path = dir.path().join("db");
-        config.store.map_size_mb = 64;
+        let mut config = common::config(dir.path());
         // One environment: nothing here is about sharding, and the suite runs
         // in parallel against a finite pool of reader slots.
         config.store.shards = 1;
+        // No admin port: nothing in this suite scrapes one.
         config.observability.admin_listen = String::new();
         config.tls.listen = "127.0.0.1:0".into();
         config.tls.cert = cert.clone();
         config.tls.key = key.clone();
 
-        let server = Server::bind(config).await.expect("binding");
-        let plain = server.local_addr().unwrap();
-        let tls = server.tls_addr().expect("a TLS listener");
-        let reloadable = server.tls_reloadable();
-        let (tx, rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            server
-                .serve(async {
-                    let _ = rx.await;
-                })
-                .await
-        });
-
         Self {
-            plain,
-            tls,
+            running: common::start(config).await,
             ca,
             cert,
             key,
-            reloadable,
             dir,
-            shutdown: Some(tx),
-            handle: Some(handle),
         }
+    }
+
+    fn plain(&self) -> SocketAddr {
+        self.running.addr
+    }
+
+    fn tls(&self) -> SocketAddr {
+        self.running.tls_addr.expect("a TLS listener")
     }
 
     fn dir_path(&self) -> &std::path::Path {
@@ -119,7 +106,7 @@ impl TestServer {
     /// was started with — which is what a renewal writes over.
     fn tls_config_for_reload(&self) -> vash_server::config::TlsConfig {
         vash_server::config::TlsConfig {
-            listen: self.tls.to_string(),
+            listen: self.tls().to_string(),
             cert: self.cert.clone(),
             key: self.key.clone(),
             ..Default::default()
@@ -127,7 +114,10 @@ impl TestServer {
     }
 
     fn acceptor(&self) -> &vash_server::tls::Reloadable {
-        self.reloadable.as_ref().expect("a TLS listener")
+        self.running
+            .tls_reloadable
+            .as_ref()
+            .expect("a TLS listener")
     }
 
     /// A client that trusts exactly the CA this server was issued from, so a
@@ -146,7 +136,7 @@ impl TestServer {
     }
 
     async fn connect_tls(&self) -> Conn<tokio_rustls::client::TlsStream<TcpStream>> {
-        let stream = TcpStream::connect(self.tls).await.expect("connecting");
+        let stream = TcpStream::connect(self.tls()).await.expect("connecting");
         stream.set_nodelay(true).unwrap();
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let stream = tokio::time::timeout(DEADLINE, self.connector().connect(name, stream))
@@ -157,16 +147,9 @@ impl TestServer {
     }
 
     async fn connect_plain(&self) -> Conn<TcpStream> {
-        let stream = TcpStream::connect(self.plain).await.expect("connecting");
+        let stream = TcpStream::connect(self.plain()).await.expect("connecting");
         stream.set_nodelay(true).unwrap();
         Conn::new(stream)
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        drop(self.shutdown.take());
-        self.handle.take();
     }
 }
 
@@ -508,10 +491,9 @@ impl TlsCluster {
             .map(|(_, addr)| addr.to_string())
             .collect();
 
-        let mut config = Config::default();
+        let mut config = common::config(self.dirs[index].path());
+        // Reserved in advance, because peers are configured before a node binds.
         config.server.listen = self.plain_addrs[index];
-        config.store.path = self.dirs[index].path().join("db");
-        config.store.map_size_mb = 64;
         config.store.shards = 1;
         config.observability.admin_listen = String::new();
         config.tls.listen = self.tls_addrs[index].to_string();
@@ -633,7 +615,7 @@ async fn a_ca_that_does_not_match_is_refused_as_configuration() {
     let (wrong_ca, _, _) = issue(other.path());
 
     let tls = vash_client::TlsConfig::new(&wrong_ca, "localhost").expect("a parseable CA");
-    let error = match vash_client::Client::connect_tls(&server.tls, None, &tls).await {
+    let error = match vash_client::Client::connect_tls(&server.tls(), None, &tls).await {
         Err(error) => error,
         Ok(_) => panic!("a certificate from an unknown CA must not be accepted"),
     };
@@ -650,10 +632,7 @@ async fn a_ca_that_does_not_match_is_refused_as_configuration() {
 #[tokio::test]
 async fn a_cluster_with_an_unreadable_ca_refuses_to_start() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
-    config.server.listen = "127.0.0.1:0".parse().unwrap();
-    config.store.path = dir.path().join("db");
-    config.store.map_size_mb = 64;
+    let mut config = common::config(dir.path());
     config.store.shards = 1;
     config.observability.admin_listen = String::new();
     config.cluster.peers = vec!["127.0.0.1:1".into()];
@@ -785,13 +764,11 @@ fn client_ca(dir: &std::path::Path) -> ((rcgen::CertificateParams, rcgen::KeyPai
 
 /// A server that requires client certificates, with a credential table.
 struct MtlsServer {
-    tls: SocketAddr,
+    running: common::Running,
     server_ca: rustls::pki_types::CertificateDer<'static>,
     client_ca: (rcgen::CertificateParams, rcgen::KeyPair),
     credentials: PathBuf,
-    dir: TempDir,
-    shutdown: Option<oneshot::Sender<()>>,
-    handle: Option<JoinHandle<anyhow::Result<()>>>,
+    _dir: TempDir,
 }
 
 impl MtlsServer {
@@ -809,10 +786,7 @@ impl MtlsServer {
             std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        let mut config = Config::default();
-        config.server.listen = "127.0.0.1:0".parse().unwrap();
-        config.store.path = dir.path().join("db");
-        config.store.map_size_mb = 64;
+        let mut config = common::config(dir.path());
         config.store.shards = 1;
         config.observability.admin_listen = String::new();
         config.tls.listen = "127.0.0.1:0".into();
@@ -823,26 +797,17 @@ impl MtlsServer {
         config.auth.required = auth_required;
         config.auth.file = credentials.clone();
 
-        let server = Server::bind(config).await.expect("binding");
-        let tls = server.tls_addr().expect("a TLS listener");
-        let (tx, rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            server
-                .serve(async {
-                    let _ = rx.await;
-                })
-                .await
-        });
-
         Self {
-            tls,
+            running: common::start(config).await,
             server_ca,
             client_ca: client_ca_pair,
             credentials,
-            dir,
-            shutdown: Some(tx),
-            handle: Some(handle),
+            _dir: dir,
         }
+    }
+
+    fn tls(&self) -> SocketAddr {
+        self.running.tls_addr.expect("a TLS listener")
     }
 
     /// Connects presenting a certificate for `subject`.
@@ -863,7 +828,7 @@ impl MtlsServer {
         .with_client_auth_cert(vec![cert], key)
         .unwrap();
 
-        let stream = TcpStream::connect(self.tls).await?;
+        let stream = TcpStream::connect(self.tls()).await?;
         stream.set_nodelay(true).unwrap();
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
@@ -885,14 +850,6 @@ impl MtlsServer {
             std::fs::set_permissions(&self.credentials, std::fs::Permissions::from_mode(0o600))
                 .unwrap();
         }
-    }
-}
-
-impl Drop for MtlsServer {
-    fn drop(&mut self) {
-        drop(self.shutdown.take());
-        self.handle.take();
-        let _ = &self.dir;
     }
 }
 
@@ -1077,7 +1034,7 @@ async fn a_client_with_no_certificate_is_refused() {
     .with_root_certificates(roots)
     .with_no_client_auth();
 
-    let stream = TcpStream::connect(server.tls).await.expect("connecting");
+    let stream = TcpStream::connect(server.tls()).await.expect("connecting");
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let handshake = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(name, stream)
@@ -1214,7 +1171,7 @@ async fn a_renewed_certificate_is_picked_up_without_dropping_a_connection() {
     .with_root_certificates(roots)
     .with_no_client_auth();
 
-    let stream = TcpStream::connect(server.tls).await.expect("connecting");
+    let stream = TcpStream::connect(server.tls()).await.expect("connecting");
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let stream = tokio::time::timeout(
         DEADLINE,
@@ -1242,12 +1199,8 @@ async fn metrics_report_when_the_certificate_expires() {
     let dir = tempfile::tempdir().unwrap();
     let (cert, key, _) = issue(dir.path());
 
-    let mut config = Config::default();
-    config.server.listen = "127.0.0.1:0".parse().unwrap();
-    config.store.path = dir.path().join("db");
-    config.store.map_size_mb = 64;
+    let mut config = common::config(dir.path());
     config.store.shards = 1;
-    config.observability.admin_listen = "127.0.0.1:0".into();
     config.tls.listen = "127.0.0.1:0".into();
     config.tls.cert = cert;
     config.tls.key = key;

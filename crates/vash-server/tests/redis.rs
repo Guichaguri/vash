@@ -4,20 +4,16 @@
 //! and assert on the exact reply bytes, so they pin what a real client library
 //! will actually receive rather than what an abstraction claims it received.
 
-use std::net::SocketAddr;
+mod common;
 
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use vash_server::{Config, Server};
+use vash_server::Config;
 
 struct TestServer {
-    addr: SocketAddr,
+    running: common::Running,
     _dir: TempDir,
-    shutdown: Option<oneshot::Sender<()>>,
-    handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl TestServer {
@@ -27,55 +23,23 @@ impl TestServer {
 
     async fn start_with(tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.server.listen = "127.0.0.1:0".parse().unwrap();
-        config.store.path = dir.path().join("db");
-        // The whole protocol suite runs against whichever engine this build
-        // carries, so `--features mdbx` re-runs it on the second one. See
-        // `crates/vash-store/tests/store.rs` for the same arrangement a layer
-        // down, and `docs/mdbx-proposal.md` for why the choice is per build.
-        #[cfg(feature = "mdbx")]
-        {
-            config.store.backend = vash_server::config::Backend::Mdbx;
-        }
-        config.store.map_size_mb = 64;
-        // Port 0: these run in parallel and would otherwise fight over 9090.
-        config.observability.admin_listen = "127.0.0.1:0".into();
+        let mut config = common::config(dir.path());
         tweak(&mut config);
-
-        let server = Server::bind(config).await.expect("binding");
-        let addr = server.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            server
-                .serve(async {
-                    let _ = rx.await;
-                })
-                .await
-        });
-
         Self {
-            addr,
+            running: common::start(config).await,
             _dir: dir,
-            shutdown: Some(tx),
-            handle: Some(handle),
         }
     }
 
     async fn connect(&self) -> Conn {
-        let stream = TcpStream::connect(self.addr).await.expect("connecting");
+        let stream = TcpStream::connect(self.running.addr)
+            .await
+            .expect("connecting");
         stream.set_nodelay(true).unwrap();
         Conn {
             stream,
             buf: Vec::new(),
         }
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        drop(self.shutdown.take());
-        self.handle.take();
     }
 }
 
