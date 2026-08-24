@@ -1,9 +1,9 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Byte-for-byte differential against a real memcached or a real Redis.
 
 Sends identical command sequences to two servers and compares the raw
-responses. A client library smooths over a lot â€” exact error strings, edge-case
-verdicts, response ordering â€” and this is where those divergences show up.
+responses. A client library smooths over a lot — exact error strings, edge-case
+verdicts, response ordering — and this is where those divergences show up.
 
     python differential.py --reference 127.0.0.1:11211 --subject 127.0.0.1:11311
     python differential.py --dialect redis --reference ... --subject ...
@@ -562,7 +562,7 @@ def run_suite(dialect, suite, reference, subject, verbose=False):
     """Runs one (dialect, suite) pair. Returns the number of unexpected diffs."""
     probes = SUITES[(dialect, suite)]
 
-    # Probe keys are written as `~1`, `~2`, â€¦ and given a fresh prefix on every
+    # Probe keys are written as `~1`, `~2`, … and given a fresh prefix on every
     # run. Without it a probe like "add on an absent key" would pass once and
     # then fail forever against a server that keeps its data between runs.
     prefix = b"dx" + uuid.uuid4().hex[:8].encode()

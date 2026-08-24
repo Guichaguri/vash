@@ -74,7 +74,8 @@ pub fn acceptor(config: &TlsConfig) -> anyhow::Result<TlsAcceptor> {
             }
             if added == 0 {
                 bail!(
-                    "{} contains no certificate, so no client certificate could ever be                      verified against it",
+                    "{} contains no certificate, so no client certificate could ever be \
+                     verified against it",
                     config.client_ca.display()
                 );
             }
@@ -164,7 +165,8 @@ pub fn record_expiry(config: &TlsConfig, metrics: &crate::metrics::ServerMetrics
             metrics.tls_cert_expires_at(0);
             tracing::warn!(
                 cert = %config.cert.display(),
-                "could not determine when the TLS certificate expires; it may already have.                  vash_tls_cert_expiry_timestamp_seconds reports 0"
+                "could not determine when the TLS certificate expires; it may already have. \
+                 vash_tls_cert_expiry_timestamp_seconds reports 0"
             );
         }
     }

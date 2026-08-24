@@ -1,7 +1,7 @@
 //! Memcached response rendering.
 //!
-//! A reply's shape depends on which command asked for it â€” `get` answers with
-//! `VALUE`/`END`, `mg` with `HD`/`VA`/`EN`, `incr` with a bare number â€” so the
+//! A reply's shape depends on which command asked for it — `get` answers with
+//! `VALUE`/`END`, `mg` with `HD`/`VA`/`EN`, `incr` with a bare number — so the
 //! parser records a [`ResponseStyle`] alongside the command and the encoder
 //! renders against that. Keeping the choice in the parser means the storage
 //! layer never learns that two dialects exist.
@@ -417,7 +417,7 @@ fn encode_retrieval(out: &mut Vec<u8>, with_cas: bool, command: &Command<'_>, re
     };
 
     // A batch reply holds one slot per requested key, in order, so misses are
-    // simply skipped â€” memcached omits them rather than reporting them.
+    // simply skipped — memcached omits them rather than reporting them.
     if let Reply::Values(values) = reply {
         for (key, value) in keys.iter().zip(values) {
             let Some(value) = value else { continue };

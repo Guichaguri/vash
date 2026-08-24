@@ -26,7 +26,7 @@ pub fn encode_response(
 }
 
 /// Appends an error response. `opcode` is the raw byte from the request, which
-/// may not be a known [`Opcode`] â€” it is echoed so the client can correlate.
+/// may not be a known [`Opcode`] — it is echoed so the client can correlate.
 pub fn encode_error(out: &mut Vec<u8>, raw_opcode: u8, request_id: u32, status: Status) {
     let header = FrameHeader {
         opcode: raw_opcode,

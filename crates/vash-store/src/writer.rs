@@ -2,7 +2,7 @@
 //!
 //! LMDB allows one writer per environment. Rather than fight that, every write
 //! is funnelled to one thread that packs as many as it can into a single
-//! transaction. The commit cost â€” the expensive part â€” is then amortised across
+//! transaction. The commit cost — the expensive part — is then amortised across
 //! the whole batch instead of being paid per operation.
 //!
 //! The batch is **whatever had already queued while the previous commit was in
@@ -370,7 +370,7 @@ fn writer_loop<B: Backend>(
             std::thread::sleep(Duration::from_micros(config.linger_us));
         }
 
-        // Take whatever else has arrived. This â€” and not a timer â€” is what
+        // Take whatever else has arrived. This — and not a timer — is what
         // forms the batch.
         while batch.len() < config.max_batch {
             match rx.try_recv() {
@@ -426,10 +426,26 @@ fn writer_loop<B: Backend>(
                 // writes.
                 warn!("store is full; refusing writes and reclaiming space");
                 engine.set_pressure(Pressure::Critical);
-                if let Err(e) = free_space(&engine, &config, &metrics) {
-                    error!(error = %e, "could not reclaim space from a full store");
-                }
-                reclaim_pending = true;
+                // **Only a reclamation that freed something keeps the loop
+                // hot.** `reclaim_pending` drives `idle_timeout` to zero, so
+                // re-arming it unconditionally would spin this thread at 100%
+                // — opening a transaction, failing, and logging the warning
+                // above — for as long as the store stayed unrecoverably full.
+                // That is the hazard the arm below already names; a full map is
+                // the one case where retrying may never succeed, so it is the
+                // case that needs the backoff most.
+                //
+                // A pass that did free space is a different thing: work
+                // remains and the next one can make progress, so that keeps
+                // the loop going as it always did.
+                reclaim_pending = match free_space(&engine, &config, &metrics) {
+                    // Freed something, so the next pass can make progress too.
+                    Ok(freed) => freed > 0,
+                    Err(e) => {
+                        error!(error = %e, "could not reclaim space from a full store");
+                        false
+                    }
+                };
             }
             Err(e) => {
                 error!(error = %e, "write batch failed");
@@ -650,11 +666,17 @@ fn commit_batch<B: Backend>(
 /// because the deletions themselves need pages: on a copy-on-write B-tree,
 /// removing a record dirties the path to it, so an eviction batch sized for
 /// normal running can be too large to commit on a full map.
+///
+/// **Returns how many records it actually freed**, not merely whether a
+/// transaction committed. A pass that commits having found nothing to remove is
+/// a store that cannot recover on its own, and the caller has to be able to
+/// tell that from progress: it decides whether to keep the writer loop hot or
+/// back off to the sweep interval.
 fn free_space<B: Backend>(
     engine: &Engine<B>,
     config: &WriteConfig,
     metrics: &WriterMetrics,
-) -> Result<()> {
+) -> Result<usize> {
     for budget in [config.eviction.batch, config.eviction.batch / 8, 8] {
         let budget = budget.max(1);
         let mut wtxn = engine.write_txn()?;
@@ -672,8 +694,16 @@ fn free_space<B: Backend>(
             Ok(()) => {
                 let freed = swept + evicted;
                 metrics.evicted.fetch_add(evicted as u64, Ordering::Relaxed);
-                info!(freed, budget, "reclaimed space from a full store");
-                return Ok(());
+                if freed == 0 {
+                    warn!(
+                        budget,
+                        "a full store had nothing left to reclaim; raise store.map_size_mb or \
+                         shorten the TTLs — writes stay refused until space appears"
+                    );
+                } else {
+                    info!(freed, budget, "reclaimed space from a full store");
+                }
+                return Ok(freed);
             }
             // Too big to commit even as a deletion; try a smaller bite.
             Err(e) => {

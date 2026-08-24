@@ -33,8 +33,8 @@ use crate::backend::{Backend, ReadTxn, WriteTxn};
 
 /// A record encoded and ready to store, still missing its CAS token.
 ///
-/// Built on the calling thread so that the value copy and the record framing â€”
-/// the expensive part of a write â€” happen in parallel across connections, and
+/// Built on the calling thread so that the value copy and the record framing —
+/// the expensive part of a write — happen in parallel across connections, and
 /// the single writer thread is left with only the B-tree work.
 pub struct PreparedSet {
     pub key: Box<[u8]>,
@@ -212,7 +212,7 @@ impl<B: Backend> Engine<B> {
         // Each shard counts independently, so the raw counters collide across
         // shards. Striping them keeps every token unique server-wide, which is
         // what clients are told to expect, while staying strictly increasing
-        // within a shard â€” and therefore within any single key, which is the
+        // within a shard — and therefore within any single key, which is the
         // only ordering compare-and-swap depends on.
         Ok(counter * self.shard_count as u64 + self.shard_index as u64)
     }
@@ -836,7 +836,7 @@ impl<B: Backend> Engine<B> {
 
     /// Re-stamps a record's expiry without the client resending the value.
     ///
-    /// LMDB values are immutable blobs, so this rewrites the record â€” the value
+    /// LMDB values are immutable blobs, so this rewrites the record — the value
     /// is copied within the transaction. That is the cost of `TOUCH` being a
     /// bandwidth optimisation rather than a storage one.
     pub fn apply_touch(&self, wtxn: &mut B::RwTxn<'_>, key: &[u8], ttl_secs: u32) -> Result<bool> {
@@ -886,7 +886,7 @@ impl<B: Backend> Engine<B> {
     /// Empties the cache, returning the new flush epoch.
     ///
     /// The epoch bump and the clear do different jobs, and both are needed. The
-    /// clear frees the space â€” an epoch bump alone would leak every record
+    /// clear frees the space — an epoch bump alone would leak every record
     /// without a TTL, since nothing would ever come looking for them. The epoch
     /// closes the MVCC window: a read transaction opened before this commit
     /// still sees the old snapshot, and comparing those records against the new

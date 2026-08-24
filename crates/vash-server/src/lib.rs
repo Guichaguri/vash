@@ -648,7 +648,8 @@ async fn serve_encrypted(
                         state.metrics.tls_identity_rejected();
                         debug!(
                             %subject,
-                            "closing a TLS connection: the client certificate matches no                              credential row"
+                            "closing a TLS connection: the client certificate matches no \
+                             credential row"
                         );
                         state.metrics.tls_closed();
                         return Ok(());

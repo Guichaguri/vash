@@ -71,7 +71,9 @@ pub(crate) fn refuse_foreign_database(
         return Ok(());
     }
     Err(StoreError::Corrupt(format!(
-        "database at {} was written by the {their_name} backend, but this server is          configured for a different one; the file formats are not interchangeable,          so wipe the directory or change store.backend",
+        "database at {} was written by the {their_name} backend, but this server is \
+         configured for a different one; the file formats are not interchangeable, \
+         so wipe the directory or change store.backend",
         path.display()
     )))
 }

@@ -2,7 +2,7 @@
 //!
 //! Rendered straight from atomics rather than through a metrics facade. With
 //! this few instrumentation points a global recorder would be more machinery
-//! than it saves, and the exposition format stays explicit â€” which matters,
+//! than it saves, and the exposition format stays explicit — which matters,
 //! because a dashboard is only as trustworthy as the meaning of its series.
 //!
 //! Nothing here reports a value it does not measure. A counter that is always
@@ -778,7 +778,9 @@ pub fn render_prometheus(
     metric!(
         "vash_tls_connections_active",
         "gauge",
-        "Encrypted connections currently open. Equal to vash_connections_active          when nothing is arriving in the clear, which is what makes closing the          plaintext port safe.",
+        "Encrypted connections currently open. Equal to vash_connections_active \
+         when nothing is arriving in the clear, which is what makes closing the \
+         plaintext port safe.",
         load(&server.tls_connections_active).to_string(),
     );
 
@@ -805,7 +807,8 @@ pub fn render_prometheus(
     // series beneath it, the same arrangement `vash_command_seconds` uses.
     let _ = writeln!(
         out,
-        "# HELP vash_tls_handshake_seconds Time to complete a TLS handshake,          which is the most expensive thing an unauthenticated peer can ask for."
+        "# HELP vash_tls_handshake_seconds Time to complete a TLS handshake, \
+         which is the most expensive thing an unauthenticated peer can ask for."
     );
     let _ = writeln!(out, "# TYPE vash_tls_handshake_seconds histogram");
     server
@@ -819,7 +822,8 @@ pub fn render_prometheus(
     metric!(
         "vash_tls_cert_expiry_timestamp_seconds",
         "gauge",
-        "When the certificate chain in use stops verifying. 0 means it does          not verify now — expired, not yet valid, or an incomplete chain.",
+        "When the certificate chain in use stops verifying. 0 means it does \
+         not verify now — expired, not yet valid, or an incomplete chain.",
         load(&server.tls_cert_expiry).to_string(),
     );
 

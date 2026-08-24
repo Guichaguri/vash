@@ -18,7 +18,7 @@ struct TestServer {
     addr: SocketAddr,
     admin: Option<SocketAddr>,
     dir: TempDir,
-    /// Held so tests can inspect on-disk state directly â€” `entries()` is the
+    /// Held so tests can inspect on-disk state directly — `entries()` is the
     /// only way to tell the sweeper apart from the lazy read-path check.
     ///
     /// An `Option` because it must be released before the server shuts down:

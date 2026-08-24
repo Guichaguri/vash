@@ -1,7 +1,7 @@
 //! Storage-engine tests, driven directly against the `Store` trait.
 //!
-//! These cover behaviour that is invisible from the wire â€” expiry-index
-//! bookkeeping, sweeper reclamation, group commit â€” and would otherwise only be
+//! These cover behaviour that is invisible from the wire — expiry-index
+//! bookkeeping, sweeper reclamation, group commit — and would otherwise only be
 //! observable as a slow disk leak.
 
 use std::time::{Duration, Instant};

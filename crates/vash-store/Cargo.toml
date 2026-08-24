@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "vash-store"
 version.workspace = true
 edition.workspace = true

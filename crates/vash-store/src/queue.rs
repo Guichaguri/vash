@@ -217,7 +217,7 @@ impl WriteOp {
     /// Individual key operations this job carries.
     ///
     /// Counted rather than treating one job as one unit, because a `SET_MANY`
-    /// of 256 is 256 writes sharing a commit â€” which is exactly what the batch
+    /// of 256 is 256 writes sharing a commit — which is exactly what the batch
     /// metric is supposed to show.
     pub(crate) fn item_count(&self) -> usize {
         match self {

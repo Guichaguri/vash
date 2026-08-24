@@ -151,7 +151,9 @@ impl Cluster {
                     Some(
                         vash_client::TlsConfig::new(&config.tls_ca, &name).with_context(|| {
                             format!(
-                                "building the TLS configuration for peer {addr} (verifying the                                  name {name:?} against {}). Peers named by IP need either                                  certificates with IP SANs or cluster.tls_server_name",
+                                "building the TLS configuration for peer {addr} (verifying the \
+                                 name {name:?} against {}). Peers named by IP need either \
+                                 certificates with IP SANs or cluster.tls_server_name",
                                 config.tls_ca.display()
                             )
                         })?,

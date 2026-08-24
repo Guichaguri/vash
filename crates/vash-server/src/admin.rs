@@ -15,9 +15,11 @@
 //! be understood well enough to read its path.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 use tracing::{debug, info};
 
 use crate::metrics::render_prometheus;
@@ -28,6 +30,25 @@ use crate::state::ServerState;
 /// get an easy denial of service.
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 
+/// Admin requests served at once.
+///
+/// This port has no authentication — it is meant to be bound to a private
+/// interface — so the only thing bounding it is this. Generous against any real
+/// scraper (Prometheus opens one connection per scrape) and small enough that
+/// filling it costs nothing worth having.
+const MAX_CONCURRENT: usize = 32;
+
+/// How long one admin request has to send its head and read its response.
+///
+/// Without it a client that connects and sends a single byte parks a task
+/// forever: unlike the cache port, there is no credential to be waiting for and
+/// so no pre-auth deadline to fold this into.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long in-flight requests get to finish once shutdown is signalled, before
+/// they are aborted outright.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub async fn serve(
     listener: TcpListener,
     state: Arc<ServerState>,
@@ -36,19 +57,67 @@ pub async fn serve(
     info!(addr = ?listener.local_addr().ok(), "admin endpoints listening");
     tokio::pin!(shutdown);
 
+    // **Tracked rather than detached, and that is the point.** Every one of
+    // these holds an `Arc<ServerState>`, which shares a reference count with
+    // the store handle `Server::serve` releases after awaiting this function.
+    // A detached request still running at that moment would keep the storage
+    // environment open past shutdown — the same hazard the reload task is
+    // joined for, one layer down.
+    let mut live: JoinSet<()> = JoinSet::new();
+
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue };
+
+                // Reap whatever has finished before judging the limit, so a
+                // busy-but-healthy endpoint is not refused for connections that
+                // are already gone.
+                while live.try_join_next().is_some() {}
+                if live.len() >= MAX_CONCURRENT {
+                    debug!(
+                        in_flight = live.len(),
+                        "refusing an admin connection: too many in flight"
+                    );
+                    drop(stream);
+                    continue;
+                }
+
                 let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(e) = handle(stream, state).await {
-                        debug!(error = %e, "admin request failed");
+                live.spawn(async move {
+                    match tokio::time::timeout(REQUEST_TIMEOUT, handle(stream, state)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => debug!(error = %e, "admin request failed"),
+                        Err(_) => debug!(
+                            timeout = ?REQUEST_TIMEOUT,
+                            "closing an admin request that did not finish"
+                        ),
                     }
                 });
             }
+            // Keeps the set from accumulating finished tasks while the endpoint
+            // is idle. Disabled when there is nothing outstanding, so an empty
+            // set cannot make this arm fire in a loop.
+            Some(_) = live.join_next(), if !live.is_empty() => {}
             _ = &mut shutdown => break,
         }
+    }
+
+    // Stop accepting first, then let what is in flight finish. Anything still
+    // running past the grace period is aborted: `shutdown` awaits every task,
+    // so no admin request survives this function and none can hold the store
+    // open behind it.
+    drop(listener);
+    let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while live.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        debug!(
+            in_flight = live.len(),
+            "admin drain timed out; aborting requests still in flight"
+        );
+        live.shutdown().await;
     }
 }
 
@@ -62,13 +131,20 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
         if read == 0 {
             return Ok(());
         }
+        // Where the terminator could start given what just arrived: three bytes
+        // back from the old end, since the four-byte sequence may straddle the
+        // boundary. Rescanning the whole buffer each time would be quadratic in
+        // the head's length for no gain.
+        let from = buf.len().saturating_sub(3);
         buf.extend_from_slice(&chunk[..read]);
 
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
+        // Checked before the terminator search, so the cap is the cap rather
+        // than the cap plus whatever the last read happened to bring.
         if buf.len() > MAX_REQUEST_HEAD {
             return respond(&mut stream, 431, "text/plain", "request head too large").await;
+        }
+        if buf[from..].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
         }
     }
 

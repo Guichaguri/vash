@@ -168,8 +168,11 @@ jobs:
       # is the shipping configuration, and that is still LMDB.
       - name: Check libmdbx also links statically under musl
         run: |
-          cargo build --release --bin vash-server --features vash-server/mdbx             --target x86_64-unknown-linux-musl
-          ldd target/x86_64-unknown-linux-musl/release/vash-server 2>&1             | grep -q "not a dynamic executable"             || { echo "the mdbx build is dynamically linked"; exit 1; }
+          cargo build --release --bin vash-server --features vash-server/mdbx \
+            --target x86_64-unknown-linux-musl
+          ldd target/x86_64-unknown-linux-musl/release/vash-server 2>&1 \
+            | grep -q "not a dynamic executable" \
+            || { echo "the mdbx build is dynamically linked"; exit 1; }
           cargo build --release --bin vash-server --target x86_64-unknown-linux-musl
 
       # A "static" binary that turns out to be dynamically linked is a problem

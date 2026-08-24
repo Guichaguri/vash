@@ -752,7 +752,8 @@ impl Config {
         );
         anyhow::ensure!(
             self.store.preallocate_mb <= self.store.map_size_mb,
-            "store.preallocate_mb is {} MiB, which is larger than store.map_size_mb ({} MiB);              a file cannot start bigger than its own ceiling",
+            "store.preallocate_mb is {} MiB, which is larger than store.map_size_mb ({} MiB); \
+             a file cannot start bigger than its own ceiling",
             self.store.preallocate_mb,
             self.store.map_size_mb
         );
@@ -821,11 +822,15 @@ impl Config {
         #[cfg(not(feature = "tls"))]
         anyhow::ensure!(
             !self.cluster.tls,
-            "cluster.tls is set, but this binary was built without the `tls` feature.              Rebuild with `--features tls`, or clear cluster.tls — it will not fall back              to dialling peers in the clear"
+            "cluster.tls is set, but this binary was built without the `tls` feature. \
+             Rebuild with `--features tls`, or clear cluster.tls — it will not fall back \
+             to dialling peers in the clear"
         );
         anyhow::ensure!(
             !self.cluster.tls || !self.cluster.tls_ca.as_os_str().is_empty(),
-            "cluster.tls is set but cluster.tls_ca is empty. Peers are verified against an              explicit CA; there is no fallback to the platform roots, because these are              internal names issued by an internal authority"
+            "cluster.tls is set but cluster.tls_ca is empty. Peers are verified against an \
+             explicit CA; there is no fallback to the platform roots, because these are \
+             internal names issued by an internal authority"
         );
 
         // Peers are ordinary VCP clients on the ordinary port, so enabling auth

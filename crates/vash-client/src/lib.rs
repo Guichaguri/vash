@@ -5,7 +5,7 @@
 //! the outside, and to carry the server's own peer traffic — a cluster peer is
 //! just another VCP client, so cluster invalidation goes over the published
 //! protocol rather than a private side channel. Pipelining and out-of-order
-//! completion â€” which the frame format already supports via `request_id` â€” are a
+//! completion — which the frame format already supports via `request_id` — are a
 //! later concern.
 
 use bytes::{Bytes, BytesMut};

@@ -218,7 +218,7 @@ impl<B: Backend> Engine<B> {
             //
             // This pass can share a transaction with the very `DELETE_BY_TAG`
             // that queued it, and the registry is only updated *after* that
-            // commits â€” so the in-memory generation still reads as the old one
+            // commits — so the in-memory generation still reads as the old one
             // here. Trusting it would mark every record live, advance the
             // cursor past them, and leak them permanently. The job carries the
             // target precisely so this decision needs no RAM state.
@@ -226,15 +226,15 @@ impl<B: Backend> Engine<B> {
                 Some(tag) => tag.generation.get() < job.target_generation,
                 None => {
                     // The record no longer carries this tag, so the entry is
-                    // litter â€” but the record itself is somebody else's.
+                    // litter — but the record itself is somebody else's.
                     wtxn.delete(self.tagidx, &index_key)?;
                     stats.orphaned += 1;
                     continue;
                 }
             };
 
-            // A record the registry already knows to be dead â€” expired, flushed
-            // or invalidated via another tag â€” is fair game too. RAM can lag
+            // A record the registry already knows to be dead — expired, flushed
+            // or invalidated via another tag — is fair game too. RAM can lag
             // behind the truth but never runs ahead of it, so "dead" is always
             // trustworthy even when "alive" is not.
             let known_dead = {

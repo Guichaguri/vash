@@ -426,9 +426,8 @@ async fn run_writes_awaited(
     let cas = pending.wait().await.ok()?;
 
     crate::dispatch::count_stored(state, dialect, &run.sets, &cas, started.elapsed());
-    for (index, suppressed) in run.suppress.iter().enumerate() {
+    for suppressed in &run.suppress {
         if !suppressed {
-            let _ = index;
             out.extend_from_slice(stored);
         }
     }

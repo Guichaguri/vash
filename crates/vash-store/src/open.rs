@@ -53,7 +53,8 @@ pub fn open(config: &StoreConfig) -> Result<StoreHandle> {
     // preallocation to avoid.
     if config.preallocate > 0 && config.backend == BackendKind::Lmdb {
         tracing::warn!(
-            "store.preallocate is set but the lmdb backend ignores it; it sizes its file              to store.map_size at creation and never grows"
+            "store.preallocate is set but the lmdb backend ignores it; it sizes its file \
+             to store.map_size at creation and never grows"
         );
     }
 

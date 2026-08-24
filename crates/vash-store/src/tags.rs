@@ -282,7 +282,7 @@ pub fn decode_entry(raw: &[u8]) -> Option<(u32, u64)> {
 ///
 /// The distinction matters after the commit: a created tag has to be published
 /// into the in-memory registry as a new entry, a raised one only needs its
-/// counter advanced, and an unchanged one needs nothing at all â€” which is the
+/// counter advanced, and an unchanged one needs nothing at all — which is the
 /// common case, since a peer that is already up to date receives the same
 /// generation over and over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,7 +333,7 @@ impl<B: Backend> Engine<B> {
     /// seen the tag and invalidated it. Starting from it keeps the generation
     /// uniform across a node's shards. Starting from zero instead would mean a
     /// record written here captured a *lower* number than the node reports to
-    /// its peers, and the first gossip round would kill it â€” an invalidation of
+    /// its peers, and the first gossip round would kill it — an invalidation of
     /// a record that was written after the last invalidation.
     pub fn apply_create_tag(
         &self,
@@ -365,7 +365,7 @@ impl<B: Backend> Engine<B> {
     ///
     /// **Merges by maximum**, never assigns, which is what makes an
     /// invalidation received from a peer idempotent, order-independent and safe
-    /// to retry â€” see [`vash_core::cluster`]. It is also how a local
+    /// to retry — see [`vash_core::cluster`]. It is also how a local
     /// invalidation is applied, so both paths share one implementation and one
     /// set of consequences.
     pub fn apply_merge_tag(
@@ -385,7 +385,7 @@ impl<B: Backend> Engine<B> {
 
         let Some((id, current)) = existing else {
             // Nothing here can carry a tag this shard has never registered, so
-            // there is no reclamation to queue â€” only the registration itself,
+            // there is no reclamation to queue — only the registration itself,
             // so that records written from now on capture the right number.
             let (id, generation) = self.apply_create_tag(wtxn, name, generation)?;
             return Ok(TagMerge::Created { id, generation });

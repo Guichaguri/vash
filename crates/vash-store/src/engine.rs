@@ -27,7 +27,7 @@ pub enum Pressure {
     Soft = 1,
     /// Actively evicting live records to get back under the soft mark.
     Hard = 2,
-    /// Writes are refused. Reads and deletes still work â€” a delete frees space,
+    /// Writes are refused. Reads and deletes still work — a delete frees space,
     /// so refusing it would be self-defeating.
     Critical = 3,
 }
@@ -142,8 +142,8 @@ impl<B: Backend> Engine<B> {
     /// Bytes genuinely occupied, excluding pages on the free list.
     ///
     /// **Not** the high-water mark. Neither engine returns freed pages to the OS
-    /// nor lowers that mark â€” a deleted record's pages go onto a free list for
-    /// reuse â€” so a high-water measure only ever rises. Using it for the
+    /// nor lowers that mark — a deleted record's pages go onto a free list for
+    /// reuse — so a high-water measure only ever rises. Using it for the
     /// capacity watermarks meant pressure could never fall, and the evictor
     /// would keep going until the cache was empty.
     ///

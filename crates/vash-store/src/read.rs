@@ -108,7 +108,7 @@ impl<B: Backend> Engine<B> {
     }
 
     /// Resolves a whole batch inside one read transaction, so every key in a
-    /// `GET_MANY` sees the same consistent snapshot â€” and under at most one tag
+    /// `GET_MANY` sees the same consistent snapshot — and under at most one tag
     /// registry lock rather than one per key. At most, because a batch in which
     /// no key carries tags takes none at all: see [`LazyTags`].
     pub fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>> {

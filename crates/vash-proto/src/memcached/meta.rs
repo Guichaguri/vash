@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn an_unknown_flag_is_rejected_not_ignored() {
         // Silently accepting it would let a client trust behaviour that is not
-        // implemented â€” the same reason upstream rejects it.
+        // implemented — the same reason upstream rejects it.
         assert!(matches!(
             parse_any(b"mg foo Z\r\n"),
             Err(ProtocolError::Recoverable {

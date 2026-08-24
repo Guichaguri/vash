@@ -148,8 +148,8 @@ impl<B: Backend> Engine<B> {
     /// expired.
     ///
     /// Takes them from the front of the expiry index, which is soonest-to-expire
-    /// first and never-expiring last. That ordering is free â€” the index already
-    /// exists for TTLs â€” and it is the right policy for a cache: a TTL is the
+    /// first and never-expiring last. That ordering is free — the index already
+    /// exists for TTLs — and it is the right policy for a cache: a TTL is the
     /// client's own statement of how long a value is worth keeping, so the item
     /// dying in three seconds is the cheapest thing in the store to lose.
     ///
