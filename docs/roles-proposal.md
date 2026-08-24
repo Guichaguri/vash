@@ -94,12 +94,53 @@ server rather than configurable.
 | `flush` | `0x10` | `FLUSH`, `flush_all` | Empties the cache. |
 | `peer` | `0x20` | `TAG_SYNC` | Sets a generation to any value, where `DELETE_BY_TAG` moves it by one. |
 
-**Why `delete` is not a seventh role.** It would fence off nothing: an identity
-with `write` deletes any key it can name by writing it with a one-second TTL.
-A role that records an intent the server cannot enforce is worse than no role,
-because the file then documents a boundary that does not exist. The same test
-is what justifies each of the other five — `invalidate`, `flush`, `list` and
-`peer` all reach something `write` cannot reach at all.
+**The test that decides the set: containment, not severity.** Fold `X` into `Y`
+exactly when `Y` can already achieve `X`'s effect. A role that fences off
+nothing is worse than no role, because the file then documents a boundary the
+server cannot enforce.
+
+**Why `delete` is not a seventh role.** It passes the test: an identity with
+`write` deletes any key it can name by writing it with a one-second TTL. Same
+end state, same reachable set, so `delete ⊂ write` and the separate role would
+be decoration.
+
+**Why `invalidate` is, even though `DELETE` is not.** It fails the test in
+*both* directions, which is the case for keeping it apart:
+
+- **`write` cannot reach it.** `DELETE_BY_TAG` destroys keys the caller cannot
+  name — it names a *tag*, and the server resolves the key set from the
+  registry. A writer is bounded by its knowledge of the keyspace, and without
+  `list` it has no way to enumerate one. Tags make that gap wider rather than
+  narrower: they are low-cardinality and guessable (`products`, `user:42`)
+  where keys usually are not, so one guessed tag destroys what thousands of
+  guessed keys would. It also fans out to every node in the cluster, where a
+  `DELETE` is local.
+- **`invalidate` cannot reach `write`.** It cannot put a byte anywhere.
+
+So the two are **incomparable**, and — this is the part that matters more than
+the blast radius — the damage differs in *kind*. An invalidation causes
+**misses**, which are self-healing: the cache refills from the origin. A write
+causes **wrong answers**, which are not: a poisoned value is served until
+something overwrites or expires it. Folding them in either direction hands one
+of two real deployment roles an authority it does not need, and the direction it
+gets wrong is the worse one — the invalidation worker in §4 would have to hold
+`write`, turning a leaked change-data-capture credential from "can cause a
+stampede" into "can poison every key it can name".
+
+The honest cost of the split: a web tier that writes tagged entries is usually
+also what invalidates them, so most `write` rows will carry `invalidate` too. A
+role earns its keep only in the rows that withhold it — and both of those rows
+are real here, the filler that never invalidates and the invalidator that never
+writes.
+
+`flush`, `list` and `peer` fail the containment test the same way: each reaches
+something no combination of the others does.
+
+**Not to be confused with how the server classifies a command internally.**
+`DELETE_BY_TAG` is a write in the storage sense — it goes to every shard writer,
+and `Command::inline_safe` answers `false` for it. That classification is about
+which thread may run it. Roles are about what authority it needs, and the two
+axes do not have to agree.
 
 Three commands need **two** roles, because they genuinely do two things:
 
@@ -596,6 +637,12 @@ Beyond §3's granularity options:
   it puts a lock and a map probe on the hot path, and it makes authority
   inconsistent with the identity's own secret, which already only changes at the
   next authentication. Emergency revocation is a restart, as it is today.
+- **Folding `invalidate` into `write`,** on the reasoning that `DELETE` is
+  already there. §2's containment test says no: `DELETE` folds because a writer
+  can achieve it with a short TTL, and `DELETE_BY_TAG` does not because it
+  destroys keys the caller cannot name. The cost of getting this one wrong is
+  paid by the invalidator-only row, which would have to hold the authority to
+  poison values in order to keep the authority to cause misses.
 - **Denying `STATS` to a restricted identity.** §2 — it breaks real client
   libraries to fence off what the admin port already discloses.
 - **A `ROLES` capability bit.** §7 — the credential file cannot load into a
