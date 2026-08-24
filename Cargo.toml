@@ -16,6 +16,28 @@ rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/guichaguri/vash"
 
+# The lint policy, so that `cargo clippy` locally decides the same things CI
+# does. It used to live only in the CI invocation, which meant the first time a
+# rule was enforced was on a pull request.
+#
+# CI still adds `-D warnings` and `--all-features` on top: the deny is a gate
+# rather than a policy, and the feature selection is not something a manifest
+# can express. Run `cargo clippy --all-targets --all-features` to match it.
+[workspace.lints.clippy]
+# The `unsafe` in this workspace is confined to the two backends and the
+# prefault path, and every block there already carries a `SAFETY:` note
+# explaining which invariant makes it sound. This is what keeps the next one
+# from being the exception.
+undocumented_unsafe_blocks = "warn"
+# Placeholders that compile. A `todo!()` reaching a release build is a panic on
+# a request path; `dbg!` is debugging output on somebody's stdout.
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+# The store hands out values borrowed from a memory map, so leaking a guard
+# rather than dropping it is not a harmless mistake here.
+mem_forget = "warn"
+
 [workspace.dependencies]
 vash-core = { path = "crates/vash-core" }
 vash-store = { path = "crates/vash-store" }
@@ -32,6 +54,12 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
+# Already in the build twice over — `heed-types` and `tracing-subscriber`'s
+# json layer both pull it — so naming it directly costs no compilation. The
+# admin endpoint's /stats body used to be a `format!` over a `concat!` with
+# twenty-four positional arguments, where inserting a field silently
+# reassigned every value after it.
+serde_json = "1"
 toml = "0.9"
 clap = { version = "4", features = ["derive"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

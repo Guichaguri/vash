@@ -1745,6 +1745,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-webpki",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "tempfile",

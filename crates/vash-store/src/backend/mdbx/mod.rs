@@ -107,6 +107,8 @@ pub struct MdbxBackend {
 // hold raw pointers and are therefore neither `Send` nor `Sync`, so neither can
 // cross a thread even by accident.
 unsafe impl Send for MdbxBackend {}
+// SAFETY: as above — shared access to the environment is what mdbx is built
+// for, and the transactions that are not shareable cannot cross a thread.
 unsafe impl Sync for MdbxBackend {}
 
 impl MdbxBackend {

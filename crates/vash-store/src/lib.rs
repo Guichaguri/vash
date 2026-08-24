@@ -33,8 +33,11 @@
 //!   [`tags`] and `listing`.
 //! - [`writer`] — the single writer thread, packing operations into shared
 //!   commits and running the expiry sweeper in the same transaction.
-//! - [`lmdb`] — the [`Store`] implementation composing the rest, and where the
-//!   engine parameter stops.
+//! - [`store`] — the [`Store`] implementation composing the rest, and where the
+//!   engine parameter stops. It is named for what it is rather than for an
+//!   engine: nothing in it knows which one is underneath, and the module that
+//!   does is [`backend::lmdb`]. `LmdbStore` is the alias naming the common
+//!   choice of `B`.
 
 mod apply;
 pub mod backend;
@@ -44,7 +47,6 @@ mod env;
 pub mod error;
 pub mod expiry;
 mod listing;
-pub mod lmdb;
 /// An in-memory implementation, for tests. See [`memory::MemoryStore`].
 #[cfg(feature = "testing")]
 pub mod memory;
@@ -56,6 +58,7 @@ mod readers;
 pub mod reclaim;
 pub mod schema;
 mod shard;
+pub mod store;
 pub mod tags;
 mod writer;
 
@@ -68,8 +71,8 @@ pub use backend::{Backend, LmdbBackend, ReadTxn, WriteTxn};
 pub use config::{BackendKind, Durability, EvictionConfig, StoreConfig, WriteConfig};
 pub use engine::Pressure;
 pub use error::{Result, StoreError};
-pub use lmdb::{LmdbStore, VashStore};
 pub use open::{StoreHandle, open};
+pub use store::{LmdbStore, VashStore};
 
 /// A [`Store::submit_set_many`] in flight.
 ///

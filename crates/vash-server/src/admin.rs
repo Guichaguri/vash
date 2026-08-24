@@ -205,66 +205,110 @@ fn request_line(buf: &[u8]) -> Option<(&str, &str)> {
     Some((method, target.split('?').next().unwrap_or(target)))
 }
 
+/// The `/stats` body.
+///
+/// **A struct rather than a format string, and the field names are the keys.**
+/// This was a `format!` over a `concat!` with twenty-four positional
+/// arguments, which is a shape where inserting a field in the middle silently
+/// reassigns every value after it — `evicted` reporting the tag count and so
+/// on — and produces output that still parses. Nothing would have caught it:
+/// the test below checks the shape, not which number landed under which name.
+///
+/// Here a field cannot drift from its key, because it *is* its key. Several of
+/// these names deliberately differ from the `StoreStats` field they come from
+/// — `items` for `entries`, `expired_reclaimed` for `reclaimed` — and the
+/// `rename` makes that mapping something you can read rather than count.
+#[derive(serde::Serialize)]
+struct StatsBody<'a> {
+    shards: u32,
+    pressure: &'a str,
+    #[serde(rename = "items")]
+    entries: u64,
+    used_bytes: u64,
+    map_size: u64,
+    utilisation: f64,
+    evicted: u64,
+    #[serde(rename = "expired_reclaimed")]
+    reclaimed: u64,
+    tag_reclaimed: u64,
+    pending_reclaims: u64,
+    sweep_lag_ms: u64,
+    tags: u64,
+    expiry_entries: u64,
+    tag_index_entries: u64,
+    commits: u64,
+    committed_ops: u64,
+    mean_batch_size: f64,
+    readers_in_use: u32,
+    max_readers: u32,
+    epoch: u32,
+    cluster_mode: &'a str,
+    cluster_peers: usize,
+    cluster_peers_reachable: u64,
+    cluster_last_exchange_age_ms: u64,
+}
+
+/// Rounds a float to `places` decimals.
+///
+/// The two float fields were rendered `{:.6}` and `{:.2}`, and serde would
+/// otherwise emit every digit an `f64` has. Rounding the value rather than the
+/// rendering keeps the body byte-identical to what it has always been, which
+/// matters for something a dashboard may already be scraping.
+fn rounded(value: f64, places: i32) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let scale = 10f64.powi(places);
+    (value * scale).round() / scale
+}
+
 fn stats_json(
     store: &vash_store::StoreStats,
     view: &vash_core::ClusterInfo,
     peers_reachable: u64,
     last_exchange_age_ms: u64,
 ) -> String {
-    format!(
-        concat!(
-            "{{\n",
-            "  \"shards\": {},\n",
-            "  \"pressure\": \"{}\",\n",
-            "  \"items\": {},\n",
-            "  \"used_bytes\": {},\n",
-            "  \"map_size\": {},\n",
-            "  \"utilisation\": {:.6},\n",
-            "  \"evicted\": {},\n",
-            "  \"expired_reclaimed\": {},\n",
-            "  \"tag_reclaimed\": {},\n",
-            "  \"pending_reclaims\": {},\n",
-            "  \"sweep_lag_ms\": {},\n",
-            "  \"tags\": {},\n",
-            "  \"expiry_entries\": {},\n",
-            "  \"tag_index_entries\": {},\n",
-            "  \"commits\": {},\n",
-            "  \"committed_ops\": {},\n",
-            "  \"mean_batch_size\": {:.2},\n",
-            "  \"readers_in_use\": {},\n",
-            "  \"max_readers\": {},\n",
-            "  \"epoch\": {},\n",
-            "  \"cluster_mode\": \"{}\",\n",
-            "  \"cluster_peers\": {},\n",
-            "  \"cluster_peers_reachable\": {},\n",
-            "  \"cluster_last_exchange_age_ms\": {}\n",
-            "}}\n"
-        ),
-        store.shards,
-        store.pressure,
-        store.entries,
-        store.used_bytes,
-        store.map_size,
-        store.utilisation,
-        store.evicted,
-        store.reclaimed,
-        store.tag_reclaimed,
-        store.pending_reclaims,
-        store.sweep_lag_ms,
-        store.tags,
-        store.expiry_entries,
-        store.tag_index_entries,
-        store.commits,
-        store.committed_ops,
-        store.mean_batch_size(),
-        store.readers_in_use,
-        store.max_readers,
-        store.epoch,
-        view.mode.as_str(),
-        view.peers.len(),
-        peers_reachable,
-        last_exchange_age_ms,
-    )
+    let body = StatsBody {
+        shards: store.shards,
+        pressure: store.pressure,
+        entries: store.entries,
+        used_bytes: store.used_bytes,
+        map_size: store.map_size,
+        utilisation: rounded(store.utilisation, 6),
+        evicted: store.evicted,
+        reclaimed: store.reclaimed,
+        tag_reclaimed: store.tag_reclaimed,
+        pending_reclaims: store.pending_reclaims,
+        sweep_lag_ms: store.sweep_lag_ms,
+        tags: store.tags,
+        expiry_entries: store.expiry_entries,
+        tag_index_entries: store.tag_index_entries,
+        commits: store.commits,
+        committed_ops: store.committed_ops,
+        mean_batch_size: rounded(store.mean_batch_size(), 2),
+        readers_in_use: store.readers_in_use,
+        max_readers: store.max_readers,
+        epoch: store.epoch,
+        cluster_mode: view.mode.as_str(),
+        cluster_peers: view.peers.len(),
+        cluster_peers_reachable: peers_reachable,
+        cluster_last_exchange_age_ms: last_exchange_age_ms,
+    };
+
+    // Pretty-printed because `/stats` is the route for humans; `/metrics` is
+    // the one a machine reads. Serialisation cannot fail for a struct of
+    // scalars, and answering with an empty object would be a lie, so the
+    // fallback names the failure instead.
+    match serde_json::to_string_pretty(&body) {
+        Ok(mut json) => {
+            json.push('\n');
+            json
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "could not render the stats body");
+            format!("{{\"error\": \"could not render stats: {e}\"}}\n")
+        }
+    }
 }
 
 async fn respond(
@@ -325,15 +369,81 @@ mod tests {
             0,
             0,
         );
-        // No serde here, so the shape is checked rather than assumed.
-        assert!(json.starts_with('{') && json.trim_end().ends_with('}'));
-        assert_eq!(
-            json.matches(':').count(),
-            json.lines()
-                .filter(|l| l.contains('"') && l.contains(':'))
-                .count(),
-            "every line with a key should have exactly one colon: {json}"
-        );
-        assert!(json.contains("\"pressure\": \"normal\""));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["pressure"], "normal");
+        assert_eq!(parsed["cluster_mode"], "local");
+        assert!(json.ends_with('\n'), "the body should end in a newline");
+    }
+
+    /// **Every value lands under its own name.**
+    ///
+    /// The shape this replaces was twenty-four positional arguments against a
+    /// `concat!` template, where inserting a field in the middle shifted every
+    /// value after it onto the wrong key and still produced valid JSON. The
+    /// old test counted colons and would have passed through all of it. This
+    /// gives every field a distinct value and checks where each one arrives,
+    /// so a mapping mistake fails here rather than on a dashboard.
+    #[test]
+    fn every_stat_lands_under_its_own_key() {
+        let store = vash_store::StoreStats {
+            shards: 1,
+            pressure: "high",
+            evicted: 2,
+            entries: 3,
+            expiry_entries: 4,
+            tag_index_entries: 5,
+            tags: 6,
+            pending_reclaims: 7,
+            map_size: 8,
+            used_bytes: 9,
+            utilisation: 0.101_112_9,
+            readers_in_use: 11,
+            max_readers: 12,
+            oldest_reader_age_ms: 13,
+            epoch: 14,
+            commits: 4,
+            committed_ops: 15,
+            sweeps: 16,
+            reclaimed: 17,
+            sweep_lag_ms: 18,
+            tag_reclaimed: 19,
+            queue_wait_us: 20,
+            commit_us: 21,
+        };
+        let json = stats_json(&store, &vash_core::ClusterInfo::standalone(), 22, 23);
+        let got: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        for (key, want) in [
+            ("shards", 1.0),
+            ("items", 3.0),
+            ("used_bytes", 9.0),
+            ("map_size", 8.0),
+            // Rounded to six places, as the format string it replaced was.
+            ("utilisation", 0.101_113),
+            ("evicted", 2.0),
+            ("expired_reclaimed", 17.0),
+            ("tag_reclaimed", 19.0),
+            ("pending_reclaims", 7.0),
+            ("sweep_lag_ms", 18.0),
+            ("tags", 6.0),
+            ("expiry_entries", 4.0),
+            ("tag_index_entries", 5.0),
+            ("commits", 4.0),
+            ("committed_ops", 15.0),
+            // 15 operations over 4 commits, to two places.
+            ("mean_batch_size", 3.75),
+            ("readers_in_use", 11.0),
+            ("max_readers", 12.0),
+            ("epoch", 14.0),
+            ("cluster_peers", 0.0),
+            ("cluster_peers_reachable", 22.0),
+            ("cluster_last_exchange_age_ms", 23.0),
+        ] {
+            let found = got[key]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{key} is missing or not a number: {json}"));
+            assert_eq!(found, want, "{key} carries the wrong value");
+        }
+        assert_eq!(got["pressure"], "high");
     }
 }

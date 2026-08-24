@@ -56,7 +56,7 @@ impl Pressure {
 ///
 /// Everything outside this crate — the benchmarks, the examples — names this,
 /// and nothing outside this crate should have to care which engine is
-/// underneath. `LmdbStore` in [`crate::lmdb`] is the same idea one layer up.
+/// underneath. `LmdbStore` in [`crate::store`] is the same idea one layer up.
 pub type LmdbEngine = Engine<LmdbBackend>;
 
 /// One storage environment and everything derived from it.

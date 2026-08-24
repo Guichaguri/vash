@@ -12,6 +12,10 @@ mdbx.lck
 /.idea
 /.vscode
 
+# Agent scratch worktrees. Tool-managed and disposable; each is a full checkout
+# of this repository and must never be committed into it.
+/.claude/worktrees/
+
 # Local overrides
 /vash.local.toml
 

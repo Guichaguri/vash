@@ -58,3 +58,6 @@ path = "src/load.rs"
 [[example]]
 name = "tls_spike"
 path = "examples/tls_spike.rs"
+
+[lints]
+workspace = true

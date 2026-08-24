@@ -1,3 +1,16 @@
+//! The [`Store`] implementation, composed from the layers below it.
+//!
+//! **Engine-neutral despite the name it used to have.** This file was called
+//! `lmdb.rs`, which was wrong in the way that costs someone an afternoon: it
+//! names no engine, opens no environment and mentions `heed` nowhere. Every
+//! engine-specific decision is in [`crate::backend`], and the module that
+//! actually knows what LMDB is is `backend::lmdb`. What lives here is the
+//! sharding, the routing and the 27 trait methods, all of which are the same
+//! whichever `B` is chosen.
+//!
+//! [`LmdbStore`] is the alias naming the common choice of that parameter, and
+//! it keeps its name because it genuinely does name an engine.
+
 use std::sync::atomic::Ordering;
 
 use vash_core::{Key, Listing, Set, Value, ValueRef};
