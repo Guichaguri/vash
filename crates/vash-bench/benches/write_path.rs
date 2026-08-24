@@ -376,10 +376,7 @@ fn rmw_touch(bencher: divan::Bencher) {
     {
         let txn = wtxn.as_mut().expect("open");
         let mut prepared = engine
-            .prepare_set(
-                &set_of(b"session", &vec![b'x'; 64], SetMode::Set),
-                Vec::new(),
-            )
+            .prepare_set(&set_of(b"session", &[b'x'; 64], SetMode::Set), Vec::new())
             .expect("prepared");
         engine.apply_set(txn, &mut prepared).expect("seed");
     }
@@ -545,7 +542,7 @@ fn clock_now_ms(bencher: divan::Bencher) {
 #[divan::bench]
 fn get_hit(bencher: divan::Bencher) {
     let fixture = Fixture::new();
-    fixture.write(b"user:1234:profile", &vec![b'x'; 64]);
+    fixture.write(b"user:1234:profile", &[b'x'; 64]);
     let key = Key::new(b"user:1234:profile").expect("valid");
 
     bencher.bench(|| divan::black_box(fixture.store().get(divan::black_box(key)).expect("read")));
@@ -556,7 +553,7 @@ fn get_hit(bencher: divan::Bencher) {
 #[divan::bench]
 fn deadline_hit(bencher: divan::Bencher) {
     let fixture = Fixture::new();
-    fixture.write(b"user:1234:profile", &vec![b'x'; 64]);
+    fixture.write(b"user:1234:profile", &[b'x'; 64]);
     let key = Key::new(b"user:1234:profile").expect("valid");
 
     bencher.bench(|| {

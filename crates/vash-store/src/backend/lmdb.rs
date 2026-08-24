@@ -15,9 +15,9 @@ use std::path::Path;
 use heed::types::Bytes as HeedBytes;
 use heed::{Env, EnvFlags, EnvOpenOptions, RwTxn, WithTls};
 
-use crate::backend::{
-    Backend, DbStat, EnvInfo, Range, ReadTxn, Warmed, WriteTxn, refuse_foreign_database,
-};
+#[cfg(feature = "mdbx")]
+use crate::backend::refuse_foreign_database;
+use crate::backend::{Backend, DbStat, EnvInfo, Range, ReadTxn, Warmed, WriteTxn};
 use crate::config::{Durability, StoreConfig};
 use crate::error::{Result, StoreError};
 use crate::schema::MAX_DBS;

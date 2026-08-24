@@ -1328,8 +1328,7 @@ fn a_batch_smaller_than_the_shard_count_still_lands_in_order() {
         let names: Vec<String> = (0..count).map(|i| format!("small{count}-{i}")).collect();
         let sets: Vec<Set<'_>> = names
             .iter()
-            .enumerate()
-            .map(|(i, name)| Set {
+            .map(|name| Set {
                 key: Key::new(name.as_bytes()).unwrap(),
                 // Distinct per position, so a result landing in the wrong slot
                 // is visible rather than accidentally equal.

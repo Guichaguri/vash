@@ -774,7 +774,7 @@ fn frames() -> String {
             decrement: true,
         },
         missing: Missing::Fail,
-        ..counter.clone()
+        ..counter
     };
     v.request(
         "arithmetic_request_decrement",
@@ -796,7 +796,7 @@ fn frames() -> String {
         },
         on_bound: OnBound::Clamp,
         ttl: TtlChange::Set(60),
-        ..counter.clone()
+        ..counter
     };
     v.request(
         "arithmetic_request_int_clamp",
@@ -820,7 +820,7 @@ fn frames() -> String {
         },
         on_bound: OnBound::Skip,
         ttl: TtlChange::SetIfPersistent(300),
-        ..counter.clone()
+        ..counter
     };
     v.request(
         "arithmetic_request_float_skip",

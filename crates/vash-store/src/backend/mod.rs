@@ -39,6 +39,7 @@ pub mod mdbx;
 use std::ops::Bound;
 use std::path::Path;
 
+#[cfg(feature = "mdbx")]
 use crate::error::StoreError;
 
 use crate::config::StoreConfig;
@@ -59,6 +60,7 @@ pub use mdbx::MdbxBackend;
 /// on every key, which is a silent, total cache loss. A cache's data is
 /// reconstructible by definition, so "refuse, and let the operator wipe" is
 /// both safer and less code than a conversion. See `docs/storage.md`.
+#[cfg(feature = "mdbx")]
 pub(crate) fn refuse_foreign_database(
     path: &Path,
     ours: &str,
