@@ -364,23 +364,13 @@ pub fn execute_memcached_block(
 /// the memcached half of the rule that the gate has to sit *ahead* of the
 /// batching, not inside `execute`: a batched write never passes through
 /// `execute` at all.
-fn conn_gated(state: &ServerState, conn: &ConnAuth, command: &Command<'_>) -> bool {
-    if !conn.is_authenticated() {
-        return state.auth.required();
-    }
-    !conn_roles(conn).allows(crate::auth::roles_for_command(command))
-}
-
-/// The roles this connection carries, or everything when it has no identity.
 ///
-/// The fallback is only ever reached with `auth.required` off and nothing
-/// authenticated, which is the configuration where there is no identity to
-/// restrict — the server is not defending anything to begin with.
-#[inline]
-fn conn_roles(conn: &ConnAuth) -> crate::auth::Roles {
-    conn.identity()
-        .map(crate::auth::Identity::roles)
-        .unwrap_or(crate::auth::Roles::UNRESTRICTED)
+/// The decision itself is [`crate::auth::AuthState::allows`]; what is local
+/// here is only which roles a memcached command needs.
+fn conn_gated(state: &ServerState, conn: &ConnAuth, command: &Command<'_>) -> bool {
+    !state
+        .auth
+        .allows(conn, crate::auth::roles_for_command(command))
 }
 
 /// Submits a held run of `set`s and writes `STORED` — or the failure — for each.
@@ -434,12 +424,11 @@ pub fn execute_memcached(
         | vash_proto::memcached::encode::ResponseStyle::CacheDump(_) => crate::auth::Roles::LIST,
         _ => crate::auth::roles_for_command(&parsed.command),
     };
-    let roles = conn_roles(conn);
-    if !roles.allows(needed) {
+    if let Some(crate::auth::Refused::Missing(missing)) = state.auth.refusal(conn, needed) {
         deny(
             state,
             conn,
-            roles.missing(needed),
+            missing,
             CommandKind::of(&parsed.command).name(),
         );
         return refuse_memcached(state, parsed, out, "unauthorized");
@@ -1170,36 +1159,35 @@ fn header_refusal(state: &ServerState, conn: &ConnAuth, frame: &[u8]) -> Option<
         })
     };
 
-    if !conn.is_authenticated() {
-        if !state.auth.required() {
-            // Nothing is enforced and nobody has authenticated, so there is no
-            // identity to check roles against either.
-            return None;
-        }
-        if opcode == Opcode::Hello as u8 || opcode == Opcode::Auth as u8 {
-            return None;
-        }
-        return refused(None);
+    // The pre-auth exemption, which is this dialect's own: first-byte detection
+    // requires a VCP connection to open with `HELLO`, so there is no way to
+    // announce the dialect before authenticating. Applied before the shared
+    // decision because it is about *which commands* are exempt rather than
+    // about what the connection may do.
+    if !conn.is_authenticated() && (opcode == Opcode::Hello as u8 || opcode == Opcode::Auth as u8) {
+        return None;
     }
-
-    // Authenticated, so the question becomes what this identity may do — and
-    // it is asked whether or not `auth.required` is set. An identity carries
-    // its roles from the moment it is established, which is what lets a client
-    // rolled during auth.md §15's step 2 experience its role set before
-    // enforcement is turned on.
-    let roles = conn
-        .identity()
-        .map(crate::auth::Identity::roles)
-        .unwrap_or(crate::auth::Roles::UNRESTRICTED);
 
     // An unknown opcode is left to the decoder, which reports it as
     // `UNSUPPORTED`. Refusing it here would be answering for a command this
-    // build does not have.
-    let needed = crate::auth::roles_for_opcode(vash_proto::vcp::Opcode::from_u8(opcode)?);
-    if roles.allows(needed) {
-        return None;
+    // build does not have — but only once the connection has authenticated:
+    // for one that has not, the refusal below must not depend on whether the
+    // byte is recognised, or an unauthenticated stranger could enumerate which
+    // opcodes this build implements by watching for a different status.
+    let Some(known) = vash_proto::vcp::Opcode::from_u8(opcode) else {
+        return match state.auth.refusal(conn, crate::auth::Roles::NONE) {
+            Some(crate::auth::Refused::Unauthenticated) => refused(None),
+            _ => None,
+        };
+    };
+
+    match state
+        .auth
+        .refusal(conn, crate::auth::roles_for_opcode(known))?
+    {
+        crate::auth::Refused::Unauthenticated => refused(None),
+        crate::auth::Refused::Missing(missing) => refused(Some(missing)),
     }
-    refused(Some(roles.missing(needed)))
 }
 
 /// Answers an `AUTH` frame.

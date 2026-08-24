@@ -178,20 +178,20 @@ fn roles_for(command: &Command<'_>) -> (crate::auth::Roles, &'static str) {
 /// Separate from [`refusal`] because the two are different questions with
 /// different counters: that one is "has this connection authenticated", this is
 /// "may this identity do that". Redis draws the same distinction on the wire
-/// with `NOAUTH` against `NOPERM`.
-///
-/// Asked whenever an identity is present, including with `auth.required` off —
-/// an identity carries its roles from the moment it is established, which is
-/// what lets a client rolled during auth.md §15's step 2 experience its role
-/// set before enforcement is turned on.
-fn denial(conn: &ConnAuth, command: &Command<'_>) -> Option<(crate::auth::Roles, &'static str)> {
-    let identity = conn.identity()?;
+/// with `NOAUTH` against `NOPERM`, so this dialect needs them apart even though
+/// both come from the one decision in [`crate::auth::AuthState::refusal`].
+fn denial(
+    state: &ServerState,
+    conn: &ConnAuth,
+    command: &Command<'_>,
+) -> Option<(crate::auth::Roles, &'static str)> {
     let (needed, name) = roles_for(command);
-    let roles = identity.roles();
-    if roles.allows(needed) {
-        return None;
+    match state.auth.refusal(conn, needed)? {
+        crate::auth::Refused::Missing(missing) => Some((missing, name)),
+        // Answered by `refusal` instead, which knows this dialect's pre-auth
+        // exemptions and Redis's wording for them.
+        crate::auth::Refused::Unauthenticated => None,
     }
-    Some((roles.missing(needed), name))
 }
 
 /// A plain `SET` this block may hold back, already translated.
@@ -208,7 +208,7 @@ fn batchable_set<'a>(
 ) -> Option<vash_core::Set<'a>> {
     if !matches!(command, Command::Set(_))
         || refusal(state, conn, command).is_some()
-        || denial(conn, command).is_some()
+        || denial(state, conn, command).is_some()
     {
         return None;
     }
@@ -243,14 +243,30 @@ fn flush_sets(
 
 /// Whether a `SET` is one the awaited write path can serve.
 ///
-/// Translation is the test: a `SET` whose expiry cannot be represented, or whose
-/// key this store will not hold, has an error to report that only [`execute`]
-/// words correctly, so it fails this and takes the ordinary route.
+/// **A conservative structural test, deliberately not a translation.** This
+/// runs inside `measure_resp`, once per command, purely to decide which tier a
+/// run is offered to — and `translate` reads the clock and resolves an expiry
+/// to answer it. That was a `SystemTime::now()` per `SET` spent on a question
+/// with a cheaper answer, thrown away, and then asked again by
+/// [`parse_writes`] on the very next line of the same block.
+///
+/// Everything [`crate::dispatch::awaitable`] needs is legible on the RESP
+/// command without translating: an unconditional `SET`, with no `GET` to
+/// report and no tags to register. What is *not* checked here is whether the
+/// translation would succeed at all — a `SET` whose expiry cannot be
+/// represented, or whose key this store will not hold — and it deliberately is
+/// not, because being wrong in that direction costs nothing: [`parse_writes`]
+/// still translates, still declines, and the block then takes the ordinary
+/// route where [`execute`] words the error. Misjudging here picks a tier, not
+/// an answer.
 pub fn batchable_write(command: &Command<'_>) -> bool {
-    matches!(command, Command::Set(_))
-        && translate(command)
-            .ok()
-            .is_some_and(|domain| crate::dispatch::awaitable(&domain))
+    let Command::Set(set) = command else {
+        return false;
+    };
+    // Mirrors `dispatch::awaitable` — `SetMode::Set`, no `return_previous`, no
+    // tags — read off the wire form rather than the domain one.
+    // `the_shortcut_agrees_with_the_domain` pins that the two stay in step.
+    matches!(set.condition, Condition::Always) && !set.return_previous && set.tags.is_empty()
 }
 
 /// Decodes a RESP block that is nothing but plain `SET`s.
@@ -342,7 +358,7 @@ fn execute(
     // reuse of `UNAUTHORIZED`, because real clients know the code and the
     // alternative — "command disabled by configuration" — sends an operator to
     // the wrong config file.
-    if let Some((missing, name)) = denial(conn, command) {
+    if let Some((missing, name)) = denial(state, conn, command) {
         crate::dispatch::deny(state, conn, missing, name);
         state.metrics.other();
         state.metrics.error(ErrorClass::Client);
@@ -1489,6 +1505,40 @@ mod tests {
                 "{command:?} is classified differently by the shortcut and by the domain"
             );
         }
+    }
+
+    /// **The awaited-write shortcut agrees with the domain it stands in for.**
+    ///
+    /// `batchable_write` reads an unconditional, untagged, non-`GET` `SET`
+    /// straight off the wire form rather than translating one — that is the
+    /// point of it, since it runs per command inside `measure_resp` and
+    /// translating there costs a clock read. This is what keeps the cheap
+    /// answer and the real one from drifting: for every storage command that
+    /// translates, the shortcut must say exactly what `dispatch::awaitable`
+    /// says about the translation.
+    ///
+    /// A command that does *not* translate is skipped rather than asserted
+    /// about, because there the shortcut is allowed to be optimistic: it only
+    /// decides which tier is tried first, and `parse_writes` declines for real.
+    #[test]
+    fn the_awaited_write_shortcut_agrees_with_the_domain() {
+        let mut saw_batchable = false;
+        for command in storage_commands() {
+            let Ok(translated) = translate(&command) else {
+                continue;
+            };
+            let domain = crate::dispatch::awaitable(&translated);
+            saw_batchable |= domain;
+            assert_eq!(
+                batchable_write(&command),
+                domain,
+                "{command:?} is classified differently by the shortcut and by the domain"
+            );
+        }
+        assert!(
+            saw_batchable,
+            "the fixture no longer contains a plain SET, so this proves nothing"
+        );
     }
 
     /// The two commands answered in several steps do not reach `translate`, so

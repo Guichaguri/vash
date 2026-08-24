@@ -165,27 +165,25 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         // only a dialect's own parser can say where its commands end — and what
         // a fatal framing error owes the client. Everything after that point is
         // identical, and used to be written out three times.
-        // Ordered so an authenticated connection never touches the lock. A gated
-        // connection's write owes a refusal that only the dialect's own executor
-        // can render, so the awaited path is withheld from it entirely.
+        // A gated connection's write owes a refusal that only the dialect's own
+        // executor can render, so the awaited path is withheld from it entirely.
+        // Used by `measure_vcp` for the reserve cap as well, which is why it is
+        // asked separately from `may_write` below.
         let gated = !conn_auth.is_authenticated() && state.auth.required();
         // **The fourth path into storage.** The awaited write path decodes a run
         // of plain writes and submits it to the store directly — it passes
         // through neither `dispatch::execute` nor any dialect's executor, so it
         // is a third bypass beside the fused read and `SetBatch`, and it has to
-        // be withheld from a connection whose writes owe a refusal. `gated`
-        // already withholds it for want of authentication; this withholds it for
-        // want of the `write` role, for exactly the same reason: the refusal is
-        // the executor's to word.
+        // be withheld from a connection whose writes owe a refusal. That covers
+        // both reasons a write can be refused, which is exactly what
+        // `AuthState::allows` answers: for want of authentication, and for want
+        // of the `write` role. Either way the refusal is the executor's to word.
         //
         // Recomputed every iteration, so an `AUTH` that narrows the identity
         // takes effect on the next read. Within one read it cannot go stale in
         // the dangerous direction: a block carrying an `AUTH` is not a block of
         // plain writes, so it never reaches this path to begin with.
-        let may_write = !gated
-            && conn_auth
-                .identity()
-                .is_none_or(|identity| identity.roles().allows(crate::auth::Roles::WRITE));
+        let may_write = state.auth.allows(&conn_auth, crate::auth::Roles::WRITE);
         let keep_going = match protocol.expect("set above") {
             Protocol::Vcp => {
                 drain(
@@ -402,6 +400,22 @@ type ParseWrites = for<'a> fn(&'a [u8]) -> Option<WriteRun<'a>>;
 /// as it always did. Re-running an unconditional write that a shard already
 /// committed rewrites the same bytes, which is the same trade
 /// [`crate::dispatch::SetBatch`] already documents for its own retry.
+///
+/// # Why the block is parsed again here
+///
+/// `measure` has already walked these very bytes to find the run, so parsing
+/// them a second time looks like waste. It is not avoidable: `measure` reads
+/// `&BytesMut`, and the run only exists once `split_to` has moved those bytes
+/// into a refcounted `Bytes` — which invalidates every borrow the measuring
+/// parse produced. Carrying the parsed commands across that hand-off would
+/// mean copying each key and value out of the buffer, which is the copy this
+/// whole path exists to avoid.
+///
+/// So the boundary is deliberate, and the response to it is to keep the
+/// *measuring* pass cheap rather than to try to reuse it: `measure` decides
+/// only which tier a run is offered to, and both dialects answer that
+/// structurally now — see [`crate::resp::batchable_write`], which used to read
+/// the clock per `SET` to answer a question this function asks again anyway.
 async fn run_writes_awaited(
     state: &Arc<ServerState>,
     block: &[u8],

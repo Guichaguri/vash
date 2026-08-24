@@ -676,6 +676,64 @@ impl AuthState {
         self.required.store(auth.required(), Ordering::Relaxed);
         *current = Arc::new(auth);
     }
+
+    /// **The one decision behind every gate, in every dialect.**
+    ///
+    /// `None` means the connection may proceed. The two refusals are kept
+    /// apart because they are different problems with different fixes and
+    /// different counters — "nobody rolled their credential" against
+    /// "someone's role set is wrong" — and because Redis words them
+    /// differently on the wire (`NOAUTH` against `NOPERM`).
+    ///
+    /// This used to be written out at five call sites: the memcached batch
+    /// gate, the memcached executor, the VCP header gate, the RESP pair, and
+    /// the awaited-write check in `conn`. All five agreed, which was lucky
+    /// rather than enforced — each one independently combined
+    /// `is_authenticated`, `required()`, and the identity's roles, and a new
+    /// bypass path meant finding all five. Now they differ only in what they
+    /// exempt beforehand and how they word the answer, which is the part that
+    /// genuinely is per-dialect.
+    ///
+    /// **Roles are checked whether or not `auth.required` is set.** An identity
+    /// carries its roles from the moment it is established, which is what lets
+    /// a client rolled during auth.md §15's step 2 experience its role set
+    /// before enforcement is turned on.
+    #[inline]
+    pub fn refusal(&self, conn: &ConnAuth, needed: Roles) -> Option<Refused> {
+        let Some(identity) = conn.identity() else {
+            // Nothing enforced and nobody authenticated: there is no identity
+            // to restrict, because the server is not defending anything.
+            return self.required().then_some(Refused::Unauthenticated);
+        };
+        let roles = identity.roles();
+        if roles.allows(needed) {
+            return None;
+        }
+        Some(Refused::Missing(roles.missing(needed)))
+    }
+
+    /// Whether a connection may run something needing `needed`.
+    ///
+    /// [`Self::refusal`] without the reason, for the gates that only have to
+    /// pick a code path rather than word an answer.
+    #[inline]
+    pub fn allows(&self, conn: &ConnAuth, needed: Roles) -> bool {
+        self.refusal(conn, needed).is_none()
+    }
+}
+
+/// Why a connection may not run a command.
+///
+/// Both answer `UNAUTHORIZED` on the VCP wire — auth.md §6.2 widened that
+/// status to "refused by policy", which covers both — so this exists to keep
+/// the *counters* and the log apart, not the status. An alert that cannot tell
+/// the two apart is an alert that gets muted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// Has presented no credential, and this server requires one.
+    Unauthenticated,
+    /// Authenticated, but the identity is short these roles.
+    Missing(Roles),
 }
 
 /// The roles a command needs, and the authority every gate defers to.
@@ -1026,6 +1084,84 @@ mod tests {
 
     fn digest_line(name: &str, secret: &str) -> String {
         format!("{name}  sha256:{}", hex(&sha256(secret.as_bytes())))
+    }
+
+    fn state(required: bool, roles: Roles) -> AuthState {
+        AuthState::new(
+            Auth::for_test_with_roles(required, "default", SECRET.as_bytes(), roles),
+            Limits {
+                timeout: std::time::Duration::from_secs(1),
+                max_attempts: 3,
+                max_connections: 1,
+            },
+        )
+    }
+
+    fn connected(state: &AuthState) -> ConnAuth {
+        let mut conn = ConnAuth::default();
+        conn.succeed(
+            state
+                .current()
+                .verify(b"default", SECRET.as_bytes())
+                .expect("the test credential verifies"),
+        );
+        conn
+    }
+
+    /// **The whole decision table of the one gate every dialect defers to.**
+    ///
+    /// This used to be written out at five call sites — the memcached batch
+    /// gate, the memcached executor, the VCP header gate, the RESP pair and
+    /// the awaited-write check in `conn` — each independently combining
+    /// `is_authenticated`, `required()` and the identity's roles. They agreed,
+    /// but nothing made them: a sixth path could have got any cell of this
+    /// wrong on its own. Pinning the table here is what that consolidation
+    /// bought.
+    #[test]
+    fn the_gate_answers_the_same_four_questions_for_every_dialect() {
+        let anonymous = ConnAuth::default();
+
+        // Nothing enforced and nobody authenticated: there is no identity to
+        // restrict, because the server is not defending anything.
+        let open = state(false, Roles::READ);
+        assert_eq!(open.refusal(&anonymous, Roles::FLUSH), None);
+        assert!(open.allows(&anonymous, Roles::FLUSH));
+
+        // Enforced and nobody authenticated: refused, and for that reason
+        // rather than for a role — the two carry different counters.
+        let closed = state(true, Roles::READ);
+        assert_eq!(
+            closed.refusal(&anonymous, Roles::READ),
+            Some(Refused::Unauthenticated)
+        );
+        assert!(!closed.allows(&anonymous, Roles::NONE));
+
+        // Authenticated and holding the role: through.
+        let reader = connected(&closed);
+        assert_eq!(closed.refusal(&reader, Roles::READ), None);
+
+        // Authenticated and short of it: refused with what is missing, so the
+        // denial log can name the role an operator should add.
+        assert_eq!(
+            closed.refusal(&reader, Roles::READ_WRITE),
+            Some(Refused::Missing(Roles::WRITE))
+        );
+    }
+
+    /// Roles bind whether or not enforcement is on.
+    ///
+    /// An identity carries its roles from the moment it is established, which
+    /// is what lets a client rolled during auth.md §15's step 2 experience its
+    /// role set before `auth.required` is turned on — the step that would
+    /// otherwise break at 3am on the first `FLUSH`.
+    #[test]
+    fn an_identity_is_held_to_its_roles_before_enforcement_begins() {
+        let open = state(false, Roles::READ);
+        let reader = connected(&open);
+        assert_eq!(
+            open.refusal(&reader, Roles::FLUSH),
+            Some(Refused::Missing(Roles::FLUSH))
+        );
     }
 
     #[test]
