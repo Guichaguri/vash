@@ -28,10 +28,12 @@ the reasoning, then what was rejected.
    credential file. Not per-key patterns, not Redis's category algebra:
    [§3](#3-choosing-the-granularity) argues that the useful axis here is *blast
    radius*, and that this cache has exactly six rungs on it.
-2. **Absence of `roles=` means unrestricted**, so every credential file that
-   exists today keeps working byte for byte. `auth.require_roles = true` turns
-   the permissive default into a startup error for operators who want every row
-   explicit. [§4](#4-where-the-roles-live).
+2. **A row without `roles=` inherits `auth.default_roles`, which is every role
+   until an operator narrows it**, so every credential file that exists today
+   keeps working byte for byte — and an operator who has finished the rollout
+   can make omission mean least privilege instead, so that forgetting the field
+   on a new row fails safe rather than failing open.
+   [§4](#absence-and-authdefault_roles).
 3. **The identity carries its roles**, resolved once at authentication.
    The per-command check is one bit test against a `u8` already in `ConnAuth` —
    no table lookup, no lock, nothing on the shared cacheline.
@@ -219,6 +221,13 @@ side of the line — it returns stored state the caller did not supply, so it is
 | **Cons** | Two files have to agree — the credential file (mode 600, not committed) and the main config (committed) — and a row referencing a role the config does not define is a startup failure in a *different* file from the one being edited. The indirection also inverts the property that makes the credential file auditable: today one line tells you everything about one identity. |
 | **Verdict** | Rejected for v1, and it composes cleanly if it is ever wanted: named sets would expand to the same bitset, so nothing below changes. |
 
+`auth.default_roles` (§4) is the one piece of authority that does live in the
+main config, and the objection above does not reach it: there is no name to
+resolve, so no row can dangle against a definition that is missing or misspelt,
+and it applies to rows that said *nothing* rather than to rows that pointed
+somewhere. A row carrying `roles=` remains readable on its own line, which is
+the property being protected.
+
 ### Summary
 
 | Option | Expressive enough | Hot-path cost | Auditable per row | Verdict |
@@ -267,27 +276,60 @@ peer            sha256:9b07…                 roles=peer
   duplicates, order irrelevant.
 - **No `all` keyword.** It would mean "and every role added in future
   versions", which is a grant an operator cannot have consented to. Omitting
-  the field is how you say "unrestricted" and it carries that meaning
-  explicitly (below).
+  the field is how you say that, and it says it as a deliberate default rather
+  than as a word on a row (below).
 - **`roles=` with an empty list is refused**, because it is indistinguishable
   at a glance from the field being absent while meaning the opposite. A row
   that should authorise nothing should be deleted, and deleting it is also what
   closes the connections holding it.
 
-**Absence means unrestricted.** Every credential file in existence was written
-without this field, and the whole point of the loader's reserved-field error is
-that those files are still valid. A row with no `roles=` gets every role,
-including roles added later — which is the *opposite* asymmetry from `all`, and
-deliberately: absence is a legacy row that predates the question, presence is an
-answer to it. `auth.require_roles = true` turns absence into a startup error for
-operators who want that answer from every row.
+### Absence, and `auth.default_roles`
 
-**`VASH_AUTH_SECRET`** builds a one-row `default` table and therefore an
-unrestricted identity. It is the deployment that has one credential; there is
-nothing for it to be restricted relative to. `auth.require_roles = true` and
-`VASH_AUTH_SECRET` together are refused at startup rather than silently
-resolving one way or the other, matching how the two credential sources already
-refuse to coexist.
+**A row with no `roles=` inherits `auth.default_roles`, which is every role
+unless an operator says otherwise.** Every credential file in existence was
+written without this field, and the whole point of the loader's reserved-field
+error is that those files are still valid — so the out-of-the-box default has to
+be "unrestricted", and is.
+
+What the setting buys is that "unrestricted" stops being the *only* thing
+omission can mean. An operator who has finished §14's rollout writes
+
+```toml
+[auth]
+default_roles = ["read"]
+```
+
+and from then on a row somebody adds without thinking is least-privilege rather
+than most-privilege. **That is the important property, and it is why this is a
+default rather than a lint:** forgetting `roles=` on a new row now fails *safe*,
+where a startup error would fail *loud* — and a credential file is often written
+by a rotation job at 3am, where loud means the node does not come back. §15 has
+the version of this that was rejected.
+
+It is also the only way to narrow an identity whose credential file this
+operator does not edit: the file may be rendered by a secret manager, while the
+main config is committed and reviewed.
+
+**The default's own default is absence, not an enumeration**, and the
+distinction is not pedantry. If the setting is unset the meaning is "every role,
+now and in later versions"; if an operator writes out all six names, the meaning
+is "exactly these six", and a seventh role added in a future version is withheld
+from every bare row on upgrade. That is the same absence-is-permissive,
+presence-is-strict asymmetry the `roles=` field itself has, one level up — and
+it is why §12 shows the key commented out rather than spelled out with six
+names, which would be a subtly *different* configuration from the default.
+
+**`default_roles = []` is allowed**, and is the fail-safe form of "every row
+must state its own authority": a bare row authenticates and is then refused
+everything. Because that is confusing to debug from the client side, a table
+that has both an empty default and at least one bare row logs a `warn` at
+startup **naming those rows** — the lint, kept, without the boot failure.
+
+**`VASH_AUTH_SECRET`** builds a one-row `default` table, and that row is a bare
+row like any other, so it takes `auth.default_roles` too. This is a capability
+the single-secret deployment did not previously have — its one identity can now
+be restricted without adopting a credential file — and it costs a special case
+rather than adding one.
 
 **`mtls:` rows take `roles=` like any other row.** A certificate subject is an
 identity, not a mechanism — M12's whole argument — so authorization attaches to
@@ -311,7 +353,9 @@ impl Roles {
     pub const FLUSH: Self      = Self(0x10);
     pub const PEER: Self       = Self(0x20);
 
-    /// A row with no `roles=`: everything, now and later. See §4.
+    /// What `auth.default_roles` is when unset: everything, now and in later
+    /// versions, which is what keeps every credential file written before this
+    /// feature loading unchanged. See §4.
     pub const UNRESTRICTED: Self = Self(u8::MAX);
 
     #[inline]
@@ -323,6 +367,12 @@ impl Roles {
 
 `allows` takes a set, not a single role, so §2's three two-role commands are one
 call and not a special case at each site.
+
+**`auth.default_roles` is resolved at load, not at check time.** A bare row gets
+the default baked into its `Credential` as a concrete bitset when the file is
+parsed, so nothing below this line knows the difference between an inherited set
+and a written one. The whole of §4's addition is confined to the loader and one
+config key — the gate, the wire and the hot path are unaffected by it.
 
 **`Identity` carries the roles**, resolved once when the credential verifies:
 
@@ -534,6 +584,11 @@ needs rewriting to say the gates now compose.
   the transition rather than per command — the rate-limiting shape §8 already
   uses for a peer's refusal, and for the same reason: a wrong role set will not
   fix itself and will otherwise fill the log at line rate.
+- **The effective default at startup, with the rows that took it**, at `info`:
+  the resolved `auth.default_roles` and how many rows inherited it, plus the
+  `warn` naming them when that default is empty (§4). This is the auditability
+  a bare row gives up by taking its authority from another file, handed back in
+  the log where an operator reading a boot sequence will see it.
 - **`vash_roles` in `stats conns`**, beside `vash_authenticated`,
   `vash_auth_method` and `vash_tls`. The reasoning already written for
   `vash_tls` — *"the rollout's only honest progress bar … no aggregate can say
@@ -561,13 +616,20 @@ The check is genuinely free; what this feature costs is the operational risk in
 
 ```toml
 [auth]
-require_roles = false   # a row without `roles=` is a startup error (§4)
+# default_roles = ["read"]   # what a row with no `roles=` gets (§4)
 ```
 
-That is the whole addition. There is no `auth.roles_required` runtime switch and
-no per-role enable — **the unit of rollout is the row**, which is finer than a
-global flag and needs no new state. An operator restricts one identity, watches
-`vash_auth_denied_total`, and moves to the next.
+**Shown commented, and that is the documented default rather than a shorthand
+for it.** Unset means every role, now and in later versions; writing the six
+names out means exactly those six, and withholds a seventh added later. An
+operator who wants today's behaviour should leave the key alone, not spell it
+out.
+
+That is the whole addition. There is no runtime switch and no per-role enable —
+**the unit of rollout is the row**, which is finer than a global flag and needs
+no new state. An operator restricts one identity, watches
+`vash_auth_denied_total`, moves to the next, and only then lowers the floor for
+everything that was never restricted.
 
 `[cluster] auth_name` gains the startup check in §8 but no new key.
 
@@ -587,8 +649,14 @@ global flag and needs no new state. An operator restricts one identity, watches
   three two-role commands, whose failure mode (`roles=write` reading values) is
   invisible in a test that only checks the happy path.
 - **Loader tests** for each rule in §4, all asserting a *hard* error: unknown
-  role, empty list, duplicate, `all`, `require_roles` with a bare row,
-  `require_roles` with `VASH_AUTH_SECRET`.
+  role in a row, unknown role in `default_roles`, empty `roles=`, duplicate,
+  `all`.
+- **`default_roles` resolution**, which is where the compatibility promise
+  lives: a bare row with the key unset is unrestricted; a bare row with the key
+  set gets exactly it; a row with `roles=` ignores it entirely; the
+  `VASH_AUTH_SECRET` identity takes it like any other bare row; and
+  `default_roles = []` leaves a bare row authenticating and then refused
+  everything, with the rows named in the startup warning.
 - **A three-node cluster converges with `roles=peer`**, and a node whose row
   lacks `peer` refuses to start — the pair M9 already runs for a missing peer
   credential.
@@ -604,22 +672,30 @@ Roles have no global switch to flip, so the rollout is per identity and can stop
 anywhere:
 
 1. Add `roles=` to **one** row — the one whose job is narrowest and best
-   understood. Everything else stays unrestricted.
+   understood. Everything else keeps inheriting the default, which is still
+   every role.
 2. `SIGHUP` (or restart on Windows, per M9's carried-forward limitation). The
    identity's *next* authentication picks it up; live connections keep what they
    have (§5).
 3. Watch `vash_auth_denied_total` and the `warn` log. A wrong guess names the
    identity, the command and the missing role, so the fix is the same edit
    again.
-4. Repeat. When every row is explicit, set `auth.require_roles = true` so the
-   next row somebody adds cannot be unrestricted by omission.
+4. Repeat, one row at a time.
+5. **Last, and only last, lower `auth.default_roles`** — to the floor a bare row
+   should get, or to `[]`. This is the one step that is *not* per row: it moves
+   every identity that never got an explicit `roles=` at once, which is why it
+   belongs at the end, when the set of such rows is small and known. Its purpose
+   is not to restrict anything that is running — by then, nothing should be
+   inheriting a default it needs — but to decide what the *next* row somebody
+   adds is worth if they forget the field.
 
 **There is deliberately no audit-only mode.** auth.md §15's sentence applies
 unchanged — *"a mode where unauthenticated clients still work is not
 authentication, it is a log line"* — and a mode where denied commands still run
 is not authorization for the same reason. The per-row granularity is what makes
 the safe rollout possible without one: the blast radius of a wrong role set is
-one identity, and step 1 chooses which.
+one identity, and step 1 chooses which. Step 5 is the exception that proves it,
+which is exactly why it is fifth.
 
 ---
 
@@ -637,6 +713,15 @@ Beyond §3's granularity options:
   it puts a lock and a map probe on the hot path, and it makes authority
   inconsistent with the identity's own secret, which already only changes at the
   next authentication. Emergency revocation is a restart, as it is today.
+- **`auth.require_roles` — a startup error on any row without `roles=`.** It was
+  the first shape of §4's setting and `default_roles` supersedes it on two
+  counts. It fails loud where the same concern can be made to fail *safe*: a
+  credential file is often rendered by a rotation job, and turning a routine row
+  addition into a refusal to boot is an outage vector aimed at the operator who
+  was being the most careful. And it can only demand explicitness, never supply
+  a value, so it does nothing for the deployment whose credential file is
+  generated elsewhere and cannot carry `roles=` at all. `default_roles = []`
+  plus the startup `warn` naming the bare rows keeps what the lint was for.
 - **Folding `invalidate` into `write`,** on the reasoning that `DELETE` is
   already there. §2's containment test says no: `DELETE` folds because a writer
   can achieve it with a short TTL, and `DELETE_BY_TAG` does not because it
@@ -668,7 +753,7 @@ established once.
 
 | # | Scope | Exit criteria |
 |---|---|---|
-| **M13** | `Roles` bitset and the `roles=` field; the mapping from `Command` and from `Opcode`; the gate at the three existing authentication call sites; the `AUTH` reply body and `vash-client` exposure; `-NOPERM` and `CLIENT_ERROR unauthorized`; `auth.require_roles`; the peer-role startup check; the denial counter, the `warn` log and `vash_roles` in `stats conns` | The property test proves no command in any dialect executes without its roles, **including pipelined batches and the fused `GET`**; a `roles=write` identity cannot read a value through `gat`, `incr`, or `SET … GET`; a three-node cluster converges with `roles=peer` and a node whose row lacks it refuses to start; every credential file that loads today loads unchanged; a `roles=` file is refused by a build without the feature |
+| **M13** | `Roles` bitset and the `roles=` field; the mapping from `Command` and from `Opcode`; the gate at the three existing authentication call sites; the `AUTH` reply body and `vash-client` exposure; `-NOPERM` and `CLIENT_ERROR unauthorized`; `auth.default_roles` and its resolution at load; the peer-role startup check; the denial counter, the `warn` log and `vash_roles` in `stats conns` | The property test proves no command in any dialect executes without its roles, **including pipelined batches and the fused `GET`**; a `roles=write` identity cannot read a value through `gat`, `incr`, or `SET … GET`; a three-node cluster converges with `roles=peer` and a node whose row lacks it refuses to start; every credential file that loads today loads unchanged with `default_roles` unset, and `default_roles` narrows exactly the rows that omitted `roles=`; a `roles=` file is refused by a build without the feature |
 
 Sequencing: the loader and the bitset first (they are testable with no server),
 then the `Command` mapping and its exhaustive match, then VCP (the dialect we
@@ -684,6 +769,8 @@ The same order M9 used, for the same reasons.
 |---|---|---|
 | A role set that is too narrow breaks a working client in production | An outage in the one place the operator was trying to make safer | The unit of rollout is one row (§14); the denial names the identity and the command within seconds (§10); the fix is one line and a `SIGHUP` |
 | The gate is added at a fourth path into storage that bypasses all three call sites | Silent loss of authority checking on whichever command took that path — the §6 failure, regrown | The property test drives all three dialects including pipelined batches; the exhaustive `match` makes a new *command* a compile error, though not a new *path* |
+| `auth.default_roles` is narrowed while rows are still inheriting it | Every unrestricted identity loses authority at once — the one fleet-wide change in a design that is otherwise per row | §14 makes it step 5 for exactly this reason; the startup log names how many rows inherit the default and warns with their names when it is empty, so the size of the blast radius is readable before the edit |
+| An operator writes out all six names to "keep the default" | A seventh role added later is silently withheld from every bare row on upgrade | §4 and §12 state the absence/enumeration distinction, and §12 shows the key commented rather than spelled out |
 | The opcode mapping and the command mapping drift | An opcode authorised as one role executes as another | They are compared in a test that decodes every opcode (§13) |
 | A peer row without `peer` | A cluster that stops converging while reporting itself healthy | Startup refusal on the local row (§8), plus the existing transition-logged `UNAUTHORIZED` classification |
 | `roles=write` believed to exclude reads | A credential quietly stronger than its name | §2's two-role rule, and a test per fused command (§13) |
