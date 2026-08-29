@@ -1341,3 +1341,307 @@ trips, which is the client's decision rather than the server's.
 `SET` closed loop is 47,849 here against Redis's 60,810 — the closest the write
 path has been. Closing it further means attacking per-request syscalls, not
 anything in the storage tier.
+
+---
+
+# The request path, measured directly
+
+Everything from here down was measured with `cargo bench -p vash-bench --bench
+hot_path` and one standalone contention probe, on a **different host** from the
+one the tables above use: an Intel i7-9750H, 6 cores / 12 threads, Windows 11,
+release profile. **None of these numbers may be compared to the throughput
+tables in §1 or §15** — they are component costs, not server throughput, and the
+host is not the benchmark container.
+
+They are still the right kind of number for what follows, because every item
+below is a fixed per-command cost that no batching amortises. §15 established
+that a *write* is now bound by the commit; the four items here are all on the
+path a **read** takes, which §15 and §16 did not decompose.
+
+Two clocks for orientation, both from the same host: a full storage read plus
+encode (`read_encode_in_txn`, 1 KiB value) is **272 ns**, and `record_liveness`
+with no tags is **1.6 ns**. The storage engine is not what the sections below
+are about.
+
+---
+
+## 17. The measuring pass parses every command in full, and throws it away
+
+**Status: proposed, and the fatal-error argument that makes it safe is checked.**
+
+`conn::drain` walks a block twice. `measure_resp` calls `vash_proto::resp::parse`
+to find where each command ends, and then `resp::execute_block` calls the very
+same `parse` on the very same bytes to run them. The second parse is
+unavoidable — `conn.rs` already explains why, at length: `measure` reads a
+`&BytesMut`, and `split_to` invalidates every borrow it produced. The *first*
+one is the problem, because of how much it does for what it is asked.
+
+`resp::parse` walks the multibulk framing and then calls `parse_command`, which
+upper-cases the verb into a fixed buffer, dispatches a `match` over
+twenty-eight verbs, validates arity, parses expiry integers, and — for `MGET`,
+`DEL`, `UNLINK`, `MSET`, `EXISTS` and `DELBYTAG` — **allocates a `Vec` of the
+key slices**.
+`measure_resp` uses exactly two things out of all that: `parsed.consumed`, and a
+three-way tag from `inline_safe` / `batchable_write`.
+
+### What it costs
+
+| | median |
+|---|---:|
+| `resp_parse_get` | **86.6 ns** |
+| `resp_parse_set` | **204.2 ns** |
+| `memcached_parse_get` | 46.4 ns |
+| `memcached_parse_set` | 235.6 ns |
+| `vcp_peek_frame_len` | **5.2 ns** |
+
+The last row is the point. **VCP already does this correctly**: `measure_vcp`
+reads a length header, and `is_read_only_frame` classifies from the opcode byte
+alone without decoding a body. It spends 5.2 ns where RESP spends 86.6 ns to
+answer the same two questions.
+
+Against the 272 ns that a whole 1 KiB storage read and encode costs, a RESP
+`GET` spends **86.6 ns on a parse whose result is discarded** — 32% of the
+storage work again, for nothing. Both parses together are 173 ns, or 64% of the
+storage work, and half of that is avoidable.
+
+### What it would take
+
+Split `parse` in two. The framing walk — read `*N`, then `N` `$len` bulks, sum
+the bytes — already exists as the first half of `parse`; expose it as a mode
+that returns `consumed` plus the argument slices, without calling
+`parse_command`. `measure_resp` then classifies from the verb bytes directly.
+
+For most commands that is a `match` on the verb and nothing else: `GET`, `MGET`,
+`EXISTS`, `TYPE`, `TTL`, `PING`, `HELLO`, `AUTH`, `QUIT` and `INFO` are `Reads`;
+everything unrecognised is `Other`. **`SET` is the one that still needs its
+options read**, because `batchable_write` asks about `NX`/`XX`, `GET` and tags —
+so the win there is smaller: it skips the expiry parsing, the validation and the
+error construction, not the option scan.
+
+### Why this is safe, and it is the one thing worth checking
+
+Making the measuring pass framing-only means `parse_command`'s errors are no
+longer seen during measurement. That is fine for `Recoverable` — an arity error
+becomes an `Other` run, and the executor renders it in the position it occupied,
+exactly as it does today. It would **not** be fine for `Fatal`, which closes the
+connection and must still be caught before a block is dispatched.
+
+It is caught. `ProtocolError::Fatal` is constructed in **seven places, all of
+them in `resp/mod.rs`** — `invalid multibulk length`, `invalid bulk length`,
+the `\r\n` terminator check, and the header-length guards — and in **none** in
+`command.rs`. Every fatal error in this dialect is a framing error by
+construction, so a framing-only walk sees precisely the set it sees today. That
+property is currently incidental; it should become a test.
+
+**Acceptance criterion**: `resp_parse_get` gains a measuring-mode sibling bench
+that lands near `vcp_peek_frame_len`, and the RESP integration suite is
+unchanged.
+
+---
+
+## 18. A multi-key read never got the fused path, and it is the larger half of one
+
+**Status: proposed. The prize is already measured by a bench in the tree.**
+
+`execute_get_into` exists because building a `Value` costs a copy out of the
+memory map and a heap allocation on every hit, and the encoder then copies the
+same bytes a second time into the write buffer. `hot_path.rs` measures it, the
+single-key RESP `GET` takes it, and — since the fix recorded in `memcached.rs` —
+so does a memcached `get` naming one key.
+
+**A genuine multi-key read still does not.** `Command::GetMany` goes to
+`Store::get_many`, which returns `Vec<Option<Value>>`, and `render` then walks
+that vector copying each `value.data` into `out`. Two copies and one allocation
+per hit key, against one copy and none for the same key read on its own.
+
+### What it costs
+
+Medians, all three from `hot_path.rs`. `read_batch_of_one_then_encode` is the
+`get_many` path and `read_encode_in_txn` is the fused one:
+
+| value | `get_many` path | fused path | saving |
+|---|---:|---:|---:|
+| 64 B | 356.6 ns | 270.9 ns | **24%** |
+| 1 KiB | 419.6 ns | 272.0 ns | **35%** |
+| 4 KiB | 494.5 ns | 324.4 ns | **34%** |
+| 16 KiB | 1102 ns | 870.8 ns | **21%** |
+
+**These are the floor.** That fixture is single-shard, so it takes
+`read_batch`'s single-shard shortcut and pays none of the scatter-gather. A
+multi-shard `MGET` additionally allocates `vec![T::default(); keys.len()]`, the
+grouping buffer, and a `Vec<Key>` per shard group.
+
+### The objection in the code, and why it does not hold
+
+`memcached.rs` states it plainly: a multi-key `get` "cannot" fuse, because "its
+keys are grouped by shard before they are read, so the values come back out of
+request order, and putting them back in order is what the `Vec` this avoids is
+for."
+
+That is true of the current loop, not of the problem. **Invert it.** Open one
+read transaction per shard — two to four of them — hold them for the batch, then
+walk the keys in **request order**, routing each to its shard's already-open
+transaction and rendering it inline. Order is preserved by construction, so
+nothing is reordered, no result vector exists, and no `Value` is ever built.
+
+The consistency guarantee is unchanged: each shard still opens exactly one
+transaction for the call, which is what "one snapshot per batch" already means
+in a sharded store — the shards never shared a snapshot to begin with.
+
+### What it costs, stated plainly
+
+`read.rs` opens with a warning that a long-lived read transaction pins a version
+and stops the writer reusing freed pages. This holds *shard_count* transactions
+instead of one, for the length of one batch. That is a real change and it is the
+thing to argue about — but the risk that warning describes is the listing scan,
+bounded by `listing_max_scan`, not a multiget bounded by `MAX_BATCH_ITEMS` reads
+of a resident map. `oldest_reader_age_ms` already exists to say if that
+judgement is wrong.
+
+**Acceptance criterion**: a `read_batch_of_many_then_encode` bench beside the
+three that exist, landing within noise of `read_encode_in_txn` times the key
+count.
+
+---
+
+## 19. Seven contended atomics and two clock reads per command
+
+**Status: proposed. This is the one that does not show up on four cores.**
+
+Every command pays, before any storage work:
+
+- `CommandMetrics::observe` — **four** relaxed `fetch_add`s: the per-command
+  counter, the histogram bucket, `sum_us`, and `count`.
+- `ServerMetrics::read` — **three** more: `commands_total`, `reads`, and `hits`.
+- `Instant::now()` **twice**, to bracket the call.
+
+And every read transaction pays a `SystemTime::now()` for its snapshot.
+
+`commands_total`, `reads`, `writes`, `hits` and `misses` are five adjacent
+`AtomicU64` in one struct — **one cache line, written by every core on every
+command**. The histogram is two more lines, likewise shared.
+
+### What it costs, and why it is invisible today
+
+A probe running the same seven `fetch_add`s in the same layout, against two
+alternatives. The figures are **aggregate** — total elapsed divided by *all*
+threads' operations — so a number that falls means the system got faster:
+
+| threads | today (shared) | accumulate per block | stripe per thread |
+|---:|---:|---:|---:|
+| 1 | 40.7 ns | 4.5 ns | 33.9 ns |
+| 2 | 56.1 ns | 5.2 ns | 24.2 ns |
+| 4 | 65.8 ns | 4.7 ns | 11.2 ns |
+| 8 | **66.2 ns** | **4.8 ns** | **7.3 ns** |
+
+**Today's counters get slower in aggregate as cores are added.** 40.7 ns on one
+thread, 66.2 ns on eight — adding seven cores made this term 1.6× *worse*
+system-wide. Both alternatives scale or stay flat. Every measurement in this
+document was taken on a four-core container, which is exactly where this cost is
+still small enough to hide.
+
+The clocks, same host: `Instant::now()` **36.0 ns**, `SystemTime::now()`
+**19.4 ns**. These are Windows figures and Linux's vDSO is cheaper, around
+20–25 ns — but there are three of them per read either way.
+
+Per `GET`, on this host: ~41 ns of atomics, ~72 ns of `Instant`, ~19 ns of
+`SystemTime` — **about 130 ns of instrumentation against 272 ns of storage
+read.**
+
+### What it would take, and the codebase has already solved this once
+
+`readers.rs` is the precedent, and its reasoning applies verbatim: the obvious
+design needs a lock or a search for a free slot on every read, and reads are the
+hot path this whole server is shaped around. Its answer — a slot claimed per
+thread, once, written with a relaxed store — is exactly what the metrics never
+got.
+
+Two options, which compose:
+
+- **(a) Accumulate per block.** A block is already the unit `drain` works in, and
+  already the unit `bytes_read` and `ConnInfo::touched` count in. Hold the counts
+  in a stack-local struct for the run and flush with one `fetch_add` per counter
+  at the end. At pipeline 16 that is seven RMWs per sixteen commands, and it
+  measured flat at ~4.7 ns.
+- **(b) Stripe per thread**, padded to a cache line and summed at scrape. Larger
+  change, scales better still, and costs memory proportional to worker count.
+
+**(a) is the one to take first**: it is smaller, it needs no new scrape-side
+arithmetic beyond what already exists, and it is the same granularity the
+connection already uses for two other counters.
+
+The clocks are a separate decision and a smaller one. `clock.rs` already
+documents the coarse clock as the escape hatch and states honestly why it has
+not been taken — a cached clock that stops ticking fails silently and serves
+expired data. That objection stands. The cheaper move that costs no correctness
+is to stop calling `Instant::now()` twice: one read per command serves as both
+the previous command's end and the next one's start, halving the clock reads
+across a block.
+
+**Acceptance criterion**: the probe above, rerun against the real
+`ServerMetrics`, flat from one thread to eight. And `stats` must report the same
+totals it does now — a per-block flush is not allowed to lose the tail of a
+block that closes the connection.
+
+---
+
+## 20. Two small ones, both free
+
+**Status: proposed. Neither is worth a section on its own; together they are an
+afternoon.**
+
+**A `Set` cloned to answer a question about three of its fields.** `resp.rs`, in
+`parse_writes`:
+
+```rust
+if !crate::dispatch::awaitable(&vash_core::Command::Set(set.clone())) {
+```
+
+`awaitable` reads `set.mode`, `set.return_previous` and `set.tags.is_empty()`. To
+ask it, the code builds a whole `Command` and discards it, once per `SET` on the
+**awaited write run** — the path §8 built to be the fast one. An
+`awaitable_set(&Set) -> bool` taking the borrow removes it.
+
+It is also a second opinion on a settled question: `measure_resp` classified this
+run as `Writes` only because `batchable_write` already checked the same three
+fields on every command in it. Worth keeping as a guard, worth not paying a move
+for.
+
+**A 64-bit division per key.** `shard.rs`:
+
+```rust
+(xxhash_rust::xxh3::xxh3_64(key) % self.shards.len() as u64) as usize
+```
+
+The shard count is a runtime value, so this is a hardware `div` on the path of
+every read and every key of every batch. The multiply-shift reduction —
+`((h as u128 * n as u128) >> 64) as usize` — is uniform for a uniformly
+distributed hash and compiles to one widening multiply.
+
+Isolated, the probe measured **6.90 ns against 0.78 ns**. **In situ it will be
+much less than that**: `shard_routing_hash` measures the hash alone at 3.9 ns for
+an 8-byte key, so the division is clearly pipelining with it rather than adding
+6.9 ns on top. Low single-digit nanoseconds per key is the honest claim. It is
+listed because it is three lines and cannot regress anything, not because it is
+large.
+
+---
+
+## 21. What to do first
+
+Ordered by measured prize over effort, against a `GET` whose storage work is
+272 ns on the host these were taken on:
+
+| | prize | effort | risk |
+|---|---|---|---|
+| §17 framing-only measure | ~80 ns per RESP command | medium | low — fatal errors are provably framing-only |
+| §19(a) per-block counters | ~35 ns per command, and removes an anti-scaling term | small | low, but the flush must not be lost on a closing block |
+| §18 fused multi-key read | 21–35% per key of a multiget | medium | the one real trade: *shard_count* readers open for a batch |
+| §20 both small ones | a few ns each | trivial | none |
+
+**Measure them with `resident_mode` on.** `store.resident_mode` and
+`store.inline_reads` both still default to `false`, and §3 measured the former at
+roughly 10× on closed-loop `GET`. With the hand-off to the blocking pool still in
+the path, every item above is rounding error against it — anyone benchmarking
+these changes on the shipped defaults will correctly conclude they did nothing.
+(`store.durability` needs no such warning: it already defaults to `lazy`.)
