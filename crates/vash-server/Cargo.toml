@@ -31,6 +31,7 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
+xxhash-rust.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -67,6 +68,12 @@ mdbx = ["vash-store/mdbx"]
 # because a server that terminates TLS but gossips in the clear is not a
 # configuration anybody wants.
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki", "vash-client/tls"]
+# The slowlog and the hot-key sampler, off by default. Not because they are
+# expensive — the whole point of docs/slowlog-proposal.md §7 is to establish
+# whether they are — but because the gates are stated as a percentage against
+# *the same build without them*, and that build has to exist to be measured.
+# Once phase 0's numbers are in, this is expected to become a default.
+introspect = ["vash-store/introspect"]
 # Off by default, against plan §2, which expected 10-20% from it on
 # allocation-heavy connection handling. Measured on this workload it is worth
 # nothing: 1.13M against 1.11M ops/s on 64-byte GETs and 537k against 540k on

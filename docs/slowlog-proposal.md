@@ -60,6 +60,48 @@ the reasoning, then what was rejected.
 
 ---
 
+> **Phase 0 has run. One gate failed and changed the design, and two of the
+> three could not be evaluated as written.**
+> Measured in [benchmarks.md](benchmarks.md#what-the-slowlog-and-the-hot-key-sampler-cost):
+>
+> 1. **Gates 1 and 2 are not measurable on this box, and the control proves
+>    it.** They ask for ≤1% end to end. Six ABBA blocks put pipelined `GET` at
+>    −2.34% median with per-block deltas from −9.4% to +6.3%, and the spread
+>    within a single arm is 27.8%. The `SET` arm is the control — the
+>    instrumentation cannot make writes faster — and it measured **+14.5% in one
+>    block**. A harness reporting a 14% speed-up from a change that cannot cause
+>    one cannot rule on 1%, so the plausible-looking −2.34% is the same noise
+>    wearing a better sign. §7's gates 1 and 2 are answered by the
+>    micro-benchmark instead, and the end-to-end runs bound the effect rather
+>    than measuring it.
+> 2. **The instrument costs 3.81 ns a request**, priced directly on
+>    `cargo bench --bench hot_path`: about 1.2 ns of hot-key sampler and the rest
+>    the slowlog's threshold compare. That is 4.2% of the 90.9 ns RESP parse
+>    [performance-proposals.md](performance-proposals.md) §11 dismissed as "0.8%
+>    of one core" — roughly 0.03% of a core at the same request rate.
+> 3. **[§3.5](#35-where-the-buffer-lives-and-what-the-threshold-check-costs) was
+>    wrong, and gate 3 caught it.** Its argument that one mutex is safe because
+>    "the lock is only ever taken by a request that already lost" holds at the
+>    shipping threshold and fails at `threshold_us = 1`, which is what an
+>    operator sets during an incident: closed-loop p99 rose 16% and p99.9 38%,
+>    with **all four ABBA blocks moving the same direction** — the one signal a
+>    ±20% harness can still carry. The rings are now striped per thread and
+>    merged on read, as §7 pre-committed, and the signs go mixed. The section
+>    below is kept as written.
+> 4. **Two bugs the benchmarks did not find.** A `RefCell` holding the sampler's
+>    PRNG and its summary together cost 7.06 ns against the 3.92 ns of splitting
+>    the PRNG into a `Cell` — and two thirds of that saving was the `#[cold]`
+>    split rather than the borrow flag, since the *disabled* path improved by as
+>    much. And rings hung off thread-locals lose their entries when the thread
+>    exits, which for a pool tokio retires after ten seconds idle means losing
+>    exactly the slow **writes** the log exists to catch. A test asserting an
+>    entry outlives its thread is what found it.
+>
+> The rest of this document is kept as written, including the parts the
+> measurements went on to contradict.
+
+---
+
 ## 1. Why the existing metrics cannot be extended to cover this
 
 Not "they were built wrong" — they were built for a different question, and the
@@ -470,7 +512,7 @@ the surface area rather than after it. This is M13; M11 and M12 are taken by
 
 | Phase | Scope | Exit |
 |---|---|---|
-| **0** | Instrument only, no surface: the enqueue instant through the shard queue, the threshold compare, the sampled summary. Behind a cargo feature so a compiled-out build exists to measure against | §7's gates 1–3 pass, published in [benchmarks.md](benchmarks.md) with ranges. Gate failures reopen §3.5 or §4.2 *before* anything is built on top |
+| **0** — **done** | Instrument only, no surface: the enqueue instant through the shard queue, the threshold compare, the sampled summary, and the ring the saturated case needed in order to be measurable at all. Behind `--features introspect` | **Ran.** Gate 3 failed and rewrote §3.5; gates 1 and 2 proved unmeasurable end to end and were answered at 3.81 ns on `hot_path`. Published in [benchmarks.md](benchmarks.md#what-the-slowlog-and-the-hot-key-sampler-cost) |
 | **1** | The ring buffer, the entry, the batch rule, `GET /slowlog` | An entry appears for a request slower than the threshold, with `queue_us` and `exec_us` both populated and distinguishable; a stalled batch produces one entry with the right `batch` |
 | **2** | RESP `SLOWLOG GET/LEN/RESET/HELP`, `INFO`'s `slowlog_len`, the `roles_for_command` mapping, the §3.3 key gate | `redis-cli slowlog get` renders unchanged; keys are digests until `listing_enabled`; `RESET` clears the buffer and not the counters |
 | **3** | Space-Saving summaries, the merge, `GET /hotkeys` behind the listing gate | §7's gate 4 passes against a known Zipfian; the route refuses when `listing_enabled` is clear |

@@ -136,7 +136,7 @@ fn render_histogram(out: &mut String, name: &str, labels: &str, read: &Buckets) 
 /// plus a runtime worker per core, because those are the threads that reach a
 /// counter. Past it, threads share [`SHARED_LANE`] and pay a locked add for it —
 /// slower, never wrong.
-const LANES: usize = 256;
+pub(crate) const LANES: usize = 256;
 
 /// The lane threads fall back to once every private one is taken.
 ///
@@ -146,9 +146,15 @@ const LANES: usize = 256;
 const SHARED_LANE: usize = LANES - 1;
 
 /// Which stripe a thread writes, and whether it has that stripe to itself.
+///
+/// Shared with [`crate::introspect`], which stripes its per-thread rings and
+/// summaries the same way and for the same reason. One lane allocator rather
+/// than two: the reclaim behaviour below — a lane handed back when its thread
+/// exits — is the part that is easy to leave out and expensive to discover
+/// missing, and it should exist once.
 #[derive(Clone, Copy, Debug)]
-struct Lane {
-    index: usize,
+pub(crate) struct Lane {
+    pub(crate) index: usize,
     owned: bool,
 }
 
@@ -213,7 +219,7 @@ thread_local! {
 /// is the one moment `with` cannot hand anything back. A count taken there is
 /// still counted, just not privately.
 #[inline]
-fn lane() -> Lane {
+pub(crate) fn lane() -> Lane {
     LANE.try_with(|guard| guard.0).unwrap_or(FALLBACK)
 }
 

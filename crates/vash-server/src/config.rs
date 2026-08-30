@@ -576,6 +576,8 @@ pub struct ObservabilityConfig {
     /// `json` or `pretty`.
     pub log_format: String,
     pub log_level: String,
+    /// The slowlog and the hot-key sampler. See [`IntrospectConfig`].
+    pub introspect: IntrospectConfig,
     /// Address for `/metrics`, `/health` and `/stats`. Empty — the default —
     /// serves none of them.
     ///
@@ -726,7 +728,55 @@ impl Default for ObservabilityConfig {
         Self {
             log_format: "pretty".into(),
             log_level: "info".into(),
+            introspect: IntrospectConfig::default(),
             admin_listen: String::new(),
+        }
+    }
+}
+
+/// What the slowlog records, and how finely hot keys are sampled.
+///
+/// Proposed in `docs/slowlog-proposal.md` §6. Both halves default **on**, which
+/// is a departure from `listing_enabled` and `auth.required`: those are off
+/// because they expose data or change who may connect, where these expose
+/// counters and — until the listing gate is opened — digests. An observability
+/// feature that defaults to off is one that is not running when the incident
+/// starts.
+///
+/// Without the `introspect` cargo feature every field here is inert. The
+/// settings are still parsed and still validated, so a configuration file does
+/// not become invalid by moving between builds.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IntrospectConfig {
+    /// Requests at or above this many microseconds are recorded. `0` disables
+    /// recording.
+    ///
+    /// 10,000 matches Redis's own default, which is a number operators already
+    /// have intuitions about, and is some two hundred times this server's `GET`
+    /// median. There is deliberately no "record everything" setting: that is
+    /// what the latency histogram is for.
+    pub slowlog_threshold_us: u64,
+    /// How many entries the ring holds before it evicts its oldest.
+    pub slowlog_max_len: usize,
+    pub hotkeys_enabled: bool,
+    /// One request in this many is sampled. Rounded up to a power of two so the
+    /// test on the request path is a mask rather than a division.
+    pub hotkeys_sample_rate: u64,
+    /// Counters in each per-thread summary. Bounds both the memory and the
+    /// sensitivity: a summary of `m` is guaranteed to hold anything above
+    /// `1/m` of its thread's sampled stream.
+    pub hotkeys_counters: usize,
+}
+
+impl Default for IntrospectConfig {
+    fn default() -> Self {
+        Self {
+            slowlog_threshold_us: 10_000,
+            slowlog_max_len: 128,
+            hotkeys_enabled: true,
+            hotkeys_sample_rate: 128,
+            hotkeys_counters: 64,
         }
     }
 }

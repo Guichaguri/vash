@@ -1106,6 +1106,139 @@ this section and the argument for the feature flag staying a feature flag.
 
 ---
 
+## What the slowlog and the hot-key sampler cost
+
+Phase 0 of [slowlog-proposal.md](slowlog-proposal.md). Its §7 set four gates
+before any number existed, so they could not be moved afterwards. Three of them
+ran. **One of the three failed and changed the design; the other two turned out
+not to be measurable as written**, which is its own finding and the one worth
+reading first.
+
+Everything below is `--features introspect` against a build without it, on the
+same 12-core Windows 11 box as the rest of this file.
+
+### The end-to-end gates cannot resolve what they ask for
+
+Gates 1 and 2 ask for **≤1% throughput loss** on pipelined `GET` and `SET`. Six
+ABBA blocks each — `off, on, on, off`, so a linear drift cancels inside a block —
+five-second runs, 16 connections, pipeline 128, 64-byte values:
+
+| | off, median | on, median | paired deltas, per block |
+|---|---:|---:|---|
+| `GET` | 1,644,958 | 1,595,689 | −2.97, +6.34, −9.44, −2.52, −2.16, −0.72 % |
+| `SET` | 174,543 | 174,785 | +0.52, −6.78, −4.32, −0.11, **+14.52**, +1.10 % |
+
+Within a single arm the spread is 27.8% on `GET` and 37.8% on `SET`. That is the
+±25% this file has warned about throughout, and it is more than an order of
+magnitude coarser than the 1% the gate names.
+
+**The `SET` arm is the control, and it is what settles the matter.** The
+instrumentation cannot make writes faster. It nevertheless measured +14.5% in one
+block and +0.20% at the median. A harness that reports a 14% speed-up from a
+change that cannot produce one is not a harness that can rule on 1% — and a
+reader should be equally sceptical of the −2.34% median on the `GET` side, which
+is the same noise wearing a plausible sign.
+
+An earlier round made exactly that mistake. Ten alternating runs put `GET` at
+−2.4% and the change was treated as real; the raw series then showed both arms
+falling monotonically — 1.85M to 1.55M on `off`, 1.81M to 1.31M on `on` — across
+the ten runs. The measurement was thermal, not causal.
+
+### So the instrument is priced directly
+
+`cargo bench -p vash-bench --features introspect --bench hot_path`, which is
+where this project already prices per-request work, and where the noise floor is
+in nanoseconds rather than in hundreds of thousands of ops/s:
+
+| | median | what it is |
+|---|---:|---|
+| `observed_get` | **3.81 ns** | everything a `GET` pays, at shipping defaults |
+| `observed_get_sampling_off` | 2.61 ns | the slowlog's threshold compare alone |
+| `sampler`, rate 0 | 2.61 ns | sampling disabled — the floor |
+| `sampler`, rate 16 | 5.41 ns | |
+| `sampler`, rate 128 | 3.81 ns | the default |
+| `sampler`, rate 1024 | 3.71 ns | |
+
+So a request pays **3.81 ns**, of which about 1.2 ns is the hot-key sampler and
+the rest is the threshold compare and the call around it.
+
+Put beside the numbers this project already has: `hot_path` prices a RESP `GET`
+parse at 90.9 ns, and [performance-proposals.md](performance-proposals.md) §11
+dismissed optimising the parsers as "0.8% of one core" at 220,000 requests a
+second. The instrument is **4.2% of that parse**, or about 0.03% of one core at
+the same rate. That is the honest answer to gates 1 and 2, and it is two orders
+of magnitude inside what they were trying to protect.
+
+### Gate 3 failed, and the ring buffer changed
+
+Gate 3 sets `slowlog_threshold_us = 1` so that **every** request records, and
+asks that the tail not move. One binary against itself, two servers, closed loop
+at 16 connections and 1 KiB values, four ABBA blocks.
+
+The proposal's §3.5 had argued for a single mutex on the grounds that "the lock
+is only ever taken by a request that already lost". True at the shipping
+threshold. Not true here:
+
+| | one shared ring | a ring per lane |
+|---|---:|---:|
+| ops/s | −3.8% | +3.6% |
+| p99 | **+16.0%** | −12.0% |
+| p99.9 | **+38.1%** | −26.0% |
+| per-block p99 | +24.0, +3.4, +4.2, +17.9 % | −6.3, −21.4, +8.0, −7.7 % |
+| every block the same sign | **yes** | no |
+
+The last row is the whole test, and it is the answer to the noise problem above:
+four blocks all moving the same way is a signal that a ±20% harness can still
+carry, where a median cannot. After the change the signs are mixed and the
+medians move the direction the instrument cannot cause, which is what "within
+noise" looks like.
+
+The remedy was the one §7 pre-committed: rings striped per thread and merged on
+read. They are indexed by the same lane allocator `metrics.rs` stripes its
+counters with, reusing the part that hands a lane back when its thread exits.
+`observed_get` was re-priced afterwards at 3.81 ns against 3.92 before, so the
+indirection is free.
+
+### Two things the first implementation got wrong
+
+Neither was caught by a benchmark.
+
+**A `RefCell` on the common path cost 45%.** The sampler first held its PRNG and
+its summary together in one `RefCell<Option<..>>`, so the borrow flag and the
+`Option` check were paid on every request rather than on every sample. Splitting
+the PRNG into a bare `Cell` and marking the admit path `#[cold]` took
+`observed_get` from **7.06 ns to 3.92 ns**.
+
+The decomposition is the interesting half. With sampling *disabled* — a path that
+returns before touching either thread-local — the same split moved 4.66 ns to
+2.52 ns. That is 2.1 of the 3.1 ns saved, on a path whose code did not change at
+all: it is `observe` no longer being inlined whole into its call sites. Only
+about 1 ns was the borrow flag. The `#[cold]` mattered more than the `Cell`.
+
+**Rings hung off thread-locals lose the entries that matter most.** The first
+per-thread version held each ring in a thread-local `Arc` with the log keeping a
+`Weak`. Writes execute on the blocking pool, and tokio retires an idle blocking
+thread after ten seconds — so the slow writes an operator is hunting are exactly
+the ones most likely to have vanished before anyone reads the log. A test asserting
+that an entry outlives its thread is what found it; the lane array is what fixed
+it. The same flaw was in the hot-key summaries and was fixed with it.
+
+A third, found by a test rather than measured: a `sample_rate` of `0` means
+*sample nothing*, and rounding it to a mask of `0` makes `rng & mask == 0` true
+for every request — the cheapest possible setting silently selecting the most
+expensive possible behaviour.
+
+### What phase 0 concludes
+
+- The instrument costs **3.81 ns a request**, which is 4% of one RESP parse.
+- **Gates 1 and 2 are not evaluable on this box** and are answered by the
+  micro-benchmark instead. The end-to-end runs bound the effect; they do not
+  measure it.
+- **Gate 3 failed as designed and has been fixed**, and it is the one gate whose
+  end-to-end form worked — because a contention regression shows up as four
+  blocks agreeing on a sign, where a 1% cost cannot show up at all.
+- Gate 4 belongs to phase 3, with the surface it validates.
+
 ## What to take from all of this
 
 **Reads are where vash now leads.** Closed loop with `resident_mode`, `GET` is

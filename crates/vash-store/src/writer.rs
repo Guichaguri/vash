@@ -39,7 +39,7 @@ struct WriteJob {
     /// **awaited**. A caller that blocks on the reply parks an OS thread for the
     /// whole queue wait, and measured on a four-core container that hand-off was
     /// most of what a write cost. See `docs/performance-proposals.md` §8.
-    reply: oneshot::Sender<Result<WriteOutcome>>,
+    reply: oneshot::Sender<(Result<WriteOutcome>, u64)>,
     /// When the caller handed this to the queue.
     ///
     /// The difference between this and the moment its transaction opens is the
@@ -47,6 +47,15 @@ struct WriteJob {
     /// and the number that says whether the writer is the bottleneck or merely
     /// downstream of one.
     queued: Instant,
+    /// How long that wait turned out to be, stamped when the batch carrying
+    /// this job opens its transaction.
+    ///
+    /// Held on the job rather than recomputed at each reply site, because
+    /// `queued.elapsed()` after the commit is the wait *plus* the apply and the
+    /// commit — a different and much larger number. Stamping it once, in the
+    /// same pass that already sums it for [`WriterMetrics::queue_wait_us`], is
+    /// what lets every reply carry the wait and only the wait.
+    waited_us: u64,
 }
 
 /// Counters describing how well group commit is working.
@@ -89,7 +98,7 @@ pub(crate) struct Writer {
 /// deliberately not `Drop`-safe in any clever way: dropping one without
 /// [`SetManyPending::wait`] simply abandons the reply, and the writer discovers
 /// that when its send fails.
-pub struct SetManyPending(oneshot::Receiver<Result<WriteOutcome>>);
+pub struct SetManyPending(oneshot::Receiver<(Result<WriteOutcome>, u64)>);
 
 impl SetManyPending {
     /// Blocks until this shard's batch has committed. Off a runtime worker
@@ -104,8 +113,58 @@ impl SetManyPending {
     /// and yield, instead of occupying a pool thread that does nothing but
     /// sleep until the commit lands.
     pub async fn wait_async(self) -> Result<Vec<u64>> {
-        let outcome = self.0.await.map_err(|_| StoreError::ShuttingDown)??;
-        Writer::set_many_reply(outcome)
+        let (outcome, waited_us) = self.0.await.map_err(|_| StoreError::ShuttingDown)?;
+        // Published before the `?`, so a batch that failed still reports what
+        // it waited: a write that queued for 40 ms and then hit a full map is
+        // exactly the case an operator needs the wait for.
+        queue_wait::publish(waited_us);
+        Writer::set_many_reply(outcome?)
+    }
+}
+
+/// The queue wait of the most recent write **completed on this thread**.
+///
+/// A thread-local rather than a return value, and that needs defending, because
+/// this codebase prefers explicit plumbing. The alternative is threading a
+/// second output through `Writer`'s twelve write methods, the `Store` trait
+/// above them and both of its implementations, to reach one consumer —
+/// `dispatch::execute`, which calls the store and returns without awaiting
+/// anything in between. The state really is per-thread-per-call, and making it
+/// so is a smaller and more truthful change than widening a seam that eleven
+/// other callers do not want widened.
+///
+/// The contract is narrow and [`take`] enforces the dangerous half of it:
+/// reading **clears**, so a command that submitted no write reads `0` rather
+/// than inheriting the wait of whatever this thread did last. A stale non-zero
+/// here would be charged to the wrong request.
+pub mod queue_wait {
+    #[cfg(feature = "introspect")]
+    thread_local! {
+        static LAST_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Records the wait a completed write reported. Called by the writer's
+    /// reply path, on the thread that submitted the write.
+    #[inline]
+    pub(crate) fn publish(_waited_us: u64) {
+        #[cfg(feature = "introspect")]
+        LAST_US.with(|cell| cell.set(_waited_us));
+    }
+
+    /// Reads and clears the wait of the last write completed on this thread.
+    ///
+    /// Valid only immediately after a synchronous store write returns, on the
+    /// thread that made it. Always `0` without the `introspect` feature.
+    #[inline]
+    pub fn take() -> u64 {
+        #[cfg(feature = "introspect")]
+        {
+            LAST_US.with(|cell| cell.replace(0))
+        }
+        #[cfg(not(feature = "introspect"))]
+        {
+            0
+        }
     }
 }
 
@@ -141,12 +200,13 @@ impl Writer {
     ///
     /// The receiver must be drained, or the writer's reply send fails and the
     /// job's work is discarded after it has already been applied.
-    fn send(&self, op: WriteOp) -> Result<oneshot::Receiver<Result<WriteOutcome>>> {
+    fn send(&self, op: WriteOp) -> Result<oneshot::Receiver<(Result<WriteOutcome>, u64)>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let job = WriteJob {
             op,
             reply: reply_tx,
             queued: Instant::now(),
+            waited_us: 0,
         };
 
         let tx = self.tx.as_ref().ok_or(StoreError::ShuttingDown)?;
@@ -167,10 +227,13 @@ impl Writer {
     /// a plain thread. Every caller of the synchronous `Store` write methods is
     /// on one; the async path uses [`SetManyPending::wait`] instead and parks
     /// nothing.
-    fn collect(reply: oneshot::Receiver<Result<WriteOutcome>>) -> Result<WriteOutcome> {
-        reply
+    fn collect(reply: oneshot::Receiver<(Result<WriteOutcome>, u64)>) -> Result<WriteOutcome> {
+        let (outcome, waited_us) = reply
             .blocking_recv()
-            .map_err(|_| StoreError::ShuttingDown)?
+            .map_err(|_| StoreError::ShuttingDown)?;
+        // Before the outcome is unwrapped, for the reason `wait_async` gives.
+        queue_wait::publish(waited_us);
+        outcome
     }
 
     /// Submits an operation and blocks until it has been committed.
@@ -486,11 +549,15 @@ fn commit_batch<B: Backend>(
 ) -> Result<()> {
     let batch_size = batch.len();
     let committed_items: usize = batch.iter().map(|job| job.op.item_count()).sum();
-    // Measured before the transaction opens, so it is the wait and nothing else.
-    let waited: u64 = batch
-        .iter()
-        .map(|job| job.queued.elapsed().as_micros().min(u64::MAX as u128) as u64)
-        .sum();
+    // Measured before the transaction opens, so it is the wait and nothing
+    // else. Stamped onto each job on the way past, so the reply can carry the
+    // per-job wait as well as the total: the total answers "is the writer the
+    // bottleneck", the per-job answers "was *this* request stuck behind it".
+    let mut waited: u64 = 0;
+    for job in batch.iter_mut() {
+        job.waited_us = job.queued.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        waited += job.waited_us;
+    }
     let started = Instant::now();
     let mut wtxn = match engine.write_txn() {
         Ok(txn) => txn,
@@ -499,7 +566,9 @@ fn commit_batch<B: Backend>(
             // left waiting.
             let message = e.to_string();
             for job in batch.drain(..) {
-                let _ = job.reply.send(Err(StoreError::Corrupt(message.clone())));
+                let _ = job
+                    .reply
+                    .send((Err(StoreError::Corrupt(message.clone())), job.waited_us));
             }
             return Err(e);
         }
@@ -529,7 +598,7 @@ fn commit_batch<B: Backend>(
     if let Some(err) = poisoned {
         drop(wtxn);
         for job in batch.drain(..) {
-            let _ = job.reply.send(Err(err.clone_shallow()));
+            let _ = job.reply.send((Err(err.clone_shallow()), job.waited_us));
         }
         return Err(err);
     }
@@ -597,7 +666,7 @@ fn commit_batch<B: Backend>(
                 );
             }
             for (job, outcome) in batch.drain(..).zip(outcomes) {
-                let _ = job.reply.send(outcome);
+                let _ = job.reply.send((outcome, job.waited_us));
             }
             if let Some(stats) = sweep_stats {
                 metrics.sweeps.fetch_add(1, Ordering::Relaxed);
@@ -649,10 +718,13 @@ fn commit_batch<B: Backend>(
             let err = e;
             let message = err.to_string();
             for job in batch.drain(..) {
-                let _ = job.reply.send(Err(match &err {
-                    StoreError::CapacityFull => StoreError::CapacityFull,
-                    _ => StoreError::Corrupt(message.clone()),
-                }));
+                let _ = job.reply.send((
+                    Err(match &err {
+                        StoreError::CapacityFull => StoreError::CapacityFull,
+                        _ => StoreError::Corrupt(message.clone()),
+                    }),
+                    job.waited_us,
+                ));
             }
             Err(err)
         }

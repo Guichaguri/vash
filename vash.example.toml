@@ -585,3 +585,53 @@ log_level = "info"      # overridden by RUST_LOG when set
 # /health returns 503 when a shard has reached critical pressure and is
 # refusing writes: the process is up, but it is not doing its job.
 admin_listen = ""      # e.g. "127.0.0.1:9090"
+
+# ---------------------------------------------------------------------------
+# What was slow, and which key is hot.
+#
+# Both need `--features introspect` to do anything; without it these settings
+# are parsed and validated but inert, so a config file stays valid across
+# builds. Designed in docs/slowlog-proposal.md and priced in
+# docs/benchmarks.md — 3.81 ns a request, which is 4% of what parsing one
+# costs.
+#
+# Unlike listing and auth, these default ON. Those two are off because they
+# expose data or change who may connect; these expose counters and, until
+# listing is enabled, key digests rather than key names. An observability
+# feature that defaults to off is one that is not running when the incident
+# starts.
+[observability.introspect]
+
+# Requests at or above this many microseconds are recorded, queue wait and
+# execution kept apart. 0 disables recording.
+#
+# There is no "record everything" setting: that is the latency histogram's job.
+# 10 ms matches Redis's default and is some two hundred times this server's GET
+# median.
+#
+# Lowering it during an incident is the intended use and is safe to do: the
+# rings are striped per thread, which is what gate 3 of the proposal forced
+# after a single shared ring moved closed-loop p99 by 16%.
+slowlog_threshold_us = 10000
+
+# Entries per thread-lane, not per server. The ceiling is this times the number
+# of threads that have actually recorded one — a few in practice, since a lane
+# is reused by whichever thread claims it next.
+slowlog_max_len = 128
+
+hotkeys_enabled = true
+
+# One request in this many is sampled. Rounded up to a power of two so the test
+# on the request path is a mask. 0 disables.
+#
+# A hot key is by definition one a uniform sample hits often, so this is not a
+# compromise: at 128 and a million reads a second, a key taking 1% of traffic
+# lands ~100 samples a second. Everything the sampler reports is an estimate
+# scaled by this number, and is named as one.
+hotkeys_sample_rate = 128
+
+# Counters in each per-thread summary, which bounds both memory and
+# sensitivity: a summary of m is guaranteed to hold anything above 1/m of its
+# thread's sampled stream. At 64 that is roughly 1.6% — enough to find the key
+# taking a third of the traffic, not the one taking half a percent.
+hotkeys_counters = 64

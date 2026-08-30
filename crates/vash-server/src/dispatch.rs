@@ -209,6 +209,12 @@ pub fn count_stored(
     if sets.is_empty() {
         return;
     }
+    // The batch published a queue wait that no `execute` will take. Phase 1
+    // turns this into one entry for the batch; until then it is discarded here
+    // so it cannot be charged to whatever this thread runs next. See
+    // docs/slowlog-proposal.md §3.4.
+    state.introspect.discard_queue_wait();
+
     let each = elapsed / sets.len() as u32;
     for (index, set) in sets.iter().enumerate() {
         state
@@ -336,10 +342,9 @@ pub fn execute_get_into(
     // the time it took.
     let started = std::time::Instant::now();
     let outcome = state.store.get_with(key, render);
-    state
-        .metrics
-        .commands
-        .observe(kind, dialect, started.elapsed());
+    let elapsed = started.elapsed();
+    state.metrics.commands.observe(kind, dialect, elapsed);
+    state.introspect.observed_get(key, kind, dialect, elapsed);
 
     let hit = outcome.map_err(to_failed)?;
     state.metrics.read(u64::from(hit), u64::from(!hit));
@@ -404,10 +409,12 @@ pub fn execute(
     // question of whether the writer is the bottleneck.
     let started = std::time::Instant::now();
     let outcome = execute_inner(state, command);
-    state
-        .metrics
-        .commands
-        .observe(CommandKind::of(command), dialect, started.elapsed());
+    let elapsed = started.elapsed();
+    let kind = CommandKind::of(command);
+    state.metrics.commands.observe(kind, dialect, elapsed);
+    // After the histogram, and taking the queue wait the store published for
+    // this thread — see `crate::introspect`.
+    state.introspect.observed(command, kind, dialect, elapsed);
 
     // Counted here, at the single point every command passes through, so the
     // numbers cannot drift apart from what was actually served.

@@ -647,3 +647,88 @@ impl ReadFixture {
         Self { store, _dir: dir }
     }
 }
+
+// ---- introspection ---------------------------------------------------------
+//
+// Phase 0 of docs/slowlog-proposal.md. The gates in §7 are stated end to end,
+// and phase 0 found that end to end cannot see them: pipelined `GET` on this
+// box drifts by more than 15% across ten consecutive runs, which is an order of
+// magnitude larger than the 1% being looked for. These price the same code
+// directly, where the noise floor is nanoseconds instead of hundreds of
+// thousands of ops/s.
+
+#[cfg(feature = "introspect")]
+mod introspect {
+    use vash_server::config::IntrospectConfig;
+    use vash_server::introspect::Introspect;
+    use vash_server::metrics::{CommandKind, Dialect};
+
+    /// What a `GET` pays for the whole instrument: the sampler's PRNG step and
+    /// the slowlog's threshold compare, at the settings that ship.
+    ///
+    /// **This is the number §7's gate 1 is really about.** Divided into the
+    /// per-request CPU budget at a million operations a second — roughly a
+    /// microsecond — it is the throughput percentage the feature costs.
+    #[divan::bench(sample_size = 1000)]
+    fn observed_get(bencher: divan::Bencher) {
+        let introspect = Introspect::new(&IntrospectConfig::default());
+        let key = vash_core::Key::new(b"user:1234:profile").unwrap();
+        let elapsed = std::time::Duration::from_micros(40);
+
+        bencher.bench(|| {
+            introspect.observed_get(
+                divan::black_box(key),
+                CommandKind::Get,
+                Dialect::Vcp,
+                divan::black_box(elapsed),
+            )
+        });
+    }
+
+    /// The same call with sampling off, which isolates the slowlog's compare
+    /// from the sampler. The difference between this and `observed_get` is what
+    /// the hot-key sampler costs, and nothing else.
+    #[divan::bench(sample_size = 1000)]
+    fn observed_get_sampling_off(bencher: divan::Bencher) {
+        let introspect = Introspect::new(&IntrospectConfig {
+            hotkeys_enabled: false,
+            ..IntrospectConfig::default()
+        });
+        let key = vash_core::Key::new(b"user:1234:profile").unwrap();
+        let elapsed = std::time::Duration::from_micros(40);
+
+        bencher.bench(|| {
+            introspect.observed_get(
+                divan::black_box(key),
+                CommandKind::Get,
+                Dialect::Vcp,
+                divan::black_box(elapsed),
+            )
+        });
+    }
+
+    /// The sampler alone, at the rate that ships. Amortised over the 127
+    /// requests it declines and the one it admits, which is the number a
+    /// request actually pays rather than either half of it.
+    #[divan::bench(args = [0, 16, 128, 1024], sample_size = 1000)]
+    fn sampler(bencher: divan::Bencher, rate: u64) {
+        let introspect = Introspect::new(&IntrospectConfig {
+            hotkeys_sample_rate: rate.max(1),
+            hotkeys_enabled: rate != 0,
+            // Never crosses, so this measures the sampler and not the ring.
+            slowlog_threshold_us: u64::MAX,
+            ..IntrospectConfig::default()
+        });
+        let key = vash_core::Key::new(b"user:1234:profile").unwrap();
+        let elapsed = std::time::Duration::from_micros(40);
+
+        bencher.bench(|| {
+            introspect.observed_get(
+                divan::black_box(key),
+                CommandKind::Get,
+                Dialect::Vcp,
+                divan::black_box(elapsed),
+            )
+        });
+    }
+}

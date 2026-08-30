@@ -11,6 +11,7 @@ pub mod config;
 pub mod conn;
 pub mod connections;
 pub mod dispatch;
+pub mod introspect;
 /// The memcached dialects. One of three siblings beside [`resp`] and [`vcp`],
 /// all of which meet at [`dispatch`].
 pub mod memcached;
@@ -244,6 +245,7 @@ impl Server {
                 max_blocking_threads: config.server.max_blocking_threads as u64,
                 read_buffer: config.server.read_buffer as u64,
             },
+            &config.observability.introspect,
         );
 
         info!(

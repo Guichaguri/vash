@@ -73,6 +73,7 @@ pub use engine::Pressure;
 pub use error::{Result, StoreError};
 pub use open::{StoreHandle, open};
 pub use store::{LmdbStore, VashStore};
+pub use writer::queue_wait;
 
 /// A [`Store::submit_set_many`] in flight.
 ///

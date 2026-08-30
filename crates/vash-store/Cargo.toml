@@ -36,6 +36,12 @@ testing = []
 # becomes a valid configuration; without it, that setting is refused at startup
 # rather than silently falling back. See `docs/mdbx-proposal.md`.
 mdbx = []
+# The per-job queue wait, published to the thread that submitted the write so
+# the server can charge it to one request. Off by default so a build exists to
+# measure the instrumented one against — see `docs/slowlog-proposal.md` §7. The
+# job carries its stamped wait either way; this feature is the thread-local
+# hand-off and nothing else.
+introspect = []
 
 [build-dependencies]
 # Compiles the vendored libmdbx, and only when the `mdbx` feature is on. The

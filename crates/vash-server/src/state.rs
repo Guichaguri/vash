@@ -51,6 +51,12 @@ pub struct ServerState {
     pub binding: Binding,
     /// Who is connected, for `stats conns`. See [`crate::connections`].
     pub connections: crate::connections::Registry,
+    /// What was slow and which key is hot. See [`crate::introspect`].
+    ///
+    /// Present whether or not the `introspect` feature is compiled in, so
+    /// dispatch has no `cfg` on its hot path — without the feature the type is
+    /// empty and its methods have no bodies.
+    pub introspect: crate::introspect::Introspect,
 }
 
 /// Where this node is listening, and the ceilings it is running under.
@@ -82,6 +88,11 @@ pub struct Binding {
 }
 
 impl ServerState {
+    // Eight, and they are eight independent things a server is assembled from
+    // rather than one thing with eight parts. A parameter struct here would
+    // exist only to satisfy the lint, and every caller would fill it in field
+    // by field at the call site this signature already is.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn Store>,
         info: ServerInfo,
@@ -90,6 +101,7 @@ impl ServerState {
         cluster: Arc<Cluster>,
         inline_reads: bool,
         binding: Binding,
+        introspect: &crate::config::IntrospectConfig,
     ) -> Arc<Self> {
         let write_permits = Arc::new(tokio::sync::Semaphore::new(
             binding.max_blocking_threads.max(1) as usize,
@@ -112,6 +124,7 @@ impl ServerState {
             started: std::time::Instant::now(),
             binding,
             connections: crate::connections::Registry::default(),
+            introspect: crate::introspect::Introspect::new(introspect),
         })
     }
 }

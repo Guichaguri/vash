@@ -1759,6 +1759,7 @@ dependencies = [
  "vash-core",
  "vash-proto",
  "vash-store",
+ "xxhash-rust",
 ]
 
 [[package]]

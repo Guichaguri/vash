@@ -43,6 +43,12 @@ vash-store.workspace = true
 xxhash-rust.workspace = true
 
 
+[features]
+# Compiles the slowlog and the hot-key sampler into the embedded server and
+# into `benches/hot_path.rs`, so phase 0 of docs/slowlog-proposal.md can price
+# them against the build without them.
+introspect = ["vash-server/introspect"]
+
 [[bench]]
 name = "hot_path"
 harness = false
