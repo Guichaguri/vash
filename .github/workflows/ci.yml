@@ -181,16 +181,24 @@ jobs:
           cargo build --release --bin vash-server --features vash-server/mdbx \
             --target x86_64-unknown-linux-musl
           ldd target/x86_64-unknown-linux-musl/release/vash-server 2>&1 \
-            | grep -q "not a dynamic executable" \
+            | grep -qE "not a dynamic executable|statically linked" \
             || { echo "the mdbx build is dynamically linked"; exit 1; }
           cargo build --release --bin vash-server --target x86_64-unknown-linux-musl
 
       # A "static" binary that turns out to be dynamically linked is a problem
       # discovered on the target machine, so it is asserted here instead.
+      #
+      # **Both spellings, because `ldd` has two.** The musl target builds a
+      # static *PIE*, and glibc's `ldd` answers "statically linked" for one of
+      # those, where it answers "not a dynamic executable" for a non-PIE static
+      # binary. Matching only the latter failed this job against a binary that
+      # `file` calls "static-pie linked" — the assertion was wrong, not the
+      # build.
       - name: Check the binary is actually static
         run: |
           file target/x86_64-unknown-linux-musl/release/vash-server
-          ldd target/x86_64-unknown-linux-musl/release/vash-server 2>&1 | grep -q "not a dynamic executable" \
+          ldd target/x86_64-unknown-linux-musl/release/vash-server 2>&1 \
+            | grep -qE "not a dynamic executable|statically linked" \
             || { echo "vash-server is dynamically linked"; exit 1; }
 
       - name: Check it runs and serves

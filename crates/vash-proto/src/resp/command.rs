@@ -1154,8 +1154,10 @@ fn at_least<'t, 'a>(
 }
 
 fn pairs<'a>(flat: &[&'a [u8]]) -> Vec<(&'a [u8], &'a [u8])> {
-    flat.chunks_exact(2)
-        .map(|pair| (pair[0], pair[1]))
+    flat.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[key, value]| (key, value))
         .collect()
 }
 
