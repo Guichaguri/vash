@@ -11,13 +11,15 @@ client against. Per-opcode implementation contract:
 [docs/opcodes.md](docs/opcodes.md). Design and rationale:
 [docs/plan.md](docs/plan.md). Original brief: [docs/project.md](docs/project.md).
 
-**Status: M6 complete — feature work done.** Speaks its own binary protocol, the
-memcached text and meta protocols, and a subset of Redis in RESP2 and RESP3, all
-on the same port. TTLs with background reclamation, group-committed writes across
+**Status: feature work done.** Speaks its own binary protocol, the memcached
+text and meta protocols, and a subset of Redis in RESP2 and RESP3, all on the
+same port. TTLs with background reclamation, group-committed writes across
 independent shards, constant-time tag invalidation that propagates across a
 cluster, capacity eviction, Prometheus metrics, continuous fuzzing of every
-parser, and a static binary you can ship. See [Performance](#performance) for
-what it does and what it does not.
+parser, and a static binary you can ship. Authentication, TLS and keyspace
+listing are built and off by default; a slowlog and a hot-key sampler are built
+behind a build feature. See [Performance](#performance) for what it does and
+what it does not.
 
 ## Quick start
 
@@ -49,6 +51,7 @@ Run with `--ephemeral` to start from an empty database, or
 | Sharding | Working — independent environments, one writer each |
 | Capacity watermarks and eviction | Working — TTL-ordered, never LRU |
 | Metrics and admin endpoints | Working — `/metrics`, `/health`, `/stats` |
+| Slowlog and hot keys | Working — `/slowlog`, `/hotkeys`, Redis's `SLOWLOG`, and needs `--features introspect`. Costs [~1.2 ns a request](docs/benchmarks.md#what-the-slowlog-and-the-hot-key-sampler-cost) |
 | Cluster tag invalidation | Working — fan-out plus anti-entropy, see [Clustering](#clustering) |
 | `LIST_KEYS`, `LIST_TAGS` | Working — administrative, cursor-paged, glob-filtered, **off unless enabled** |
 | Authentication | Working — credential table, all three dialects, **off unless enabled** |
@@ -348,6 +351,45 @@ working set), `vash_sweep_lag_ms` growing (reclamation is losing to expiry),
 `vash_cluster_last_exchange_age_ms` growing past a few gossip intervals, which
 means this node is drifting out of step with its peers.
 
+### What was slow, and which key is hot
+
+A histogram says the 99th percentile crossed 25 ms. It cannot say *which*
+request, against which key, from which client, or whether the time went into the
+shard queue or into the commit. Two more endpoints answer that, in a binary
+built with `--features introspect`:
+
+```bash
+curl -s localhost:9090/slowlog?count=20
+curl -s localhost:9090/hotkeys
+redis-cli -p 11311 SLOWLOG GET 10
+```
+
+**`/slowlog`** records every request past
+`observability.introspect.slowlog_threshold_us` — 10 ms by default, Redis's own
+— and each entry splits its time into `queue_us` and `exec_us`. That split is
+the reason this is not simply Redis's slowlog: on this server a write waits at a
+shard writer before it executes, so "the store is slow" and "the store is fine
+and the queue is 900 deep" are different diagnoses with different fixes, and one
+duration cannot tell them apart. Entries also name the connection, so a single
+misbehaving client is distinguishable from a server that is slow for everyone.
+
+**`/hotkeys`** ranks the keys taking the most traffic, sampled one request in
+128, and the tags being invalidated, counted exactly. Every key estimate is
+published with its own `relative_error`, because the top of that ranking is an
+order and the tail is a set — two rows whose estimates differ by less than the
+sum of their errors are not ordered by this instrument. It is off unless
+`protocol.listing_enabled` is set: a ranking of key names is enumeration by
+another name.
+
+Costs about 1.2 ns a request over a build without it, which is a little over 1%
+of what parsing one request costs.
+[docs/operations.md](docs/operations.md#what-was-slow-and-where-did-the-time-go)
+is the runbook from the alert to a verdict,
+[docs/benchmarks.md](docs/benchmarks.md#what-the-slowlog-and-the-hot-key-sampler-cost)
+has the measurements — including the gate that failed and rewrote the ring
+buffer, and the two that turned out not to be measurable on this box at all —
+and [docs/slowlog-proposal.md](docs/slowlog-proposal.md) has the design.
+
 ## Memcached compatibility
 
 All three protocols share one port. The dialect is settled by the connection's
@@ -461,12 +503,13 @@ redis-cli -3 -p 11311 INCREX ratelimit:42 BYINT 1 UBOUND 100 EX 60 ENX
 Supported: `GET` `SET` `DEL` `UNLINK` `MSET` `MGET` `MSETEX` `SETTAGS`
 `MSETTAGS` `DELBYTAG` `EXISTS` `TYPE`
 `EXPIRE` `EXPIREAT` `PERSIST` `TTL` `APPEND` `INCR` `INCRBY` `DECR` `DECRBY`
-`INCRBYFLOAT` `INCREX` `SCAN` `INFO`, plus `HELLO`, `PING` and `QUIT` to
-negotiate and keep a connection. `TYPE` answers `string` or `none` — every value
+`INCRBYFLOAT` `INCREX` `SCAN` `INFO` `SLOWLOG`, plus `HELLO`, `PING` and `QUIT`
+to negotiate and keep a connection. `TYPE` answers `string` or `none` — every value
 here is a string. `SET` takes `NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`;
 `EXPIRE` and `EXPIREAT` take `NX`/`XX`/`GT`/`LT`; `INCREX` takes its full option
-set. Anything else answers `unknown command`, which is how a client library
-discovers a feature is missing.
+set. `SLOWLOG` takes `GET`/`LEN`/`RESET`/`HELP` and needs `--features
+introspect`. Anything else answers `unknown command`, which is how a client
+library discovers a feature is missing.
 
 The last three are **tags**, which Redis has no equivalent of: `SETTAGS` is
 `SET` and `MSETTAGS` is `MSETEX`, each with a counted tag list before the usual

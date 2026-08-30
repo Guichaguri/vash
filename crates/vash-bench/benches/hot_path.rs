@@ -660,6 +660,7 @@ impl ReadFixture {
 #[cfg(feature = "introspect")]
 mod introspect {
     use vash_server::config::IntrospectConfig;
+    use vash_server::dispatch::Origin;
     use vash_server::introspect::Introspect;
     use vash_server::metrics::{CommandKind, Dialect};
 
@@ -679,7 +680,7 @@ mod introspect {
             introspect.observed_get(
                 divan::black_box(key),
                 CommandKind::Get,
-                Dialect::Vcp,
+                Origin::internal(Dialect::Vcp),
                 divan::black_box(elapsed),
             )
         });
@@ -701,7 +702,7 @@ mod introspect {
             introspect.observed_get(
                 divan::black_box(key),
                 CommandKind::Get,
-                Dialect::Vcp,
+                Origin::internal(Dialect::Vcp),
                 divan::black_box(elapsed),
             )
         });
@@ -726,7 +727,7 @@ mod introspect {
             introspect.observed_get(
                 divan::black_box(key),
                 CommandKind::Get,
-                Dialect::Vcp,
+                Origin::internal(Dialect::Vcp),
                 divan::black_box(elapsed),
             )
         });

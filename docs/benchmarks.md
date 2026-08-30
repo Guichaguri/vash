@@ -1162,6 +1162,14 @@ in nanoseconds rather than in hundreds of thousands of ops/s:
 So a request pays **3.81 ns**, of which about 1.2 ns is the hot-key sampler and
 the rest is the threshold compare and the call around it.
 
+Re-measured after the later phases, and unchanged: 3.45 ns against a 2.25 ns
+floor, where phase 0 read 3.81 against 2.61. The whole board moved by the same
+0.36 ns, so the instrument still costs 1.2 ns over a build that does nothing —
+which is the number to carry, being the only one that does not move with the
+box. It also settles the one thing that looked expensive in the later work:
+widening the dialect argument into an `Origin` carrying the connection put a
+48-byte value on the hot path and cost nothing measurable.
+
 Put beside the numbers this project already has: `hot_path` prices a RESP `GET`
 parse at 90.9 ns, and [performance-proposals.md](performance-proposals.md) §11
 dismissed optimising the parsers as "0.8% of one core" at 220,000 requests a
