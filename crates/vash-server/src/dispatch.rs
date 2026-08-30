@@ -344,6 +344,53 @@ pub fn execute_get_into(
     Ok(hit)
 }
 
+/// [`execute_get_into`] over a batch: **renders every key straight out of the
+/// map, in request order.**
+///
+/// The multi-key half of the same trade. `dispatch::execute` answers a
+/// `GetMany` with `Reply::Values`, which copies every hit out of the memory map
+/// into a `Value` and allocates a vector to hold them — the two costs
+/// `execute_get_into` was built to remove for a single key, still being paid by
+/// every `MGET` and every memcached `get` naming more than one. Measured, that
+/// is 21–35% per key. See `docs/performance-proposals.md` §18.
+///
+/// `render` is called once per key, in order, with `None` for a miss. **It must
+/// not block or call back into the store**: a read transaction per shard is open
+/// for the whole batch.
+///
+/// The counting is `execute`'s, reproduced for the same reason
+/// [`execute_get_into`] reproduces it — one `commands` observation for the
+/// command, and one `read` carrying the batch's hits and misses.
+/// `OutcomeMetrics::observe` has no `Command::GetMany` arm to reproduce, which
+/// `metrics::tests::observe_has_nothing_to_say_about_a_get` keeps true.
+pub fn execute_get_many_into(
+    state: &ServerState,
+    keys: &[vash_core::Key<'_>],
+    kind: CommandKind,
+    dialect: Dialect,
+    render: &mut dyn FnMut(usize, Option<vash_core::ValueRef<'_>>),
+) -> Result<(), Failed> {
+    let mut hits = 0u64;
+
+    let started = std::time::Instant::now();
+    let outcome = state.store.get_many_with(keys, &mut |index, value| {
+        hits += u64::from(value.is_some());
+        render(index, value);
+    });
+    state
+        .metrics
+        .commands
+        .observe(kind, dialect, started.elapsed());
+
+    // Counted before the error is propagated, exactly as `execute_get_into`
+    // does: a read that failed still took the time it took. The hit split is
+    // only counted for a batch that finished, because a partial one has not
+    // decided about the keys it never reached.
+    outcome.map_err(to_failed)?;
+    state.metrics.read(hits, keys.len() as u64 - hits);
+    Ok(())
+}
+
 pub fn execute(
     state: &ServerState,
     command: &Command<'_>,

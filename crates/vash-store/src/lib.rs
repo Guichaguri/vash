@@ -298,6 +298,28 @@ pub trait Store: Send + Sync + 'static {
     /// Resolves many keys against a single consistent snapshot.
     fn get_many(&self, keys: &[Key<'_>]) -> Result<Vec<Option<Value>>>;
 
+    /// [`Store::get_with`] over a batch: **renders every key in request order,
+    /// straight out of the map.**
+    ///
+    /// `render` is called exactly once per key, in the order the keys were
+    /// given, with `None` for one that is absent or not live — so a caller can
+    /// append to its reply buffer as it goes and needs no vector of its own.
+    /// `index` is that key's position, passed rather than counted so a caller
+    /// cannot drift out of step with the order this promises.
+    ///
+    /// The same restriction [`Store::get_with`] carries applies, and applies for
+    /// longer: **`render` must not block or call back into the store**, because
+    /// a read transaction per shard is open for the whole batch.
+    ///
+    /// Exists because `get_many` copies every hit into a `Value` and allocates a
+    /// vector to hold them, which the single-key path stopped doing long ago.
+    /// See `docs/performance-proposals.md` §18.
+    fn get_many_with(
+        &self,
+        keys: &[Key<'_>],
+        render: &mut dyn FnMut(usize, Option<ValueRef<'_>>),
+    ) -> Result<()>;
+
     /// A live key's expiry deadline in unix milliseconds, **without copying its
     /// value**.
     ///

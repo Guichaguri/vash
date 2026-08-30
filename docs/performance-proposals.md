@@ -1473,68 +1473,92 @@ the obvious next one.
 
 ---
 
-## 18. A multi-key read never got the fused path, and it is the larger half of one
+## 18. Implemented: a multi-key read is fused too
 
-**Status: proposed. The prize is already measured by a bench in the tree.**
+**Status: shipped for both text dialects. 2× on a multi-get, which is twice what
+the proposal costed — and the reason the estimate was low is worth more than the
+number.**
 
 `execute_get_into` exists because building a `Value` costs a copy out of the
 memory map and a heap allocation on every hit, and the encoder then copies the
-same bytes a second time into the write buffer. `hot_path.rs` measures it, the
-single-key RESP `GET` takes it, and — since the fix recorded in `memcached.rs` —
-so does a memcached `get` naming one key.
+same bytes a second time into the write buffer. The single-key RESP `GET` took
+that path, and so did a memcached `get` naming one key. **A genuine multi-key
+read did not**: `Command::GetMany` went to `Store::get_many`, which returns
+`Vec<Option<Value>>`, and the renderer then walked that vector copying each
+`value.data` into `out`.
 
-**A genuine multi-key read still does not.** `Command::GetMany` goes to
-`Store::get_many`, which returns `Vec<Option<Value>>`, and `render` then walks
-that vector copying each `value.data` into `out`. Two copies and one allocation
-per hit key, against one copy and none for the same key read on its own.
+### The objection in the code, and why it did not hold
 
-### What it costs
-
-Medians, all three from `hot_path.rs`. `read_batch_of_one_then_encode` is the
-`get_many` path and `read_encode_in_txn` is the fused one:
-
-| value | `get_many` path | fused path | saving |
-|---|---:|---:|---:|
-| 64 B | 356.6 ns | 270.9 ns | **24%** |
-| 1 KiB | 419.6 ns | 272.0 ns | **35%** |
-| 4 KiB | 494.5 ns | 324.4 ns | **34%** |
-| 16 KiB | 1102 ns | 870.8 ns | **21%** |
-
-**These are the floor.** That fixture is single-shard, so it takes
-`read_batch`'s single-shard shortcut and pays none of the scatter-gather. A
-multi-shard `MGET` additionally allocates `vec![T::default(); keys.len()]`, the
-grouping buffer, and a `Vec<Key>` per shard group.
-
-### The objection in the code, and why it does not hold
-
-`memcached.rs` states it plainly: a multi-key `get` "cannot" fuse, because "its
+`memcached.rs` stated it plainly: a multi-key `get` "cannot" fuse, because "its
 keys are grouped by shard before they are read, so the values come back out of
 request order, and putting them back in order is what the `Vec` this avoids is
 for."
 
-That is true of the current loop, not of the problem. **Invert it.** Open one
-read transaction per shard — two to four of them — hold them for the batch, then
-walk the keys in **request order**, routing each to its shard's already-open
-transaction and rendering it inline. Order is preserved by construction, so
-nothing is reordered, no result vector exists, and no `Value` is ever built.
+True of the loop, not of the problem. `Store::get_many_with` inverts it: one
+`BatchReader` per shard, opened lazily and held for the batch, and then the
+**keys walked in request order**, each routed to its shard's already-open
+transaction and rendered inline. The order holds by construction, so nothing is
+reordered, no result vector exists, and no `Value` is ever built.
 
-The consistency guarantee is unchanged: each shard still opens exactly one
-transaction for the call, which is what "one snapshot per batch" already means
-in a sharded store — the shards never shared a snapshot to begin with.
+The consistency guarantee is unchanged. Each shard still opens exactly one
+transaction for the call, which is what "one snapshot per batch" always meant in
+a sharded store — the shards never shared a snapshot to begin with.
 
-### What it costs, stated plainly
+### Measured
+
+Four shards, 1 KiB values, both arms in one run:
+
+| keys | `get_many` + encode | `get_many_with` | saving |
+|---|---:|---:|---:|
+| 2 | 1.248 µs | **623.2 ns** | **50%** |
+| 16 | 6.065 µs | **3.112 µs** | **49%** |
+| 100 | 37.05 µs | **18.37 µs** | **50%** |
+
+A flat **2×**, or 370.5 ns per key down to 183.7 ns.
+
+**The proposal predicted 21–35% and this is 50%**, because the proposal costed it
+with the wrong fixture. It reasoned from `read_batch_of_one_then_encode` against
+`read_encode_in_txn`, both of which run against a *single-shard* store — so they
+measured the copy and the `Value` allocation, and nothing of the scatter-gather.
+The proposal even said so, calling its own numbers "the floor" and listing the
+three further allocations a multi-shard batch makes. It was right that they were
+a floor and wrong about how far above them the answer sat. A bench that
+approximates the shape of the thing measures the part it shares with it, and
+silently drops the rest.
+
+### What it costs, and the two tests that pay for it
 
 `read.rs` opens with a warning that a long-lived read transaction pins a version
 and stops the writer reusing freed pages. This holds *shard_count* transactions
-instead of one, for the length of one batch. That is a real change and it is the
-thing to argue about — but the risk that warning describes is the listing scan,
-bounded by `listing_max_scan`, not a multiget bounded by `MAX_BATCH_ITEMS` reads
-of a resident map. `oldest_reader_age_ms` already exists to say if that
-judgement is wrong.
+instead of one, for the length of one batch. That is the real trade, and the
+judgement is that the warning is about a listing scan bounded by
+`listing_max_scan`, not a multiget bounded by `MAX_BATCH_ITEMS` lookups against a
+resident map. `oldest_reader_age_ms` exists to say if that is ever wrong.
 
-**Acceptance criterion**: a `read_batch_of_many_then_encode` bench beside the
-three that exist, landing within noise of `read_encode_in_txn` times the key
-count.
+The order is now load-bearing in a way it was not. `get_many` collects and
+reorders afterwards; `get_many_with` renders as it goes, so a version that
+visited keys in shard order would emit a reply with the values silently
+transposed and there is no vector left to catch it.
+`a_rendered_batch_arrives_in_request_order_across_shards` interleaves hits and
+misses across eight shards and asserts both the index and the value at every
+position; `rendering_a_batch_agrees_with_collecting_one` pins the two paths
+against each other at one shard and four, so `MGET` and `GET_MANY` cannot start
+disagreeing about the same keys.
+
+### VCP is not fused, and it is not an oversight
+
+`GET_MANY` over VCP still builds a `Reply::Values`. The obstacle is structural
+rather than incidental: **a VCP frame header carries the length of its body**, so
+the body cannot be streamed into the write buffer before its total size is
+known. The encoder already sizes the payload in one pass and fills it in a
+second, which is why the comment there says the payload copy "is the only one
+that happens".
+
+There is still something available — building that body through
+`get_many_with` rather than through a `Vec<Option<Value>>` would drop the
+per-hit allocation and one of the two copies — but it is a different change with
+a different shape, and it does not remove the second copy the way it does for a
+text dialect. Recorded rather than done.
 
 ---
 
@@ -1731,7 +1755,7 @@ Ordered by measured prize over effort, against a `GET` whose storage work is
 |---|---|---|---|
 | §17 framing-only measure | ~80 ns per RESP command — **measured at 24, see §17** | medium | low — fatal errors are provably framing-only |
 | §19 striped counters | 41.8 -> 5.7 ns per command, and the anti-scaling term is gone | small | low — one writer per lane, pinned by tests |
-| §18 fused multi-key read | 21–35% per key of a multiget | medium | the one real trade: *shard_count* readers open for a batch |
+| §18 fused multi-key read | 21–35% per key of a multiget — **measured at 50%, see §18** | medium | the one real trade: *shard_count* readers open for a batch |
 | §20 both small ones | a few ns each | trivial | none — **wrong, see §20** |
 
 **Measure them with `resident_mode` on.** `store.resident_mode` and

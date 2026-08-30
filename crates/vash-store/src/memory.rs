@@ -234,6 +234,30 @@ impl Store for MemoryStore {
             .collect())
     }
 
+    fn get_many_with(
+        &self,
+        keys: &[Key<'_>],
+        render: &mut dyn FnMut(usize, Option<ValueRef<'_>>),
+    ) -> Result<()> {
+        // One lock for the batch, which is this store's equivalent of the one
+        // transaction per shard the real one holds — and the same guarantee:
+        // every key judged against one snapshot, rendered in request order.
+        let now = self.clock.now_ms();
+        let inner = self.lock()?;
+        for (index, key) in keys.iter().enumerate() {
+            render(
+                index,
+                inner.live(key.as_bytes(), now).map(|entry| ValueRef {
+                    data: &entry.value,
+                    mc_flags: entry.mc_flags,
+                    cas: entry.cas,
+                    expires_at_ms: Some(entry.expires_at_ms),
+                }),
+            );
+        }
+        Ok(())
+    }
+
     fn deadline(&self, key: Key<'_>) -> Result<Option<u64>> {
         let now = self.clock.now_ms();
         let inner = self.lock()?;

@@ -107,6 +107,26 @@ impl<B: Backend> Engine<B> {
         })
     }
 
+    /// Opens the reader a batch reuses for every key that lands on this shard.
+    ///
+    /// **The half of [`Engine::get_with`] that a sharded batch needs.**
+    /// `get_with` opens a transaction, reads one key and drops it, which is
+    /// right for a single `GET` and wrong for a hundred-key `MGET`: the batch
+    /// wants the transaction open across all of its keys, so that the values can
+    /// be rendered straight out of the map in *request* order rather than
+    /// collected into a `Vec<Option<Value>>` and put back in order afterwards.
+    /// See `docs/performance-proposals.md` §18.
+    pub fn batch_reader(&self) -> Result<BatchReader<'_, B>> {
+        let txn = self.read_txn()?;
+        let at = self.snapshot(&txn);
+        Ok(BatchReader {
+            engine: self,
+            txn,
+            tags: LazyTags::new(&self.tags),
+            at,
+        })
+    }
+
     /// Resolves a whole batch inside one read transaction, so every key in a
     /// `GET_MANY` sees the same consistent snapshot — and under at most one tag
     /// registry lock rather than one per key. At most, because a batch in which
@@ -176,6 +196,56 @@ impl<B: Backend> Engine<B> {
             now_ms: txn.opened_at_ms(),
             epoch: self.epoch(),
         }
+    }
+}
+
+/// One shard's open read transaction, reused across the keys of a batch that
+/// land on it.
+///
+/// Holds the three things a read needs and a batch should only establish once:
+/// the transaction, the snapshot it is judged against, and the tag registry
+/// lock — still taken lazily, so a batch touching no tagged record takes none.
+///
+/// **This is a reader held open across several keys**, which `read.rs` opens by
+/// warning against. The warning is about *long-lived* readers pinning a version
+/// and starving page reuse — a listing scan, bounded by `listing_max_scan`. A
+/// batch is bounded by `MAX_BATCH_ITEMS` lookups against a map that is usually
+/// resident, and `oldest_reader_age_ms` is what says so if that judgement is
+/// ever wrong.
+pub struct BatchReader<'e, B: Backend> {
+    engine: &'e Engine<B>,
+    txn: TrackedTxn<'e, B>,
+    tags: LazyTags<'e>,
+    at: Snapshot,
+}
+
+impl<B: Backend> BatchReader<'_, B> {
+    /// Runs `project` against a live record without copying its value, exactly
+    /// as [`Engine::get_with`] does — but on a transaction that outlives the
+    /// call, so the next key in the batch reuses it.
+    ///
+    /// `None` means the key is absent or not live. The caller renders that in
+    /// its own dialect, which is the same division of labour `get_with` already
+    /// has.
+    pub fn get_with<R>(
+        &mut self,
+        key: Key<'_>,
+        project: impl FnOnce(ValueRef<'_>) -> R,
+    ) -> Result<Option<R>> {
+        self.engine.read_alive(
+            &self.txn,
+            &mut self.tags,
+            self.at,
+            key.as_bytes(),
+            |record| {
+                project(ValueRef {
+                    data: record.value,
+                    mc_flags: record.mc_flags(),
+                    cas: record.cas(),
+                    expires_at_ms: Some(record.expires_at_ms()),
+                })
+            },
+        )
     }
 }
 

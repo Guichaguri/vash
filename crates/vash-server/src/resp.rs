@@ -724,6 +724,33 @@ fn run(
             Ok(())
         }
 
+        // The batch form of the arm above, and it steps around `Reply` for the
+        // same reason: `Reply::Values` copies every hit out of the map into a
+        // `Value` and allocates a vector to hold them, where this appends each
+        // one straight into the reply buffer. The array header has to be written
+        // before the first value, which is what makes the request-order
+        // guarantee `get_many_with` gives load-bearing rather than convenient.
+        Command::MGet { keys } => {
+            let keys = keys_of(keys.iter().copied())?;
+            // Read out of the `&mut` before the closure borrows `out`, because
+            // a miss renders differently in the two RESP versions and the
+            // closure needs to know which.
+            let negotiated = *version;
+            encode::array(out, keys.len());
+            crate::dispatch::execute_get_many_into(
+                state,
+                &keys,
+                crate::metrics::CommandKind::GetMany,
+                crate::metrics::Dialect::Resp,
+                &mut |_, value| match value {
+                    Some(value) => encode::bulk(out, value.data),
+                    None => encode::null(out, negotiated),
+                },
+            )
+            .map_err(resp_error)?;
+            Ok(())
+        }
+
         // Everything past this point touches storage, so it goes through the
         // shared boundary: translated into a `vash_core::Command`, executed by
         // `dispatch::execute` — which is where it gets counted and where its

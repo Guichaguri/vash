@@ -470,6 +470,97 @@ fn read_encode_in_txn(bencher: divan::Bencher, value_len: usize) {
     });
 }
 
+/// **What a multi-get costs today.** `get_many` copies every hit out of the map
+/// into a `Value`, allocates a vector to hold them, and the caller then copies
+/// each one again into the reply buffer.
+#[divan::bench(args = [2, 16, 100], sample_size = 200)]
+fn read_batch_of_many_then_encode(bencher: divan::Bencher, keys: usize) {
+    let store = BatchFixture::new(keys);
+    let lookups = store.keys();
+
+    let mut out = Vec::with_capacity(keys * (BatchFixture::VALUE_LEN + 64));
+    bencher.bench_local(|| {
+        out.clear();
+        let values = vash_store::Store::get_many(&store.store, divan::black_box(&lookups)).unwrap();
+        for value in values.into_iter().flatten() {
+            out.extend_from_slice(&value.data);
+        }
+        divan::black_box(out.len())
+    });
+}
+
+/// The same batch through `get_many_with`: one reader per shard, keys walked in
+/// request order, every value appended straight out of the map. No `Value`, no
+/// result vector, no second copy. This is §18.
+#[divan::bench(args = [2, 16, 100], sample_size = 200)]
+fn read_batch_of_many_in_txn(bencher: divan::Bencher, keys: usize) {
+    let store = BatchFixture::new(keys);
+    let lookups = store.keys();
+
+    let mut out = Vec::with_capacity(keys * (BatchFixture::VALUE_LEN + 64));
+    bencher.bench_local(|| {
+        out.clear();
+        vash_store::Store::get_many_with(&store.store, divan::black_box(&lookups), &mut |_, v| {
+            if let Some(value) = v {
+                out.extend_from_slice(value.data);
+            }
+        })
+        .unwrap();
+        divan::black_box(out.len())
+    });
+}
+
+/// A populated multi-shard environment, which is the shape the fused path has to
+/// earn its keep in: four shards means four readers held for one batch, and the
+/// grouping allocations the old path made are proportional to that.
+struct BatchFixture {
+    store: vash_store::LmdbStore,
+    names: Vec<String>,
+    _dir: tempfile::TempDir,
+}
+
+impl BatchFixture {
+    const VALUE_LEN: usize = 1024;
+
+    fn new(keys: usize) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config = vash_store::StoreConfig {
+            path: dir.path().join("db"),
+            map_size: 256 * 1024 * 1024,
+            shards: 4,
+            ..vash_store::StoreConfig::default()
+        };
+        let store = vash_store::LmdbStore::open(&config).unwrap();
+        let names: Vec<String> = (0..keys).map(|i| format!("user:{i}:profile")).collect();
+        let value = vec![b'x'; Self::VALUE_LEN];
+        let sets: Vec<vash_core::Set<'_>> = names
+            .iter()
+            .map(|name| vash_core::Set {
+                key: vash_core::Key::new(name.as_bytes()).unwrap(),
+                value: &value,
+                ttl: vash_core::TtlChange::Set(0),
+                return_previous: false,
+                mc_flags: 0,
+                tags: Vec::new(),
+                mode: vash_core::SetMode::Set,
+            })
+            .collect();
+        vash_store::Store::set_many(&store, &sets).unwrap();
+        Self {
+            store,
+            names,
+            _dir: dir,
+        }
+    }
+
+    fn keys(&self) -> Vec<vash_core::Key<'_>> {
+        self.names
+            .iter()
+            .map(|name| vash_core::Key::new(name.as_bytes()).unwrap())
+            .collect()
+    }
+}
+
 /// One populated single-shard environment, kept alive with its directory.
 struct ReadFixture {
     store: vash_store::LmdbStore,

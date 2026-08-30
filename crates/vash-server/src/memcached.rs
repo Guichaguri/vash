@@ -274,36 +274,44 @@ pub fn execute_memcached(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // A plain `get` or `gets` naming exactly one key. That is what every
-    // memcached client library sends for a single-key read — `pymemcache`'s
-    // `get`, `libmemcached`'s `memcached_get` — so it is the most executed
-    // command this server has, and it was on the copying path purely because
-    // the *grammar* admits more than one key.
+    // A plain `get` or `gets`, naming any number of keys. A single-key read is
+    // what every memcached client library sends — `pymemcache`'s `get`,
+    // `libmemcached`'s `memcached_get` — so it is the most executed command this
+    // server has, and a multi-get is what every library sends the moment an
+    // application asks for two things at once.
     //
-    // Only the one-key case fuses. A genuine multi-key `get` cannot: its keys
-    // are grouped by shard before they are read, so the values come back out of
-    // request order, and putting them back in order is what the `Vec` this
-    // avoids is for.
+    // **Both fuse now.** This used to be one key only, on the grounds that a
+    // multi-key `get` groups its keys by shard before reading them, so the
+    // values come back out of request order — and putting them back in order was
+    // what the `Vec` this avoids was for. That was true of the loop, not of the
+    // problem: `Store::get_many_with` walks the keys in request order and routes
+    // each to its shard's already-open reader, so the order holds by
+    // construction and nothing is collected. See §18.
     //
     // `GetAndTouch` shares this response style and must not come through here —
     // it writes. Matching the command rather than the style is what excludes
     // it, exactly as it is for `mg` below.
     if let vash_proto::memcached::encode::ResponseStyle::Retrieval { with_cas } = parsed.style
         && let Command::GetMany(keys) = &parsed.command
-        && let [key] = keys.as_slice()
         && !parsed.noreply
     {
-        let rendered = execute_get_into(
+        let keys = keys.as_slice();
+        let rendered = crate::dispatch::execute_get_many_into(
             state,
-            *key,
+            keys,
             CommandKind::GetMany,
             Dialect::Memcached,
-            &mut |value| mc::encode_value_line(out, with_cas, key.as_bytes(), value),
+            // A miss writes no `VALUE` line at all — memcached omits misses
+            // rather than reporting them — which is why this dialect needs the
+            // index only to name the key it is answering.
+            &mut |index, value| {
+                if let Some(value) = value {
+                    mc::encode_value_line(out, with_cas, keys[index].as_bytes(), value);
+                }
+            },
         );
         match rendered {
-            // A miss writes no `VALUE` line at all — memcached omits misses
-            // rather than reporting them — so both outcomes end the same way.
-            Ok(_) => out.extend_from_slice(mc::RETRIEVAL_END),
+            Ok(()) => out.extend_from_slice(mc::RETRIEVAL_END),
             Err(failed) => mc::encode_error(out, memcached_error(failed.status)),
         }
         return Closing::No;

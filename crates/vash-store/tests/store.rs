@@ -1315,6 +1315,125 @@ fn batches_are_reassembled_into_request_order_across_shards() {
     }
 }
 
+/// **The order `get_many_with` promises is the whole of why it can be fused.**
+///
+/// `get_many` collects into a vector and puts the shards' results back in order
+/// afterwards; `get_many_with` renders as it goes, so if it ever visited keys in
+/// shard order instead of request order a caller would emit a reply with the
+/// values silently transposed. There is no vector left to catch that, so this is
+/// the test that does.
+#[test]
+fn a_rendered_batch_arrives_in_request_order_across_shards() {
+    let h = Harness::with(|c| c.shards = 8);
+
+    let keys: Vec<String> = (0..64).map(|i| format!("rkey{i}")).collect();
+    let sets: Vec<Set<'_>> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| Set {
+            key: Key::new(key.as_bytes()).unwrap(),
+            value: if i % 3 == 0 { b"a" } else { b"b" },
+            ttl: vash_core::TtlChange::Set(0),
+            return_previous: false,
+            mc_flags: 0,
+            tags: Vec::new(),
+            mode: vash_core::SetMode::Set,
+        })
+        .collect();
+    h.store().set_many(&sets).unwrap();
+
+    let lookups: Vec<Key<'_>> = keys
+        .iter()
+        .map(|k| Key::new(k.as_bytes()).unwrap())
+        .collect();
+    // Hits and misses interleaved, so a transposition cannot hide behind a
+    // uniform answer.
+    let doomed: Vec<Key<'_>> = lookups.iter().step_by(2).copied().collect();
+    assert!(
+        h.store()
+            .delete_many(&doomed)
+            .unwrap()
+            .iter()
+            .all(|hit| *hit)
+    );
+
+    let mut seen: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+    h.store()
+        .get_many_with(&lookups, &mut |index, value| {
+            seen.push((index, value.map(|v| v.data.to_vec())));
+        })
+        .unwrap();
+
+    assert_eq!(seen.len(), lookups.len(), "one render per key, hit or miss");
+    for (position, (index, value)) in seen.iter().enumerate() {
+        assert_eq!(
+            *index, position,
+            "keys were rendered out of request order at {position}"
+        );
+        if position % 2 == 0 {
+            assert!(value.is_none(), "rkey{position} was deleted");
+        } else {
+            let expected: &[u8] = if position % 3 == 0 { b"a" } else { b"b" };
+            assert_eq!(
+                value.as_deref(),
+                Some(expected),
+                "rkey{position} came back in the wrong slot"
+            );
+        }
+    }
+}
+
+/// The rendered path and the collecting one must answer identically, or `MGET`
+/// and `GET_MANY` would disagree about the same keys depending on which dialect
+/// asked.
+#[test]
+fn rendering_a_batch_agrees_with_collecting_one() {
+    for shards in [1usize, 4] {
+        let h = Harness::with(move |c| c.shards = shards);
+
+        let present: Vec<String> = (0..20).map(|i| format!("both{shards}-{i}")).collect();
+        let sets: Vec<Set<'_>> = present
+            .iter()
+            .map(|key| Set {
+                key: Key::new(key.as_bytes()).unwrap(),
+                value: key.as_bytes(),
+                ttl: vash_core::TtlChange::Set(0),
+                return_previous: false,
+                mc_flags: 0,
+                tags: Vec::new(),
+                mode: vash_core::SetMode::Set,
+            })
+            .collect();
+        h.store().set_many(&sets).unwrap();
+
+        // Half present, half never written, interleaved.
+        let absent: Vec<String> = (0..20).map(|i| format!("gone{shards}-{i}")).collect();
+        let mut names: Vec<&String> = Vec::new();
+        for i in 0..20 {
+            names.push(&present[i]);
+            names.push(&absent[i]);
+        }
+        let lookups: Vec<Key<'_>> = names
+            .iter()
+            .map(|k| Key::new(k.as_bytes()).unwrap())
+            .collect();
+
+        let collected = h.store().get_many(&lookups).unwrap();
+        let mut rendered: Vec<Option<Vec<u8>>> = Vec::new();
+        h.store()
+            .get_many_with(&lookups, &mut |_, value| {
+                rendered.push(value.map(|v| v.data.to_vec()));
+            })
+            .unwrap();
+
+        let collected: Vec<Option<Vec<u8>>> = collected
+            .into_iter()
+            .map(|value| value.map(|v| v.data.to_vec()))
+            .collect();
+        assert_eq!(rendered, collected, "across {shards} shard(s)");
+    }
+}
+
 #[test]
 fn a_batch_smaller_than_the_shard_count_still_lands_in_order() {
     // The test above uses more keys than shards, so every shard has work and the

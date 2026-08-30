@@ -206,6 +206,50 @@ impl<B: Backend> Store for VashStore<B> {
         self.read_batch(keys, Engine::get_many)
     }
 
+    fn get_many_with(
+        &self,
+        keys: &[Key<'_>],
+        render: &mut dyn FnMut(usize, Option<ValueRef<'_>>),
+    ) -> Result<()> {
+        // **The loop is inverted against `read_batch`, and that is the point.**
+        // Grouping by shard first is what forced the results out of request
+        // order, and putting them back is what the `Vec<Option<Value>>` — and
+        // the copy of every value into it — existed for. Walking the keys in
+        // request order and routing each to its shard's already-open reader
+        // keeps the order by construction, so nothing is collected and nothing
+        // is reordered. See `docs/performance-proposals.md` §18.
+        //
+        // Each shard still opens exactly one transaction for the call, which is
+        // what "one snapshot per batch" already meant here: the shards never
+        // shared a snapshot to begin with.
+        if let [only] = self.shards.all() {
+            let mut reader = only.engine.batch_reader()?;
+            for (index, key) in keys.iter().enumerate() {
+                if reader.get_with(*key, |value| render(index, Some(value)))?.is_none() {
+                    render(index, None);
+                }
+            }
+            return Ok(());
+        }
+
+        // Opened lazily, so a batch that touches two of four shards opens two
+        // transactions rather than four — and a reader is never opened for a
+        // shard no key in this batch lands on.
+        let mut readers: Vec<Option<crate::read::BatchReader<'_, B>>> =
+            (0..self.shards.len()).map(|_| None).collect();
+        for (index, key) in keys.iter().enumerate() {
+            let shard = self.shards.index_of(key.as_bytes());
+            let reader = match &mut readers[shard] {
+                Some(open) => open,
+                slot => slot.insert(self.shards.all()[shard].engine.batch_reader()?),
+            };
+            if reader.get_with(*key, |value| render(index, Some(value)))?.is_none() {
+                render(index, None);
+            }
+        }
+        Ok(())
+    }
+
     fn deadline(&self, key: Key<'_>) -> Result<Option<u64>> {
         self.shards.for_key(key.as_bytes()).engine.deadline(key)
     }
