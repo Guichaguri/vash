@@ -13,7 +13,28 @@ use super::{ErrorReply, Parsed, ProtocolError};
 /// Longest verb this server recognises, rounded up. Used to upper-case a
 /// command name into a fixed buffer so the dispatch stays one `match` and
 /// allocates nothing.
-const MAX_VERB_LEN: usize = 16;
+///
+/// Public because `vash_server::resp::classify` upper-cases a verb the same way
+/// for the measuring pass, and a second copy of this number is a second thing to
+/// keep in step. See [`upper_verb`].
+pub const MAX_VERB_LEN: usize = 16;
+
+/// Upper-cases a command name into `buffer` for dispatch.
+///
+/// ASCII, and short: this keeps a verb match a single `match` over byte-string
+/// literals without allocating. **A name too long to be any verb we know comes
+/// back empty**, which falls through to the unknown-command arm rather than
+/// truncating into a verb it is not.
+#[inline]
+pub fn upper_verb<'b>(raw: &[u8], buffer: &'b mut [u8; MAX_VERB_LEN]) -> &'b [u8] {
+    if raw.len() > MAX_VERB_LEN {
+        return &[];
+    }
+    let upper = &mut buffer[..raw.len()];
+    upper.copy_from_slice(raw);
+    upper.make_ascii_uppercase();
+    upper
+}
 
 #[derive(Debug)]
 pub enum Command<'a> {
@@ -267,18 +288,8 @@ pub fn parse_command<'a>(
     let raw_verb = args[0]; // the framing layer rejects an empty array
     let fail = |reply: ErrorReply<'a>| ProtocolError::Recoverable { reply, consumed };
 
-    // ASCII, and short: upper-casing into a fixed buffer keeps the dispatch a
-    // single `match` without allocating. A name too long to be any verb we know
-    // falls through to the unknown-command arm.
     let mut buffer = [0u8; MAX_VERB_LEN];
-    let verb: &[u8] = if raw_verb.len() <= MAX_VERB_LEN {
-        let upper = &mut buffer[..raw_verb.len()];
-        upper.copy_from_slice(raw_verb);
-        upper.make_ascii_uppercase();
-        upper
-    } else {
-        &[]
-    };
+    let verb = upper_verb(raw_verb, &mut buffer);
 
     let command = match verb {
         b"HELLO" => {

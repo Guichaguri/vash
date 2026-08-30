@@ -1365,77 +1365,111 @@ are about.
 
 ---
 
-## 17. The measuring pass parses every command in full, and throws it away
+## 17. Implemented: the measuring pass no longer parses
 
-**Status: proposed, and the fatal-error argument that makes it safe is checked.**
+**Status: shipped. The prize was overestimated by a factor of three, and the
+first attempt made one case slower.**
 
-`conn::drain` walks a block twice. `measure_resp` calls `vash_proto::resp::parse`
-to find where each command ends, and then `resp::execute_block` calls the very
+`conn::drain` walks a block twice. `measure_resp` called `vash_proto::resp::parse`
+to find where each command ends, and then `resp::execute_block` called the very
 same `parse` on the very same bytes to run them. The second parse is
-unavoidable — `conn.rs` already explains why, at length: `measure` reads a
-`&BytesMut`, and `split_to` invalidates every borrow it produced. The *first*
-one is the problem, because of how much it does for what it is asked.
+unavoidable — `conn.rs` explains why at length: `measure` reads a `&BytesMut`,
+and `split_to` invalidates every borrow it produced. The *first* one was the
+problem, because of how much it did for what it was asked.
 
 `resp::parse` walks the multibulk framing and then calls `parse_command`, which
-upper-cases the verb into a fixed buffer, dispatches a `match` over
-twenty-eight verbs, validates arity, parses expiry integers, and — for `MGET`,
-`DEL`, `UNLINK`, `MSET`, `EXISTS` and `DELBYTAG` — **allocates a `Vec` of the
-key slices**.
-`measure_resp` uses exactly two things out of all that: `parsed.consumed`, and a
-three-way tag from `inline_safe` / `batchable_write`.
+upper-cases the verb, dispatches a `match` over twenty-eight verbs, validates
+arity, parses expiry integers, and — for `MGET`, `DEL`, `UNLINK`, `MSET`,
+`EXISTS` and `DELBYTAG` — allocates a `Vec` of the key slices. `measure_resp`
+used exactly two things out of all that: `parsed.consumed`, and a three-way tag.
 
-### What it costs
+### What shipped
 
-| | median |
-|---|---:|
-| `resp_parse_get` | **86.6 ns** |
-| `resp_parse_set` | **204.2 ns** |
-| `memcached_parse_get` | 46.4 ns |
-| `memcached_parse_set` | 235.6 ns |
-| `vcp_peek_frame_len` | **5.2 ns** |
+`resp::frame` is the framing walk, and both `parse` and the new `resp::peek`
+run it. `peek` hands the argument slices to a classifier and stops;
+`vash_server::resp::classify` answers from the verb bytes, and for `SET` from a
+scan of its option tokens, which is what `batchable_write` needs.
 
-The last row is the point. **VCP already does this correctly**: `measure_vcp`
-reads a length header, and `is_read_only_frame` classifies from the opcode byte
-alone without decoding a body. It spends 5.2 ns where RESP spends 86.6 ns to
-answer the same two questions.
+Three things fell out that were not in the proposal:
 
-Against the 272 ns that a whole 1 KiB storage read and encode costs, a RESP
-`GET` spends **86.6 ns on a parse whose result is discarded** — 32% of the
-storage work again, for nothing. Both parses together are 173 ns, or 64% of the
-storage work, and half of that is avoidable.
+- **`Fatal` is now its own type.** The proposal's safety argument was that every
+  fatal error in this dialect is a framing error, so a framing-only walk sees
+  the same set a full parse would. That was true and was checked by reading the
+  source. It is now in the signature: `frame`, `read_header` and `read_bulk`
+  return `Result<_, Fatal>`, and `parse_command` cannot construct one.
+  `framing_cleanly_means_never_fatal` pins the property from the outside as
+  well, over arbitrary argument bytes.
+- **The classifier is pinned against the judgement it replaces.**
+  `the_wire_classifier_agrees_with_the_parsed_one` walks every verb the dialect
+  recognises, every `SET` option, and both cases, asserting the cheap answer and
+  the real one match *exactly* — not merely conservatively, because a classifier
+  that fell back to `Other` too eagerly would cost a hop to the blocking pool
+  and nothing would notice.
+- **A malformed command now lands in the run its verb names.** `GET a b` is
+  measured as a read, where it used to be measured as an error. That is
+  harmless — the executor parses it, meets the arity error and renders it in
+  place, never reaching storage — and `a_malformed_read_stays_in_the_read_run`
+  says so out loud, because "a read run may hold something that is not a read"
+  reads as a bug otherwise.
 
-### What it would take
+### Measured, and the proposal was wrong about the size
 
-Split `parse` in two. The framing walk — read `*N`, then `N` `$len` bulks, sum
-the bytes — already exists as the first half of `parse`; expose it as a mode
-that returns `consumed` plus the argument slices, without calling
-`parse_command`. `measure_resp` then classifies from the verb bytes directly.
+Both arms in one run, because this host drifts about 15% between runs — every
+figure below moved against the numbers in §17's original table, `record_parse`
+and `vcp_peek_frame_len` included, and only a within-run comparison means
+anything.
 
-For most commands that is a `match` on the verb and nothing else: `GET`, `MGET`,
-`EXISTS`, `TYPE`, `TTL`, `PING`, `HELLO`, `AUTH`, `QUIT` and `INFO` are `Reads`;
-everything unrecognised is `Other`. **`SET` is the one that still needs its
-options read**, because `batchable_write` asks about `NX`/`XX`, `GET` and tags —
-so the win there is smaller: it skips the expiry parsing, the validation and the
-error construction, not the option scan.
+| | `parse` (before) | `peek` (after) | saving |
+|---|---:|---:|---:|
+| `GET` | 90.2 ns | **66.7 ns** | 23.5 ns, 26% |
+| `SET key value EX 300` | 206.1 ns | **138.6 ns** | 67.5 ns, 33% |
+| `MGET`, 2 keys | 174.3 ns | **127.4 ns** | 46.9 ns, 27% |
+| `MGET`, 16 keys | 610.1 ns | **565.4 ns** | 44.7 ns, 7% |
+| `MGET`, 100 keys | 2.605 µs | **2.536 µs** | 69 ns, 3% |
 
-### Why this is safe, and it is the one thing worth checking
+**The proposal claimed ~80 ns per RESP command and delivered ~24 ns on a `GET`.**
+It assumed the whole 86.6 ns of `resp_parse_get` was `parse_command`'s to lose.
+It was not: the framing walk is about 67 ns of it and both passes pay that. What
+`parse_command` actually costs is the 24 ns difference.
 
-Making the measuring pass framing-only means `parse_command`'s errors are no
-longer seen during measurement. That is fine for `Recoverable` — an arity error
-becomes an `Other` run, and the executor renders it in the position it occupied,
-exactly as it does today. It would **not** be fine for `Fatal`, which closes the
-connection and must still be caught before a block is dispatched.
+The same error is visible in the proposal's parting line — *"the bar to clear is
+`vcp_peek_frame_len`"*, at 5.2 ns. That bar was never reachable. VCP reads one
+length header for a whole frame; RESP has to walk a `*` header and then a `$`
+header and payload per argument, with a `memchr` and an integer parse each. The
+dialects are not doing the same amount of work, and comparing them as though
+they were is what produced the 16× figure in the first place.
 
-It is caught. `ProtocolError::Fatal` is constructed in **seven places, all of
-them in `resp/mod.rs`** — `invalid multibulk length`, `invalid bulk length`,
-the `\r\n` terminator check, and the header-length guards — and in **none** in
-`command.rs`. Every fatal error in this dialect is a framing error by
-construction, so a framing-only walk sees precisely the set it sees today. That
-property is currently incidental; it should become a test.
+The `MGET` rows show the same thing from the other end: the more arguments a
+command has, the more of its cost is framing that both passes share, so the
+saving is flat in nanoseconds and shrinking in proportion.
 
-**Acceptance criterion**: `resp_parse_get` gains a measuring-mode sibling bench
-that lands near `vcp_peek_frame_len`, and the RESP integration suite is
-unchanged.
+### The first attempt made a hundred-key `MGET` slower
+
+Worth recording because it did not look like a performance change at all.
+`frame` first *returned* the arguments — `Result<Option<(Args, usize)>, Fatal>` —
+which reads as the obvious factoring. [`Args`] is an inline array of eight
+slices, 136 bytes, so that moved 136 bytes out of `frame` on every command, for
+`parse` and `peek` alike. Measured, `MGET` with 100 keys took **2.741 µs to
+measure against 2.409 µs to fully parse**: the pass that does strictly less work
+was 14% slower.
+
+`frame` now takes a closure and hands the arguments to it, so `Args` stays on
+its own stack and is never moved by either caller. That is what the table above
+measures, and it is also why `parse` did not regress.
+
+### What is left, and it is now the larger half
+
+The framing walk itself is ~67 ns for a two-argument `GET`, and `read_header`
+is most of it: a `memchr` for the newline, then `str::from_utf8`, then
+`str::parse::<i64>()` — three headers' worth for a `GET`, for numbers that are
+almost always one to four digits. A hand-rolled small-integer parse would cut
+both `parse` and `peek`, which is to say the whole RESP surface rather than only
+the measuring pass.
+
+**Not taken here**, because it is a change to the parser every client's bytes go
+through, with its own error-compatibility surface (`invalid multibulk length` is
+a wire-visible string), and this section was scoped to the measuring pass. It is
+the obvious next one.
 
 ---
 
@@ -1657,7 +1691,7 @@ Ordered by measured prize over effort, against a `GET` whose storage work is
 
 | | prize | effort | risk |
 |---|---|---|---|
-| §17 framing-only measure | ~80 ns per RESP command | medium | low — fatal errors are provably framing-only |
+| §17 framing-only measure | ~80 ns per RESP command — **measured at 24, see §17** | medium | low — fatal errors are provably framing-only |
 | §19(a) per-block counters | ~35 ns per command, and removes an anti-scaling term | small | low, but the flush must not be lost on a closing block |
 | §18 fused multi-key read | 21–35% per key of a multiget | medium | the one real trade: *shard_count* readers open for a batch |
 | §20 both small ones | a few ns each | trivial | none — **wrong, see §20** |

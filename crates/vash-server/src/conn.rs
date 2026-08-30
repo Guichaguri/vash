@@ -333,7 +333,7 @@ struct Measured {
 /// throughput, and a 25% write workload ran slower than a 100% write one, which
 /// nothing but this explains. See `docs/performance-proposals.md` §14.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunKind {
+pub(crate) enum RunKind {
     /// Answerable without touching the writer, so it may run on this worker
     /// when `inline_reads` is on.
     Reads,
@@ -757,29 +757,40 @@ fn measure_memcached(buf: &[u8], runs: &mut Vec<Run>) -> Measured {
     measured
 }
 
+/// Measures RESP commands from their multibulk framing, **without decoding
+/// one**.
+///
+/// This used to run the whole of `resp::parse` — `parse_command` included — over
+/// a block it was only measuring, and every byte of that block is then parsed
+/// again by `resp::execute_block`. Measured, that throwaway parse was 86.6 ns
+/// per `GET` against the 272 ns a whole storage read and encode costs, and it
+/// allocated a `Vec` of key slices for each of the variadic commands. It now
+/// does what `measure_vcp` above has always done: find the boundary, classify
+/// from the verb, and leave the meaning to the executor. See
+/// `docs/performance-proposals.md` §17.
+///
+/// A recoverable error no longer has an arm of its own. It does not need one:
+/// `classify` answers `Other` for anything it does not recognise, the executor
+/// meets the error where it always did, and both walks agree on `consumed` —
+/// which `peek_and_parse_agree_on_the_boundary` pins.
 fn measure_resp(buf: &[u8], runs: &mut Vec<Run>) -> Measured {
     use vash_proto::resp;
 
     let mut measured = Measured::default();
     loop {
-        match resp::parse(&buf[measured.complete..]) {
-            Ok(resp::Outcome::Incomplete) => break,
-            Ok(resp::Outcome::Command(parsed)) => {
-                let kind = if crate::resp::inline_safe(&parsed.command) {
-                    RunKind::Reads
-                } else if crate::resp::batchable_write(&parsed.command) {
-                    RunKind::Writes
-                } else {
-                    RunKind::Other
-                };
-                Run::extend(runs, kind, parsed.consumed);
-                measured.complete += parsed.consumed;
-            }
-            Err(resp::ProtocolError::Recoverable { consumed, .. }) => {
-                Run::extend(runs, RunKind::Other, consumed);
+        match resp::peek(&buf[measured.complete..], crate::resp::classify) {
+            Ok(resp::Framed::Incomplete) => break,
+            Ok(resp::Framed::Command {
+                classified,
+                consumed,
+            }) => {
+                Run::extend(runs, classified, consumed);
                 measured.complete += consumed;
             }
-            Err(resp::ProtocolError::Fatal(detail)) => {
+            // Framing is the only thing this walk judges, and every framing
+            // error is fatal — which is what `resp::Fatal` being its own type
+            // says, rather than a comment saying it.
+            Err(resp::Fatal(detail)) => {
                 measured.fatal = Some(detail);
                 break;
             }

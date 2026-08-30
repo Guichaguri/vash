@@ -301,6 +301,72 @@ pub(crate) fn parse_writes(block: &[u8]) -> Option<crate::conn::WriteRun<'_>> {
     Some(run)
 }
 
+/// Which tier a RESP command belongs to, **decided from its wire form alone**.
+///
+/// What `conn::measure_resp` asks of every command in a block, and the reason
+/// that pass no longer decodes one. The two questions it used to ask —
+/// [`inline_safe`] and [`batchable_write`] — both take a `Command`, so asking
+/// them meant running `parse_command` over a block that `resp::execute_block`
+/// is about to parse again anyway. See `docs/performance-proposals.md` §17.
+///
+/// **Conservative in one direction only.** A verb this does not recognise, and
+/// any `SET` whose option tokens it cannot vouch for, answer [`RunKind::Other`]
+/// — which is the tier everything took before runs existed, so the cost of
+/// being wrong that way is a hop to the blocking pool. Being wrong the other
+/// way would matter, and cannot happen: `Reads` is a closed list of verbs whose
+/// every parse is [`inline_safe`], and `Writes` requires a `SET` with none of
+/// the three tokens that could disqualify it.
+///
+/// A malformed command still lands in whichever run its verb names — `GET a b`
+/// is measured as a read — and that is harmless: the executor parses it, meets
+/// the arity error, and renders it in the position it occupied. It never
+/// reaches storage.
+///
+/// `the_wire_classifier_agrees_with_the_parsed_one` pins this against the two
+/// functions it replaces, verb by verb.
+pub(crate) fn classify(args: &[&[u8]]) -> crate::conn::RunKind {
+    use crate::conn::RunKind;
+
+    let Some(raw_verb) = args.first() else {
+        return RunKind::Other;
+    };
+    let mut buffer = [0u8; vash_proto::resp::command::MAX_VERB_LEN];
+    let verb = vash_proto::resp::command::upper_verb(raw_verb, &mut buffer);
+
+    match verb {
+        // Exactly the variants `inline_safe` names, by the verbs that produce
+        // them. `SCAN` and `DELBYTAG` are absent for the reasons recorded there.
+        b"GET" | b"MGET" | b"EXISTS" | b"TYPE" | b"TTL" | b"PING" | b"HELLO" | b"AUTH"
+        | b"QUIT" | b"INFO" => RunKind::Reads,
+
+        // `SETTAGS` is deliberately not here: it carries tags, which is the one
+        // thing `dispatch::awaitable` refuses beyond `batchable`.
+        b"SET" if plainly_batchable(args) => RunKind::Writes,
+
+        _ => RunKind::Other,
+    }
+}
+
+/// Whether a `SET`'s option tokens leave it unconditional, untagged, and silent
+/// about what it displaced — the three things [`batchable_write`] asks of the
+/// parsed form.
+///
+/// **Only the option tokens are scanned.** The value is `args[2]` and is never
+/// looked at, so a value that happens to spell `GET` cannot disqualify the write
+/// carrying it. Everything that could change any of the three answers is a
+/// token in `args[3..]`: `NX` and `XX` set the condition, `GET` asks for the
+/// previous value, and tags arrive only under a different verb.
+fn plainly_batchable(args: &[&[u8]]) -> bool {
+    // `SET key value` at minimum; anything shorter is an arity error, and
+    // rendering that is the executor's job.
+    args.len() >= 3
+        && !args[3..].iter().any(|token| {
+            token.eq_ignore_ascii_case(b"NX")
+                || token.eq_ignore_ascii_case(b"XX")
+                || token.eq_ignore_ascii_case(b"GET")
+        })
+}
+
 /// Whether a command can be answered without any chance of writing.
 ///
 /// Note what is missing: every arithmetic command rewrites its key, and so does
@@ -1539,6 +1605,149 @@ mod tests {
             saw_batchable,
             "the fixture no longer contains a plain SET, so this proves nothing"
         );
+    }
+
+    /// Renders tokens as a RESP multibulk command, so the wire classifier can be
+    /// asked the same question the connection asks it.
+    fn wire(tokens: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", tokens.len()).into_bytes();
+        for token in tokens {
+            out.extend_from_slice(format!("${}\r\n", token.len()).as_bytes());
+            out.extend_from_slice(token);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    /// **The wire classifier agrees with the parsed one, verb by verb.**
+    ///
+    /// `classify` decides a command's tier from its verb and, for `SET`, its
+    /// option tokens — never from a decoded `Command`. That is what lets
+    /// `measure_resp` walk a block without parsing it (§17). The judgement it
+    /// replaces is the one written out longhand below, and this is what keeps
+    /// the two from drifting: for every command the dialect recognises, the
+    /// cheap answer and the real one must match exactly.
+    ///
+    /// Exactly, not conservatively. A `classify` that fell back to `Other` too
+    /// eagerly would cost a hop to the blocking pool and no test would notice,
+    /// which is precisely the kind of silent regression a §17 is written to
+    /// avoid.
+    #[test]
+    fn the_wire_classifier_agrees_with_the_parsed_one() {
+        use crate::conn::RunKind;
+
+        // What `measure_resp` used to do, kept here as the reference answer.
+        fn parsed_kind(input: &[u8]) -> RunKind {
+            match vash_proto::resp::parse(input) {
+                Ok(Outcome::Command(parsed)) => {
+                    if inline_safe(&parsed.command) {
+                        RunKind::Reads
+                    } else if batchable_write(&parsed.command) {
+                        RunKind::Writes
+                    } else {
+                        RunKind::Other
+                    }
+                }
+                _ => RunKind::Other,
+            }
+        }
+
+        let commands: &[&[&[u8]]] = &[
+            // One well-formed example of every verb the dialect recognises.
+            &[b"HELLO", b"3"],
+            &[b"AUTH", b"secret"],
+            &[b"PING"],
+            &[b"QUIT"],
+            &[b"GET", b"k"],
+            &[b"SET", b"k", b"v"],
+            &[b"SETTAGS", b"k", b"v", b"TAGS", b"1", b"news"],
+            &[b"DEL", b"k"],
+            &[b"UNLINK", b"k"],
+            &[b"MGET", b"a", b"b"],
+            &[b"MSET", b"a", b"1", b"b", b"2"],
+            &[b"MSETEX", b"300", b"a", b"1"],
+            &[b"MSETTAGS", b"300", b"TAGS", b"1", b"news", b"a", b"1"],
+            &[b"DELBYTAG", b"news"],
+            &[b"EXISTS", b"k"],
+            &[b"TYPE", b"k"],
+            &[b"APPEND", b"k", b"v"],
+            &[b"EXPIRE", b"k", b"60"],
+            &[b"EXPIREAT", b"k", b"99999999999"],
+            &[b"PERSIST", b"k"],
+            &[b"TTL", b"k"],
+            &[b"INCR", b"k"],
+            &[b"DECR", b"k"],
+            &[b"INCRBY", b"k", b"2"],
+            &[b"DECRBY", b"k", b"2"],
+            &[b"INCRBYFLOAT", b"k", b"1.5"],
+            &[b"SCAN", b"0"],
+            &[b"INFO"],
+            // The `SET` options, which are the whole of what `plainly_batchable`
+            // has to get right.
+            &[b"SET", b"k", b"v", b"EX", b"300"],
+            &[b"SET", b"k", b"v", b"PX", b"300"],
+            &[b"SET", b"k", b"v", b"KEEPTTL"],
+            &[b"SET", b"k", b"v", b"NX"],
+            &[b"SET", b"k", b"v", b"XX"],
+            &[b"SET", b"k", b"v", b"GET"],
+            &[b"SET", b"k", b"v", b"EX", b"300", b"XX", b"GET"],
+            // Lower and mixed case: the wire form a client actually sends.
+            &[b"get", b"k"],
+            &[b"set", b"k", b"v"],
+            &[b"Set", b"k", b"v", b"nx"],
+            // A value that spells an option must not disqualify its own write.
+            &[b"SET", b"k", b"GET"],
+            &[b"SET", b"k", b"NX"],
+            // Not ours.
+            &[b"LPUSH", b"k", b"v"],
+            &[b"AVERYLONGVERBINDEEDXX", b"k"],
+        ];
+
+        for tokens in commands {
+            let input = wire(tokens);
+            let Ok(vash_proto::resp::Framed::Command { classified, .. }) =
+                vash_proto::resp::peek(&input, classify)
+            else {
+                panic!("the framing walk did not settle {tokens:?}")
+            };
+            assert_eq!(
+                classified,
+                parsed_kind(&input),
+                "the wire classifier and the parsed one disagree about {tokens:?}"
+            );
+        }
+    }
+
+    /// A malformed command is measured by its verb, so it can land in a read run
+    /// — and that must stay harmless. It is: the executor parses it, meets the
+    /// arity error and renders it in place, without reaching storage.
+    ///
+    /// Asserted rather than assumed, because "a read run may contain something
+    /// that is not a read" is the sort of claim that reads as a bug later.
+    #[test]
+    fn a_malformed_read_stays_in_the_read_run() {
+        use crate::conn::RunKind;
+
+        for tokens in [
+            [b"GET".as_slice(), b"a", b"b"].as_slice(),
+            [b"GET".as_slice()].as_slice(),
+            [b"MGET".as_slice()].as_slice(),
+        ] {
+            let input = wire(tokens);
+            let Ok(vash_proto::resp::Framed::Command { classified, .. }) =
+                vash_proto::resp::peek(&input, classify)
+            else {
+                panic!("the framing walk did not settle {tokens:?}")
+            };
+            assert_eq!(classified, RunKind::Reads, "{tokens:?}");
+            assert!(
+                matches!(
+                    vash_proto::resp::parse(&input),
+                    Err(vash_proto::resp::ProtocolError::Recoverable { .. })
+                ),
+                "{tokens:?} should be a recoverable error, not something that runs"
+            );
+        }
     }
 
     /// The two commands answered in several steps do not reach `translate`, so

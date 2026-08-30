@@ -80,6 +80,28 @@ pub enum ProtocolError<'a> {
     Fatal(&'static str),
 }
 
+/// A framing error: the stream cannot be resynchronised.
+///
+/// **The only kind of error the framing walk can produce**, and a separate type
+/// so that guarantee lives in the signature of [`peek`] rather than in a comment
+/// beside it. `read_header`, `read_bulk` and `frame` return this;
+/// [`parse_command`] returns none of them, only [`ProtocolError::Recoverable`].
+///
+/// That asymmetry is what makes it safe for `conn::measure_resp` to walk a block
+/// without decoding it: a framing-only pass sees exactly the set of fatal errors
+/// a full parse would. `framing_cleanly_means_never_fatal` pins it as a
+/// property, because the day a fatal error appears in `command.rs` is the day
+/// the measuring pass starts letting a connection carry on past an
+/// unrecoverable stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fatal(pub &'static str);
+
+impl From<Fatal> for ProtocolError<'_> {
+    fn from(Fatal(detail): Fatal) -> Self {
+        Self::Fatal(detail)
+    }
+}
+
 /// An error line, kept as borrowed pieces so the parser still allocates
 /// nothing on the path a hostile client is most likely to exercise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,18 +135,85 @@ impl ErrorReply<'_> {
 /// no-op, and a client that sends one is waiting for the *next* command's
 /// reply, not for an error.
 pub fn parse(buf: &[u8]) -> Result<Outcome<'_>, ProtocolError<'_>> {
+    match frame(buf, parse_command)? {
+        None => Ok(Outcome::Incomplete),
+        Some(parsed) => parsed.map(Outcome::Command),
+    }
+}
+
+/// What [`peek`] found at the front of a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framed<T> {
+    /// More bytes are needed for a whole command.
+    Incomplete,
+    Command {
+        /// Whatever the caller's classifier made of the argument slices.
+        classified: T,
+        consumed: usize,
+    },
+}
+
+/// Walks one command's framing and hands its argument slices to `classify`,
+/// **without decoding the command**.
+///
+/// The half of [`parse`] that a caller needs when it only wants to know where a
+/// command ends and roughly what kind it is. `conn::measure_resp` is that
+/// caller: it walks a whole block to find the run boundaries, and everything it
+/// measures is then parsed *again* by `resp::execute_block`, because `split_to`
+/// invalidates every borrow the measuring pass produced. Running the full
+/// [`parse_command`] there — a verb upper-case, a match over twenty-eight verbs,
+/// arity validation, expiry parsing and, for the variadic commands, a `Vec` of
+/// the key slices — was 86.6 ns per `GET` spent on a result that is dropped.
+/// The VCP dialect has always done this correctly, at 5.2 ns. See
+/// `docs/performance-proposals.md` §17.
+///
+/// `classify` sees the arguments verb-first, exactly as [`parse_command`] does.
+/// It cannot fail: a buffer that frames correctly but means nothing is a
+/// *recoverable* error, and rendering that is the executor's job, in the
+/// position the bad command occupied. Only [`Fatal`] stops the walk, and by
+/// construction that is the only error this can meet.
+#[inline]
+pub fn peek<T>(buf: &[u8], classify: impl FnOnce(&[&[u8]]) -> T) -> Result<Framed<T>, Fatal> {
+    Ok(
+        match frame(buf, |args, consumed| Framed::Command {
+            classified: classify(args),
+            consumed,
+        })? {
+            None => Framed::Incomplete,
+            Some(framed) => framed,
+        },
+    )
+}
+
+/// The framing walk, shared so that [`parse`] and [`peek`] cannot disagree about
+/// where a command ends or which streams are unrecoverable.
+///
+/// `Ok(None)` means the terminator has not arrived. Empty arrays are skipped
+/// here rather than reported, which is why this loops.
+///
+/// **`with` is handed the arguments rather than the walk returning them**, and
+/// that is not a stylistic choice. [`Args`] is an inline array of eight slices —
+/// 136 bytes — so returning it moves that much out of this frame on every
+/// command, for both callers. Measured, doing exactly that made a hundred-key
+/// `MGET` *slower* to measure than it had been to parse. Kept on this stack, it
+/// is never moved at all.
+#[inline]
+fn frame<'a, R>(
+    buf: &'a [u8],
+    with: impl FnOnce(&[&'a [u8]], usize) -> R,
+) -> Result<Option<R>, Fatal> {
     let mut pos = 0;
 
     loop {
         let Some((count, after_header)) = read_header(buf, pos, b'*', "invalid multibulk length")?
         else {
-            return Ok(Outcome::Incomplete);
+            return Ok(None);
         };
 
         // A request is never null, and a negative count is how a desynchronised
         // stream usually presents itself.
         if count < 0 || count as u64 > MAX_ARGS as u64 {
-            return Err(ProtocolError::Fatal("invalid multibulk length"));
+            return Err(Fatal("invalid multibulk length"));
         }
 
         if count == 0 {
@@ -136,13 +225,13 @@ pub fn parse(buf: &[u8]) -> Result<Outcome<'_>, ProtocolError<'_>> {
         let mut cursor = after_header;
         for _ in 0..count {
             let Some((arg, next)) = read_bulk(buf, cursor)? else {
-                return Ok(Outcome::Incomplete);
+                return Ok(None);
             };
             args.push(arg);
             cursor = next;
         }
 
-        return parse_command(&args, cursor).map(Outcome::Command);
+        return Ok(Some(with(&args, cursor)));
     }
 }
 
@@ -230,19 +319,19 @@ fn read_header(
     pos: usize,
     prefix: u8,
     detail: &'static str,
-) -> Result<Option<(i64, usize)>, ProtocolError<'static>> {
+) -> Result<Option<(i64, usize)>, Fatal> {
     let Some(first) = buf.get(pos) else {
         return Ok(None);
     };
     if *first != prefix {
-        return Err(ProtocolError::Fatal(detail));
+        return Err(Fatal(detail));
     }
 
     let Some(newline) = memchr::memchr(b'\n', &buf[pos..]).map(|offset| pos + offset) else {
         // Bounded before the buffer can grow: a client that never terminates a
         // header would otherwise pin memory for free.
         if buf.len() - pos > MAX_HEADER_LEN {
-            return Err(ProtocolError::Fatal(detail));
+            return Err(Fatal(detail));
         }
         return Ok(None);
     };
@@ -253,14 +342,14 @@ fn read_header(
         newline
     };
 
-    let text = std::str::from_utf8(&buf[pos + 1..end]).map_err(|_| ProtocolError::Fatal(detail))?;
-    let value: i64 = text.parse().map_err(|_| ProtocolError::Fatal(detail))?;
+    let text = std::str::from_utf8(&buf[pos + 1..end]).map_err(|_| Fatal(detail))?;
+    let value: i64 = text.parse().map_err(|_| Fatal(detail))?;
 
     Ok(Some((value, newline + 1)))
 }
 
 /// Reads one `$<len>\r\n<bytes>\r\n` argument at `pos`.
-fn read_bulk(buf: &[u8], pos: usize) -> Result<Option<(&[u8], usize)>, ProtocolError<'static>> {
+fn read_bulk(buf: &[u8], pos: usize) -> Result<Option<(&[u8], usize)>, Fatal> {
     let Some((len, after_header)) = read_header(buf, pos, b'$', "invalid bulk length")? else {
         return Ok(None);
     };
@@ -268,7 +357,7 @@ fn read_bulk(buf: &[u8], pos: usize) -> Result<Option<(&[u8], usize)>, ProtocolE
     // Rejected before waiting for that many bytes to arrive, or a client could
     // pin a connection's buffer at will by announcing a huge argument.
     if len < 0 || len as u64 > MAX_BULK_LEN as u64 {
-        return Err(ProtocolError::Fatal("invalid bulk length"));
+        return Err(Fatal("invalid bulk length"));
     }
     let len = len as usize;
 
@@ -280,7 +369,7 @@ fn read_bulk(buf: &[u8], pos: usize) -> Result<Option<(&[u8], usize)>, ProtocolE
     // information — but checking it is what turns a desynchronised stream into
     // one clear error instead of a run of nonsense commands.
     if &buf[end..end + 2] != b"\r\n" {
-        return Err(ProtocolError::Fatal("expected '\\r\\n'"));
+        return Err(Fatal("expected '\\r\\n'"));
     }
 
     Ok(Some((&buf[after_header..end], end + 2)))
@@ -435,5 +524,91 @@ mod tests {
         };
         assert_eq!(reply, ErrorReply::UnknownCommand(b"LPUSH"));
         assert_eq!(consumed, input.len(), "the whole command must be consumed");
+    }
+
+    /// **The invariant [`peek`] rests on.** `conn::measure_resp` walks a block
+    /// with [`frame`] alone and lets the executor meet every recoverable error
+    /// later, in the position it occupied. That is only safe while a buffer that
+    /// frames cleanly can never turn out to be *fatally* malformed once its
+    /// meaning is read — because a fatal error closes the connection, and the
+    /// measuring pass would already have handed the block on.
+    ///
+    /// Stated as a property rather than as a review of [`parse_command`]:
+    /// whatever arguments a client sends, if the framing walk accepted them then
+    /// the full parse answers a command or a recoverable error, never a fatal
+    /// one.
+    #[test]
+    fn framing_cleanly_means_never_fatal() {
+        use proptest::prelude::*;
+
+        // Arbitrary argument bytes, the empty argument included, and bytes that
+        // look like framing — a `$` or a CRLF inside a payload is legal, since
+        // every argument is length-delimited.
+        let args =
+            proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..12), 1..6);
+
+        proptest!(|(args in args)| {
+            let mut input = format!("*{}\r\n", args.len()).into_bytes();
+            for arg in &args {
+                input.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+                input.extend_from_slice(arg);
+                input.extend_from_slice(b"\r\n");
+            }
+
+            // The premise: the framing walk accepted this buffer.
+            prop_assume!(matches!(frame(&input, |_, consumed| consumed), Ok(Some(_))));
+
+            prop_assert!(
+                !matches!(parse(&input), Err(ProtocolError::Fatal(_))),
+                "framing accepted {input:?} but the full parse called it fatal",
+            );
+        });
+    }
+
+    /// The two walks must also agree on *where* a command ends, or the measuring
+    /// pass would hand the executor a block cut in the wrong place.
+    #[test]
+    fn peek_and_parse_agree_on_the_boundary() {
+        for input in [
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n".as_slice(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            // Consumed whole even though it means nothing.
+            b"*2\r\n$5\r\nLPUSH\r\n$1\r\nk\r\n",
+            // An empty array is skipped by both rather than reported.
+            b"*0\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            // The start of a second command must not be counted into the first.
+            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n*2\r\n$3\r\nGET",
+        ] {
+            let Ok(Framed::Command {
+                consumed: peeked, ..
+            }) = peek(input, |args: &[&[u8]]| args.len())
+            else {
+                panic!("peek did not frame {input:?}")
+            };
+            let parsed = match parse(input) {
+                Ok(Outcome::Command(parsed)) => parsed.consumed,
+                Err(ProtocolError::Recoverable { consumed, .. }) => consumed,
+                other => panic!("parse did not settle {input:?}: {other:?}"),
+            };
+            assert_eq!(peeked, parsed, "boundary disagreement on {input:?}");
+        }
+    }
+
+    /// An incomplete buffer must stay incomplete under both, or the measuring
+    /// pass would either spin or dispatch half a command.
+    #[test]
+    fn peek_and_parse_agree_on_incompleteness() {
+        let whole = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
+        for cut in 1..whole.len() {
+            let partial = &whole[..cut];
+            assert!(
+                matches!(peek(partial, |args: &[&[u8]]| args.len()), Ok(Framed::Incomplete)),
+                "peek settled a {cut}-byte prefix",
+            );
+            assert!(
+                matches!(parse(partial), Ok(Outcome::Incomplete)),
+                "parse settled a {cut}-byte prefix",
+            );
+        }
     }
 }

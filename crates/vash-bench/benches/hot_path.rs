@@ -148,6 +148,70 @@ fn resp_parse_set(bencher: divan::Bencher) {
     bencher.bench(|| divan::black_box(vash_proto::resp::parse(divan::black_box(&input)).is_ok()));
 }
 
+/// **What `conn::measure_resp` actually pays now.** The measuring pass walks a
+/// block only to find where each command ends and which tier it belongs to, and
+/// everything it measures is parsed again by `resp::execute_block`. It used to
+/// run `resp_parse_get` above to answer that; it now runs this, which stops at
+/// the framing. The pair is the whole of §17: the gap between them is per
+/// command, on every RESP connection, and is spent on a result that is dropped.
+///
+/// The bar to clear is `vcp_peek_frame_len`, which is the same job in the
+/// dialect that has always done it this way.
+#[divan::bench(sample_size = 500)]
+fn resp_peek_get(bencher: divan::Bencher) {
+    let line = b"*2\r\n$3\r\nGET\r\n$17\r\nuser:1234:profile\r\n";
+    bencher.bench(|| {
+        divan::black_box(
+            vash_proto::resp::peek(divan::black_box(line), |args: &[&[u8]]| args.len()).is_ok(),
+        )
+    });
+}
+
+/// [`resp_peek_get`] for the write shape. Closer to its `parse` twin than the
+/// read is, and deliberately so: classifying a `SET` still has to scan its
+/// option tokens, because that is what decides whether the run can be awaited.
+#[divan::bench(sample_size = 500)]
+fn resp_peek_set(bencher: divan::Bencher) {
+    let mut input = b"*5\r\n$3\r\nSET\r\n$17\r\nuser:1234:profile\r\n$1024\r\n".to_vec();
+    input.extend_from_slice(VALUE);
+    input.extend_from_slice(b"\r\n$2\r\nEX\r\n$3\r\n300\r\n");
+
+    bencher.bench(|| {
+        divan::black_box(
+            vash_proto::resp::peek(divan::black_box(&input), |args: &[&[u8]]| args.len()).is_ok(),
+        )
+    });
+}
+
+/// The variadic read, where the parse the measuring pass used to run also
+/// **allocated** a `Vec` of the key slices — once to measure and once to
+/// execute. `peek` allocates nothing at any batch size.
+#[divan::bench(args = [2, 16, 100], sample_size = 500)]
+fn resp_measure_mget(bencher: divan::Bencher, keys: usize) {
+    let mut input = format!("*{}\r\n$4\r\nMGET\r\n", keys + 1).into_bytes();
+    for i in 0..keys {
+        let key = format!("user:{i}:profile");
+        input.extend_from_slice(format!("${}\r\n{key}\r\n", key.len()).as_bytes());
+    }
+    bencher.bench(|| {
+        divan::black_box(
+            vash_proto::resp::peek(divan::black_box(&input), |args: &[&[u8]]| args.len()).is_ok(),
+        )
+    });
+}
+
+/// [`resp_measure_mget`]'s predecessor, kept beside it so the allocation the
+/// measuring pass used to make is visible rather than asserted.
+#[divan::bench(args = [2, 16, 100], sample_size = 500)]
+fn resp_parse_mget(bencher: divan::Bencher, keys: usize) {
+    let mut input = format!("*{}\r\n$4\r\nMGET\r\n", keys + 1).into_bytes();
+    for i in 0..keys {
+        let key = format!("user:{i}:profile");
+        input.extend_from_slice(format!("${}\r\n{key}\r\n", key.len()).as_bytes());
+    }
+    bencher.bench(|| divan::black_box(vash_proto::resp::parse(divan::black_box(&input)).is_ok()));
+}
+
 // ---- record and liveness ---------------------------------------------------
 
 /// Parsing a stored record. This is a cast plus bounds checks over bytes that
