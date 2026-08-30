@@ -510,6 +510,58 @@ fn read_batch_of_many_in_txn(bencher: divan::Bencher, keys: usize) {
     });
 }
 
+/// **A VCP `GET_MANY` as it was framed.** Three copies of every value — out of
+/// the map into a `Value`, out of that into the body, out of the body into the
+/// write buffer — and two allocations on top of the one per hit that building a
+/// `Value` costs. The frame header carries the body length, which is why the
+/// body had to exist before the header could be written.
+#[divan::bench(args = [2, 16, 100], sample_size = 200)]
+fn vcp_batch_reply_buffered(bencher: divan::Bencher, keys: usize) {
+    use vash_proto::vcp::Opcode;
+
+    let store = BatchFixture::new(keys);
+    let lookups = store.keys();
+
+    let mut out = Vec::with_capacity(keys * (BatchFixture::VALUE_LEN + 64));
+    bencher.bench_local(|| {
+        out.clear();
+        let values = vash_store::Store::get_many(&store.store, divan::black_box(&lookups)).unwrap();
+        vash_proto::vcp::encode_reply(
+            &mut out,
+            Opcode::GetMany,
+            1,
+            &vash_core::Reply::Values(values),
+        );
+        divan::black_box(out.len())
+    });
+}
+
+/// The same reply streamed: header with a placeholder length, entries appended
+/// straight out of the memory map in request order, length patched in at the
+/// end. One copy, no allocations. See `ValuesFrame` and §18.
+#[divan::bench(args = [2, 16, 100], sample_size = 200)]
+fn vcp_batch_reply_streamed(bencher: divan::Bencher, keys: usize) {
+    use vash_proto::vcp::{Opcode, ValuesFrame};
+
+    let store = BatchFixture::new(keys);
+    let lookups = store.keys();
+
+    let mut out = Vec::with_capacity(keys * (BatchFixture::VALUE_LEN + 64));
+    bencher.bench_local(|| {
+        out.clear();
+        let frame = ValuesFrame::open(&mut out, Opcode::GetMany, 1, lookups.len() as u32);
+        vash_store::Store::get_many_with(&store.store, divan::black_box(&lookups), &mut |_, v| {
+            match v {
+                Some(value) => frame.hit(&mut out, value),
+                None => frame.miss(&mut out),
+            }
+        })
+        .unwrap();
+        frame.finish(&mut out).unwrap();
+        divan::black_box(out.len())
+    });
+}
+
 /// A populated multi-shard environment, which is the shape the fused path has to
 /// earn its keep in: four shards means four readers held for one batch, and the
 /// grouping allocations the old path made are proportional to that.

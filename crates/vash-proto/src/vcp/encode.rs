@@ -3,7 +3,7 @@ use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32};
 
 use super::decode::SetBodyHeader;
-use super::frame::{FrameHeader, Opcode, Status};
+use super::frame::{FrameHeader, MAX_BODY_LEN, Opcode, Status};
 
 /// Appends a request frame.
 pub fn encode_request(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, body: &[u8]) {
@@ -241,6 +241,102 @@ pub fn encode_reply(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, reply: &
         Reply::Value(value) => encode_value(out, opcode, request_id, value.borrowed()),
     }
 }
+
+/// A `GET_MANY` reply written **straight into the caller's buffer**, one entry
+/// at a time.
+///
+/// # Why this is not just a function
+///
+/// A VCP frame header carries the length of its body, and a batch's length is
+/// not known until every value has been read. That is why [`encode_reply`]
+/// builds `Reply::Values` into a `Vec` first — and why a VCP batch was the one
+/// multi-key read §18 could not fuse: the values were copied out of the memory
+/// map into a `Value`, out of that into the body, and out of the body into the
+/// write buffer. Three copies and two allocations, against the one copy and none
+/// that [`encode_value`] has managed for a single key all along.
+///
+/// The alternative to buffering is not to size the body first — that means
+/// reading every value twice — but to **write the header with a placeholder
+/// length, stream the entries, and patch the length in afterwards**. The header
+/// carries no checksum and `body_len` sits at a fixed offset, so the patch is a
+/// four-byte store. The entry *count* needs no patching at all: a batch knows
+/// how many keys it was asked about before it reads any of them.
+///
+/// # Use
+///
+/// [`open`](Self::open), then one [`hit`](Self::hit) or [`miss`](Self::miss) per
+/// key **in request order**, then [`finish`](Self::finish). The frame is
+/// abandoned rather than finished if the reply cannot be completed, which
+/// truncates every byte it wrote.
+#[must_use = "an unfinished frame leaves a placeholder length in the header"]
+pub struct ValuesFrame {
+    /// Where this frame's header begins in the caller's buffer. Everything from
+    /// here on belongs to the frame, which is what makes abandoning it exact.
+    start: usize,
+}
+
+impl ValuesFrame {
+    /// Writes the header with a placeholder length, and the entry count.
+    ///
+    /// `count` is the number of keys asked about, so a client reading the reply
+    /// finds one entry per key whether or not the batch runs to completion.
+    pub fn open(out: &mut Vec<u8>, opcode: Opcode, request_id: u32, count: u32) -> Self {
+        let start = out.len();
+        let header = FrameHeader::response(opcode, request_id, Status::Ok, 0);
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        Self { start }
+    }
+
+    /// Appends one live value: `1 | mc_flags | cas | len | data`.
+    pub fn hit(&self, out: &mut Vec<u8>, value: ValueRef<'_>) {
+        out.reserve(1 + VALUE_PREFIX_LEN + 4 + value.data.len());
+        out.push(1);
+        out.extend_from_slice(&value.mc_flags.to_le_bytes());
+        out.extend_from_slice(&value.cas.to_le_bytes());
+        out.extend_from_slice(&(value.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(value.data);
+    }
+
+    /// Appends one absent key, which is a single zero byte.
+    pub fn miss(&self, out: &mut Vec<u8>) {
+        out.push(0);
+    }
+
+    /// Patches the real body length into the header.
+    ///
+    /// Fails when the body outgrew what a frame may carry, and **that is a fix
+    /// rather than a new restriction**: the buffered encoder wrote
+    /// `body.len() as u32` unchecked, so a batch over [`MAX_BODY_LEN`] produced
+    /// a frame that every decoder — including this crate's — rejects as
+    /// unrecoverable, killing the connection. One over `u32::MAX` truncated the
+    /// length outright and desynchronised the stream. The caller answers
+    /// [`Status::TooLarge`] instead, which is a reply the client can act on.
+    pub fn finish(self, out: &mut Vec<u8>) -> Result<(), TooLarge> {
+        let body_len = out.len() - self.start - super::frame::HEADER_LEN;
+        if body_len > MAX_BODY_LEN as usize {
+            out.truncate(self.start);
+            return Err(TooLarge);
+        }
+
+        // `body_len` occupies the last four bytes of the twelve-byte header —
+        // see `FrameHeader`. Written back rather than re-encoding the header, so
+        // nothing else in it can be disturbed by the patch.
+        let at = self.start + super::frame::HEADER_LEN - 4;
+        out[at..at + 4].copy_from_slice(&(body_len as u32).to_le_bytes());
+        Ok(())
+    }
+
+    /// Drops everything this frame wrote, so the caller can render an error in
+    /// its place.
+    pub fn abandon(self, out: &mut Vec<u8>) {
+        out.truncate(self.start);
+    }
+}
+
+/// A batch reply whose body outgrew [`MAX_BODY_LEN`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooLarge;
 
 /// Renders a `GET` hit as one frame: header, value metadata, payload.
 ///
@@ -546,9 +642,220 @@ pub fn decode_hello_response(body: &[u8]) -> Option<ServerInfo> {
 mod tests {
     use super::*;
     use crate::vcp::decode::{Decoded, decode};
+    use crate::vcp::frame::HEADER_LEN;
     use bytes::Bytes;
     use vash_core::Value;
     use zerocopy::FromBytes;
+
+    fn sample_values() -> Vec<Option<Value>> {
+        vec![
+            Some(Value {
+                data: Bytes::from_static(b"first"),
+                mc_flags: 0xaabb_ccdd,
+                cas: 7,
+                expires_at_ms: Some(0),
+            }),
+            None,
+            Some(Value {
+                data: Bytes::from_static(b""),
+                mc_flags: 0,
+                cas: u64::MAX,
+                expires_at_ms: Some(0),
+            }),
+            None,
+            Some(Value {
+                data: Bytes::from_static(b"last one, a bit longer"),
+                mc_flags: 1,
+                cas: 12_345_678_901,
+                expires_at_ms: Some(0),
+            }),
+        ]
+    }
+
+    fn stream(out: &mut Vec<u8>, request_id: u32, values: &[Option<Value>]) -> ValuesFrame {
+        let frame = ValuesFrame::open(out, Opcode::GetMany, request_id, values.len() as u32);
+        for value in values {
+            match value {
+                Some(value) => frame.hit(
+                    out,
+                    ValueRef {
+                        data: &value.data,
+                        mc_flags: value.mc_flags,
+                        cas: value.cas,
+                        expires_at_ms: value.expires_at_ms,
+                    },
+                ),
+                None => frame.miss(out),
+            }
+        }
+        frame
+    }
+
+    /// **The streamed frame must be the frame that was already being sent.**
+    ///
+    /// [`ValuesFrame`] replaces a buffered `Reply::Values` on the server read
+    /// path, and the only thing standing between it and every VCP client is that
+    /// the bytes come out the same. Asserted byte for byte rather than field by
+    /// field, because a field-by-field check cannot see a missing field.
+    ///
+    /// The fixture mixes hits and misses, an empty payload, and a zero and a
+    /// maximal CAS, so an entry written in the wrong order or a length taken
+    /// from the wrong place shows up as a difference rather than as a
+    /// coincidence.
+    #[test]
+    fn a_streamed_batch_is_byte_identical_to_a_buffered_one() {
+        let values = sample_values();
+
+        let mut buffered = Vec::new();
+        encode_reply(
+            &mut buffered,
+            Opcode::GetMany,
+            99,
+            &Reply::Values(values.clone()),
+        );
+
+        let mut streamed = Vec::new();
+        stream(&mut streamed, 99, &values)
+            .finish(&mut streamed)
+            .expect("a small batch frames");
+
+        assert_eq!(streamed, buffered);
+    }
+
+    /// The frame is opened before any value has been read, so it is written into
+    /// a buffer that may already hold earlier replies. The patched length has to
+    /// be this frame body, not everything in the buffer.
+    #[test]
+    fn a_streamed_batch_patches_its_own_length_only() {
+        let mut out = Vec::new();
+        encode_response(&mut out, Opcode::Ping, 1, Status::Ok, &[]);
+        let preceding = out.len();
+
+        let frame = ValuesFrame::open(&mut out, Opcode::GetMany, 2, 1);
+        frame.hit(
+            &mut out,
+            ValueRef {
+                data: b"body",
+                mc_flags: 0,
+                cas: 1,
+                expires_at_ms: Some(0),
+            },
+        );
+        frame.finish(&mut out).expect("a small batch frames");
+
+        let header =
+            FrameHeader::ref_from_bytes(&out[preceding..preceding + HEADER_LEN]).expect("a header");
+        // count(4) + present(1) + prefix(12) + len(4) + "body"(4)
+        assert_eq!(
+            header.body_len.get() as usize,
+            4 + 1 + VALUE_PREFIX_LEN + 4 + 4
+        );
+        assert_eq!(
+            out.len(),
+            preceding + HEADER_LEN + header.body_len.get() as usize
+        );
+
+        // And the frame in front of it is untouched.
+        let first = FrameHeader::ref_from_bytes(&out[..HEADER_LEN]).expect("the preceding header");
+        assert_eq!(first.request_id.get(), 1);
+        assert_eq!(first.body_len.get(), 0);
+    }
+
+    /// A body that outgrows a frame is refused rather than truncated into one.
+    ///
+    /// The buffered encoder wrote `body.len() as u32` unchecked, so this case
+    /// produced a frame every decoder rejects as unrecoverable — closing the
+    /// connection over a reply that was merely too big. `finish` reports it and
+    /// leaves the buffer as it found it, so the caller can answer `TooLarge`.
+    #[test]
+    fn a_batch_too_large_to_frame_is_refused_and_leaves_nothing_behind() {
+        let mut out = Vec::new();
+        encode_response(&mut out, Opcode::Ping, 1, Status::Ok, &[]);
+        let preceding = out.len();
+
+        let oversized = vec![0u8; MAX_BODY_LEN as usize + 1];
+        let frame = ValuesFrame::open(&mut out, Opcode::GetMany, 2, 1);
+        frame.hit(
+            &mut out,
+            ValueRef {
+                data: &oversized,
+                mc_flags: 0,
+                cas: 1,
+                expires_at_ms: Some(0),
+            },
+        );
+        assert_eq!(frame.finish(&mut out), Err(TooLarge));
+        assert_eq!(
+            out.len(),
+            preceding,
+            "a refused frame must not leave a partial one in the stream"
+        );
+    }
+
+    /// The same, for a batch the store could not finish.
+    #[test]
+    fn an_abandoned_frame_leaves_nothing_behind() {
+        let mut out = Vec::new();
+        encode_response(&mut out, Opcode::Ping, 1, Status::Ok, &[]);
+        let preceding = out.len();
+
+        let frame = ValuesFrame::open(&mut out, Opcode::GetMany, 2, 4);
+        frame.hit(
+            &mut out,
+            ValueRef {
+                data: b"partial",
+                mc_flags: 0,
+                cas: 1,
+                expires_at_ms: Some(0),
+            },
+        );
+        frame.miss(&mut out);
+        frame.abandon(&mut out);
+        assert_eq!(out.len(), preceding);
+    }
+
+    /// The point of the exercise: a streamed frame reads back, in order, with
+    /// no bytes left over.
+    #[test]
+    fn a_streamed_batch_decodes_back() {
+        let values = sample_values();
+        let mut out = Vec::new();
+        stream(&mut out, 42, &values)
+            .finish(&mut out)
+            .expect("a small batch frames");
+
+        let decoded = read_back_values(&out);
+        assert_eq!(decoded.len(), values.len());
+        for (got, want) in decoded.iter().zip(&values) {
+            assert_eq!(got.as_deref(), want.as_ref().map(|v| &v.data[..]));
+        }
+    }
+
+    /// Reads a `GET_MANY` response body back into per-key payloads, the way a
+    /// client does.
+    fn read_back_values(frame: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let header = FrameHeader::ref_from_bytes(&frame[..HEADER_LEN]).expect("a header");
+        assert_eq!(header.status.get(), Status::Ok as u16);
+        let body = &frame[HEADER_LEN..HEADER_LEN + header.body_len.get() as usize];
+
+        let count = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+        let mut at = 4;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if body[at] == 0 {
+                at += 1;
+                out.push(None);
+                continue;
+            }
+            at += 1 + VALUE_PREFIX_LEN;
+            let len = u32::from_le_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+            at += 4;
+            out.push(Some(body[at..at + len].to_vec()));
+            at += len;
+        }
+        assert_eq!(at, body.len(), "the body has no bytes left over");
+        out
+    }
 
     #[test]
     fn value_reply_carries_flags_cas_and_payload() {

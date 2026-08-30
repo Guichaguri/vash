@@ -11,7 +11,7 @@ pub enum StoreError {
     /// per-engine, and the only distinction any caller in this crate draws is
     /// [`Self::CapacityFull`], which each backend maps for itself. Keeping the
     /// message as a `String` is also what makes this variant `Clone` — see
-    /// [`StoreError::clone_shallow`], which used to have to downgrade an LMDB
+    /// `StoreError::clone_shallow`, which used to have to downgrade an LMDB
     /// failure to `Corrupt` because `heed::Error` is not.
     #[error("engine: {0}")]
     Engine(String),

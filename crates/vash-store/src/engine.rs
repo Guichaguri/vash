@@ -1,7 +1,7 @@
 //! Storage operations, with no threading of their own.
 //!
 //! Every write method takes the transaction it should act in, so the writer
-//! thread can pack many of them into one commit (see [`crate::writer`]). Keeping
+//! thread can pack many of them into one commit (see `crate::writer`). Keeping
 //! the transaction out of this layer is what makes group commit possible
 //! without duplicating the operations.
 //!
@@ -62,9 +62,9 @@ pub type LmdbEngine = Engine<LmdbBackend>;
 /// One storage environment and everything derived from it.
 ///
 /// The fields are `pub(crate)` rather than private because the operations that
-/// act on them live in sibling modules — [`crate::env`], [`crate::read`],
-/// [`crate::apply`], and the maintenance halves of [`crate::expiry`],
-/// [`crate::reclaim`], [`crate::tags`] and [`crate::listing`]. Rust's privacy is
+/// act on them live in sibling modules — `crate::env`, `crate::read`,
+/// `crate::apply`, and the maintenance halves of [`crate::expiry`],
+/// [`crate::reclaim`], [`crate::tags`] and `crate::listing`. Rust's privacy is
 /// per-module, so co-locating each operation with the layout it walks costs this
 /// widening. The boundary that matters is still the crate: nothing outside
 /// `vash-store` can reach past the [`Store`] trait.

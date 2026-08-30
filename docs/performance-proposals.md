@@ -1473,11 +1473,12 @@ the obvious next one.
 
 ---
 
-## 18. Implemented: a multi-key read is fused too
+## 18. Implemented: a multi-key read is fused, in all three dialects
 
-**Status: shipped for both text dialects. 2× on a multi-get, which is twice what
-the proposal costed — and the reason the estimate was low is worth more than the
-number.**
+**Status: shipped, text dialects first and VCP in a second round. 2–2.3× on a
+multi-get, which is twice what the proposal costed — and the reason the
+estimate was low is worth more than the number. The VCP half also turned up a
+framing bug that had been there all along.**
 
 `execute_get_into` exists because building a `Value` costs a copy out of the
 memory map and a heap allocation on every hit, and the encoder then copies the
@@ -1545,20 +1546,71 @@ position; `rendering_a_batch_agrees_with_collecting_one` pins the two paths
 against each other at one shard and four, so `MGET` and `GET_MANY` cannot start
 disagreeing about the same keys.
 
-### VCP is not fused, and it is not an oversight
+### VCP too, by writing the length last
 
-`GET_MANY` over VCP still builds a `Reply::Values`. The obstacle is structural
-rather than incidental: **a VCP frame header carries the length of its body**, so
-the body cannot be streamed into the write buffer before its total size is
-known. The encoder already sizes the payload in one pass and fills it in a
-second, which is why the comment there says the payload copy "is the only one
-that happens".
+The first round left VCP alone, on the grounds that **a VCP frame header carries
+the length of its body**, so the body cannot be streamed into the write buffer
+before its total size is known. That is true, and it is not the obstacle it
+looked like.
 
-There is still something available — building that body through
-`get_many_with` rather than through a `Vec<Option<Value>>` would drop the
-per-hit allocation and one of the two copies — but it is a different change with
-a different shape, and it does not remove the second copy the way it does for a
-text dialect. Recorded rather than done.
+The buffered encoder was the worst of the three dialects, not the one that could
+not be helped. `Reply::Values` cost **three copies of every value** — out of the
+memory map into a `Value`, out of that into the body `Vec`, and out of the body
+into the write buffer — plus two allocations and one more per hit for the
+`Bytes`. `encode_value` has rendered a *single* key with one copy and no
+allocation since it was written.
+
+The way out is not to size the body first — that means reading every value
+twice — but to **write the header with a placeholder length, stream the entries,
+and patch the length in afterwards**. Two things make that cheap:
+
+- The header carries no checksum, and `body_len` sits at a fixed offset in a
+  twelve-byte struct. Patching it is a four-byte store.
+- The entry *count*, which the body begins with, needs no patching at all. A
+  batch knows how many keys it was asked about before it reads any of them.
+
+`vcp::encode::ValuesFrame` is that: `open`, then a `hit` or `miss` per key in
+request order, then `finish`. It is a type rather than a function because the
+patch is the sort of step that is easy to forget and silent when forgotten — an
+unfinished frame leaves a zero length in the header, so it is `#[must_use]` and
+`finish` consumes it.
+
+| keys | buffered | **streamed** | saving |
+|---|---:|---:|---:|
+| 2 | 1.383 µs | **709.3 ns** | 49% |
+| 16 | 7.591 µs | **3.259 µs** | 57% |
+| 100 | 52.9 µs | **23.8 µs** | 55% |
+
+**2.0–2.3×**, a little ahead of the text dialects' 2× because VCP had the extra
+copy to lose.
+
+The guarantee that matters is that the bytes did not change, and it is asserted
+as such: `a_streamed_batch_is_byte_identical_to_a_buffered_one` renders the same
+mixed fixture — hits, misses, an empty payload, a zero and a maximal CAS —
+through both encoders and compares the frames byte for byte, because a
+field-by-field check cannot see a missing field.
+`a_streamed_batch_patches_its_own_length_only` puts a frame in front of it, since
+a pipelined reply buffer is not empty when the frame opens.
+
+### A bug that fell out of it
+
+The buffered encoder wrote `body.len() as u32` unchecked. A `GET_MANY` whose
+values totalled more than `MAX_BODY_LEN` therefore produced a frame that **every
+decoder rejects as unrecoverable, including this crate's** — so a reply that was
+merely too big closed the connection, and one over `u32::MAX` truncated the
+length and desynchronised the stream outright. Reachable in principle at
+`MAX_BATCH_ITEMS` × `max_value_bytes`, and never diagnosable from the client end,
+where it looks like the server hanging up.
+
+Streaming forces the question — something has to happen at `finish` — so `finish`
+returns `Err(TooLarge)`, drops every byte the frame wrote, and the caller answers
+`Status::TooLarge`. A reply the client can act on instead of a broken frame.
+`a_batch_too_large_to_frame_is_refused_and_leaves_nothing_behind` pins both
+halves, the truncation included.
+
+Two cases stay on the ordinary path and are excluded explicitly: a `NO_REPLY`
+batch, which has nowhere to render into, and an empty one, which would open a
+frame for nothing.
 
 ---
 
@@ -1755,7 +1807,7 @@ about 15% between runs and only a within-run comparison means anything.
 | | proposed | **measured** | where the estimate went |
 |---|---|---|---|
 | §17 framing-only measure | ~80 ns per RESP command | **24 ns** on a `GET`, 68 on a `SET` | assumed the whole parse was `parse_command`'s to lose; the framing walk is ~67 ns of it and both passes pay that |
-| §18 fused multi-key read | 21–35% per key | **50%**, flat from 2 keys to 100 | costed from single-shard fixtures, which measured the copy and none of the scatter-gather |
+| §18 fused multi-key read | 21–35% per key | **50%** text, **55%** VCP | costed from single-shard fixtures, which measured the copy and none of the scatter-gather |
 | §19 striped counters | ~35 ns per command | **41.8 → 5.7 ns**, and the anti-scaling term is gone | the counters were right; the *remedy* was proposed as a per-block flush, and a per-thread lane beat it on every row |
 | §20 both small ones | a few ns each | a few ns each | the routing half was proposed **wrong** — it would have invalidated every multi-shard cache on upgrade |
 
@@ -1779,6 +1831,11 @@ Three things follow, and they are the reusable part of this round:
   the dangerous one.** §20's reduction was correct arithmetic and the wrong
   invariant, and the invariant it needed was written down twice in the files it
   touched.
+- **A constraint that is real can still not be the obstacle.** §18 recorded that
+  a VCP frame header carries its body length and concluded the batch could not
+  be fused. The first half was true; the conclusion assumed the length had to be
+  known before the body was written, when it only had to be known before the
+  frame was *sent*. VCP turned out to be the dialect with the most to gain.
 
 ### What is left, in order
 
@@ -1791,10 +1848,7 @@ Three things follow, and they are the reusable part of this round:
    `str::parse::<i64>()`, three times over, for numbers that are almost always
    one to four digits. This cuts `parse` as well as `peek`, so it is the whole
    RESP surface rather than the measuring pass.
-3. **VCP `GET_MANY`.** Still collects, because a VCP frame header carries its
-   body length and the body cannot be streamed before its size is known. A
-   smaller prize than §18's and a different shape; see §18.
-4. **§15**, which is untouched by any of this and is still the write path's
+3. **§15**, which is untouched by any of this and is still the write path's
    largest single item.
 
 **Measure any of it with `resident_mode` on.** `store.resident_mode` and

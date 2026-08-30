@@ -16,8 +16,8 @@
 use tracing::{error, warn};
 use vash_core::{Command, Reply};
 use vash_proto::vcp::{
-    AuthRequest, DecodeError, Decoded, Opcode, Status, decode, encode_error, encode_reply,
-    encode_response,
+    AuthRequest, DecodeError, Decoded, Opcode, Status, ValuesFrame, decode, encode_error,
+    encode_reply, encode_response,
 };
 
 use crate::auth::{ConnAuth, DEFAULT_NAME, Mechanism};
@@ -195,6 +195,50 @@ fn execute_frame_batched<'a>(
                     // here, so a miss keeps whatever that mapping says it is.
                     Ok(false) => encode_reply(out, opcode, request_id, &Reply::NotFound),
                     Err(failed) => encode_error(out, opcode as u8, request_id, failed.status),
+                }
+                return;
+            }
+
+            // The batch form, fused the only way a length-prefixed frame can
+            // be: the header goes down with a placeholder, the entries stream
+            // straight out of the memory map in request order, and the length
+            // is patched in at the end. See `vcp::encode::ValuesFrame` and
+            // `docs/performance-proposals.md` §18.
+            //
+            // `NO_REPLY` is excluded for the same reason it is above — there is
+            // nowhere to render into — and so is an empty batch, which the
+            // ordinary path already answers and which would otherwise open a
+            // frame for nothing.
+            if let Command::GetMany(keys) = &request.command
+                && !request.no_reply
+                && !keys.is_empty()
+            {
+                let (opcode, request_id) = (request.opcode, request.request_id);
+                let frame = ValuesFrame::open(out, opcode, request_id, keys.len() as u32);
+                let rendered = crate::dispatch::execute_get_many_into(
+                    state,
+                    keys,
+                    CommandKind::GetMany,
+                    Dialect::Vcp,
+                    &mut |_, value| match value {
+                        Some(value) => frame.hit(out, value),
+                        None => frame.miss(out),
+                    },
+                );
+                match rendered {
+                    // A body too large to frame is not a reply that can be
+                    // trimmed — the client asked for these keys and half of
+                    // them is not an answer — so the frame is abandoned and
+                    // the status carries it.
+                    Ok(()) => {
+                        if frame.finish(out).is_err() {
+                            encode_error(out, opcode as u8, request_id, Status::TooLarge);
+                        }
+                    }
+                    Err(failed) => {
+                        frame.abandon(out);
+                        encode_error(out, opcode as u8, request_id, failed.status);
+                    }
                 }
                 return;
             }

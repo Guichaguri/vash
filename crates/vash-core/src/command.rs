@@ -309,6 +309,8 @@ impl<'a> Set<'a> {
     }
 
     /// As [`Set::plain`], for a caller that already has a [`TtlChange`].
+    ///
+    /// [`TtlChange`]: crate::arith::TtlChange
     pub fn with_ttl(key: Key<'a>, value: &'a [u8], ttl: crate::arith::TtlChange) -> Self {
         Self {
             key,

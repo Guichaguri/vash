@@ -72,6 +72,8 @@ use crate::state::ServerState;
 /// `T` is whatever the dialect needs to render one reply — a `noreply` flag for
 /// memcached, a request id for VCP — kept here rather than in three parallel
 /// vectors so an entry cannot lose its context.
+///
+/// [`Store::set_many`]: vash_store::Store::set_many
 pub struct SetBatch<'a, T> {
     sets: Vec<vash_core::Set<'a>>,
     notes: Vec<T>,
@@ -309,9 +311,9 @@ pub(crate) fn deny(
 ///
 /// The cost of stepping around that boundary is that the counting `execute`
 /// does has to be reproduced here. For a `GET` that is exactly two things — the
-/// command histogram and the hit/miss split — because [`Outcomes::observe`] has
-/// no `Command::Get` arm, and none for `Command::GetMany` either. That is
-/// load-bearing rather than lucky, so
+/// command histogram and the hit/miss split — because
+/// [`OutcomeMetrics::observe`] has no `Command::Get` arm, and none for
+/// `Command::GetMany` either. That is load-bearing rather than lucky, so
 /// `metrics::tests::observe_has_nothing_to_say_about_a_get` fails if anyone
 /// adds one.
 ///
@@ -321,7 +323,7 @@ pub(crate) fn deny(
 /// concerned. Taking it as an argument is what keeps the fused path from
 /// quietly moving a command from one counter to another.
 ///
-/// [`Outcomes::observe`]: crate::metrics::Outcomes::observe
+/// [`OutcomeMetrics::observe`]: crate::metrics::OutcomeMetrics::observe
 pub fn execute_get_into(
     state: &ServerState,
     key: vash_core::Key<'_>,

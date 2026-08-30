@@ -107,6 +107,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Doc links rot silently. A rename moves an item and every `[Old]` link
+      # aimed at it still compiles, so the first sign of breakage is a dead
+      # link on a rendered page rather than a failing build. This is also why
+      # it is `-D warnings` rather than just the broken-link lint: a public
+      # doc pointing at a private item resolves for the author and for nobody
+      # reading the crate from outside, and that only warns by default.
+      - name: Check the docs build with no broken links
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # These parsers read bytes from strangers, so they get coverage-guided fuzzing
   # on every PR rather than only the property tests. A short run per target

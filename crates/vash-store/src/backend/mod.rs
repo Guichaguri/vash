@@ -181,7 +181,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ///
     /// On the backend rather than as a free function because how you warm a map
     /// is an engine question: LMDB has no such call, so this reads its data file
-    /// and `madvise`s it (see [`crate::prefault`]), while an engine with a
+    /// and `madvise`s it (see `crate::prefault`), while an engine with a
     /// warm-up primitive of its own would call that instead.
     ///
     /// Best-effort by contract. The result is *reported* rather than assumed

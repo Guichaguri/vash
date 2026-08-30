@@ -553,7 +553,7 @@ impl Auth {
     }
 
     /// The roles a named row carries, for the startup checks that have to look
-    /// one up without authenticating as it — see [`crate::check_peer_role`].
+    /// one up without authenticating as it — see `crate::check_peer_role`.
     ///
     /// `None` when the row does not exist, which the caller reports differently
     /// from a row that exists and lacks a role.

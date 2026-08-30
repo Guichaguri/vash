@@ -8,7 +8,7 @@
 //!    threads, which measured 56× worse on this project's own reader benchmark
 //!    and is worse in absolute terms than LMDB's equivalent. Every maintained
 //!    Rust wrapper sets it unconditionally — which is most of why this backend
-//!    talks to the C library directly. [`tests::sticky_threads_stay_sticky`]
+//!    talks to the C library directly. `tests::sticky_threads_stay_sticky`
 //!    is the guard.
 //! 2. **Windows needs its working set raised before a map can be pinned.**
 //!    `VirtualLock` refuses past the process working-set maximum with
@@ -20,6 +20,8 @@
 //! rather than merely spelled differently: `store.map_size_mb` becomes an upper
 //! bound that the file grows toward and can shrink back from, where LMDB takes
 //! it as a fixed reservation. See [`MdbxBackend::open`].
+//!
+//! [`ffi`]: crate::backend::mdbx::ffi
 
 pub mod ffi;
 

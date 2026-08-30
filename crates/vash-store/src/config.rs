@@ -36,7 +36,7 @@ pub enum Durability {
     /// What it gives up is **durability only, and boundedly**: an OS crash loses
     /// writes newer than the last periodic sync, `write.sync_interval_ms`. What
     /// it keeps is integrity — the database is still consistent and still
-    /// openable, unlike [`Self::Ephemeral`], which has to be wiped.
+    /// openable, unlike `ephemeral`, which has to be wiped.
     ///
     /// **That guarantee has a condition**, and it is LMDB's rather than this
     /// crate's: `MDB_NOSYNC` preserves atomicity, consistency and isolation

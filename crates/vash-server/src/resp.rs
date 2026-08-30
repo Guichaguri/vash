@@ -21,7 +21,7 @@
 //! Several Redis commands collapse onto one domain operation on the way through:
 //! `EXISTS`, `TYPE` and `TTL` are all deadline queries that differ only in how
 //! the answer is worded, and `PERSIST` is an `EXPIRE` with a guard. The
-//! translation is in [`translate`] and the wording in [`render`].
+//! translation is in `translate` and the wording in `render`.
 //!
 //! **The arithmetic commands are atomic (M10).** `INCR`, `INCRBY`, `DECR`,
 //! `DECRBY`, `INCRBYFLOAT`, `INCREX` and `APPEND` are single storage primitives
@@ -248,16 +248,16 @@ fn flush_sets(
 /// run is offered to — and `translate` reads the clock and resolves an expiry
 /// to answer it. That was a `SystemTime::now()` per `SET` spent on a question
 /// with a cheaper answer, thrown away, and then asked again by
-/// [`parse_writes`] on the very next line of the same block.
+/// `parse_writes` on the very next line of the same block.
 ///
 /// Everything [`crate::dispatch::awaitable`] needs is legible on the RESP
 /// command without translating: an unconditional `SET`, with no `GET` to
 /// report and no tags to register. What is *not* checked here is whether the
 /// translation would succeed at all — a `SET` whose expiry cannot be
 /// represented, or whose key this store will not hold — and it deliberately is
-/// not, because being wrong in that direction costs nothing: [`parse_writes`]
+/// not, because being wrong in that direction costs nothing: `parse_writes`
 /// still translates, still declines, and the block then takes the ordinary
-/// route where [`execute`] words the error. Misjudging here picks a tier, not
+/// route where `execute` words the error. Misjudging here picks a tier, not
 /// an answer.
 pub fn batchable_write(command: &Command<'_>) -> bool {
     let Command::Set(set) = command else {

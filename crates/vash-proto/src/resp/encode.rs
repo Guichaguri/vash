@@ -424,7 +424,7 @@ const FIELDS: &[(Section, &str, Source)] = &[
     ),
 ];
 
-/// The counter names [`FIELDS`] reads from.
+/// The counter names `FIELDS` reads from.
 ///
 /// Exported so `vash-server` can assert that every one of them is a counter
 /// `stats::collect` actually emits. The table and the counters live in

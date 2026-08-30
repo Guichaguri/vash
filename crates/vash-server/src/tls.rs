@@ -1,6 +1,6 @@
 //! TLS termination, compiled in only under the `tls` feature.
 //!
-//! Phase 1 of [`docs/tls-proposal.md`], in the shape Phase 0 measured: server
+//! Phase 1 of `docs/tls-proposal.md`, in the shape Phase 0 measured: server
 //! certificates only, TLS 1.3 only, `ring` as the provider. Client
 //! certificates and the identity mapping onto the credential table are phase 3
 //! and deliberately absent — a half-built mTLS path that authenticates nobody

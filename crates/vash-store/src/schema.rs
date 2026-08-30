@@ -35,7 +35,7 @@ pub mod db {
     // Created from M1/M2 onward; named here so the set is reviewable in one place.
     /// (expires_at_bucket BE || xxh3_64(key) BE) -> key
     pub const EXPIRY: &str = "exp";
-    /// DUP_SORT: tag_id BE -> [key]
+    /// DUP_SORT: tag_id BE -> \[key\]
     pub const TAG_INDEX: &str = "tagidx";
     /// tag name -> { tag_id, generation }
     pub const TAGS: &str = "tags";

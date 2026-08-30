@@ -31,7 +31,7 @@
 //!   `apply` writes them, and the sweeper, reclaimer, tag writes and listing
 //!   scan sit beside their own key encodings in [`expiry`], [`reclaim`],
 //!   [`tags`] and `listing`.
-//! - [`writer`] — the single writer thread, packing operations into shared
+//! - `writer` — the single writer thread, packing operations into shared
 //!   commits and running the expiry sweeper in the same transaction.
 //! - [`store`] — the [`Store`] implementation composing the rest, and where the
 //!   engine parameter stops. It is named for what it is rather than for an
@@ -344,6 +344,8 @@ pub trait Store: Send + Sync + 'static {
     /// value the key held beforehand — captured inside the write transaction, so
     /// `SET … GET` reports what this write actually displaced rather than what a
     /// read a moment earlier happened to see.
+    ///
+    /// [`SetMode`]: vash_core::SetMode
     fn store(&self, set: &Set<'_>) -> Result<Written>;
 
     /// Changes a key's deadline under a guard, atomically.

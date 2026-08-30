@@ -31,7 +31,7 @@
 //!
 //! The `stats` **subcommands** are specified nowhere — upstream's protocol
 //! document says their data "is not documented in this version of the protocol,
-//! and [is] subject to change" — so the framing is matched against what
+//! and \[is\] subject to change" — so the framing is matched against what
 //! memcached 1.6.45 sends and the field list is deliberately a subset. See
 //! `docs/stats-subcommands.md`.
 

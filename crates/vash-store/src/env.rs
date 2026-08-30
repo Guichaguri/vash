@@ -194,7 +194,7 @@ impl<B: Backend> Engine<B> {
 
     /// Whether this shard's map is pinned in memory, so a read cannot fault to
     /// disk. What `store.resident_mode` checks before it puts reads on a
-    /// runtime worker; see [`crate::prefault::Warmed::locked`].
+    /// runtime worker; see [`crate::backend::Warmed::locked`].
     pub fn map_locked(&self) -> bool {
         self.map_locked
     }
@@ -206,7 +206,7 @@ impl<B: Backend> Engine<B> {
     /// Opens a read transaction, recording how long it stays open.
     ///
     /// The recording is one relaxed store here and another when the returned
-    /// guard drops — see [`crate::readers`] for why it is a slot per thread
+    /// guard drops — see `crate::readers` for why it is a slot per thread
     /// rather than a registry, and why the engine cannot answer the question
     /// itself.
     ///
