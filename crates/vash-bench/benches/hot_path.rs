@@ -212,6 +212,47 @@ fn resp_parse_mget(bencher: divan::Bencher, keys: usize) {
     bencher.bench(|| divan::black_box(vash_proto::resp::parse(divan::black_box(&input)).is_ok()));
 }
 
+// ---- instrumentation -------------------------------------------------------
+
+/// **Everything a `GET` pays before it touches storage.** One
+/// `CommandMetrics::observe` and one `ServerMetrics::read`, which between them
+/// used to be seven locked read-modify-writes across three cache lines shared by
+/// every core. They are striped per thread now — see §19 — so this measures a
+/// handful of plain stores into lines nobody else touches.
+///
+/// Single-threaded, which is the *worst* case for the change: the old counters
+/// were uncontended here and still cost 41.8 ns in the standalone probe. What
+/// striping is really for does not show up until several threads count at once,
+/// and a divan bench cannot show that; `metrics::striping_tests` and the probe
+/// in §19 carry that half.
+#[divan::bench(sample_size = 500)]
+fn metrics_for_a_read(bencher: divan::Bencher) {
+    use vash_server::metrics::{CommandKind, Dialect, ServerMetrics};
+
+    let metrics = ServerMetrics::default();
+    let elapsed = std::time::Duration::from_micros(7);
+    bencher.bench_local(|| {
+        metrics
+            .commands
+            .observe(CommandKind::Get, Dialect::Resp, divan::black_box(elapsed));
+        metrics.read(1, 0);
+        divan::black_box(&metrics);
+    });
+}
+
+/// The two clock reads that bracket every command, plus the one every read
+/// transaction takes for its snapshot. Not a change — measured so §19's claim
+/// that they are the larger half of a command's instrumentation is checked
+/// against this host rather than asserted.
+#[divan::bench(sample_size = 500)]
+fn metrics_clock_reads(bencher: divan::Bencher) {
+    bencher.bench(|| {
+        let started = std::time::Instant::now();
+        divan::black_box(started.elapsed());
+        divan::black_box(std::time::SystemTime::now())
+    });
+}
+
 // ---- record and liveness ---------------------------------------------------
 
 /// Parsing a stored record. This is a cast plus bounds checks over bytes that

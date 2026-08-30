@@ -1538,84 +1538,122 @@ count.
 
 ---
 
-## 19. Seven contended atomics and two clock reads per command
+## 19. Implemented: the counters are striped per thread
 
-**Status: proposed. This is the one that does not show up on four cores.**
+**Status: shipped, and better than proposed. It also settles which half of a
+command's instrumentation actually costs anything, and it is not the half this
+section was about.**
 
-Every command pays, before any storage work:
+Every command used to pay, before any storage work:
 
-- `CommandMetrics::observe` — **four** relaxed `fetch_add`s: the per-command
-  counter, the histogram bucket, `sum_us`, and `count`.
-- `ServerMetrics::read` — **three** more: `commands_total`, `reads`, and `hits`.
-- `Instant::now()` **twice**, to bracket the call.
+- `CommandMetrics::observe` — four relaxed `fetch_add`s: the per-command counter,
+  the histogram bucket, `sum_us`, and `count`.
+- `ServerMetrics::read` — three more: `commands_total`, `reads`, and `hits`.
 
-And every read transaction pays a `SystemTime::now()` for its snapshot.
-
-`commands_total`, `reads`, `writes`, `hits` and `misses` are five adjacent
+`commands_total`, `reads`, `writes`, `hits` and `misses` were five adjacent
 `AtomicU64` in one struct — **one cache line, written by every core on every
-command**. The histogram is two more lines, likewise shared.
+command**. The histogram was two more lines, likewise shared.
 
-### What it costs, and why it is invisible today
+### What shipped, and why not the proposal
 
-A probe running the same seven `fetch_add`s in the same layout, against two
-alternatives. The figures are **aggregate** — total elapsed divided by *all*
-threads' operations — so a number that falls means the system got faster:
+The proposal was to accumulate counts in a stack-local for the length of a block
+and flush once. That works, and it needs an accumulator threaded through every
+call site between `drain` and `dispatch::execute`. A probe against a third option
+made the choice easy:
 
-| threads | today (shared) | accumulate per block | stripe per thread |
+| threads | shared `fetch_add` (before) | per-block flush | **per-thread lane** |
 |---:|---:|---:|---:|
-| 1 | 40.7 ns | 4.5 ns | 33.9 ns |
-| 2 | 56.1 ns | 5.2 ns | 24.2 ns |
-| 4 | 65.8 ns | 4.7 ns | 11.2 ns |
-| 8 | **66.2 ns** | **4.8 ns** | **7.3 ns** |
+| 1 | 41.8 ns | 4.7 ns | **3.0 ns** |
+| 2 | 55.8 ns | 5.2 ns | **2.3 ns** |
+| 4 | 86.2 ns | 4.7 ns | **0.9 ns** |
+| 8 | 89.5 ns | 4.8 ns | **0.9 ns** |
 
-**Today's counters get slower in aggregate as cores are added.** 40.7 ns on one
-thread, 66.2 ns on eight — adding seven cores made this term 1.6× *worse*
-system-wide. Both alternatives scale or stay flat. Every measurement in this
-document was taken on a four-core container, which is exactly where this cost is
-still small enough to hide.
+Aggregate figures — total elapsed over *all* threads' operations — so a number
+that falls means the system got faster. The per-thread lane wins on every row and
+needs no accumulator anywhere: only the counters' storage changes.
 
-The clocks, same host: `Instant::now()` **36.0 ns**, `SystemTime::now()`
-**19.4 ns**. These are Windows figures and Linux's vDSO is cheaper, around
-20–25 ns — but there are three of them per read either way.
+**Two things make it fast, and the second is the one that is easy to miss.** The
+first is that lanes are cache-line aligned, so two threads counting at once never
+contend. The second is that a lane has exactly one writer, which means an update
+does not need to be a read-modify-write at all: a relaxed load, an add, a relaxed
+store. Dropping the lock prefix is most of the 41.8 → 3.0 ns on a single thread,
+where there was never any contention to remove.
 
-Per `GET`, on this host: ~41 ns of atomics, ~72 ns of `Instant`, ~19 ns of
-`SystemTime` — **about 130 ns of instrumentation against 272 ns of storage
-read.**
+`vash-store`'s `readers.rs` already had this shape, and its reasoning transfers
+without changing a word: *"the obvious design needs a lock or a search for a free
+slot on every read, and reads are the hot path this whole server is shaped
+around."*
 
-### What it would take, and the codebase has already solved this once
+### The bookkeeping, which is where the correctness lives
 
-`readers.rs` is the precedent, and its reasoning applies verbatim: the obvious
-design needs a lock or a search for a free slot on every read, and reads are the
-hot path this whole server is shaped around. Its answer — a slot claimed per
-thread, once, written with a relaxed store — is exactly what the metrics never
-got.
+A plain store is sound **only** while one thread owns the lane, so the lane
+table is the whole safety argument:
 
-Two options, which compose:
+- 255 lanes are handed out privately; the 256th is reserved as a shared lane and
+  is never *owned* by anyone. Threads past the limit use it and pay a
+  `fetch_add`. Slower, never wrong.
+- **Lanes are returned when a thread exits.** Tokio retires an idle blocking
+  thread after ten seconds, so a server under bursty load churns through them; a
+  scheme that never reclaimed would hand out all 255 over a few hours and then
+  put every thread after that on the shared lane, silently. This is the one part
+  of the design that exists purely because of how the runtime behaves rather
+  than how the counters do.
+- During thread-local destruction there is no lane to hand back, so a count
+  taken there goes to the shared one. Counted, just not privately.
 
-- **(a) Accumulate per block.** A block is already the unit `drain` works in, and
-  already the unit `bytes_read` and `ConnInfo::touched` count in. Hold the counts
-  in a stack-local struct for the run and flush with one `fetch_add` per counter
-  at the end. At pipeline 16 that is seven RMWs per sixteen commands, and it
-  measured flat at ~4.7 ns.
-- **(b) Stripe per thread**, padded to a cache line and summed at scrape. Larger
-  change, scales better still, and costs memory proportional to worker count.
+`metrics::striping_tests` pins all of it: that sixteen threads' counts sum
+exactly, that the shared lane loses nothing, that a lane comes back when its
+thread exits, and that the Prometheus exposition sums the same lanes the `stats`
+surfaces do.
 
-**(a) is the one to take first**: it is smaller, it needs no new scrape-side
-arithmetic beyond what already exists, and it is the same granularity the
-connection already uses for two other counters.
+### Measured against the real thing
 
-The clocks are a separate decision and a smaller one. `clock.rs` already
-documents the coarse clock as the escape hatch and states honestly why it has
-not been taken — a cached clock that stops ticking fails silently and serves
-expired data. That objection stands. The cheaper move that costs no correctness
-is to stop calling `Instant::now()` twice: one read per command serves as both
-the previous command's end and the next one's start, halving the clock reads
-across a block.
+`metrics_for_a_read` runs what a `GET` actually pays — one
+`CommandMetrics::observe` and one `ServerMetrics::read` — against a real
+`ServerMetrics`:
 
-**Acceptance criterion**: the probe above, rerun against the real
-`ServerMetrics`, flat from one thread to eight. And `stats` must report the same
-totals it does now — a per-block flush is not allowed to lose the tail of a
-block that closes the connection.
+| | median |
+|---|---:|
+| `metrics_for_a_read` | **5.72 ns** |
+| `metrics_clock_reads` | **101.3 ns** |
+
+Single-threaded, which is the worst case for this change: the old counters were
+uncontended there and still cost 41.8 ns in the probe. The scaling half — where
+the old design got *worse* with more cores — a divan bench cannot show, and the
+probe table above carries it.
+
+### What this settles: the clocks are now the whole cost
+
+`metrics_clock_reads` is the two `Instant::now()` calls that bracket every
+command plus the one `SystemTime::now()` every read transaction takes for its
+snapshot. **101.3 ns against 5.72 ns of counters.**
+
+So after this change the instrumentation on a `GET` is about 95% clock reads,
+and §19's original decomposition — "~41 ns of atomics, ~72 ns of `Instant`,
+~19 ns of `SystemTime`" — had the ranking right and the remedy pointed at the
+smaller half. Against a 302.7 ns storage read on this host, the clocks are a
+third of the read and the counters are under 2%.
+
+These are Windows figures and `Instant::now()` is a `QueryPerformanceCounter`
+here; Linux's vDSO is cheaper, perhaps 20–25 ns a call. The ratio moves, the
+conclusion does not.
+
+**Nothing was taken here, and the reasons are worth stating rather than
+leaving:**
+
+- A per-command latency histogram needs two timestamps per command. There is no
+  arrangement of one.
+- Sampling — observe one command in N and scale — is the obvious answer and
+  changes what the histogram *is*. This section's acceptance criterion was that
+  `stats` reports the same totals it did, and a sampled histogram does not.
+- The coarse clock for `SystemTime::now()` is the escape hatch `clock.rs` has
+  documented since it was written, together with the reason it has not been
+  taken: a cached clock that stops ticking fails silently and serves expired
+  data. That objection is unaffected by anything measured here.
+
+The honest summary is that the counters were worth fixing, are fixed, and were
+never the expensive part. The next round on this path is a clock decision, and
+it is a correctness argument rather than a performance one.
 
 ---
 
@@ -1692,7 +1730,7 @@ Ordered by measured prize over effort, against a `GET` whose storage work is
 | | prize | effort | risk |
 |---|---|---|---|
 | §17 framing-only measure | ~80 ns per RESP command — **measured at 24, see §17** | medium | low — fatal errors are provably framing-only |
-| §19(a) per-block counters | ~35 ns per command, and removes an anti-scaling term | small | low, but the flush must not be lost on a closing block |
+| §19 striped counters | 41.8 -> 5.7 ns per command, and the anti-scaling term is gone | small | low — one writer per lane, pinned by tests |
 | §18 fused multi-key read | 21–35% per key of a multiget | medium | the one real trade: *shard_count* readers open for a batch |
 | §20 both small ones | a few ns each | trivial | none — **wrong, see §20** |
 

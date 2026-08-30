@@ -10,7 +10,7 @@
 //! looks like healthy silence.
 
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use vash_core::{Command, Reply};
 use vash_store::StoreStats;
@@ -55,33 +55,246 @@ impl Histogram {
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Renders one Prometheus histogram family, with `labels` on every series.
-    ///
-    /// Prometheus buckets are **cumulative**, so each `le` line carries the
-    /// running total rather than the bucket's own count — getting that wrong
-    /// produces a histogram that renders but quantiles wrongly, which is the
-    /// kind of error a dashboard hides rather than shows.
-    fn render(&self, out: &mut String, name: &str, labels: &str) {
-        let mut running = 0u64;
-        for (index, bound) in LATENCY_BOUNDS_US.iter().enumerate() {
-            running += self.buckets[index].load(Ordering::Relaxed);
-            let seconds = *bound as f64 / 1e6;
-            let _ = writeln!(out, "{name}_bucket{{{labels}le=\"{seconds}\"}} {running}");
+    fn snapshot(&self) -> Buckets {
+        Buckets {
+            buckets: std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed)),
+            sum_us: self.sum_us.load(Ordering::Relaxed),
+            count: self.count.load(Ordering::Relaxed),
         }
-        running += self.buckets[LATENCY_BOUNDS_US.len()].load(Ordering::Relaxed);
-        let _ = writeln!(out, "{name}_bucket{{{labels}le=\"+Inf\"}} {running}");
-        let _ = writeln!(
-            out,
-            "{name}_sum{{{}}} {:.6}",
-            labels.trim_end_matches(','),
-            self.sum_us.load(Ordering::Relaxed) as f64 / 1e6
+    }
+
+    fn render(&self, out: &mut String, name: &str, labels: &str) {
+        render_histogram(out, name, labels, &self.snapshot());
+    }
+}
+
+/// One histogram's cells, already read.
+///
+/// The exposition takes this rather than the live cells because the striped
+/// command histograms have to be summed across lanes before they can be
+/// rendered, and a second copy of the cumulative-bucket arithmetic is the last
+/// thing this file needs. See [`render_histogram`].
+#[derive(Debug, Default, Clone, Copy)]
+struct Buckets {
+    buckets: [u64; LATENCY_BOUNDS_US.len() + 1],
+    sum_us: u64,
+    count: u64,
+}
+
+impl Buckets {
+    fn merge(&mut self, other: &Buckets) {
+        for (mine, theirs) in self.buckets.iter_mut().zip(other.buckets) {
+            *mine += theirs;
+        }
+        self.sum_us += other.sum_us;
+        self.count += other.count;
+    }
+}
+
+/// Renders one Prometheus histogram family, with `labels` on every series.
+///
+/// Prometheus buckets are **cumulative**, so each `le` line carries the
+/// running total rather than the bucket's own count — getting that wrong
+/// produces a histogram that renders but quantiles wrongly, which is the
+/// kind of error a dashboard hides rather than shows.
+fn render_histogram(out: &mut String, name: &str, labels: &str, read: &Buckets) {
+    let mut running = 0u64;
+    for (index, bound) in LATENCY_BOUNDS_US.iter().enumerate() {
+        running += read.buckets[index];
+        let seconds = *bound as f64 / 1e6;
+        let _ = writeln!(out, "{name}_bucket{{{labels}le=\"{seconds}\"}} {running}");
+    }
+    running += read.buckets[LATENCY_BOUNDS_US.len()];
+    let _ = writeln!(out, "{name}_bucket{{{labels}le=\"+Inf\"}} {running}");
+    let _ = writeln!(
+        out,
+        "{name}_sum{{{}}} {:.6}",
+        labels.trim_end_matches(','),
+        read.sum_us as f64 / 1e6
+    );
+    let _ = writeln!(
+        out,
+        "{name}_count{{{}}} {}",
+        labels.trim_end_matches(','),
+        read.count
+    );
+}
+
+// ---- striping --------------------------------------------------------------
+//
+// Every counter below this line is written once per command by every thread
+// that serves one. Kept as plain shared `AtomicU64`s, that made a `GET` pay
+// seven locked read-modify-writes across three cache lines — and measured, the
+// cost *rose* with core count in aggregate: 41.8 ns on one thread, 89.5 ns on
+// eight, so adding cores made the instrumentation slower system-wide than it
+// had been. `readers.rs` in `vash-store` already answers this shape, and this
+// is the same answer. See `docs/performance-proposals.md` §19.
+
+/// Threads that get a private copy of the per-command counters.
+///
+/// Sized above the default blocking pool (`server.max_blocking_threads`, 128)
+/// plus a runtime worker per core, because those are the threads that reach a
+/// counter. Past it, threads share [`SHARED_LANE`] and pay a locked add for it —
+/// slower, never wrong.
+const LANES: usize = 256;
+
+/// The lane threads fall back to once every private one is taken.
+///
+/// Reserved rather than handed out, so no thread ever *owns* a lane that a
+/// latecomer might also be writing. That is the whole correctness condition for
+/// [`bump`]: an owned lane has exactly one writer.
+const SHARED_LANE: usize = LANES - 1;
+
+/// Which stripe a thread writes, and whether it has that stripe to itself.
+#[derive(Clone, Copy, Debug)]
+struct Lane {
+    index: usize,
+    owned: bool,
+}
+
+/// The lane a thread with nowhere private to write uses.
+const FALLBACK: Lane = Lane {
+    index: SHARED_LANE,
+    owned: false,
+};
+
+/// Private lanes handed out so far. Touched once in a thread's life.
+static NEXT_LANE: AtomicUsize = AtomicUsize::new(0);
+
+/// Lanes given back by threads that have exited, for the next one to claim.
+///
+/// **Without this the win decays.** Tokio retires an idle blocking thread after
+/// ten seconds, so a server under bursty load churns through them; a scheme that
+/// never reclaimed a lane would hand out all 255 over a few hours and then
+/// quietly put every thread after that on the shared one. A mutex is ample for
+/// something touched twice in a thread's life.
+static FREED_LANES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Holds a lane for the life of a thread and gives it back on the way out.
+struct LaneGuard(Lane);
+
+impl LaneGuard {
+    fn claim() -> Self {
+        if let Some(index) = FREED_LANES.lock().ok().and_then(|mut free| free.pop()) {
+            return Self(Lane { index, owned: true });
+        }
+        let claimed = NEXT_LANE.fetch_add(1, Ordering::Relaxed);
+        Self(if claimed < SHARED_LANE {
+            Lane {
+                index: claimed,
+                owned: true,
+            }
+        } else {
+            // Pinned rather than left to climb, so a very long uptime cannot
+            // wrap the counter. Every thread past the limit shares one lane.
+            NEXT_LANE.store(SHARED_LANE, Ordering::Relaxed);
+            FALLBACK
+        })
+    }
+}
+
+impl Drop for LaneGuard {
+    fn drop(&mut self) {
+        if self.0.owned
+            && let Ok(mut free) = FREED_LANES.lock()
+        {
+            free.push(self.0.index);
+        }
+    }
+}
+
+thread_local! {
+    static LANE: LaneGuard = LaneGuard::claim();
+}
+
+/// This thread's lane.
+///
+/// Falls back to the shared one while thread-locals are being destroyed, which
+/// is the one moment `with` cannot hand anything back. A count taken there is
+/// still counted, just not privately.
+#[inline]
+fn lane() -> Lane {
+    LANE.try_with(|guard| guard.0).unwrap_or(FALLBACK)
+}
+
+/// Adds `n` to one thread's cell.
+///
+/// **On an owned lane this is deliberately not a `fetch_add`.** Nothing else
+/// writes the cell, so nothing can interleave between the load and the store,
+/// and dropping the lock prefix is most of what this arrangement buys: measured,
+/// seven of these cost 3.0 ns against 41.8 ns for seven shared `fetch_add`s on
+/// one thread, and 0.9 ns against 89.5 ns on eight.
+///
+/// A scraper summing the lanes sees exactly the staleness a relaxed `fetch_add`
+/// already gave it — these counters were never a consistent snapshot across
+/// series, and nothing reads them expecting one.
+#[inline]
+fn bump(cell: &AtomicU64, n: u64, owned: bool) {
+    if owned {
+        cell.store(
+            cell.load(Ordering::Relaxed).wrapping_add(n),
+            Ordering::Relaxed,
         );
-        let _ = writeln!(
-            out,
-            "{name}_count{{{}}} {}",
-            labels.trim_end_matches(','),
-            self.count.load(Ordering::Relaxed)
-        );
+    } else {
+        cell.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// One thread's copy of the four counters every command touches.
+///
+/// Cache-line aligned, which is the other half of §19: these were five adjacent
+/// `AtomicU64`s in one struct — one cache line, written by every core on every
+/// command.
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct RateLane {
+    commands_total: AtomicU64,
+    reads: AtomicU64,
+    writes: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+/// The command-rate counters, one lane per thread.
+#[derive(Debug)]
+pub struct Rates {
+    lanes: Box<[RateLane]>,
+}
+
+impl Default for Rates {
+    fn default() -> Self {
+        Self {
+            lanes: (0..LANES).map(|_| RateLane::default()).collect(),
+        }
+    }
+}
+
+impl Rates {
+    fn sum(&self, pick: impl Fn(&RateLane) -> &AtomicU64) -> u64 {
+        self.lanes
+            .iter()
+            .map(|lane| pick(lane).load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub fn commands_total(&self) -> u64 {
+        self.sum(|lane| &lane.commands_total)
+    }
+
+    pub fn reads(&self) -> u64 {
+        self.sum(|lane| &lane.reads)
+    }
+
+    pub fn writes(&self) -> u64 {
+        self.sum(|lane| &lane.writes)
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.sum(|lane| &lane.hits)
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.sum(|lane| &lane.misses)
     }
 }
 
@@ -232,29 +445,99 @@ impl CommandKind {
 /// a command's latency is a property of the storage work rather than of the
 /// wire format that asked for it. Splitting the histograms by dialect as well
 /// would triple the series to separate numbers that measure the same thing.
+/// One thread's copy of the per-command counters and latency histograms.
+///
+/// Cache-line aligned for the reason in [`RateLane`], and one allocation rather
+/// than one per counter so a thread's cells sit together.
+#[repr(align(64))]
+#[derive(Debug)]
+struct CommandLane {
+    /// Indexed `kind * Dialect::ALL.len() + dialect`, as before.
+    counts: [AtomicU64; CommandKind::ALL.len() * Dialect::ALL.len()],
+    latency: [LatencyCells; CommandKind::ALL.len()],
+}
+
+impl Default for CommandLane {
+    fn default() -> Self {
+        Self {
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            latency: std::array::from_fn(|_| LatencyCells::default()),
+        }
+    }
+}
+
+/// One histogram's live cells, for one thread.
 #[derive(Debug, Default)]
+struct LatencyCells {
+    buckets: [AtomicU64; LATENCY_BOUNDS_US.len() + 1],
+    sum_us: AtomicU64,
+    count: AtomicU64,
+}
+
+#[derive(Debug)]
 pub struct CommandMetrics {
-    counts: Vec<AtomicU64>,
-    latency: Vec<Histogram>,
+    lanes: Box<[CommandLane]>,
+}
+
+impl Default for CommandMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommandMetrics {
     fn new() -> Self {
         Self {
-            counts: (0..CommandKind::ALL.len() * Dialect::ALL.len())
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-            latency: (0..CommandKind::ALL.len())
-                .map(|_| Histogram::default())
-                .collect(),
+            lanes: (0..LANES).map(|_| CommandLane::default()).collect(),
         }
     }
 
     #[inline]
     pub fn observe(&self, kind: CommandKind, dialect: Dialect, elapsed: std::time::Duration) {
+        let lane = lane();
+        let mine = &self.lanes[lane.index];
         let index = kind.index();
-        self.counts[index * Dialect::ALL.len() + dialect as usize].fetch_add(1, Ordering::Relaxed);
-        self.latency[index].observe(elapsed);
+        bump(
+            &mine.counts[index * Dialect::ALL.len() + dialect as usize],
+            1,
+            lane.owned,
+        );
+
+        // The bucket search that `Histogram::observe` does, against this
+        // thread's cells rather than the shared ones.
+        let micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        let bucket = LATENCY_BOUNDS_US
+            .iter()
+            .position(|bound| micros <= *bound)
+            .unwrap_or(LATENCY_BOUNDS_US.len());
+        let cells = &mine.latency[index];
+        bump(&cells.buckets[bucket], 1, lane.owned);
+        bump(&cells.sum_us, micros, lane.owned);
+        bump(&cells.count, 1, lane.owned);
+    }
+
+    /// This command's count on one dialect, across every lane.
+    fn count_of(&self, kind: CommandKind, dialect: Dialect) -> u64 {
+        let slot = kind.index() * Dialect::ALL.len() + dialect as usize;
+        self.lanes
+            .iter()
+            .map(|lane| lane.counts[slot].load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// This command's latency histogram, across every lane.
+    fn latency_of(&self, kind: CommandKind) -> Buckets {
+        let index = kind.index();
+        let mut merged = Buckets::default();
+        for lane in &self.lanes {
+            let cells = &lane.latency[index];
+            merged.merge(&Buckets {
+                buckets: std::array::from_fn(|b| cells.buckets[b].load(Ordering::Relaxed)),
+                sum_us: cells.sum_us.load(Ordering::Relaxed),
+                count: cells.count.load(Ordering::Relaxed),
+            });
+        }
+        merged
     }
 
     /// How many times this command ran, across every dialect.
@@ -263,10 +546,9 @@ impl CommandMetrics {
     /// request happened to arrive on. The per-dialect split stays available to
     /// Prometheus, which is where the question "who is sending this" belongs.
     pub fn total(&self, kind: CommandKind) -> u64 {
-        let base = kind.index() * Dialect::ALL.len();
-        self.counts[base..base + Dialect::ALL.len()]
-            .iter()
-            .map(|count| count.load(Ordering::Relaxed))
+        Dialect::ALL
+            .into_iter()
+            .map(|dialect| self.count_of(kind, dialect))
             .sum()
     }
 
@@ -278,8 +560,7 @@ impl CommandMetrics {
         let _ = writeln!(out, "# TYPE vash_command_total counter");
         for kind in CommandKind::ALL {
             for dialect in Dialect::ALL {
-                let value = self.counts[kind.index() * Dialect::ALL.len() + dialect as usize]
-                    .load(Ordering::Relaxed);
+                let value = self.count_of(kind, dialect);
                 let _ = writeln!(
                     out,
                     "vash_command_total{{command=\"{}\",dialect=\"{}\"}} {value}",
@@ -295,10 +576,11 @@ impl CommandMetrics {
         );
         let _ = writeln!(out, "# TYPE vash_command_seconds histogram");
         for kind in CommandKind::ALL {
-            self.latency[kind.index()].render(
+            render_histogram(
                 out,
                 "vash_command_seconds",
                 &format!("command=\"{}\",", kind.name()),
+                &self.latency_of(kind),
             );
         }
     }
@@ -484,11 +766,12 @@ pub struct ServerMetrics {
     pub auth_timeouts: AtomicU64,
     pub auth_capacity_rejected: AtomicU64,
 
-    pub commands_total: AtomicU64,
-    pub reads: AtomicU64,
-    pub writes: AtomicU64,
-    pub hits: AtomicU64,
-    pub misses: AtomicU64,
+    /// Command rates and the hit/miss split, **striped per thread**.
+    ///
+    /// These five were adjacent `AtomicU64`s written by every core on every
+    /// command, which is one cache line and three to four locked adds per
+    /// request. See the striping block above and §19.
+    pub rates: Rates,
 
     /// Requests answered with a non-OK status, split by the classes an operator
     /// acts on differently.
@@ -522,11 +805,7 @@ impl Default for ServerMetrics {
             auth_denied: std::array::from_fn(|_| AtomicU64::new(0)),
             auth_timeouts: AtomicU64::new(0),
             auth_capacity_rejected: AtomicU64::new(0),
-            commands_total: AtomicU64::new(0),
-            reads: AtomicU64::new(0),
-            writes: AtomicU64::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            rates: Rates::default(),
             errors_client: AtomicU64::new(0),
             errors_capacity: AtomicU64::new(0),
             errors_overloaded: AtomicU64::new(0),
@@ -613,25 +892,33 @@ impl ServerMetrics {
 
     #[inline]
     pub fn read(&self, hits: u64, misses: u64) {
-        self.commands_total.fetch_add(1, Ordering::Relaxed);
-        self.reads.fetch_add(1, Ordering::Relaxed);
+        let lane = lane();
+        let mine = &self.rates.lanes[lane.index];
+        bump(&mine.commands_total, 1, lane.owned);
+        bump(&mine.reads, 1, lane.owned);
+        // Still guarded: a `GET_MANY` that hit nothing should not write the hit
+        // counter's cache line at all, and on the shared lane that guard is the
+        // difference between a locked add and none.
         if hits > 0 {
-            self.hits.fetch_add(hits, Ordering::Relaxed);
+            bump(&mine.hits, hits, lane.owned);
         }
         if misses > 0 {
-            self.misses.fetch_add(misses, Ordering::Relaxed);
+            bump(&mine.misses, misses, lane.owned);
         }
     }
 
     #[inline]
     pub fn write(&self) {
-        self.commands_total.fetch_add(1, Ordering::Relaxed);
-        self.writes.fetch_add(1, Ordering::Relaxed);
+        let lane = lane();
+        let mine = &self.rates.lanes[lane.index];
+        bump(&mine.commands_total, 1, lane.owned);
+        bump(&mine.writes, 1, lane.owned);
     }
 
     #[inline]
     pub fn other(&self) {
-        self.commands_total.fetch_add(1, Ordering::Relaxed);
+        let lane = lane();
+        bump(&self.rates.lanes[lane.index].commands_total, 1, lane.owned);
     }
 
     pub fn error(&self, class: ErrorClass) {
@@ -867,31 +1154,31 @@ pub fn render_prometheus(
         "vash_commands_total",
         "counter",
         "Commands executed.",
-        load(&server.commands_total).to_string(),
+        server.rates.commands_total().to_string(),
     );
     metric!(
         "vash_reads_total",
         "counter",
         "Read commands executed.",
-        load(&server.reads).to_string(),
+        server.rates.reads().to_string(),
     );
     metric!(
         "vash_writes_total",
         "counter",
         "Write commands executed.",
-        load(&server.writes).to_string(),
+        server.rates.writes().to_string(),
     );
     metric!(
         "vash_hits_total",
         "counter",
         "Keys served from cache. Counted per key, so a multi-get adds several.",
-        load(&server.hits).to_string(),
+        server.rates.hits().to_string(),
     );
     metric!(
         "vash_misses_total",
         "counter",
         "Keys looked up and not found live.",
-        load(&server.misses).to_string(),
+        server.rates.misses().to_string(),
     );
 
     server.commands.render(&mut out);
@@ -1147,6 +1434,135 @@ pub fn render_prometheus(
     );
 
     out
+}
+
+#[cfg(test)]
+mod striping_tests {
+    use super::*;
+
+    /// **Striping must not lose a count.** An owned lane is updated with a plain
+    /// load-add-store rather than a `fetch_add`, which is sound only while
+    /// exactly one thread writes it — so this is the test that the lane
+    /// bookkeeping actually delivers that, rather than the comment claiming it.
+    #[test]
+    fn every_count_survives_being_spread_across_lanes() {
+        const THREADS: usize = 16;
+        const EACH: u64 = 20_000;
+
+        let metrics = std::sync::Arc::new(ServerMetrics::default());
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let metrics = std::sync::Arc::clone(&metrics);
+                scope.spawn(move || {
+                    for _ in 0..EACH {
+                        metrics.read(1, 1);
+                        metrics.write();
+                        metrics.commands.observe(
+                            CommandKind::Get,
+                            Dialect::Resp,
+                            std::time::Duration::from_micros(7),
+                        );
+                    }
+                });
+            }
+        });
+
+        let total = THREADS as u64 * EACH;
+        assert_eq!(metrics.rates.reads(), total);
+        assert_eq!(metrics.rates.writes(), total);
+        assert_eq!(metrics.rates.hits(), total);
+        assert_eq!(metrics.rates.misses(), total);
+        // `read` and `write` each count one command.
+        assert_eq!(metrics.rates.commands_total(), total * 2);
+        assert_eq!(metrics.commands.total(CommandKind::Get), total);
+
+        let latency = metrics.commands.latency_of(CommandKind::Get);
+        assert_eq!(latency.count, total);
+        assert_eq!(latency.sum_us, total * 7);
+        assert_eq!(
+            latency.buckets.iter().sum::<u64>(),
+            total,
+            "every observation lands in exactly one bucket"
+        );
+    }
+
+    /// The shared lane is the one place two threads write the same cells, so it
+    /// is the one place the plain store would lose counts. It must use
+    /// `fetch_add` — driven here directly, because exhausting 255 real lanes in
+    /// a test would be slower than it is worth.
+    #[test]
+    fn the_shared_lane_does_not_lose_counts() {
+        const THREADS: usize = 8;
+        const EACH: u64 = 50_000;
+
+        let cell = std::sync::Arc::new(AtomicU64::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let cell = std::sync::Arc::clone(&cell);
+                scope.spawn(move || {
+                    for _ in 0..EACH {
+                        bump(&cell, 1, FALLBACK.owned);
+                    }
+                });
+            }
+        });
+        assert_eq!(cell.load(Ordering::Relaxed), THREADS as u64 * EACH);
+    }
+
+    /// A lane comes back when its thread exits, so a server that churns through
+    /// blocking threads does not quietly exhaust them and fall back to the
+    /// shared lane for the rest of its uptime.
+    #[test]
+    fn a_lane_is_returned_when_its_thread_exits() {
+        let before = FREED_LANES.lock().expect("free list").len();
+        // Sequential, so each thread has certainly exited before the next
+        // claims — which is what makes the reuse observable at all.
+        for _ in 0..4 {
+            std::thread::spawn(|| {
+                let claimed = lane();
+                assert!(claimed.owned, "a lone thread should get a private lane");
+            })
+            .join()
+            .expect("thread");
+        }
+        let after = FREED_LANES.lock().expect("free list").len();
+        assert!(
+            after > before,
+            "lanes are not being returned: {before} before, {after} after"
+        );
+    }
+
+    /// Rendering reads the lanes the same way the `stats` surfaces do, so a
+    /// counter that summed correctly for one and not the other would be a
+    /// dashboard that disagrees with `INFO`.
+    #[test]
+    fn the_exposition_sums_the_same_lanes() {
+        let metrics = ServerMetrics::default();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        metrics.commands.observe(
+                            CommandKind::Get,
+                            Dialect::Resp,
+                            std::time::Duration::from_micros(3),
+                        );
+                    }
+                });
+            }
+        });
+
+        let mut rendered = String::new();
+        metrics.commands.render(&mut rendered);
+        assert!(
+            rendered.contains("vash_command_total{command=\"get\",dialect=\"resp\"} 4000"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("vash_command_seconds_count{command=\"get\"} 4000"),
+            "{rendered}"
+        );
+    }
 }
 
 #[cfg(test)]

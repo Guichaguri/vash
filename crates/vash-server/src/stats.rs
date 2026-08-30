@@ -101,8 +101,8 @@ pub fn collect(state: &ServerState) -> Vec<(String, String)> {
             "cmd_meta".into(),
             load(&metrics.outcomes.meta_commands).to_string(),
         ),
-        ("get_hits".into(), load(&metrics.hits).to_string()),
-        ("get_misses".into(), load(&metrics.misses).to_string()),
+        ("get_hits".into(), metrics.rates.hits().to_string()),
+        ("get_misses".into(), metrics.rates.misses().to_string()),
         // The per-command splits. `get_hits`/`get_misses` above answer "is the
         // cache working"; these answer "which command is missing", which is
         // often the more actionable question.
@@ -183,10 +183,10 @@ pub fn collect(state: &ServerState) -> Vec<(String, String)> {
         ("accepting_conns".into(), "1".into()),
         (
             "vash_commands".into(),
-            load(&metrics.commands_total).to_string(),
+            metrics.rates.commands_total().to_string(),
         ),
-        ("vash_reads".into(), load(&metrics.reads).to_string()),
-        ("vash_writes".into(), load(&metrics.writes).to_string()),
+        ("vash_reads".into(), metrics.rates.reads().to_string()),
+        ("vash_writes".into(), metrics.rates.writes().to_string()),
     ];
 
     match state.store.stats() {
@@ -473,10 +473,9 @@ fn items(state: &ServerState) -> Vec<(String, String)> {
 fn slabs(state: &ServerState) -> Vec<(String, String)> {
     let class = class_id();
     let metrics = &state.metrics;
-    let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
 
     let mut slabs = vec![
-        (format!("{class}:get_hits"), load(&metrics.hits).to_string()),
+        (format!("{class}:get_hits"), metrics.rates.hits().to_string()),
         (
             format!("{class}:cmd_set"),
             (metrics.commands.total(CommandKind::Set)
