@@ -405,6 +405,17 @@ is not provably the true top-K. This is why every count it produces is
 `estimated_ops` and why the report is documented as a ranking to investigate
 rather than a measurement to bill against.
 
+> **Measured, and the caution was warranted in a way this paragraph did not
+> anticipate.** Gate 4 found the merge sound — the estimates are calibrated to
+> the error they publish — but the *ranking* exact only while keys are separated
+> by more than the combined error of their estimates. Across three runs the top
+> six always came back in order and positions seven to ten swapped twice, on
+> pairs whose true counts were 10% apart against a 5% error each. The tail of the
+> ranking is a set, not an order. `relative_error` on every row is what lets a
+> reader tell which part they are looking at, and that is the argument for
+> publishing it per row rather than documenting it once.
+> [benchmarks.md](benchmarks.md#gate-4-what-the-hot-key-estimate-is-actually-worth).
+
 ### 4.5 Reads and writes are counted separately
 
 Two counters per summary entry, ranked on their sum. A hot *read* key is a
@@ -515,7 +526,7 @@ the surface area rather than after it. This is M13; M11 and M12 are taken by
 | **0** — **done** | Instrument only, no surface: the enqueue instant through the shard queue, the threshold compare, the sampled summary, and the ring the saturated case needed in order to be measurable at all. Behind `--features introspect` | **Ran.** Gate 3 failed and rewrote §3.5; gates 1 and 2 proved unmeasurable end to end and were answered at 3.81 ns on `hot_path`. Published in [benchmarks.md](benchmarks.md#what-the-slowlog-and-the-hot-key-sampler-cost) |
 | **1** — **done** | The entry, the batch rule, and `GET /slowlog` with the §3.3 key gate. The ring buffer landed in phase 0, which needed one in order to saturate. The entry's `conn_id` and `peer` did not — §3.2 says why | **Met.** Against a real store a batch of six records one entry at `batch: 6`, `queue_us: 34`, `exec_us: 1032` — the two durations populated and distinguishable from a real writer queue. The fused read path records too, and keys render as digests until `listing_enabled` |
 | **2** — **done** | RESP `SLOWLOG GET/LEN/RESET/HELP`, the length in `INFO vash`, the roles mapping, the §3.3 key gate | **Met, against a real `redis-cli` and a real Redis beside it.** `SLOWLOG GET` renders Redis's six-field entry; six of seven error forms match `redis:7-alpine` verbatim and the seventh is a recorded divergence; keys are digests until `listing_enabled`; `RESET` empties the ring and leaves the counters |
-| **3** | Space-Saving summaries, the merge, `GET /hotkeys` behind the listing gate | §7's gate 4 passes against a known Zipfian; the route refuses when `listing_enabled` is clear |
+| **3** — **done** | `GET /hotkeys` behind the listing gate, and the estimate's error published beside it. The summaries and the merge landed in phase 0 | **Met, with one refinement.** Gate 4 passes: the sample rate is honoured to 1.2%, the published `1/sqrt(samples)` is calibrated (mean |z| 0.88 against a predicted 0.80), and the route refuses without `listing_enabled`. But the top ten is recovered exactly only when the keys are separated by more than their combined error — see below |
 | **4** | The two Prometheus counters, an [operations.md](operations.md) runbook entry, a `protocol.md` divergences row for the batch rule | An operator can go from "p99 crossed 25 ms" to a key digest and a queue-versus-commit verdict by following written steps |
 | **5** — *not committed* | Hot **tags**, ranked the same way | `DELETE_BY_TAG` on a hot tag invalidates a whole working set at once and is the most likely trigger for the stampede this server has no defence against. It is the natural companion to a stale-while-revalidate design and should be decided with that, not before it |
 

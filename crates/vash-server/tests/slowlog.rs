@@ -43,6 +43,15 @@ impl Harness {
         config.observability.admin_listen = "127.0.0.1:0".into();
         config.observability.introspect.slowlog_threshold_us = 1;
         config.observability.introspect.slowlog_max_len = 256;
+        // Sample everything. These tests are about the routes and their gates,
+        // not about the estimator — `introspect::hotkeys::tests` drives that
+        // directly, where a known distribution can be fed in and checked.
+        //
+        // Left at the shipping 1-in-128 the hot-key test reported an empty
+        // ranking, which is not a bug: forty-odd requests really do yield no
+        // samples at that rate, and a lightly-loaded server really does have
+        // nothing to say about which key is hot.
+        config.observability.introspect.hotkeys_sample_rate = 1;
         config.protocol.listing_enabled = disclose_keys;
         config.store.path = "/nonexistent-on-purpose".into();
 
@@ -92,6 +101,19 @@ impl Harness {
             }
             out.extend_from_slice(&chunk[..read]);
         }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A raw admin request, so a test can see the status line and not only a
+    /// body — which is the whole of what `/hotkeys` asserts when it refuses.
+    async fn admin(&self, path: &str) -> String {
+        let mut stream = TcpStream::connect(self.admin).await.expect("admin connect");
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .expect("admin request");
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.expect("admin response");
         String::from_utf8_lossy(&out).into_owned()
     }
 
@@ -401,5 +423,70 @@ async fn info_reports_the_slowlog_length_under_a_vash_name() {
     assert!(
         !default.contains("vash_slowlog_len:"),
         "the Vash section leaked into a bare INFO: {default:?}"
+    );
+}
+
+// ---- the hot-key surface ---------------------------------------------------
+//
+// Phase 3. Its exit criteria: gate 4 passes against a known Zipfian — asserted
+// in `introspect::hotkeys::tests`, where the estimator can be driven directly —
+// and the route refuses when `listing_enabled` is clear, which is here.
+
+/// §5: the whole route is gated, not merely the key bytes. A ranking reduced to
+/// digests would be a list of numbers with nothing to act on, so there is no
+/// useful degraded form to fall back to.
+#[tokio::test]
+async fn hotkeys_refuses_unless_the_listing_gate_is_open() {
+    let closed = Harness::start(false).await;
+    closed
+        .resp("*3\r\n$3\r\nSET\r\n$6\r\nsecret\r\n$1\r\nv\r\n", 1)
+        .await;
+
+    let response = closed.admin("/hotkeys").await;
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "expected a refusal: {response}"
+    );
+    assert!(
+        response.contains("listing_enabled"),
+        "the refusal should name the setting that lifts it: {response}"
+    );
+    assert!(
+        !response.contains("secret"),
+        "a refusal must not leak the key it refused over: {response}"
+    );
+}
+
+/// And with the gate open it ranks what the traffic actually hit.
+#[tokio::test]
+async fn hotkeys_ranks_the_key_the_traffic_hit() {
+    let harness = Harness::start(true).await;
+
+    // One key read far more than the other, so the ranking has an answer that
+    // is not an artefact of ordering.
+    harness
+        .resp("*3\r\n$3\r\nSET\r\n$3\r\nhot\r\n$1\r\nv\r\n", 1)
+        .await;
+    harness
+        .resp("*3\r\n$3\r\nSET\r\n$4\r\ncold\r\n$1\r\nv\r\n", 1)
+        .await;
+    for _ in 0..40 {
+        harness.resp("*2\r\n$3\r\nGET\r\n$3\r\nhot\r\n", 1).await;
+    }
+    harness.resp("*2\r\n$3\r\nGET\r\n$4\r\ncold\r\n", 1).await;
+
+    let response = harness.admin("/hotkeys").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response.split_once("\r\n\r\n").expect("a body").1;
+    let value: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+
+    assert_eq!(value["enabled"], true);
+    assert_eq!(
+        value["keys"][0]["key"], "hot",
+        "the most-read key should rank first: {value}"
+    );
+    assert!(
+        value["keys"][0]["read_samples"].as_u64().expect("reads") > 1,
+        "reads should be counted apart from writes: {value}"
     );
 }

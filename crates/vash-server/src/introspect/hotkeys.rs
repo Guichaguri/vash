@@ -50,8 +50,10 @@ pub struct Counter {
 }
 
 impl Counter {
+    /// Samples of this key, reads and writes together. What the ranking sorts
+    /// on, and what [`Merged::estimated_ops`] scales.
     #[inline]
-    fn total(&self) -> u64 {
+    pub fn total(&self) -> u64 {
         self.read_samples + self.write_samples
     }
 }
@@ -183,6 +185,22 @@ impl HotKeys {
         self.sample_rate
     }
 
+    /// Counters in each per-lane summary — the `m` of §4.3.
+    ///
+    /// Reported beside every ranking because it *is* the sensitivity: a summary
+    /// of `m` is guaranteed to hold anything above `1/m` of its lane's sampled
+    /// stream, and a reader deciding whether an absent key is genuinely cold
+    /// needs the threshold that absence was judged against.
+    pub fn counters_per_lane(&self) -> usize {
+        self.capacity
+    }
+
+    /// Whether sampling is on at all, so a caller can tell an idle server from
+    /// a disabled sampler without inferring it from an empty ranking.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Offers one key to the sampler.
     ///
     /// The common path is an `xorshift32` step and a masked compare against a
@@ -280,6 +298,21 @@ impl Merged {
     /// relative standard error of roughly `1/sqrt(samples)` — §4.2.
     pub fn estimated_ops(&self, counter: &Counter) -> u64 {
         counter.total() * self.sample_rate
+    }
+
+    /// The relative standard error of [`Self::estimated_ops`] for this counter.
+    ///
+    /// `1/sqrt(samples)`: 10% at a hundred samples, 3% at a thousand. Published
+    /// beside every estimate rather than left in a document, because §2 requires
+    /// an estimate to be named as one and a bare number is not named.
+    ///
+    /// `1.0` for a counter with no samples — total uncertainty, which is the
+    /// honest reading and avoids dividing by zero.
+    pub fn relative_error(&self, counter: &Counter) -> f64 {
+        match counter.total() {
+            0 => 1.0,
+            samples => 1.0 / (samples as f64).sqrt(),
+        }
     }
 }
 
@@ -406,6 +439,236 @@ mod tests {
         assert_eq!(&*top.key, b"key:0", "the hottest key ranks first");
         assert!(merged.estimated_ops(top) > 0);
         assert!(merged.sampled > 0);
+    }
+
+    // ---- §7 gate 4: the estimator on a known distribution -------------------
+    //
+    // "Drive a Zipfian workload with a known top-10 and check the report
+    // recovers the ranking, and that `estimated_ops` lands within the error
+    // bound §4.2 claims. This is the gate that stops §4.4's merge heuristic
+    // from shipping on faith."
+    //
+    // Seeded, so it runs in CI rather than only as a benchmark — §10.
+
+    /// A Zipfian key stream with a fixed seed.
+    ///
+    /// Inverse-CDF over `1/k^s`, driven by the same `xorshift32` the sampler
+    /// uses. Deterministic given the seed, which is what makes an accuracy
+    /// assertion a test rather than a coin flip.
+    struct Zipf {
+        cdf: Vec<f64>,
+        rng: u32,
+    }
+
+    impl Zipf {
+        fn new(keys: usize, exponent: f64, seed: u32) -> Self {
+            let weights: Vec<f64> = (1..=keys)
+                .map(|rank| 1.0 / (rank as f64).powf(exponent))
+                .collect();
+            let total: f64 = weights.iter().sum();
+            let mut running = 0.0;
+            let cdf = weights
+                .iter()
+                .map(|w| {
+                    running += w / total;
+                    running
+                })
+                .collect();
+            Self {
+                cdf,
+                rng: seed.max(1),
+            }
+        }
+
+        /// The next key's rank, zero-based — rank 0 is the hottest.
+        fn next(&mut self) -> usize {
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 17;
+            self.rng ^= self.rng << 5;
+            let u = f64::from(self.rng) / f64::from(u32::MAX);
+            self.cdf
+                .iter()
+                .position(|c| u <= *c)
+                .unwrap_or(self.cdf.len() - 1)
+        }
+    }
+
+    fn zipf_key(rank: usize) -> String {
+        format!("key:{rank:04}")
+    }
+
+    /// Space-Saving's formal guarantee, asserted rather than assumed: a held
+    /// counter never *under*-counts, and never over-counts by more than the
+    /// total it inherited when it took its slot.
+    ///
+    /// Run at `sample_rate = 1` on one lane, so the only thing under test is the
+    /// estimator — no sampling error, no merge. With 64 keys in 32 counters
+    /// there is real eviction, which is the condition the guarantee is about.
+    #[test]
+    fn the_estimator_never_undercounts_and_bounds_its_overcount() {
+        const KEYS: usize = 64;
+        const CAPACITY: usize = 32;
+        const OPS: usize = 200_000;
+
+        let mut zipf = Zipf::new(KEYS, 1.0, 0x5eed);
+        let mut truth = vec![0u64; KEYS];
+        let hot = HotKeys::new(1, CAPACITY);
+
+        for _ in 0..OPS {
+            let rank = zipf.next();
+            truth[rank] += 1;
+            hot.observe(zipf_key(rank).as_bytes(), false);
+        }
+
+        let merged = hot.merge();
+        assert_eq!(merged.sampled, OPS as u64, "every observation was admitted");
+
+        for counter in &merged.counters {
+            let name = String::from_utf8_lossy(&counter.key).into_owned();
+            let rank: usize = name.trim_start_matches("key:").parse().expect("a rank");
+            let actual = truth[rank];
+
+            assert!(
+                counter.total() >= actual,
+                "{name}: Space-Saving must not undercount — held {} against {actual}",
+                counter.total()
+            );
+            assert!(
+                counter.total() - counter.error <= actual,
+                "{name}: overcounted by more than the inherited total — \
+                 held {} error {} against {actual}",
+                counter.total(),
+                counter.error
+            );
+        }
+    }
+
+    /// The ranking is the product, so the ranking is what the gate asserts: the
+    /// hottest keys come back in the order they actually occurred.
+    #[test]
+    fn the_ranking_recovers_a_known_zipfian_top_ten() {
+        const KEYS: usize = 64;
+        const CAPACITY: usize = 32;
+        const OPS: usize = 400_000;
+        const CHECKED: usize = 10;
+
+        let mut zipf = Zipf::new(KEYS, 1.0, 0xd06f00d);
+        let mut truth = vec![0u64; KEYS];
+        let hot = HotKeys::new(1, CAPACITY);
+
+        for _ in 0..OPS {
+            let rank = zipf.next();
+            truth[rank] += 1;
+            hot.observe(zipf_key(rank).as_bytes(), false);
+        }
+
+        // The true ranking, by occurrence rather than by nominal Zipf rank —
+        // a finite stream does not order itself perfectly by construction.
+        let mut expected: Vec<usize> = (0..KEYS).collect();
+        expected.sort_by_key(|rank| std::cmp::Reverse(truth[*rank]));
+
+        let merged = hot.merge();
+        let got: Vec<String> = merged
+            .counters
+            .iter()
+            .take(CHECKED)
+            .map(|c| String::from_utf8_lossy(&c.key).into_owned())
+            .collect();
+        let want: Vec<String> = expected
+            .iter()
+            .take(CHECKED)
+            .map(|r| zipf_key(*r))
+            .collect();
+
+        assert_eq!(got, want, "the top {CHECKED} were not recovered in order");
+    }
+
+    /// The other half of gate 4: `estimated_ops` under **real sampling**, which
+    /// is where the scaling can be wrong rather than merely imprecise.
+    ///
+    /// One in 128, so the top key's estimate rests on thousands of samples and
+    /// §4.2's `1/sqrt(samples)` puts its relative error near 2%. The assertion
+    /// allows 25%, which is an order of magnitude of headroom over the claim —
+    /// this is testing that the estimate is *right*, not measuring how tight it
+    /// is. The measurement is in benchmarks.md.
+    #[test]
+    fn sampled_estimates_land_near_the_true_counts() {
+        const KEYS: usize = 32;
+        const OPS: usize = 1_000_000;
+        const RATE: u64 = 128;
+
+        let mut zipf = Zipf::new(KEYS, 1.0, 0xbeef);
+        let mut truth = vec![0u64; KEYS];
+        let hot = HotKeys::new(RATE, 32);
+
+        for _ in 0..OPS {
+            let rank = zipf.next();
+            truth[rank] += 1;
+            hot.observe(zipf_key(rank).as_bytes(), false);
+        }
+
+        let merged = hot.merge();
+        assert_eq!(merged.sample_rate, RATE);
+
+        let hottest = &merged.counters[0];
+        assert_eq!(
+            &*hottest.key,
+            zipf_key(0).as_bytes(),
+            "the hottest key should rank first"
+        );
+
+        let estimated = merged.estimated_ops(hottest) as f64;
+        let actual = truth[0] as f64;
+        let off_by = (estimated - actual).abs() / actual;
+        assert!(
+            off_by < 0.25,
+            "estimated {estimated} against a true {actual}, off by {:.1}%",
+            off_by * 100.0
+        );
+
+        // And the error bound it publishes has to describe that estimate rather
+        // than being decorative.
+        let claimed = merged.relative_error(hottest);
+        assert!(
+            claimed > 0.0 && claimed < 0.1,
+            "a key with {} samples claimed a relative error of {claimed}",
+            hottest.total()
+        );
+    }
+
+    /// Gate 4 against the **merge**, which is where §4.4 gives up its formal
+    /// guarantee: independent per-lane summaries added together are a heuristic.
+    /// Four threads, capacity small enough that each lane evicts, and the
+    /// hottest key still has to come back first.
+    #[test]
+    fn the_merge_recovers_the_hottest_key_across_lanes() {
+        const KEYS: usize = 64;
+        const OPS_PER_THREAD: usize = 100_000;
+        const THREADS: u32 = 4;
+
+        let hot = HotKeys::new(1, 16);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let hot = &hot;
+                scope.spawn(move || {
+                    // A seed per thread, so the lanes see different streams
+                    // drawn from the same distribution — which is the case the
+                    // merge has to survive.
+                    let mut zipf = Zipf::new(KEYS, 1.0, 0x1000 + thread);
+                    for _ in 0..OPS_PER_THREAD {
+                        hot.observe(zipf_key(zipf.next()).as_bytes(), false);
+                    }
+                });
+            }
+        });
+
+        let merged = hot.merge();
+        assert_eq!(merged.sampled, (THREADS as usize * OPS_PER_THREAD) as u64);
+        assert_eq!(
+            &*merged.counters[0].key,
+            zipf_key(0).as_bytes(),
+            "the merge lost the hottest key"
+        );
     }
 
     /// Samples outlive the thread that took them, and merge across threads. Both

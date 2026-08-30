@@ -1239,6 +1239,85 @@ expensive possible behaviour.
   blocks agreeing on a sign, where a 1% cost cannot show up at all.
 - Gate 4 belongs to phase 3, with the surface it validates.
 
+### Gate 4: what the hot-key estimate is actually worth
+
+Phase 3. §7's fourth gate: *"Drive a Zipfian workload with a known top-10 and
+check the report recovers the ranking, and that `estimated_ops` lands within the
+error bound §4.2 claims."* It is the gate that stops §4.4's merge heuristic —
+per-lane Space-Saving summaries added together, which has no formal guarantee —
+from shipping on faith.
+
+Two million `GET`s over 64 keys drawn from a Zipf(1.0) distribution, eight
+connections, at the **shipping** sample rate of one in 128. The driver counts
+what it sent, so the truth column is exact. Three runs, each against a freshly
+started server.
+
+The sample rate is honoured first: 2,000,000 requests produced 15,680, 15,819
+and 15,7xx samples against a nominal 15,625 — within 1.2%, which is what makes
+scaling by 128 legitimate at all.
+
+One run in full:
+
+| rank | true ops | estimated | off by | published error | samples |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 421,213 | 423,680 | +0.6% | 1.74% | 3,310 |
+| 1 | 210,941 | 203,776 | −3.4% | 2.51% | 1,592 |
+| 2 | 140,703 | 140,800 | +0.1% | 3.02% | 1,100 |
+| 3 | 105,822 | 115,584 | +9.2% | 3.33% | 903 |
+| 4 | 84,368 | 82,176 | −2.6% | 3.95% | 642 |
+| 5 | 70,671 | 69,760 | −1.3% | 4.28% | 545 |
+| 6 | 59,969 | 61,568 | +2.7% | 4.56% | 481 |
+| 7 | 52,486 | 48,512 | −7.6% | 5.14% | 379 |
+| 8 | 46,535 | 45,952 | −1.3% | 5.28% | 359 |
+| 9 | 42,448 | 44,800 | +5.5% | 5.35% | 350 |
+
+**The published error is not decorative.** Expressed in units of the error each
+row claims, the ten misses are 0.34, 1.35, 0.03, 2.76, 0.66, 0.30, 0.59, 1.48,
+0.25 and 1.03 — a mean of 0.88 against the 0.80 a correctly calibrated bound
+predicts. `1/sqrt(samples)` is describing this estimator, not decorating it.
+
+### And the part a single run would have hidden
+
+The first run recovered the top ten exactly. The second and third did not:
+
+| run | exact to rank | what swapped | their true gap | their published error |
+|---|---:|---|---:|---:|
+| 1 | 9 | — | — | — |
+| 2 | 7 | 8 ↔ 9 | 9.6% | 5.3% each |
+| 3 | 6 | 7 ↔ 8 | 11.4% | 4.9% each |
+
+This is not the estimator failing. Two estimates each carrying ±5% differ with
+roughly 7% error, so a pair of keys whose true counts are 10% apart is separated
+by about 1.4 standard errors — a coin weighted about 4:1, which is exactly the
+rate at which these swapped. **The ranking is exact while keys are separated by
+more than the combined error of their estimates, and interleaves below that.**
+
+That is the finding worth carrying out of gate 4, and it changes how the surface
+should be read rather than what it should do:
+
+- The top of the ranking — where a hot key is *hot*, several times its
+  neighbours — is recovered exactly and repeatably. That is the case the
+  instrument exists for.
+- The tail, where keys differ by a few per cent, is a set rather than an order.
+  An operator reading positions 7 through 10 as a ranking is reading noise.
+- **`relative_error` is what tells them which of the two they are looking at**,
+  which is the argument for publishing it beside every row rather than
+  documenting it once. Two rows whose estimates differ by less than the sum of
+  their errors are not ordered by this instrument, and the numbers to check that
+  are in the response.
+
+Raising `hotkeys_sample_rate` sharpens the tail — the error falls with the
+square root of the samples, so a rate of 16 would roughly halve it — at a cost
+[priced above](#what-the-slowlog-and-the-hot-key-sampler-cost) at 5.41 ns a
+request against 3.81. Nothing about the top of the ranking needs it.
+
+The CI test is the same check made deterministic: `introspect::hotkeys::tests`
+drives a seeded Zipf through the estimator, asserts Space-Saving's formal
+guarantee directly — a held counter never undercounts, and never overcounts by
+more than the total it inherited — and pins the recovered top ten. §10 asked for
+a seeded test rather than only a benchmark, and the reason is this section: the
+benchmark's answer moves between runs.
+
 ## What to take from all of this
 
 **Reads are where vash now leads.** Closed loop with `resident_mode`, `GET` is

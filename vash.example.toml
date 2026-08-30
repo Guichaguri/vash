@@ -571,7 +571,8 @@ tls_server_name = ""
 log_format = "pretty"   # or "json"
 log_level = "info"      # overridden by RUST_LOG when set
 
-# /metrics (Prometheus), /health and /stats (JSON).
+# /metrics (Prometheus), /health and /stats (JSON), plus /slowlog and
+# /hotkeys with a build that has --features introspect.
 #
 # Empty — the default — serves none of them. They have no authentication of
 # their own and report the store's size, its hit rate and the cluster's
@@ -584,6 +585,10 @@ log_level = "info"      # overridden by RUST_LOG when set
 #
 # /health returns 503 when a shard has reached critical pressure and is
 # refusing writes: the process is up, but it is not doing its job.
+#
+# /slowlog answers with key digests unless protocol.listing_enabled is set, and
+# /hotkeys refuses outright without it: a ranking of digests would be a list of
+# numbers with nothing to act on, so there is no useful degraded form.
 admin_listen = ""      # e.g. "127.0.0.1:9090"
 
 # ---------------------------------------------------------------------------

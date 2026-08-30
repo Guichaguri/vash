@@ -192,6 +192,7 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
             respond(&mut stream, 200, "application/json", &body).await
         }
         "/slowlog" => slowlog(&mut stream, &state, query).await,
+        "/hotkeys" => hotkeys(&mut stream, &state, query).await,
         _ => respond(&mut stream, 404, "text/plain", "not found").await,
     }
 }
@@ -219,6 +220,54 @@ async fn slowlog(stream: &mut TcpStream, state: &ServerState, query: &str) -> st
         state.protocol.listing_enabled,
     );
     respond(stream, 200, "application/json", &body).await
+}
+
+/// `GET /hotkeys[?count=N]` — the keys taking the most traffic, hottest first.
+///
+/// **The whole route is behind `protocol.listing_enabled`**, where `/slowlog`
+/// gates only the key bytes. The difference is what each one is: a slowlog
+/// entry is still useful with its key reduced to a digest — "the same key every
+/// time" is most of the diagnosis — where a hot-key ranking reduced to digests
+/// is a list of numbers with nothing to act on. There is no useful degraded
+/// form, so it is the gate or nothing, and this port has no authentication of
+/// its own. §2 and §5.
+#[cfg(feature = "introspect")]
+async fn hotkeys(stream: &mut TcpStream, state: &ServerState, query: &str) -> std::io::Result<()> {
+    const DEFAULT_COUNT: usize = 20;
+    const MAX_COUNT: usize = 1024;
+
+    if !state.protocol.listing_enabled {
+        return respond(
+            stream,
+            403,
+            "text/plain",
+            "hot keys name keys, so they need protocol.listing_enabled",
+        )
+        .await;
+    }
+
+    let count = query_param(query, "count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_COUNT)
+        .clamp(1, MAX_COUNT);
+
+    let body = hotkeys_json(&state.introspect.hotkeys, count);
+    respond(stream, 200, "application/json", &body).await
+}
+
+#[cfg(not(feature = "introspect"))]
+async fn hotkeys(
+    stream: &mut TcpStream,
+    _state: &ServerState,
+    _query: &str,
+) -> std::io::Result<()> {
+    respond(
+        stream,
+        501,
+        "text/plain",
+        "hot-key sampling needs a build with --features introspect",
+    )
+    .await
 }
 
 #[cfg(not(feature = "introspect"))]
@@ -387,6 +436,88 @@ fn slowlog_json(log: &crate::introspect::slowlog::Slowlog, count: usize, disclos
 
     // Pretty-printed, as `/stats` is and for the same reason: this is the route
     // a person reads during an incident.
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| String::from("{}"))
+}
+
+/// One key in the hot-key ranking.
+///
+/// Every count here is a **sample** count or a number derived from one, and the
+/// field names say so. §2: an estimate that looks exact is the same failure as a
+/// counter reading zero because the feature does not exist.
+#[cfg(feature = "introspect")]
+#[derive(serde::Serialize)]
+struct HotKeyBody {
+    key: String,
+    /// `xxh3` of the whole key, so a row here can be matched against a
+    /// `/slowlog` entry whose key was withheld.
+    digest: String,
+    /// Whether `key` is the whole of it or the first 128 bytes.
+    truncated: bool,
+    /// Samples scaled by the sample rate. **An estimate.**
+    estimated_ops: u64,
+    /// Its relative standard error, `1/sqrt(samples)`. Published beside the
+    /// estimate so a reader can see which rows are solid.
+    relative_error: f64,
+    /// What the estimate was scaled from, split the way the two problems are:
+    /// a hot read key wants a client-side cache, a hot written key is a
+    /// serialisation point on one shard's single writer.
+    samples: u64,
+    read_samples: u64,
+    write_samples: u64,
+    /// Space-Saving's inherited count. The key's true sample count lies in
+    /// `(samples - samples_error, samples]`; a large value means this row
+    /// arrived recently and inherited an evicted key's total rather than
+    /// earning it.
+    samples_error: u64,
+}
+
+/// The `/hotkeys` body.
+#[cfg(feature = "introspect")]
+#[derive(serde::Serialize)]
+struct HotKeysBody {
+    /// Whether sampling is running, so an empty ranking on an idle server is
+    /// distinguishable from one on a server that is not looking.
+    enabled: bool,
+    /// One request in this many is sampled; every `estimated_ops` is scaled by
+    /// it.
+    sample_rate: u64,
+    /// Samples behind the whole ranking.
+    sampled: u64,
+    /// Counters per thread-lane — the sensitivity. A summary of `m` is
+    /// guaranteed to hold anything above `1/m` of its lane's stream, so a key
+    /// absent from this list is only known to be below that.
+    counters_per_lane: usize,
+    keys: Vec<HotKeyBody>,
+}
+
+#[cfg(feature = "introspect")]
+fn hotkeys_json(sampler: &crate::introspect::hotkeys::HotKeys, count: usize) -> String {
+    let merged = sampler.merge();
+    let keys = merged
+        .counters
+        .iter()
+        .take(count)
+        .map(|counter| HotKeyBody {
+            key: escape_key(&counter.key),
+            digest: format!("xxh3:{:016x}", counter.digest),
+            truncated: counter.truncated,
+            estimated_ops: merged.estimated_ops(counter),
+            relative_error: rounded(merged.relative_error(counter), 4),
+            samples: counter.total(),
+            read_samples: counter.read_samples,
+            write_samples: counter.write_samples,
+            samples_error: counter.error,
+        })
+        .collect();
+
+    let body = HotKeysBody {
+        enabled: sampler.is_enabled(),
+        sample_rate: merged.sample_rate,
+        sampled: merged.sampled,
+        counters_per_lane: sampler.counters_per_lane(),
+        keys,
+    };
+
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| String::from("{}"))
 }
 
@@ -661,6 +792,101 @@ mod tests {
                 0,
                 "an empty log is distinguishable from a disabled one by its threshold"
             );
+        }
+    }
+
+    #[cfg(feature = "introspect")]
+    mod hotkeys {
+        use super::*;
+        use crate::introspect::hotkeys::HotKeys;
+
+        #[test]
+        fn the_body_names_every_count_as_a_sample_or_an_estimate() {
+            let hot = HotKeys::new(1, 8);
+            for _ in 0..30 {
+                hot.observe(b"hot:key", false);
+            }
+            for _ in 0..10 {
+                hot.observe(b"hot:key", true);
+            }
+            hot.observe(b"cold:key", false);
+
+            let json = hotkeys_json(&hot, 10);
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+            assert_eq!(value["enabled"], true);
+            assert_eq!(value["sample_rate"], 1);
+            assert_eq!(value["sampled"], 41);
+            assert_eq!(value["counters_per_lane"], 8);
+
+            let hottest = &value["keys"][0];
+            assert_eq!(hottest["key"], "hot:key");
+            assert_eq!(hottest["samples"], 40);
+            assert_eq!(hottest["read_samples"], 30);
+            assert_eq!(hottest["write_samples"], 10);
+            // At a rate of one, an estimate is the count — which is the case
+            // where a wrong scaling would be invisible, so it is pinned.
+            assert_eq!(hottest["estimated_ops"], 40);
+            assert!(
+                hottest["digest"]
+                    .as_str()
+                    .expect("a digest")
+                    .starts_with("xxh3:")
+            );
+        }
+
+        /// §2: an estimate has to be named as one, and its error published
+        /// beside it rather than left in a document.
+        #[test]
+        fn an_estimate_carries_its_error_and_its_scale() {
+            let hot = HotKeys::new(64, 8);
+            for _ in 0..10_000 {
+                hot.observe(b"hot:key", false);
+            }
+
+            let json = hotkeys_json(&hot, 10);
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            assert_eq!(value["sample_rate"], 64);
+
+            let hottest = &value["keys"][0];
+            let samples = hottest["samples"].as_u64().expect("a sample count");
+            let estimated = hottest["estimated_ops"].as_u64().expect("an estimate");
+            assert_eq!(estimated, samples * 64, "the estimate is samples x rate");
+
+            let error = hottest["relative_error"].as_f64().expect("an error");
+            assert!(error > 0.0 && error < 1.0, "got {error}");
+        }
+
+        #[test]
+        fn a_disabled_sampler_says_so_rather_than_looking_idle() {
+            let hot = HotKeys::new(0, 8);
+            hot.observe(b"hot:key", false);
+
+            let json = hotkeys_json(&hot, 10);
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            assert_eq!(value["enabled"], false);
+            assert_eq!(value["sampled"], 0);
+            assert_eq!(value["keys"].as_array().expect("an array").len(), 0);
+        }
+
+        /// Keys are bytes here as everywhere, and two that differ must not
+        /// collapse onto one rendering.
+        #[test]
+        fn a_key_that_is_not_text_renders_without_colliding() {
+            let hot = HotKeys::new(1, 8);
+            hot.observe(&[0xff, 0x01], false);
+            hot.observe(&[0xfe, 0x01], false);
+
+            let json = hotkeys_json(&hot, 10);
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            let keys: Vec<&str> = value["keys"]
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|k| k["key"].as_str().expect("a key"))
+                .collect();
+            assert_eq!(keys.len(), 2);
+            assert_ne!(keys[0], keys[1]);
         }
     }
 
