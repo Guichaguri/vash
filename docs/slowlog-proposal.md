@@ -8,7 +8,7 @@ latency buckets, and a queue-wait total. They answer *how is the server*.
 Neither of the two questions an operator actually asks during an incident is an
 aggregate:
 
-1. **What was slow just now?** `vash_command_latency_seconds` says the 99th
+1. **What was slow just now?** `vash_command_seconds` says the 99th
    percentile of `set` crossed 25 ms. It cannot say which `set`, from which
    client, against which key, or whether the time went into the shard queue or
    into the commit.
@@ -527,7 +527,7 @@ the surface area rather than after it. This is M13; M11 and M12 are taken by
 | **1** — **done** | The entry, the batch rule, and `GET /slowlog` with the §3.3 key gate. The ring buffer landed in phase 0, which needed one in order to saturate. The entry's `conn_id` and `peer` did not — §3.2 says why | **Met.** Against a real store a batch of six records one entry at `batch: 6`, `queue_us: 34`, `exec_us: 1032` — the two durations populated and distinguishable from a real writer queue. The fused read path records too, and keys render as digests until `listing_enabled` |
 | **2** — **done** | RESP `SLOWLOG GET/LEN/RESET/HELP`, the length in `INFO vash`, the roles mapping, the §3.3 key gate | **Met, against a real `redis-cli` and a real Redis beside it.** `SLOWLOG GET` renders Redis's six-field entry; six of seven error forms match `redis:7-alpine` verbatim and the seventh is a recorded divergence; keys are digests until `listing_enabled`; `RESET` empties the ring and leaves the counters |
 | **3** — **done** | `GET /hotkeys` behind the listing gate, and the estimate's error published beside it. The summaries and the merge landed in phase 0 | **Met, with one refinement.** Gate 4 passes: the sample rate is honoured to 1.2%, the published `1/sqrt(samples)` is calibrated (mean |z| 0.88 against a predicted 0.80), and the route refuses without `listing_enabled`. But the top ten is recovered exactly only when the keys are separated by more than their combined error — see below |
-| **4** | The two Prometheus counters, an [operations.md](operations.md) runbook entry, a `protocol.md` divergences row for the batch rule | An operator can go from "p99 crossed 25 ms" to a key digest and a queue-versus-commit verdict by following written steps |
+| **4** — **done** | `vash_slowlog_entries_total` and `vash_slowlog_evicted_total`, an [operations.md](operations.md#what-was-slow-and-where-did-the-time-go) runbook entry, and seven `protocol.md` divergence rows — the batch rule plus everything the RESP shape could not carry | **Met, by walking it.** Driving a real server to the alert and following the written steps reached a key digest and an exec-versus-queue verdict — and found step 1 citing a metric family that does not exist (`vash_command_latency_seconds`; it is `vash_command_seconds`), which is the error a runbook nobody walks always has |
 | **5** — *not committed* | Hot **tags**, ranked the same way | `DELETE_BY_TAG` on a hot tag invalidates a whole working set at once and is the most likely trigger for the stampede this server has no defence against. It is the natural companion to a stale-while-revalidate design and should be decided with that, not before it |
 
 ## 10. Testing

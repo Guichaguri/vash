@@ -163,6 +163,7 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
                 &store,
                 state.cluster.metrics(),
                 state.cluster.peers_reachable(),
+                state.introspect.slowlog_counters(),
             );
             respond(&mut stream, 200, "text/plain; version=0.0.4", &body).await
         }
@@ -637,8 +638,10 @@ async fn respond(
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        403 => "Forbidden",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
+        501 => "Not Implemented",
         503 => "Service Unavailable",
         _ => "Error",
     };

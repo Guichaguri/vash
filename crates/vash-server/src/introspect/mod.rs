@@ -187,6 +187,31 @@ impl Introspect {
     }
 }
 
+impl Introspect {
+    /// Slowlog entries admitted and evicted, or `None` in a build without the
+    /// feature.
+    ///
+    /// `Option` rather than a pair of zeroes, and that is §2 rather than taste:
+    /// a counter reading zero because the feature does not exist looks like
+    /// healthy silence, and an operator alerting on `evicted` climbing would
+    /// have built an alert that can never fire. Absent, the family is not
+    /// emitted at all.
+    pub fn slowlog_counters(&self) -> Option<(u64, u64)> {
+        #[cfg(feature = "introspect")]
+        {
+            use std::sync::atomic::Ordering;
+            Some((
+                self.slowlog.admitted.load(Ordering::Relaxed),
+                self.slowlog.evicted.load(Ordering::Relaxed),
+            ))
+        }
+        #[cfg(not(feature = "introspect"))]
+        {
+            None
+        }
+    }
+}
+
 /// Splits a request's total time into the part spent queued and the part spent
 /// in the store.
 ///

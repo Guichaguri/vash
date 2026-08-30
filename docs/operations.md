@@ -331,7 +331,8 @@ else.
 
 `/metrics` (Prometheus), `/health` and `/stats` (JSON) on the admin port, which
 serves nothing until `observability.admin_listen` or `--admin-listen` names an
-address. `/health` returns 503 when a shard is refusing writes — the process is
+address. A build with `--features introspect` adds `/slowlog` and `/hotkeys` —
+see [what was slow](#what-was-slow-and-where-did-the-time-go). `/health` returns 503 when a shard is refusing writes — the process is
 up but not doing its job, which is what a load balancer needs to know.
 
 ### Alert on these
@@ -357,6 +358,12 @@ up but not doing its job, which is what a load balancer needs to know.
   anything and the writer is not the bottleneck.
 - **`vash_utilisation`** — crossing 0.75 is normal and means reclamation went
   continuous. Crossing 0.88 means live data is being evicted.
+- **`vash_slowlog_entries_total`** — how often something crossed the threshold.
+  A rate, not a level: it is expected to be near zero and to jump during an
+  incident, which is the point of it.
+- **`vash_slowlog_evicted_total`** — entries pushed out to make room. Zero
+  normally. Rising *while you are diagnosing* means `slowlog_max_len` is too
+  small to hold the incident and entries are being lost before you read them.
 
 ## Failure modes
 
@@ -376,6 +383,65 @@ maintenance pass that would have freed space. The writer detects this, marks the
 shard critical so callers are refused before they reach the queue, and runs a
 reclaim in a fresh transaction with progressively smaller batches — deletions
 need pages of their own.
+
+### What was slow, and where did the time go?
+
+The latency histogram says the 99th percentile crossed 25 ms. It cannot say
+which request, against which key, or whether the time went into the shard queue
+or into the commit — those are four questions and it answers none of them. This
+is the path from the alert to a verdict. It needs a build with
+`--features introspect`; without one, `/slowlog` answers `501`.
+
+**1. Which command.** `vash_command_seconds` carries a `command` label.
+Above 5 ms its buckets are 25 ms, 100 ms and an overflow, so treat this as
+naming the command rather than measuring it.
+
+**2. Read the log.** `curl -s localhost:9090/slowlog?count=20`. Entries are
+newest first. The default threshold is 10 ms, so an incident that moved a p99
+past 25 ms is in there.
+
+If it is empty, the requests are slower than the histogram's resolution but
+under 10 ms. Lower `observability.introspect.slowlog_threshold_us` and restart —
+**there is no runtime knob for it**, and that is the sharp edge of this
+instrument: the decision to look harder costs a restart, so the default is set
+low enough that it usually does not have to be made.
+
+**3. Read the verdict off two columns.** Every entry carries `queue_us` and
+`exec_us`, disjoint and summing to what the request cost inside the server.
+
+| | Means | Next |
+|---|---|---|
+| `queue_us` dominates | The store was fine; the request waited to reach a writer | The writer is behind. Check the mean batch size (`vash_committed_ops_total / vash_commits_total`) and `vash_errors_total{class="overloaded"}`. This is [the writer is saturated](#the-writer-is-saturated) |
+| `exec_us` dominates | The store itself was slow for this request | Look at `value_bytes` and `batch` on the same entry, below |
+| both small | The time was not in the store at all — it was the network, the runtime, or the client | Nothing here will help; the server did its part |
+
+**4. Read the entry's shape.** `value_bytes` says whether it was slow because it
+was large — a 4 MiB value is 4 MiB of copying, not a fault. `batch` above 1
+means the entry is a group commit of that many writes, charged its whole
+duration rather than a share of it, so a large `batch` with a large `exec_us` is
+group commit working rather than failing.
+
+**5. Which key.** `key` is `xxh3:<hex>` unless `protocol.listing_enabled` is
+set. The digest is usually enough: **the same digest on every slow entry means
+one key**, which is a different problem from a server that is uniformly slow. To
+turn digests into names, set `listing_enabled` and restart — a decision worth
+making with the evidence rather than ahead of it.
+
+**6. If it is one key.** `curl -s localhost:9090/hotkeys` ranks what the traffic
+is actually hitting. It needs `listing_enabled`, and refuses with `403` without
+it. Read the top of the ranking, not the tail: every row carries a
+`relative_error`, and two rows whose estimates differ by less than the sum of
+their errors are not ordered by this instrument — see
+[benchmarks.md](benchmarks.md#gate-4-what-the-hot-key-estimate-is-actually-worth).
+`read_samples` against `write_samples` decides what to do about it: a hot read
+key wants a client-side cache or a replica, a hot *written* key is a
+serialisation point on one shard's single writer thread and is the more
+damaging of the two.
+
+**Afterwards.** `redis-cli SLOWLOG RESET` empties the ring without touching
+`vash_slowlog_entries_total` or `vash_slowlog_evicted_total`, so reproducing
+against a clean log costs no monitoring continuity. Turn `listing_enabled` back
+off when you are done with it.
 
 ### The writer is saturated
 

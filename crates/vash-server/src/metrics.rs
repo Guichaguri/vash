@@ -1042,6 +1042,10 @@ pub fn render_prometheus(
     store: &StoreStats,
     cluster: &ClusterMetrics,
     peers_reachable: u64,
+    // Slowlog entries admitted and evicted. `None` in a build without the
+    // `introspect` feature, and then no such family is emitted at all — see
+    // `Introspect::slowlog_counters` for why absent beats zero here.
+    slowlog: Option<(u64, u64)>,
 ) -> String {
     let mut out = String::with_capacity(4096);
     let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
@@ -1055,6 +1059,28 @@ pub fn render_prometheus(
         ($name:expr, $kind:expr, $help:expr, $value:expr $(,)?) => {
             metric(&mut out, $name, $kind, $help, $value)
         };
+    }
+
+    // Two families and no more. §2 of docs/slowlog-proposal.md: a key label is
+    // unbounded *and* attacker-chosen, so nothing about which key or which
+    // request is exported here. What a scrape gets is the shape of the log, and
+    // the surfaces that name keys are pull-only.
+    if let Some((admitted, evicted)) = slowlog {
+        metric!(
+            "vash_slowlog_entries_total",
+            "counter",
+            "Requests recorded in the slowlog since start. Its rate is how often \
+             something crossed observability.introspect.slowlog_threshold_us.",
+            admitted.to_string(),
+        );
+        metric!(
+            "vash_slowlog_evicted_total",
+            "counter",
+            "Slowlog entries pushed out to make room. Rising during an incident \
+             means slowlog_max_len is too small to hold it, and entries are being \
+             lost before anyone reads them.",
+            evicted.to_string(),
+        );
     }
 
     metric!(
@@ -1617,6 +1643,7 @@ mod tests {
                 &StoreStats::default(),
                 &ClusterMetrics::default(),
                 0,
+                None,
             )
         };
 
@@ -1666,6 +1693,7 @@ mod tests {
             &StoreStats::default(),
             &ClusterMetrics::default(),
             0,
+            None,
         );
 
         // A Prometheus scrape rejects a sample without a preceding TYPE line
@@ -1696,6 +1724,45 @@ mod tests {
         }
     }
 
+    /// The slowlog's two families, and the rule that keeps them to two.
+    ///
+    /// Absent without the feature rather than zero: an alert on `evicted`
+    /// climbing, written against a build that cannot record, would be an alert
+    /// that can never fire and looks healthy for it.
+    #[test]
+    fn the_slowlog_families_are_two_and_are_absent_when_unmeasured() {
+        let metrics = ServerMetrics::default();
+
+        let without = render_prometheus(
+            &metrics,
+            &StoreStats::default(),
+            &ClusterMetrics::default(),
+            0,
+            None,
+        );
+        assert!(
+            !without.contains("vash_slowlog"),
+            "an unmeasured slowlog must emit no family at all"
+        );
+
+        let with = render_prometheus(
+            &metrics,
+            &StoreStats::default(),
+            &ClusterMetrics::default(),
+            0,
+            Some((7, 3)),
+        );
+        assert!(with.contains("vash_slowlog_entries_total 7"), "{with}");
+        assert!(with.contains("vash_slowlog_evicted_total 3"), "{with}");
+
+        // §2: no key ever reaches a label. Two families, no more.
+        assert_eq!(
+            with.matches("vash_slowlog").count(),
+            6,
+            "two families is two HELP, two TYPE and two samples: {with}"
+        );
+    }
+
     #[test]
     fn counters_record_what_happened() {
         let metrics = ServerMetrics::default();
@@ -1709,7 +1776,7 @@ mod tests {
         cluster.fanout_failed();
         cluster.merged(4);
 
-        let rendered = render_prometheus(&metrics, &StoreStats::default(), &cluster, 2);
+        let rendered = render_prometheus(&metrics, &StoreStats::default(), &cluster, 2, None);
         assert!(rendered.contains("vash_hits_total 2"), "{rendered}");
         assert!(rendered.contains("vash_misses_total 1"));
         assert!(rendered.contains("vash_writes_total 1"));
@@ -1784,6 +1851,7 @@ mod phase6_tests {
             &StoreStats::default(),
             &ClusterMetrics::default(),
             0,
+            None,
         );
         assert!(rendered.contains("vash_command_total{command=\"get\",dialect=\"resp\"} 1"));
         assert!(rendered.contains("vash_command_total{command=\"get\",dialect=\"vcp\"} 1"));
@@ -1828,6 +1896,7 @@ mod phase6_tests {
             &store,
             &ClusterMetrics::default(),
             0,
+            None,
         );
         assert!(
             rendered.contains("vash_oldest_reader_age_ms 4200"),
