@@ -1746,21 +1746,60 @@ one "none". It was wrong.
 
 ---
 
-## 21. What to do first
+## 21. All four, and what the estimates got wrong
 
-Ordered by measured prize over effort, against a `GET` whose storage work is
-272 ns on the host these were taken on:
+All shipped. Every "measured" figure below is a median with both arms taken in
+one run of `cargo bench -p vash-bench --bench hot_path`, because this host drifts
+about 15% between runs and only a within-run comparison means anything.
 
-| | prize | effort | risk |
+| | proposed | **measured** | where the estimate went |
 |---|---|---|---|
-| §17 framing-only measure | ~80 ns per RESP command — **measured at 24, see §17** | medium | low — fatal errors are provably framing-only |
-| §19 striped counters | 41.8 -> 5.7 ns per command, and the anti-scaling term is gone | small | low — one writer per lane, pinned by tests |
-| §18 fused multi-key read | 21–35% per key of a multiget — **measured at 50%, see §18** | medium | the one real trade: *shard_count* readers open for a batch |
-| §20 both small ones | a few ns each | trivial | none — **wrong, see §20** |
+| §17 framing-only measure | ~80 ns per RESP command | **24 ns** on a `GET`, 68 on a `SET` | assumed the whole parse was `parse_command`'s to lose; the framing walk is ~67 ns of it and both passes pay that |
+| §18 fused multi-key read | 21–35% per key | **50%**, flat from 2 keys to 100 | costed from single-shard fixtures, which measured the copy and none of the scatter-gather |
+| §19 striped counters | ~35 ns per command | **41.8 → 5.7 ns**, and the anti-scaling term is gone | the counters were right; the *remedy* was proposed as a per-block flush, and a per-thread lane beat it on every row |
+| §20 both small ones | a few ns each | a few ns each | the routing half was proposed **wrong** — it would have invalidated every multi-shard cache on upgrade |
 
-**Measure them with `resident_mode` on.** `store.resident_mode` and
+**Two of the four estimates were off by more than 2×, in both directions, and the
+fifth judgement — that §20 carried no risk — was the only one that could have
+caused damage.** The pattern is not that the numbers were guessed: every one of
+them came from a measurement. It is that each was measured on something *adjacent
+to* the thing being changed — a full parse standing in for a framing walk, a
+single-shard read standing in for a sharded batch, a probe standing in for the
+real counters — and the difference between the proxy and the thing is exactly
+where the estimate went.
+
+Three things follow, and they are the reusable part of this round:
+
+- **A bench that approximates the shape of a thing measures the part it shares
+  with it and silently drops the rest.** §18's fixture was honest about being a
+  floor and still landed at half the real answer.
+- **Estimating a saving as "the cost of the thing being removed" assumes the
+  replacement is free.** §17's replacement was 74% of the original.
+- **A change with no unsafe, no new state and three lines of diff can still be
+  the dangerous one.** §20's reduction was correct arithmetic and the wrong
+  invariant, and the invariant it needed was written down twice in the files it
+  touched.
+
+### What is left, in order
+
+1. **The clocks.** After §19, instrumentation on a `GET` is about 95% clock
+   reads: `metrics_clock_reads` is 101.3 ns against 5.72 ns of counters. §19
+   records why none of the three obvious fixes was taken — this is a correctness
+   argument about coarse clocks and sampled histograms, not a performance one.
+2. **`read_header`.** The framing walk §17 left behind is ~67 ns for a
+   two-argument `GET`, most of it a `memchr` then `str::from_utf8` then
+   `str::parse::<i64>()`, three times over, for numbers that are almost always
+   one to four digits. This cuts `parse` as well as `peek`, so it is the whole
+   RESP surface rather than the measuring pass.
+3. **VCP `GET_MANY`.** Still collects, because a VCP frame header carries its
+   body length and the body cannot be streamed before its size is known. A
+   smaller prize than §18's and a different shape; see §18.
+4. **§15**, which is untouched by any of this and is still the write path's
+   largest single item.
+
+**Measure any of it with `resident_mode` on.** `store.resident_mode` and
 `store.inline_reads` both still default to `false`, and §3 measured the former at
 roughly 10× on closed-loop `GET`. With the hand-off to the blocking pool still in
-the path, every item above is rounding error against it — anyone benchmarking
+the path, everything above is rounding error against it — anyone benchmarking
 these changes on the shipped defaults will correctly conclude they did nothing.
 (`store.durability` needs no such warning: it already defaults to `lazy`.)
