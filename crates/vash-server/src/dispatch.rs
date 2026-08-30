@@ -231,7 +231,20 @@ pub fn count_stored(
 /// queued — and a runtime worker may not block on that. `SetBatch` is unaffected
 /// because it runs on the blocking pool, where such a wait is legal.
 pub fn awaitable(command: &Command<'_>) -> bool {
-    batchable(command).is_some_and(|set| set.tags.is_empty())
+    batchable(command).is_some_and(awaitable_set)
+}
+
+/// [`awaitable`], asked of a [`vash_core::Set`] the caller already holds.
+///
+/// The definition rather than a copy of one: `awaitable` unwraps a `Command` and
+/// then asks this, so the two cannot drift.
+///
+/// It exists because `resp::parse_writes` holds a `Set` and nothing else, and
+/// used to build a whole `Command` around it — a clone per write — purely to
+/// match the signature above. That is once per `SET` on the awaited write run,
+/// which is the path §8 built to be the fast one.
+pub fn awaitable_set(set: &vash_core::Set<'_>) -> bool {
+    matches!(set.mode, vash_core::SetMode::Set) && !set.return_previous && set.tags.is_empty()
 }
 
 /// Whether a command is an unconditional write that [`SetBatch`] may hold back.

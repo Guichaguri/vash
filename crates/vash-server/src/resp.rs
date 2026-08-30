@@ -291,7 +291,7 @@ pub(crate) fn parse_writes(block: &[u8]) -> Option<crate::conn::WriteRun<'_>> {
         let vash_core::Command::Set(set) = domain else {
             return None;
         };
-        if !crate::dispatch::awaitable(&vash_core::Command::Set(set.clone())) {
+        if !crate::dispatch::awaitable_set(&set) {
             return None;
         }
         run.sets.push(set);

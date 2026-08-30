@@ -1585,45 +1585,68 @@ block that closes the connection.
 
 ---
 
-## 20. Two small ones, both free
+## 20. Implemented: two small ones
 
-**Status: proposed. Neither is worth a section on its own; together they are an
-afternoon.**
+**Status: shipped. One of the two was proposed wrong, and the review that caught
+it is the more useful half of this section.**
 
 **A `Set` cloned to answer a question about three of its fields.** `resp.rs`, in
-`parse_writes`:
+`parse_writes`, used to read:
 
 ```rust
 if !crate::dispatch::awaitable(&vash_core::Command::Set(set.clone())) {
 ```
 
 `awaitable` reads `set.mode`, `set.return_previous` and `set.tags.is_empty()`. To
-ask it, the code builds a whole `Command` and discards it, once per `SET` on the
-**awaited write run** — the path §8 built to be the fast one. An
-`awaitable_set(&Set) -> bool` taking the borrow removes it.
+ask it, the code built a whole `Command` and discarded it, once per `SET` on the
+**awaited write run** — the path §8 built to be the fast one.
+`dispatch::awaitable_set` now takes the borrow, and `awaitable` is defined in
+terms of it rather than beside it, so the two cannot drift.
 
-It is also a second opinion on a settled question: `measure_resp` classified this
+It is also a second opinion on a settled question: `measure_resp` classifies a
 run as `Writes` only because `batchable_write` already checked the same three
 fields on every command in it. Worth keeping as a guard, worth not paying a move
 for.
 
-**A 64-bit division per key.** `shard.rs`:
+### A 64-bit division per key — and the reduction that would have cost a cache
+
+`shard.rs` reduced a hash to a shard with `%`:
 
 ```rust
 (xxhash_rust::xxh3::xxh3_64(key) % self.shards.len() as u64) as usize
 ```
 
-The shard count is a runtime value, so this is a hardware `div` on the path of
-every read and every key of every batch. The multiply-shift reduction —
-`((h as u128 * n as u128) >> 64) as usize` — is uniform for a uniformly
-distributed hash and compiles to one widening multiply.
+The shard count is a runtime value, so that is a hardware `div` on the path of
+every read and every key of every batch, beside a hash that `shard_routing_hash`
+measures at 3.9 ns for an 8-byte key.
 
-Isolated, the probe measured **6.90 ns against 0.78 ns**. **In situ it will be
-much less than that**: `shard_routing_hash` measures the hash alone at 3.9 ns for
-an 8-byte key, so the division is clearly pipelining with it rather than adding
-6.9 ns on top. Low single-digit nanoseconds per key is the honest claim. It is
-listed because it is three lines and cannot regress anything, not because it is
-large.
+**This section originally proposed the multiply-shift reduction,
+`((h as u128 * n as u128) >> 64)`, and that would have been a serious mistake.**
+It distributes a uniform hash just as uniformly, which is the property the
+proposal checked — and entirely the wrong property. **This mapping is
+persistent.** `Shards::for_key` says so, and `StoreConfig::shards` says so
+harder: *"Fixed at creation: changing it would route every key somewhere else,
+and opening a database with a different count is refused."* A reduction that
+merely distributes as well sends every existing key to a different shard, so the
+first restart after the upgrade would have turned every multi-shard deployment
+into a **total cache miss** — silently, with no error and no corruption, looking
+exactly like a cold start nobody ordered.
+
+What shipped instead is a mask, taken only when the shard count is a power of
+two: `h & (n - 1)` is **bit-identical** to `h % n` for those counts, so no key
+moves. Other counts keep the division. `the_mask_agrees_with_the_modulo` pins
+the identity across seven counts and ten thousand keys each, and says in its
+doc comment what it is really protecting.
+
+The isolated probe measured **6.90 ns for the division against 0.78 ns**; in situ
+it is much less, because the division pipelines with the hash rather than adding
+to it. Low single-digit nanoseconds per key is the honest claim.
+
+**The lesson worth keeping** is not about the nanoseconds. A change three lines
+long, in a pure function, with no unsafe and no new state, was one property short
+of destroying every cache it ran against — and the property it needed was
+already written down twice in the files it touched. §21's risk column called this
+one "none". It was wrong.
 
 ---
 
@@ -1637,7 +1660,7 @@ Ordered by measured prize over effort, against a `GET` whose storage work is
 | §17 framing-only measure | ~80 ns per RESP command | medium | low — fatal errors are provably framing-only |
 | §19(a) per-block counters | ~35 ns per command, and removes an anti-scaling term | small | low, but the flush must not be lost on a closing block |
 | §18 fused multi-key read | 21–35% per key of a multiget | medium | the one real trade: *shard_count* readers open for a batch |
-| §20 both small ones | a few ns each | trivial | none |
+| §20 both small ones | a few ns each | trivial | none — **wrong, see §20** |
 
 **Measure them with `resident_mode` on.** `store.resident_mode` and
 `store.inline_reads` both still default to `false`, and §3 measured the former at

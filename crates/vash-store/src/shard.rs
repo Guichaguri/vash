@@ -105,6 +105,19 @@ impl<'a, T> Grouped<'a, T> {
 
 pub(crate) struct Shards<B: Backend> {
     shards: Vec<Shard<B>>,
+    /// `count - 1` when the shard count is a power of two, so [`Self::index_of`]
+    /// reduces with a mask rather than a division. `None` for every other count,
+    /// which keeps the modulo.
+    ///
+    /// **Bit-identical to `% count` for the counts it covers**, and that is the
+    /// whole reason it is a mask rather than one of the cheaper reductions that
+    /// merely distribute as well. This mapping is persistent — see
+    /// [`Self::for_key`], and `StoreConfig::shards`, which refuses to open a
+    /// database whose count has changed — so a reduction that sent keys
+    /// somewhere else would turn every existing multi-shard store into a total
+    /// miss on upgrade. A mask cannot: `h & (n - 1) == h % n` for every
+    /// power-of-two `n`, which `the_mask_agrees_with_the_modulo` pins.
+    mask: Option<u64>,
 }
 
 impl<B: Backend> Shards<B> {
@@ -114,7 +127,10 @@ impl<B: Backend> Shards<B> {
         for index in 0..count {
             shards.push(Shard::open(config, index)?);
         }
-        Ok(Self { shards })
+        Ok(Self {
+            shards,
+            mask: count.is_power_of_two().then(|| count as u64 - 1),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -140,7 +156,15 @@ impl<B: Backend> Shards<B> {
         if self.shards.len() == 1 {
             return 0;
         }
-        (xxhash_rust::xxh3::xxh3_64(key) % self.shards.len() as u64) as usize
+        let hash = xxhash_rust::xxh3::xxh3_64(key);
+        // The shard count is a runtime value, so `%` here is a 64-bit hardware
+        // division — on the path of every read and every key of every batch,
+        // beside a hash that costs 3.9 ns for a short key. See [`Self::mask`]
+        // for why the fast path is a mask and not a cheaper reduction.
+        match self.mask {
+            Some(mask) => (hash & mask) as usize,
+            None => (hash % self.shards.len() as u64) as usize,
+        }
     }
 
     /// Groups items by the shard owning their key, keeping each item's position
@@ -217,6 +241,27 @@ mod tests {
         let once = xxhash_rust::xxh3::xxh3_64(b"stable");
         let twice = xxhash_rust::xxh3::xxh3_64(b"stable");
         assert_eq!(once, twice);
+    }
+
+    /// The mask in [`super::Shards::index_of`] is an optimisation only if it
+    /// lands every key exactly where the modulo did. It does, for every
+    /// power-of-two count — and this is what makes the change safe to ship
+    /// against an existing multi-shard database rather than a silent, total
+    /// cache miss on the first restart after upgrade.
+    #[test]
+    fn the_mask_agrees_with_the_modulo() {
+        for count in [1usize, 2, 4, 8, 16, 32, 64] {
+            assert!(count.is_power_of_two(), "the mask only covers these");
+            let mask = count as u64 - 1;
+            for i in 0..10_000u64 {
+                let hash = xxhash_rust::xxh3::xxh3_64(format!("key-{i}").as_bytes());
+                assert_eq!(
+                    hash & mask,
+                    hash % count as u64,
+                    "mask and modulo disagree for {hash} across {count} shards"
+                );
+            }
+        }
     }
 
     #[test]
