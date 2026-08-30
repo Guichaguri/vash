@@ -148,7 +148,7 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
         }
     }
 
-    let Some((method, path)) = request_line(&buf) else {
+    let Some((method, path, query)) = request_line(&buf) else {
         return respond(&mut stream, 400, "text/plain", "malformed request").await;
     };
     if method != "GET" {
@@ -191,18 +191,203 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
             );
             respond(&mut stream, 200, "application/json", &body).await
         }
+        "/slowlog" => slowlog(&mut stream, &state, query).await,
         _ => respond(&mut stream, 404, "text/plain", "not found").await,
     }
 }
 
-fn request_line(buf: &[u8]) -> Option<(&str, &str)> {
+/// `GET /slowlog[?count=N]` — the requests that crossed the threshold, newest
+/// first.
+///
+/// Answers **501** rather than 404 in a build without the `introspect` feature:
+/// the route exists and the binary cannot serve it, which is a different thing
+/// from a path that means nothing, and an operator reading a 404 would go
+/// looking for a typo. The same reasoning refuses a `tls.listen` at startup in
+/// a build without TLS rather than quietly serving in the clear.
+#[cfg(feature = "introspect")]
+async fn slowlog(stream: &mut TcpStream, state: &ServerState, query: &str) -> std::io::Result<()> {
+    const DEFAULT_COUNT: usize = 32;
+
+    let count = query_param(query, "count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_COUNT)
+        .clamp(1, MAX_SLOWLOG_COUNT);
+
+    let body = slowlog_json(
+        &state.introspect.slowlog,
+        count,
+        state.protocol.listing_enabled,
+    );
+    respond(stream, 200, "application/json", &body).await
+}
+
+#[cfg(not(feature = "introspect"))]
+async fn slowlog(
+    stream: &mut TcpStream,
+    _state: &ServerState,
+    _query: &str,
+) -> std::io::Result<()> {
+    respond(
+        stream,
+        501,
+        "text/plain",
+        "the slowlog needs a build with --features introspect",
+    )
+    .await
+}
+
+fn request_line(buf: &[u8]) -> Option<(&str, &str, &str)> {
     let line = buf.split(|b| *b == b'\n').next()?;
     let line = std::str::from_utf8(line).ok()?.trim_end();
     let mut parts = line.split(' ');
     let method = parts.next()?;
     let target = parts.next()?;
-    // Strip any query string; none of these routes take parameters.
-    Some((method, target.split('?').next().unwrap_or(target)))
+    // The path and the query separately. `/slowlog` takes a `count`; the other
+    // three take nothing and ignore whatever arrives beside them, which is what
+    // they did when this function dropped the query outright.
+    match target.split_once('?') {
+        Some((path, query)) => Some((method, path, query)),
+        None => Some((method, target, "")),
+    }
+}
+
+/// One `name=value` from a query string, if present.
+///
+/// Deliberately not a general parser: there is one parameter on one route, and
+/// percent-decoding a number would be machinery in service of nothing.
+#[cfg(feature = "introspect")]
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value)
+}
+
+/// The most entries `/slowlog` will render in one response.
+///
+/// A ceiling on the *request*, not on the log: a caller asking for a million
+/// gets this many. The log itself is bounded per lane by
+/// `observability.introspect.slowlog_max_len`.
+#[cfg(feature = "introspect")]
+const MAX_SLOWLOG_COUNT: usize = 1024;
+
+/// One rendered slowlog entry.
+///
+/// Field names follow `slowlog::Entry`, with the one substitution §3.3 of
+/// docs/slowlog-proposal.md requires: `key` carries the key's bytes only where
+/// enumeration is already permitted, and its digest otherwise.
+#[cfg(feature = "introspect")]
+#[derive(serde::Serialize)]
+struct SlowlogEntryBody {
+    id: u64,
+    timestamp: u64,
+    /// Time in the shard writer queue, and time in the store with that taken
+    /// out. Disjoint, and summing to what the request cost inside the server.
+    queue_us: u64,
+    exec_us: u64,
+    command: &'static str,
+    dialect: &'static str,
+    keys: u32,
+    /// The first key, or `xxh3:<hex>` of it — see [`slowlog_key`].
+    key: String,
+    /// Whether `key` is the name or the digest, so a reader never has to guess
+    /// which of the two they are looking at.
+    key_is_digest: bool,
+    value_bytes: u64,
+    batch: u32,
+}
+
+/// The `/slowlog` body.
+#[cfg(feature = "introspect")]
+#[derive(serde::Serialize)]
+struct SlowlogBody {
+    /// What `crosses` is comparing against, so a reader can tell an empty log
+    /// from a disabled one without a second request.
+    threshold_us: u64,
+    /// Entries admitted and entries pushed out to make room, for the whole
+    /// process. Monotonic; a future `SLOWLOG RESET` clears the entries and
+    /// leaves these alone.
+    admitted: u64,
+    evicted: u64,
+    /// Whether keys are rendered as names. `false` means every `key` below is a
+    /// digest.
+    keys_disclosed: bool,
+    entries: Vec<SlowlogEntryBody>,
+}
+
+/// How an entry names its key.
+///
+/// §3.3: the bytes only under `protocol.listing_enabled`, which is the same gate
+/// that decides whether any client may enumerate keys — a slowlog is
+/// enumeration by another name, and this port has no authentication of its own.
+/// Otherwise the whole key's `xxh3`, which still answers "is it the same key
+/// every time" and discloses nothing.
+#[cfg(feature = "introspect")]
+fn slowlog_key(entry: &crate::introspect::slowlog::Entry, disclose: bool) -> (String, bool) {
+    if disclose {
+        (escape_key(&entry.key), false)
+    } else {
+        (format!("xxh3:{:016x}", entry.digest), true)
+    }
+}
+
+/// Renders arbitrary key bytes as a JSON-safe string.
+///
+/// Keys are bytes, not text: they may be invalid UTF-8 and may contain control
+/// characters. Anything outside printable ASCII becomes `%XX`, and a literal
+/// `%` is escaped too so the mapping can be reversed. Lossy UTF-8 conversion
+/// was the alternative and is worse: it maps distinct keys onto the same
+/// rendering, which is exactly the confusion an operator is here to resolve.
+#[cfg(feature = "introspect")]
+fn escape_key(key: &[u8]) -> String {
+    let mut out = String::with_capacity(key.len());
+    for byte in key {
+        match byte {
+            b'%' => out.push_str("%25"),
+            0x20..=0x7e => out.push(*byte as char),
+            other => out.push_str(&format!("%{other:02x}")),
+        }
+    }
+    out
+}
+
+#[cfg(feature = "introspect")]
+fn slowlog_json(log: &crate::introspect::slowlog::Slowlog, count: usize, disclose: bool) -> String {
+    use std::sync::atomic::Ordering;
+
+    let entries = log
+        .entries(count)
+        .into_iter()
+        .map(|entry| {
+            let (key, key_is_digest) = slowlog_key(&entry, disclose);
+            SlowlogEntryBody {
+                id: entry.id,
+                timestamp: entry.timestamp,
+                queue_us: entry.queue_us,
+                exec_us: entry.exec_us,
+                command: entry.command.name(),
+                dialect: entry.dialect.name(),
+                keys: entry.keys,
+                key,
+                key_is_digest,
+                value_bytes: entry.value_bytes,
+                batch: entry.batch,
+            }
+        })
+        .collect();
+
+    let body = SlowlogBody {
+        threshold_us: log.threshold_us(),
+        admitted: log.admitted.load(Ordering::Relaxed),
+        evicted: log.evicted.load(Ordering::Relaxed),
+        keys_disclosed: disclose,
+        entries,
+    };
+
+    // Pretty-printed, as `/stats` is and for the same reason: this is the route
+    // a person reads during an incident.
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| String::from("{}"))
 }
 
 /// The `/stats` body.
@@ -345,20 +530,138 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_line_is_parsed_and_the_query_dropped() {
+    fn request_line_is_parsed_and_the_query_kept_apart() {
         assert_eq!(
             request_line(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n"),
-            Some(("GET", "/metrics"))
+            Some(("GET", "/metrics", ""))
         );
+        // The path must not carry the query, or `match path` stops matching.
         assert_eq!(
             request_line(b"GET /stats?pretty=1 HTTP/1.1\r\n\r\n"),
-            Some(("GET", "/stats"))
+            Some(("GET", "/stats", "pretty=1"))
+        );
+        assert_eq!(
+            request_line(b"GET /slowlog?count=5&x=1 HTTP/1.1\r\n\r\n"),
+            Some(("GET", "/slowlog", "count=5&x=1"))
         );
         assert_eq!(
             request_line(b"POST /metrics HTTP/1.1\r\n\r\n"),
-            Some(("POST", "/metrics"))
+            Some(("POST", "/metrics", ""))
         );
         assert_eq!(request_line(b"garbage\r\n\r\n"), None);
+    }
+
+    #[cfg(feature = "introspect")]
+    mod slowlog {
+        use super::*;
+        use crate::introspect::slowlog::{Record, Slowlog};
+        use crate::metrics::{CommandKind, Dialect};
+
+        fn logged(key: &[u8]) -> Slowlog {
+            let log = Slowlog::new(1, 8);
+            log.record(Record {
+                queue_us: 40_000,
+                exec_us: 84,
+                command: CommandKind::Set,
+                dialect: Dialect::Resp,
+                keys: 1,
+                key,
+                value_bytes: 1024,
+                batch: 1,
+            });
+            log
+        }
+
+        #[test]
+        fn count_is_read_from_the_query_and_defaults_without_one() {
+            assert_eq!(query_param("count=5", "count"), Some("5"));
+            assert_eq!(query_param("x=1&count=7&y=2", "count"), Some("7"));
+            assert_eq!(query_param("x=1", "count"), None);
+            assert_eq!(query_param("", "count"), None);
+            // A bare flag is not a parameter, and must not panic.
+            assert_eq!(query_param("count", "count"), None);
+        }
+
+        /// The two durations are the whole reason this is not Redis's slowlog,
+        /// so the body has to keep them apart and keep them disjoint.
+        #[test]
+        fn the_body_reports_queue_and_execution_separately() {
+            let json = slowlog_json(&logged(b"session:a9f"), 32, true);
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            let entry = &value["entries"][0];
+
+            assert_eq!(entry["queue_us"], 40_000);
+            assert_eq!(entry["exec_us"], 84);
+            assert_eq!(entry["command"], "set");
+            assert_eq!(entry["dialect"], "resp");
+            assert_eq!(value["threshold_us"], 1);
+            assert_eq!(value["admitted"], 1);
+        }
+
+        /// §3.3: the key's bytes only where enumeration is already permitted,
+        /// its digest otherwise — and the body says which of the two it gave.
+        #[test]
+        fn the_key_is_disclosed_only_under_the_listing_gate() {
+            let log = logged(b"session:a9f");
+
+            let open: serde_json::Value =
+                serde_json::from_str(&slowlog_json(&log, 32, true)).expect("valid JSON");
+            assert_eq!(open["keys_disclosed"], true);
+            assert_eq!(open["entries"][0]["key"], "session:a9f");
+            assert_eq!(open["entries"][0]["key_is_digest"], false);
+
+            let closed: serde_json::Value =
+                serde_json::from_str(&slowlog_json(&log, 32, false)).expect("valid JSON");
+            assert_eq!(closed["keys_disclosed"], false);
+            assert_eq!(closed["entries"][0]["key_is_digest"], true);
+            let digest = closed["entries"][0]["key"].as_str().expect("a string");
+            assert!(digest.starts_with("xxh3:"), "got {digest}");
+            assert!(
+                !digest.contains("session"),
+                "the gate leaked the key it was closed over: {digest}"
+            );
+        }
+
+        /// A stable digest is the whole value of the closed form: it answers
+        /// "is it the same key every time" without naming it.
+        #[test]
+        fn the_digest_is_stable_for_a_key_and_differs_between_keys() {
+            let render = |key: &[u8]| {
+                let json = slowlog_json(&logged(key), 32, false);
+                let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+                value["entries"][0]["key"]
+                    .as_str()
+                    .expect("a string")
+                    .to_string()
+            };
+            assert_eq!(render(b"a"), render(b"a"));
+            assert_ne!(render(b"a"), render(b"b"));
+        }
+
+        /// Keys are bytes. A key that is not UTF-8 must still render, and two
+        /// different keys must not collapse onto one rendering.
+        #[test]
+        fn a_key_that_is_not_text_still_renders_reversibly() {
+            assert_eq!(escape_key(b"plain:key"), "plain:key");
+            assert_eq!(escape_key(&[0xff, 0x00]), "%ff%00");
+            assert_eq!(escape_key(b"a b"), "a b");
+            // A literal percent is escaped, so the mapping can be reversed.
+            assert_eq!(escape_key(b"100%"), "100%25");
+            assert_ne!(escape_key(&[0xff]), escape_key(&[0xfe]));
+        }
+
+        #[test]
+        fn an_empty_log_still_reports_its_threshold() {
+            let json = slowlog_json(&Slowlog::new(10_000, 8), 32, false);
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            assert_eq!(value["threshold_us"], 10_000);
+            assert_eq!(value["admitted"], 0);
+            assert_eq!(
+                value["entries"].as_array().expect("an array").len(),
+                0,
+                "an empty log is distinguishable from a disabled one by its threshold"
+            );
+        }
     }
 
     #[test]

@@ -212,8 +212,8 @@ measured truth, because the wait really did not happen.
 | `exec_us` | `execute` / `execute_get_into` | The number the histogram already observes |
 | `command` | `CommandKind::name()` | Reuses the existing coarse classification — `EXISTS`, `TYPE` and `TTL` are one `deadline`, as they are everywhere else |
 | `dialect` | `Dialect::name()` | Recorded here where the histogram deliberately drops it: at one entry per incident the cardinality argument does not apply |
-| `conn_id` | `ConnInfo.id` | The registry in `connections.rs` already assigns one and `stats conns` already renders it |
-| `peer` | `ConnInfo.peer` | Already disclosed by `stats conns`; nothing new is revealed |
+| `conn_id` | `ConnInfo.id` | **Not built — phase 1 left this open.** The registry in `connections.rs` assigns one and `stats conns` renders it, so sourcing it is free. *Reaching* it from `dispatch::execute` is not: it means threading the connection through three dialect executors, some two dozen call sites on the hottest signatures in the program. Worth deciding on its own rather than as a rider on the batch rule |
+| `peer` | `ConnInfo.peer` | Not built, with `conn_id`, and the weaker of the two: a pooled application server is a handful of repeated addresses. Discloses nothing `stats conns` does not |
 | `keys` | command | *Count* of keys, always present |
 | `key` | command | The first key. Gated — §3.3 |
 | `value_bytes` | command | Sum of value bytes written, `0` for a read. What separates "slow because 4 MiB" from "slow because queued" |
@@ -513,7 +513,7 @@ the surface area rather than after it. This is M13; M11 and M12 are taken by
 | Phase | Scope | Exit |
 |---|---|---|
 | **0** — **done** | Instrument only, no surface: the enqueue instant through the shard queue, the threshold compare, the sampled summary, and the ring the saturated case needed in order to be measurable at all. Behind `--features introspect` | **Ran.** Gate 3 failed and rewrote §3.5; gates 1 and 2 proved unmeasurable end to end and were answered at 3.81 ns on `hot_path`. Published in [benchmarks.md](benchmarks.md#what-the-slowlog-and-the-hot-key-sampler-cost) |
-| **1** | The ring buffer, the entry, the batch rule, `GET /slowlog` | An entry appears for a request slower than the threshold, with `queue_us` and `exec_us` both populated and distinguishable; a stalled batch produces one entry with the right `batch` |
+| **1** — **done** | The entry, the batch rule, and `GET /slowlog` with the §3.3 key gate. The ring buffer landed in phase 0, which needed one in order to saturate. The entry's `conn_id` and `peer` did not — §3.2 says why | **Met.** Against a real store a batch of six records one entry at `batch: 6`, `queue_us: 34`, `exec_us: 1032` — the two durations populated and distinguishable from a real writer queue. The fused read path records too, and keys render as digests until `listing_enabled` |
 | **2** | RESP `SLOWLOG GET/LEN/RESET/HELP`, `INFO`'s `slowlog_len`, the `roles_for_command` mapping, the §3.3 key gate | `redis-cli slowlog get` renders unchanged; keys are digests until `listing_enabled`; `RESET` clears the buffer and not the counters |
 | **3** | Space-Saving summaries, the merge, `GET /hotkeys` behind the listing gate | §7's gate 4 passes against a known Zipfian; the route refuses when `listing_enabled` is clear |
 | **4** | The two Prometheus counters, an [operations.md](operations.md) runbook entry, a `protocol.md` divergences row for the batch rule | An operator can go from "p99 crossed 25 ms" to a key digest and a queue-versus-commit verdict by following written steps |

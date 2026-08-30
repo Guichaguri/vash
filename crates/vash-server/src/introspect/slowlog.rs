@@ -2,12 +2,16 @@
 //!
 //! Design and rationale: `docs/slowlog-proposal.md` §3.
 //!
-//! **Phase 0 builds the instrument, not the surface.** There is no `/slowlog`
-//! route and no RESP `SLOWLOG` here; both are phase 1 and 2. What is here is
-//! everything that costs something on the request path, so §7's gates have
-//! something to measure. Two fields the entry will carry — the connection id and
-//! its peer — are phase 1, because they are read only when an entry is admitted
-//! and so cost nothing the gates could see.
+//! Read on the admin port as `GET /slowlog` (`crate::admin`). The RESP
+//! `SLOWLOG` command is phase 2.
+//!
+//! Two fields §3.2 lists are **not here**: the connection id and its peer. They
+//! cost nothing on the request path — an entry is built only once a request has
+//! already lost — but reaching them means threading the connection through
+//! `dispatch::execute` and the three dialect executors above it, some two dozen
+//! call sites on the hottest signatures in the program. That is a decision worth
+//! taking on its own rather than as a rider on the batch rule, so it is left
+//! open. Everything else in §3.2 is recorded.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

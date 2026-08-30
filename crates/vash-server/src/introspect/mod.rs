@@ -1,8 +1,8 @@
 //! What was slow, and which key is hot.
 //!
-//! Proposed in `docs/slowlog-proposal.md`. This is **phase 0**: the
-//! instrumentation and nothing that reads it, so §7's gates have something to
-//! measure before any surface is built on top of it.
+//! Proposed in `docs/slowlog-proposal.md`. Phase 0 built the instrumentation and
+//! priced it; phase 1 gave the slowlog its entry, its batch rule and a route to
+//! read it on. The hot-key sampler still has no surface — that is phase 3.
 //!
 //! # Why the whole thing is behind a feature
 //!
@@ -88,9 +88,10 @@ impl Introspect {
             let total_us = _total.as_micros().min(u64::MAX as u128) as u64;
             if self.slowlog.crosses(total_us) {
                 let key = first_key(_command);
+                let (queue_us, exec_us) = split(total_us, _queue_us);
                 self.slowlog.record(slowlog::Record {
-                    queue_us: _queue_us.min(total_us),
-                    exec_us: total_us.saturating_sub(_queue_us),
+                    queue_us,
+                    exec_us,
                     command: _kind,
                     dialect: _dialect,
                     keys: key_count(_command),
@@ -135,16 +136,76 @@ impl Introspect {
         }
     }
 
-    /// Clears the queue wait a completed batch published without consuming it.
+    /// Records one committed batch of writes as **a single entry**.
     ///
-    /// The awaited `set_many` path does not pass through [`Self::observed`], so
-    /// without this its wait would sit in the slot and be charged to the next
-    /// command this thread ran. Phase 1 gives the batch an entry of its own and
-    /// this becomes a use rather than a discard — §3.4.
+    /// §3.4, and the one place this instrument deliberately disagrees with the
+    /// counters beside it. `dispatch::count_stored` divides a commit's duration
+    /// across its members, which keeps the histogram's mean honest; charging a
+    /// slowlog the same way would turn a 40 ms commit of 64 sets into 64
+    /// observations of 625 µs, every one of them under any sane threshold, and
+    /// the batch that actually stalled the connection would be invisible.
+    ///
+    /// So the batch is admitted on its **undivided** duration, once, carrying
+    /// its member count. The counters keep dividing; both are right for what
+    /// they are for.
+    ///
+    /// The queue wait is taken here whether or not an entry is admitted: this
+    /// path does not pass through [`Self::observed`], and a wait left in the
+    /// slot would be charged to whatever this thread ran next.
     #[inline]
-    pub fn discard_queue_wait(&self) {
-        let _ = vash_store::queue_wait::take();
+    pub fn observed_batch(
+        &self,
+        _sets: &[vash_core::Set<'_>],
+        _dialect: Dialect,
+        _total: std::time::Duration,
+    ) {
+        let _queue_us = vash_store::queue_wait::take();
+
+        #[cfg(feature = "introspect")]
+        {
+            for set in _sets {
+                self.hotkeys.observe(set.key.as_bytes(), true);
+            }
+
+            let total_us = _total.as_micros().min(u64::MAX as u128) as u64;
+            if !self.slowlog.crosses(total_us) {
+                return;
+            }
+            let Some(first) = _sets.first() else { return };
+            let (queue_us, exec_us) = split(total_us, _queue_us);
+            self.slowlog.record(slowlog::Record {
+                queue_us,
+                exec_us,
+                command: CommandKind::Set,
+                dialect: _dialect,
+                keys: _sets.len().min(u32::MAX as usize) as u32,
+                key: first.key.as_bytes(),
+                value_bytes: _sets.iter().map(|set| set.value.len() as u64).sum(),
+                batch: _sets.len().min(u32::MAX as usize) as u32,
+            });
+        }
     }
+}
+
+/// Splits a request's total time into the part spent queued and the part spent
+/// in the store.
+///
+/// The two are **disjoint and sum to `total_us`**, which is what lets the
+/// threshold be compared against their sum and lets a reader add the columns up.
+///
+/// Both clamps are load-bearing rather than defensive noise. The total is
+/// measured by `dispatch::execute` around the whole call; the wait is measured
+/// by the shard writer against a different `Instant`, taken on a different
+/// thread. Nothing guarantees the second is inside the first — a coarse clock
+/// tick, or a batch whose members were stamped before this request's own timer
+/// started, is enough to invert them. Without the clamp `exec_us` underflows to
+/// nineteen thousand years, which renders as a plausible-looking enormous
+/// number rather than as an obvious bug.
+#[cfg(feature = "introspect")]
+#[inline]
+fn split(total_us: u64, queue_us: u64) -> (u64, u64) {
+    let queued = queue_us.min(total_us);
+    (queued, total_us - queued)
 }
 
 /// Whether a command only reads. Mirrors `dispatch::is_read`, which is private
@@ -237,6 +298,27 @@ fn value_bytes(command: &Command<'_>) -> u64 {
 mod tests {
     use super::*;
     use vash_core::KeyList;
+
+    /// The columns must add up, and must keep adding up when the two clocks
+    /// disagree — which they can, being taken on different threads.
+    #[test]
+    fn the_two_durations_are_disjoint_and_sum_to_the_whole() {
+        for (total, queue) in [(0, 0), (1, 0), (100, 0), (100, 40), (100, 100)] {
+            let (queued, executed) = split(total, queue);
+            assert_eq!(queued + executed, total, "total {total} queue {queue}");
+            assert!(queued <= total);
+        }
+    }
+
+    /// A wait longer than the total is not impossible, it is a clock artefact —
+    /// and unclamped it underflows into a number that looks like a measurement.
+    #[test]
+    fn a_wait_longer_than_the_total_clamps_rather_than_underflowing() {
+        let (queued, executed) = split(100, 40_000);
+        assert_eq!(queued, 100, "the wait is capped at what the request took");
+        assert_eq!(executed, 0);
+        assert_eq!(queued + executed, 100);
+    }
 
     fn key(bytes: &[u8]) -> Key<'_> {
         Key::new(bytes).expect("a valid key")

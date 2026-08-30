@@ -209,11 +209,13 @@ pub fn count_stored(
     if sets.is_empty() {
         return;
     }
-    // The batch published a queue wait that no `execute` will take. Phase 1
-    // turns this into one entry for the batch; until then it is discarded here
-    // so it cannot be charged to whatever this thread runs next. See
-    // docs/slowlog-proposal.md §3.4.
-    state.introspect.discard_queue_wait();
+    // One slowlog entry for the whole batch, on the undivided duration, while
+    // the counters below divide it. The two disagree on purpose — see
+    // `Introspect::observed_batch` and docs/slowlog-proposal.md §3.4. Placed
+    // here rather than in `SetBatch::flush` for the same reason the counters
+    // are: this is where both batch routes converge, so what an operator sees
+    // cannot depend on which one a client's pipelining happened to take.
+    state.introspect.observed_batch(sets, dialect, elapsed);
 
     let each = elapsed / sets.len() as u32;
     for (index, set) in sets.iter().enumerate() {
