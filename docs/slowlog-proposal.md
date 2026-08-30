@@ -212,12 +212,23 @@ measured truth, because the wait really did not happen.
 | `exec_us` | `execute` / `execute_get_into` | The number the histogram already observes |
 | `command` | `CommandKind::name()` | Reuses the existing coarse classification — `EXISTS`, `TYPE` and `TTL` are one `deadline`, as they are everywhere else |
 | `dialect` | `Dialect::name()` | Recorded here where the histogram deliberately drops it: at one entry per incident the cardinality argument does not apply |
-| `conn_id` | `ConnInfo.id` | **Not built — phase 1 left this open.** The registry in `connections.rs` assigns one and `stats conns` renders it, so sourcing it is free. *Reaching* it from `dispatch::execute` is not: it means threading the connection through three dialect executors, some two dozen call sites on the hottest signatures in the program. Worth deciding on its own rather than as a rider on the batch rule |
-| `peer` | `ConnInfo.peer` | Not built, with `conn_id`, and the weaker of the two: a pooled application server is a handful of repeated addresses. Discloses nothing `stats conns` does not |
+| `conn_id` | `ConnInfo.id` | Built. The same id `stats conns` lists, so an entry can be matched against a live connection — verified against a running server rather than assumed. Reaching it meant widening the slot every dispatch entry point already had for the dialect into an `Origin`; see below |
+| `peer` | `ConnInfo.peer` | Built, with `conn_id`. Discloses nothing `stats conns` does not, and it is what fills field five of a RESP `SLOWLOG GET` entry — the one place Redis's shape had room for something this server was not recording |
 | `keys` | command | *Count* of keys, always present |
 | `key` | command | The first key. Gated — §3.3 |
 | `value_bytes` | command | Sum of value bytes written, `0` for a read. What separates "slow because 4 MiB" from "slow because queued" |
 | `batch` | `SetBatch` | Members in the batch this entry accounts for; `1` for an ordinary command. §3.4 |
+
+**How the two connection fields reach the entry.** They are read only when an
+entry is being built — for a request that has already lost — so they cost the
+hot path nothing. What they cost was the plumbing: the three dialect executors
+and everything under them carried a `Dialect` to the counters, and carrying a
+connection alongside it would have meant a second parameter at some two dozen
+call sites on the hottest signatures in the program. Instead the slot itself
+widened. `dispatch::Origin` is the dialect *and* the connection, one `Copy`
+value built once in `conn::handle` and passed where the dialect used to go, so
+no caller gained a parameter and the three facts that identify a request travel
+together.
 
 Deliberately absent: the full argument list. Redis truncates arguments to 32 and
 each to 128 bytes; here the arguments to a `SET` are the *value*, which is user

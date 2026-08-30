@@ -185,7 +185,16 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         // the dangerous direction: a block carrying an `AUTH` is not a block of
         // plain writes, so it never reaches this path to begin with.
         let may_write = state.auth.allows(&conn_auth, crate::auth::Roles::WRITE);
-        let keep_going = match protocol.expect("set above") {
+        // Who is asking, for whichever dialect the first byte settled on. All
+        // three fields are fixed for this connection's life, so this is a copy
+        // of two loads rather than anything computed.
+        let settled = protocol.expect("set above");
+        let origin = registered.origin(match settled {
+            Protocol::Vcp => crate::metrics::Dialect::Vcp,
+            Protocol::Memcached => crate::metrics::Dialect::Memcached,
+            Protocol::Resp => crate::metrics::Dialect::Resp,
+        });
+        let keep_going = match settled {
             Protocol::Vcp => {
                 drain(
                     &state,
@@ -194,8 +203,9 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     &mut write_buf,
                     &mut (),
                     |buf, runs| measure_vcp(buf, gated, runs),
-                    |state, conn, block, (), out| {
-                        crate::vcp::execute_vcp_block(state, conn, block, out)
+                    origin,
+                    |state, conn, origin, block, (), out| {
+                        crate::vcp::execute_vcp_block(state, conn, origin, block, out)
                     },
                     |_, _| {},
                     None,
@@ -216,13 +226,14 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     &mut write_buf,
                     &mut encrypted,
                     measure_memcached,
-                    |state, conn, block, tls, out| {
-                        execute_memcached_block(state, conn, block, *tls, out)
+                    origin,
+                    |state, conn, origin, block, tls, out| {
+                        execute_memcached_block(state, conn, origin, block, *tls, out)
                     },
                     |_, _| {},
                     may_write.then_some((
                         crate::memcached::parse_memcached_writes as ParseWrites,
-                        crate::metrics::Dialect::Memcached,
+                        origin,
                         memcached::encode::STORED,
                     )),
                     &mut runs,
@@ -237,13 +248,14 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     &mut write_buf,
                     &mut resp_version,
                     measure_resp,
+                    origin,
                     crate::resp::execute_block,
                     // Redis answers a protocol error and *then* hangs up, so the
                     // client learns why instead of seeing a bare disconnect.
                     vash_proto::resp::encode::protocol_error,
                     may_write.then_some((
                         crate::resp::parse_writes as ParseWrites,
-                        crate::metrics::Dialect::Resp,
+                        origin,
                         vash_proto::resp::encode::OK,
                     )),
                     &mut runs,
@@ -370,7 +382,23 @@ impl Run {
 }
 
 /// Executes a block of one dialect's commands, rendering the replies.
-type RunBlock<S> = fn(&ServerState, &mut ConnAuth, &[u8], &mut S, &mut Vec<u8>) -> Closing;
+/// A dialect's block executor.
+///
+/// A plain `fn` pointer rather than an `impl Fn`, and the [`Origin`] is a
+/// parameter for that reason: a closure capturing it would no longer coerce
+/// here, and this is moved into a `spawn_blocking` once per block — a boxed
+/// closure per block, to carry two words that every one of these already needs,
+/// is the wrong trade.
+///
+/// [`Origin`]: crate::dispatch::Origin
+type RunBlock<S> = fn(
+    &ServerState,
+    &mut ConnAuth,
+    crate::dispatch::Origin,
+    &[u8],
+    &mut S,
+    &mut Vec<u8>,
+) -> Closing;
 
 /// A block that is nothing but unconditional writes, decoded and ready to send.
 ///
@@ -422,7 +450,7 @@ async fn run_writes_awaited(
     block: &[u8],
     out: &mut Vec<u8>,
     parse: ParseWrites,
-    dialect: crate::metrics::Dialect,
+    origin: crate::dispatch::Origin,
     stored: &'static [u8],
 ) -> Option<()> {
     let run = parse(block)?;
@@ -440,7 +468,7 @@ async fn run_writes_awaited(
     let pending = state.store.submit_set_many(&run.sets).ok()?;
     let cas = pending.wait().await.ok()?;
 
-    crate::dispatch::count_stored(state, dialect, &run.sets, &cas, started.elapsed());
+    crate::dispatch::count_stored(state, origin, &run.sets, &cas, started.elapsed());
     for suppressed in &run.suppress {
         if !suppressed {
             out.extend_from_slice(stored);
@@ -467,6 +495,10 @@ async fn run_writes_awaited(
 /// Amortising it over whatever arrived in a single read is what makes pipelining
 /// worth anything, and it costs the unpipelined case nothing — one command in
 /// the buffer is still one hop.
+// Eight, and the eighth is the `Origin` the block executor needs. A parameter
+// struct here would bundle a borrowed buffer, an owned block and two flags that
+// have nothing to do with each other, to satisfy a lint.
+#[expect(clippy::too_many_arguments)]
 async fn run_block<S: Copy + Send + 'static>(
     state: &Arc<ServerState>,
     conn_auth: &mut ConnAuth,
@@ -474,10 +506,11 @@ async fn run_block<S: Copy + Send + 'static>(
     block: Bytes,
     write_buf: &mut Vec<u8>,
     inline: bool,
+    origin: crate::dispatch::Origin,
     run: RunBlock<S>,
 ) -> std::io::Result<Closing> {
     if inline {
-        return Ok(run(state, conn_auth, &block, dialect, write_buf));
+        return Ok(run(state, conn_auth, origin, &block, dialect, write_buf));
     }
 
     let state = Arc::clone(state);
@@ -504,6 +537,7 @@ async fn run_block<S: Copy + Send + 'static>(
         let closing = run(
             &state,
             &mut authenticating,
+            origin,
             &block,
             &mut negotiating,
             &mut out,
@@ -533,12 +567,13 @@ async fn drain<S: Copy + Send + 'static>(
     write_buf: &mut Vec<u8>,
     dialect: &mut S,
     measure: impl Fn(&[u8], &mut Vec<Run>) -> Measured,
+    origin: crate::dispatch::Origin,
     run: RunBlock<S>,
     on_fatal: fn(&mut Vec<u8>, &'static str),
     // How this dialect decodes a run of nothing but writes, and what it says
     // for each one that stored. `None` for a dialect that stays on the ordinary
     // path — see `measure_vcp`.
-    writes: Option<(ParseWrites, crate::metrics::Dialect, &'static [u8])>,
+    writes: Option<(ParseWrites, crate::dispatch::Origin, &'static [u8])>,
     // Reused across every block this connection ever measures, so a block costs
     // no allocation once the connection has seen its widest mix.
     runs: &mut Vec<Run>,
@@ -642,7 +677,10 @@ async fn drain<S: Copy + Send + 'static>(
             // Reads may run on this worker; anything that can write must not,
             // because a write waits on the shard's writer queue and would block
             // the worker — and every other connection it serves — behind it.
-            if run_block(state, conn_auth, dialect, slice, write_buf, inline, run).await?
+            if run_block(
+                state, conn_auth, dialect, slice, write_buf, inline, origin, run,
+            )
+            .await?
                 == Closing::Yes
             {
                 // `quit`, and nothing after it on this connection matters — the

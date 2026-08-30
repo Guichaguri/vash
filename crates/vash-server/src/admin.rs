@@ -338,6 +338,11 @@ struct SlowlogEntryBody {
     exec_us: u64,
     command: &'static str,
     dialect: &'static str,
+    /// The connection's row in `stats conns`, and where it came from — the same
+    /// two facts that listing shows, so an entry here can be matched against a
+    /// live connection while it is still open.
+    conn_id: u64,
+    peer: String,
     keys: u32,
     /// The first key, or `xxh3:<hex>` of it — see [`slowlog_key`].
     key: String,
@@ -418,6 +423,8 @@ fn slowlog_json(log: &crate::introspect::slowlog::Slowlog, count: usize, disclos
                 exec_us: entry.exec_us,
                 command: entry.command.name(),
                 dialect: entry.dialect.name(),
+                conn_id: entry.conn_id,
+                peer: entry.peer.to_string(),
                 keys: entry.keys,
                 key,
                 key_is_digest,
@@ -697,7 +704,11 @@ mod tests {
                 queue_us: 40_000,
                 exec_us: 84,
                 command: CommandKind::Set,
-                dialect: Dialect::Resp,
+                origin: crate::dispatch::Origin {
+                    dialect: Dialect::Resp,
+                    conn_id: 7,
+                    peer: "10.0.0.7:54321".parse().expect("a peer"),
+                },
                 keys: 1,
                 key,
                 value_bytes: 1024,
@@ -728,6 +739,8 @@ mod tests {
             assert_eq!(entry["exec_us"], 84);
             assert_eq!(entry["command"], "set");
             assert_eq!(entry["dialect"], "resp");
+            assert_eq!(entry["conn_id"], 7);
+            assert_eq!(entry["peer"], "10.0.0.7:54321");
             assert_eq!(value["threshold_us"], 1);
             assert_eq!(value["admitted"], 1);
         }

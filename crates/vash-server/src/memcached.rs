@@ -18,9 +18,10 @@ use vash_proto::vcp::Status;
 
 use crate::auth::ConnAuth;
 use crate::dispatch::{
-    Closing, Failed, SetBatch, awaitable, batchable, deny, execute, execute_get_into, listing_gate,
+    Closing, Failed, Origin, SetBatch, awaitable, batchable, deny, execute, execute_get_into,
+    listing_gate,
 };
-use crate::metrics::{CommandKind, Dialect};
+use crate::metrics::CommandKind;
 use crate::state::ServerState;
 
 /// Decodes a memcached block that is nothing but plain `set`s.
@@ -67,6 +68,9 @@ pub(crate) fn parse_memcached_writes(block: &[u8]) -> Option<crate::conn::WriteR
 pub fn execute_memcached_block(
     state: &ServerState,
     conn: &mut ConnAuth,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     block: &[u8],
     tls: bool,
     out: &mut Vec<u8>,
@@ -95,22 +99,22 @@ pub fn execute_memcached_block(
                     && !(conn_gated(state, conn, &parsed.command))
                 {
                     if batch.holds(set.key) {
-                        flush_memcached(state, &mut batch, out);
+                        flush_memcached(state, origin, &mut batch, out);
                     }
                     batch.push(set.clone(), parsed.noreply);
                     rest = &rest[consumed..];
                     continue;
                 }
 
-                flush_memcached(state, &mut batch, out);
-                if execute_memcached(state, conn, &parsed, tls, out) == Closing::Yes {
+                flush_memcached(state, origin, &mut batch, out);
+                if execute_memcached(state, conn, origin, &parsed, tls, out) == Closing::Yes {
                     // `quit`: nothing after it on this connection matters.
                     return Closing::Yes;
                 }
                 rest = &rest[consumed..];
             }
             Err(ProtocolError::Recoverable { response, consumed }) => {
-                flush_memcached(state, &mut batch, out);
+                flush_memcached(state, origin, &mut batch, out);
                 // An unparseable command from an unauthenticated connection is
                 // still an unauthenticated command, and upstream answers it as
                 // one — an unknown verb, a bad command line and outright
@@ -143,7 +147,7 @@ pub fn execute_memcached_block(
     }
     // The flush every other caller in this loop is protected from forgetting,
     // because forgetting it here would drop the writes silently.
-    flush_memcached(state, &mut batch, out);
+    flush_memcached(state, origin, &mut batch, out);
     Closing::No
 }
 
@@ -166,8 +170,13 @@ fn conn_gated(state: &ServerState, conn: &ConnAuth, command: &Command<'_>) -> bo
 }
 
 /// Submits a held run of `set`s and writes `STORED` — or the failure — for each.
-fn flush_memcached(state: &ServerState, batch: &mut SetBatch<'_, bool>, out: &mut Vec<u8>) {
-    batch.flush(state, Dialect::Memcached, out, |out, noreply, result| {
+fn flush_memcached(
+    state: &ServerState,
+    origin: Origin,
+    batch: &mut SetBatch<'_, bool>,
+    out: &mut Vec<u8>,
+) {
+    batch.flush(state, origin, out, |out, noreply, result| {
         // `noreply` suppresses the response but never the work, exactly as it
         // does on the unbatched path.
         if *noreply {
@@ -189,6 +198,9 @@ fn flush_memcached(state: &ServerState, batch: &mut SetBatch<'_, bool>, out: &mu
 pub fn execute_memcached(
     state: &ServerState,
     conn: &mut ConnAuth,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     parsed: &vash_proto::memcached::Parsed<'_>,
     // `tls`: whether *this* connection is encrypted. `stats settings` reports
     // it as `ssl_enabled`, per connection rather than per server, because the
@@ -230,7 +242,7 @@ pub fn execute_memcached(
     // one `Reply` can carry — so it pages the listing itself and writes as it
     // goes. See [`execute_dump`].
     if let vash_proto::memcached::encode::ResponseStyle::Dump(dump) = &parsed.style {
-        if let Err(failed) = execute_dump(state, *dump, out) {
+        if let Err(failed) = execute_dump(state, origin, *dump, out) {
             mc::encode_error(out, memcached_error(failed.status));
         }
         return Closing::No;
@@ -239,7 +251,7 @@ pub fn execute_memcached(
     // `stats cachedump` is one page and writes `ITEM` lines, so it does not
     // share the paging loop above — but it is the same listing underneath.
     if let vash_proto::memcached::encode::ResponseStyle::CacheDump(dump) = &parsed.style {
-        if let Err(failed) = execute_cachedump(state, *dump, out) {
+        if let Err(failed) = execute_cachedump(state, origin, *dump, out) {
             mc::encode_error(out, memcached_error(failed.status));
         }
         return Closing::No;
@@ -300,7 +312,7 @@ pub fn execute_memcached(
             state,
             keys,
             CommandKind::GetMany,
-            Dialect::Memcached,
+            origin,
             // A miss writes no `VALUE` line at all — memcached omits misses
             // rather than reporting them — which is why this dialect needs the
             // index only to name the key it is answering.
@@ -327,13 +339,9 @@ pub fn execute_memcached(
         && let Command::Get { key } = parsed.command
         && !parsed.noreply
     {
-        let rendered = execute_get_into(
-            state,
-            key,
-            CommandKind::Get,
-            Dialect::Memcached,
-            &mut |value| mc::encode_meta_get_hit(out, flags, &parsed.command, value),
-        );
+        let rendered = execute_get_into(state, key, CommandKind::Get, origin, &mut |value| {
+            mc::encode_meta_get_hit(out, flags, &parsed.command, value)
+        });
         match rendered {
             Ok(true) => {}
             Ok(false) => out.extend_from_slice(b"EN\r\n"),
@@ -342,7 +350,7 @@ pub fn execute_memcached(
         return Closing::No;
     }
 
-    let result = execute(state, &parsed.command, Dialect::Memcached);
+    let result = execute(state, &parsed.command, origin);
     let closing = matches!(result, Ok(Reply::Closing));
 
     match result {
@@ -464,6 +472,9 @@ fn execute_memcached_unauthenticated(
 /// `vash_command_total{command="listing"}`.
 fn execute_dump(
     state: &ServerState,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     dump: vash_proto::memcached::encode::Dump,
     out: &mut Vec<u8>,
 ) -> Result<(), Failed> {
@@ -498,7 +509,7 @@ fn execute_dump(
             cursor: cursor.as_deref().unwrap_or(&[]),
             pattern: &[],
         };
-        let reply = execute(state, &Command::ListKeys(request), Dialect::Memcached)?;
+        let reply = execute(state, &Command::ListKeys(request), origin)?;
         let Reply::Listing(page) = reply else {
             error!("a listing produced a reply it cannot render");
             return Err(Failed::status(Status::Internal));
@@ -547,6 +558,9 @@ fn execute_dump(
 /// behind `dump_enabled`, which is the same setting under another name.
 fn execute_cachedump(
     state: &ServerState,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     dump: vash_proto::memcached::encode::CacheDump,
     out: &mut Vec<u8>,
 ) -> Result<(), Failed> {
@@ -570,7 +584,7 @@ fn execute_cachedump(
         cursor: &[],
         pattern: &[],
     };
-    let reply = execute(state, &Command::ListKeys(request), Dialect::Memcached)?;
+    let reply = execute(state, &Command::ListKeys(request), origin)?;
     let Reply::Listing(page) = reply else {
         error!("a listing produced a reply it cannot render");
         return Err(Failed::status(Status::Internal));

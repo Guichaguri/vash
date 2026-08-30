@@ -26,7 +26,8 @@ pub mod slowlog;
 
 use vash_core::{Command, Key};
 
-use crate::metrics::{CommandKind, Dialect};
+use crate::dispatch::Origin;
+use crate::metrics::CommandKind;
 
 /// The slowlog and the hot-key sampler, as one thing dispatch holds.
 pub struct Introspect {
@@ -72,7 +73,7 @@ impl Introspect {
         &self,
         _command: &Command<'_>,
         _kind: CommandKind,
-        _dialect: Dialect,
+        _origin: Origin,
         _total: std::time::Duration,
     ) {
         // Taken on every command, not only on a slow one: reading **clears**,
@@ -93,7 +94,7 @@ impl Introspect {
                     queue_us,
                     exec_us,
                     command: _kind,
-                    dialect: _dialect,
+                    origin: _origin,
                     keys: key_count(_command),
                     key,
                     value_bytes: value_bytes(_command),
@@ -113,7 +114,7 @@ impl Introspect {
         &self,
         _key: Key<'_>,
         _kind: CommandKind,
-        _dialect: Dialect,
+        _origin: Origin,
         _total: std::time::Duration,
     ) {
         #[cfg(feature = "introspect")]
@@ -126,7 +127,7 @@ impl Introspect {
                     queue_us: 0,
                     exec_us: total_us,
                     command: _kind,
-                    dialect: _dialect,
+                    origin: _origin,
                     keys: 1,
                     key: _key.as_bytes(),
                     value_bytes: 0,
@@ -156,7 +157,7 @@ impl Introspect {
     pub fn observed_batch(
         &self,
         _sets: &[vash_core::Set<'_>],
-        _dialect: Dialect,
+        _origin: Origin,
         _total: std::time::Duration,
     ) {
         let _queue_us = vash_store::queue_wait::take();
@@ -177,7 +178,7 @@ impl Introspect {
                 queue_us,
                 exec_us,
                 command: CommandKind::Set,
-                dialect: _dialect,
+                origin: _origin,
                 keys: _sets.len().min(u32::MAX as usize) as u32,
                 key: first.key.as_bytes(),
                 value_bytes: _sets.iter().map(|set| set.value.len() as u64).sum(),

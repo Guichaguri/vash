@@ -421,13 +421,18 @@ means the entry is a group commit of that many writes, charged its whole
 duration rather than a share of it, so a large `batch` with a large `exec_us` is
 group commit working rather than failing.
 
-**5. Which key.** `key` is `xxh3:<hex>` unless `protocol.listing_enabled` is
+**5. Who asked.** Every entry carries `conn_id` and `peer`. The id is the row
+`stats conns` lists, so while the connection is still open the two name the same
+thing — one client responsible for every slow entry is a different problem from
+a server that is slow for everyone.
+
+**6. Which key.** `key` is `xxh3:<hex>` unless `protocol.listing_enabled` is
 set. The digest is usually enough: **the same digest on every slow entry means
 one key**, which is a different problem from a server that is uniformly slow. To
 turn digests into names, set `listing_enabled` and restart — a decision worth
 making with the evidence rather than ahead of it.
 
-**6. If it is one key.** `curl -s localhost:9090/hotkeys` ranks what the traffic
+**7. If it is one key.** `curl -s localhost:9090/hotkeys` ranks what the traffic
 is actually hitting. It needs `listing_enabled`, and refuses with `403` without
 it. Read the top of the ranking, not the tail: every row carries a
 `relative_error`, and two rows whose estimates differ by less than the sum of

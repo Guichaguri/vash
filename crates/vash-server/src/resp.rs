@@ -52,7 +52,7 @@ use vash_proto::resp::command::{Condition, ExpireCondition, Expiry, IncrEx, Numb
 use vash_proto::resp::{Command, ErrorReply, Outcome, ProtocolError, Version, encode};
 
 use crate::auth::ConnAuth;
-use crate::dispatch::Closing;
+use crate::dispatch::{Closing, Origin};
 use crate::metrics::ErrorClass;
 use crate::state::ServerState;
 
@@ -69,6 +69,9 @@ use crate::state::ServerState;
 pub fn execute_block(
     state: &ServerState,
     conn: &mut ConnAuth,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     block: &[u8],
     version: &mut Version,
     out: &mut Vec<u8>,
@@ -85,21 +88,21 @@ pub fn execute_block(
 
                 if let Some(set) = batchable_set(state, conn, &parsed.command) {
                     if batch.holds(set.key) {
-                        flush_sets(state, &mut batch, out);
+                        flush_sets(state, origin, &mut batch, out);
                     }
                     batch.push(set, ());
                     rest = &rest[consumed..];
                     continue;
                 }
 
-                flush_sets(state, &mut batch, out);
-                if execute(state, conn, &parsed.command, version, out) == Closing::Yes {
+                flush_sets(state, origin, &mut batch, out);
+                if execute(state, conn, origin, &parsed.command, version, out) == Closing::Yes {
                     return Closing::Yes;
                 }
                 rest = &rest[consumed..];
             }
             Err(ProtocolError::Recoverable { reply, consumed }) => {
-                flush_sets(state, &mut batch, out);
+                flush_sets(state, origin, &mut batch, out);
                 state.metrics.other();
                 state.metrics.error(ErrorClass::Client);
                 encode::error_reply(out, &reply);
@@ -113,7 +116,7 @@ pub fn execute_block(
             }
         }
     }
-    flush_sets(state, &mut batch, out);
+    flush_sets(state, origin, &mut batch, out);
     Closing::No
 }
 
@@ -232,26 +235,24 @@ fn batchable_set<'a>(
 /// Submits a held run of `SET`s and writes `+OK` — or the error — for each.
 fn flush_sets(
     state: &ServerState,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     batch: &mut crate::dispatch::SetBatch<'_, ()>,
     out: &mut Vec<u8>,
 ) {
-    batch.flush(
-        state,
-        crate::metrics::Dialect::Resp,
-        out,
-        |out, (), result| match result {
-            Ok(_) => encode::ok(out),
-            // Through the same mapping `execute` uses for a storage failure, so
-            // a batched `SET` reports a full map exactly as an unbatched one
-            // does. Only the wire bytes are taken from it: `SetBatch::flush` has
-            // already counted the failure, which is what `Failure::counted`
-            // means on this path.
-            Err(failed) => {
-                let failure = resp_error_ref(failed);
-                encode::error(out, failure.code, failure.message);
-            }
-        },
-    );
+    batch.flush(state, origin, out, |out, (), result| match result {
+        Ok(_) => encode::ok(out),
+        // Through the same mapping `execute` uses for a storage failure, so
+        // a batched `SET` reports a full map exactly as an unbatched one
+        // does. Only the wire bytes are taken from it: `SetBatch::flush` has
+        // already counted the failure, which is what `Failure::counted`
+        // means on this path.
+        Err(failed) => {
+            let failure = resp_error_ref(failed);
+            encode::error(out, failure.code, failure.message);
+        }
+    });
 }
 
 /// Whether a `SET` is one the awaited write path can serve.
@@ -417,6 +418,9 @@ pub fn inline_safe(command: &Command<'_>) -> bool {
 fn execute(
     state: &ServerState,
     conn: &mut ConnAuth,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     command: &Command<'_>,
     version: &mut Version,
     out: &mut Vec<u8>,
@@ -454,7 +458,7 @@ fn execute(
         return Closing::No;
     }
 
-    match run(state, conn, command, version, out) {
+    match run(state, conn, origin, command, version, out) {
         Ok(()) => {}
         Err(failure) => {
             // Only what the shared executor has not already counted; see
@@ -654,6 +658,9 @@ type Answered = Result<(), Failure>;
 fn run(
     state: &ServerState,
     conn: &mut ConnAuth,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     command: &Command<'_>,
     version: &mut Version,
     out: &mut Vec<u8>,
@@ -716,7 +723,7 @@ fn run(
         // and the next token has to be issued from the page that comes back.
         // The boundary is still `dispatch::execute` — only the pure-function
         // helper is bypassed.
-        Command::Scan(scan) => run_scan(state, scan, *version, out),
+        Command::Scan(scan) => run_scan(state, origin, scan, *version, out),
 
         // Answered entirely from server state: the slowlog is not storage and
         // there is nothing to translate into a domain command.
@@ -724,7 +731,7 @@ fn run(
 
         // Also more than one step, for a different reason: the boundary
         // invalidates one tag at a time and this command names several.
-        Command::DelByTag { tags } => run_del_by_tag(state, tags, out),
+        Command::DelByTag { tags } => run_del_by_tag(state, origin, tags, out),
 
         // The one command that touches storage without building a `Reply`: a
         // `GET` hit is written straight out of the store into the buffer, so
@@ -736,7 +743,7 @@ fn run(
                 state,
                 key_of(key)?,
                 crate::metrics::CommandKind::Get,
-                crate::metrics::Dialect::Resp,
+                origin,
                 &mut |value| encode::bulk(out, value.data),
             )
             .map_err(resp_error)?;
@@ -763,7 +770,7 @@ fn run(
                 state,
                 &keys,
                 crate::metrics::CommandKind::GetMany,
-                crate::metrics::Dialect::Resp,
+                origin,
                 &mut |_, value| match value {
                     Some(value) => encode::bulk(out, value.data),
                     None => encode::null(out, negotiated),
@@ -779,8 +786,7 @@ fn run(
         // failures get classified — and rendered back into this dialect.
         storage => {
             let translated = translate(storage)?;
-            let reply = crate::dispatch::execute(state, &translated, crate::metrics::Dialect::Resp)
-                .map_err(resp_error)?;
+            let reply = crate::dispatch::execute(state, &translated, origin).map_err(resp_error)?;
             render(storage, &reply, *version, out)
         }
     }
@@ -809,10 +815,11 @@ fn run(
 /// than inventing a seventh field that a positional client would trip over or
 /// smuggling `queue_us=34` into the argument array as if the client had sent it.
 ///
-/// The second is the client address and name, fields five and six, which this
-/// server does not record — see `slowlog::Slowlog`. They render empty. That is
-/// not a fabricated measurement: an empty client name is what Redis itself
-/// returns for every connection that never sent `CLIENT SETNAME`.
+/// The second is field six, the client *name*, which this server does not
+/// record — there is no `CLIENT SETNAME` here, which is also why `HELLO …
+/// SETNAME` is refused. It renders empty, and that is not a fabricated
+/// measurement: empty is exactly what Redis returns for a connection that never
+/// set one. Field five, the address, is real.
 #[cfg(feature = "introspect")]
 fn run_slowlog(
     state: &ServerState,
@@ -886,9 +893,12 @@ fn run_slowlog(
                     false => encode::bulk(out, format!("xxh3:{:016x}", entry.digest).as_bytes()),
                 }
 
-                // Not recorded. Empty rather than absent: the field is
-                // positional and a client counts on it being there.
-                encode::bulk(out, b"");
+                // The address the request came from, as Redis renders it.
+                encode::bulk(out, entry.peer.to_string().as_bytes());
+                // The client *name*, which nothing here records. Empty rather
+                // than absent: the field is positional and a client counts on
+                // it being there — and empty is what Redis answers for a
+                // connection that never sent `CLIENT SETNAME`.
                 encode::bulk(out, b"");
             }
         }
@@ -912,6 +922,7 @@ fn run_slowlog(
 
 fn run_scan(
     state: &ServerState,
+    origin: Origin,
     scan: &vash_proto::resp::command::Scan<'_>,
     version: Version,
     out: &mut Vec<u8>,
@@ -942,12 +953,8 @@ fn run_scan(
         cursor,
         pattern: scan.pattern,
     };
-    let reply = crate::dispatch::execute(
-        state,
-        &vash_core::Command::ListKeys(request),
-        crate::metrics::Dialect::Resp,
-    )
-    .map_err(resp_error)?;
+    let reply = crate::dispatch::execute(state, &vash_core::Command::ListKeys(request), origin)
+        .map_err(resp_error)?;
 
     let Reply::Listing(page) = reply else {
         error!(?reply, "SCAN produced a reply it cannot render");
@@ -979,15 +986,17 @@ fn run_scan(
 /// bump is idempotent, invalidating an already-invalidated tag costs one more
 /// bump and changes nothing a client can observe, which is the same property
 /// that lets the cluster replay these freely.
-fn run_del_by_tag(state: &ServerState, tags: &[&[u8]], out: &mut Vec<u8>) -> Answered {
+fn run_del_by_tag(
+    state: &ServerState,
+    origin: Origin,
+    tags: &[&[u8]],
+    out: &mut Vec<u8>,
+) -> Answered {
     let mut registered = 0i64;
     for tag in tags {
-        let reply = crate::dispatch::execute(
-            state,
-            &vash_core::Command::DeleteByTag { tag },
-            crate::metrics::Dialect::Resp,
-        )
-        .map_err(resp_error)?;
+        let reply =
+            crate::dispatch::execute(state, &vash_core::Command::DeleteByTag { tag }, origin)
+                .map_err(resp_error)?;
 
         match reply {
             // `false` is a tag this server has never registered: nothing could

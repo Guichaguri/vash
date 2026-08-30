@@ -5,13 +5,10 @@
 //! Read on the admin port as `GET /slowlog` (`crate::admin`). The RESP
 //! `SLOWLOG` command is phase 2.
 //!
-//! Two fields §3.2 lists are **not here**: the connection id and its peer. They
-//! cost nothing on the request path — an entry is built only once a request has
-//! already lost — but reaching them means threading the connection through
-//! `dispatch::execute` and the three dialect executors above it, some two dozen
-//! call sites on the hottest signatures in the program. That is a decision worth
-//! taking on its own rather than as a rider on the batch rule, so it is left
-//! open. Everything else in §3.2 is recorded.
+//! Every field §3.2 lists is recorded, the connection included. Reaching the
+//! connection did not mean a new parameter at two dozen call sites: the slot
+//! those call sites already had for the dialect widened into a
+//! [`crate::dispatch::Origin`], which carries both.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -48,6 +45,18 @@ pub struct Entry {
     pub exec_us: u64,
     pub command: CommandKind,
     pub dialect: Dialect,
+    /// The connection's row in `stats conns`, and where it came from.
+    ///
+    /// Both are read only once an entry is being built — that is, only for a
+    /// request that has already lost — so they cost the hot path nothing. What
+    /// they cost was the plumbing: `Origin` exists because carrying them meant
+    /// widening the slot every dispatch entry point already had for the
+    /// dialect.
+    ///
+    /// `conn_id` is `0` and `peer` unspecified for the few call sites with no
+    /// connection behind them; see `dispatch::Origin::internal`.
+    pub conn_id: u64,
+    pub peer: std::net::SocketAddr,
     /// How many keys the command named.
     pub keys: u32,
     /// The first [`MAX_KEPT_KEY`] bytes of the first key.
@@ -79,7 +88,7 @@ pub struct Record<'a> {
     pub queue_us: u64,
     pub exec_us: u64,
     pub command: CommandKind,
-    pub dialect: Dialect,
+    pub origin: crate::dispatch::Origin,
     pub keys: u32,
     pub key: &'a [u8],
     pub value_bytes: u64,
@@ -171,7 +180,9 @@ impl Slowlog {
             queue_us: record.queue_us,
             exec_us: record.exec_us,
             command: record.command,
-            dialect: record.dialect,
+            dialect: record.origin.dialect,
+            conn_id: record.origin.conn_id,
+            peer: record.origin.peer,
             keys: record.keys,
             key: record.key[..record.key.len().min(MAX_KEPT_KEY)].into(),
             digest: xxhash_rust::xxh3::xxh3_64(record.key),
@@ -242,7 +253,7 @@ mod tests {
             queue_us: 1,
             exec_us: 2,
             command: CommandKind::Set,
-            dialect: Dialect::Vcp,
+            origin: crate::dispatch::Origin::internal(Dialect::Vcp),
             keys: 1,
             key,
             value_bytes: 64,

@@ -176,6 +176,22 @@ async fn a_slow_request_is_recorded_with_its_two_durations_apart() {
     assert!(entry["queue_us"].is_u64(), "queue_us must be reported");
     assert!(entry["exec_us"].is_u64(), "exec_us must be reported");
     assert_eq!(entry["value_bytes"], 1);
+
+    // And who asked. `conn_id` is the row `stats conns` lists, so the two
+    // surfaces name the same connection; the peer is a real address rather than
+    // the unspecified one `Origin::internal` uses for callers that have no
+    // connection behind them.
+    assert!(
+        entry["conn_id"].as_u64().expect("a conn id") > 0,
+        "a request over a socket should carry its connection: {entry}"
+    );
+    assert!(
+        entry["peer"]
+            .as_str()
+            .expect("a peer")
+            .starts_with("127.0.0.1:"),
+        "the peer should be the client that sent it: {entry}"
+    );
 }
 
 /// The exit criterion, second half, and §3.4: a batch is **one** entry carrying
@@ -308,9 +324,15 @@ async fn slowlog_get_renders_redis_six_field_entries() {
     // Field four is the argument array: the command family and the key.
     assert!(reply.contains("*2\r\n$3\r\nset\r\n"), "{reply:?}");
     assert!(reply.contains("alpha"), "{reply:?}");
-    // Fields five and six are the client address and name, which this server
-    // does not record. Empty, not absent — the positions have to be there.
-    assert!(reply.ends_with("$0\r\n\r\n$0\r\n\r\n"), "{reply:?}");
+    // Field five is the client address, which this server does record.
+    assert!(
+        reply.contains("127.0.0.1:"),
+        "field five should be the peer that sent it: {reply:?}"
+    );
+    // Field six is the client *name*, which nothing here records — there is no
+    // `CLIENT SETNAME`. Empty, not absent: the position has to be there, and
+    // empty is what Redis answers for a connection that never set one.
+    assert!(reply.ends_with("$0\r\n\r\n"), "{reply:?}");
 }
 
 /// The same §3.3 gate the admin route obeys, over the wire this time.

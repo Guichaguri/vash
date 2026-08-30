@@ -66,6 +66,28 @@ pub struct ConnInfo {
 const UNDETECTED: u8 = 0;
 
 impl ConnInfo {
+    /// Who is asking, for the dialect this connection settled on.
+    ///
+    /// Built here rather than at each call site so the id and the peer a
+    /// slowlog entry carries are the same two an operator reads off
+    /// `stats conns` — one source, and no chance of the two listings naming a
+    /// connection differently.
+    pub fn origin(&self, dialect: crate::metrics::Dialect) -> crate::dispatch::Origin {
+        crate::dispatch::Origin {
+            dialect,
+            conn_id: self.id,
+            peer: self.peer,
+        }
+    }
+
+    /// Where this connection came from.
+    ///
+    /// Already disclosed by `stats conns`; this is the same fact reaching the
+    /// slowlog, so an entry can name the client rather than only the request.
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
     /// Records that this connection just ran a command.
     ///
     /// One relaxed store, on the request path of every dialect. Relaxed is

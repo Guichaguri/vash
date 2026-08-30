@@ -21,8 +21,8 @@ use vash_proto::vcp::{
 };
 
 use crate::auth::{ConnAuth, DEFAULT_NAME, Mechanism};
-use crate::dispatch::{Closing, SetBatch, batchable, deny, execute, execute_get_into};
-use crate::metrics::{CommandKind, Dialect};
+use crate::dispatch::{Closing, Origin, SetBatch, batchable, deny, execute, execute_get_into};
+use crate::metrics::CommandKind;
 use crate::state::ServerState;
 
 /// Executes every complete VCP frame in `block`, appending the responses.
@@ -37,6 +37,9 @@ use crate::state::ServerState;
 pub fn execute_vcp_block(
     state: &ServerState,
     conn: &mut ConnAuth,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     block: &[u8],
     out: &mut Vec<u8>,
 ) -> Closing {
@@ -52,10 +55,10 @@ pub fn execute_vcp_block(
             error!("a VCP block did not end on a frame boundary");
             break;
         };
-        execute_frame_batched(state, conn, &rest[..len], out, &mut batch);
+        execute_frame_batched(state, conn, origin, &rest[..len], out, &mut batch);
         rest = &rest[len..];
     }
-    flush_vcp(state, &mut batch, out);
+    flush_vcp(state, origin, &mut batch, out);
     Closing::No
 }
 
@@ -67,8 +70,13 @@ struct VcpReply {
 }
 
 /// Submits a held run of writes and encodes each response.
-fn flush_vcp(state: &ServerState, batch: &mut SetBatch<'_, VcpReply>, out: &mut Vec<u8>) {
-    batch.flush(state, Dialect::Vcp, out, |out, reply, result| {
+fn flush_vcp(
+    state: &ServerState,
+    origin: Origin,
+    batch: &mut SetBatch<'_, VcpReply>,
+    out: &mut Vec<u8>,
+) {
+    batch.flush(state, origin, out, |out, reply, result| {
         if reply.no_reply {
             if let Err(failed) = result {
                 warn!(status = ?failed.status, opcode = ?reply.opcode, "no-reply request failed");
@@ -98,14 +106,17 @@ fn flush_vcp(state: &ServerState, batch: &mut SetBatch<'_, VcpReply>, out: &mut 
 pub fn execute_frame_into(
     state: &ServerState,
     conn: &mut ConnAuth,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     frame: &[u8],
     out: &mut Vec<u8>,
 ) {
     // A batch of one, flushed at once: a caller executing a lone frame has no
     // run to coalesce, and this keeps that path answering exactly as it did.
     let mut batch = SetBatch::default();
-    execute_frame_batched(state, conn, frame, out, &mut batch);
-    flush_vcp(state, &mut batch, out);
+    execute_frame_batched(state, conn, origin, frame, out, &mut batch);
+    flush_vcp(state, origin, &mut batch, out);
 }
 
 /// [`execute_frame_into`], with a run of unconditional writes that this frame
@@ -113,6 +124,9 @@ pub fn execute_frame_into(
 fn execute_frame_batched<'a>(
     state: &ServerState,
     conn: &mut ConnAuth,
+    // Who is asking, built once per connection: the dialect the counters need,
+    // and the connection a slowlog entry names.
+    origin: Origin,
     frame: &'a [u8],
     out: &mut Vec<u8>,
     batch: &mut SetBatch<'a, VcpReply>,
@@ -130,7 +144,7 @@ fn execute_frame_batched<'a>(
     // build implements: an unknown or unimplemented one is `UNAUTHORIZED` like
     // everything else, rather than `UNSUPPORTED`.
     if let Some(refused) = header_refusal(state, conn, frame) {
-        flush_vcp(state, batch, out);
+        flush_vcp(state, origin, batch, out);
         match refused.missing {
             Some(missing) => deny(state, conn, missing, OpcodeName(refused.opcode)),
             None => state.metrics.auth_refused(),
@@ -150,7 +164,7 @@ fn execute_frame_batched<'a>(
         Ok(Decoded::Auth {
             request_id, auth, ..
         }) => {
-            flush_vcp(state, batch, out);
+            flush_vcp(state, origin, batch, out);
             execute_auth(state, conn, request_id, &auth, out)
         }
 
@@ -163,7 +177,7 @@ fn execute_frame_batched<'a>(
             // not reached.
             if let Some(set) = batchable(&request.command) {
                 if batch.holds(set.key) {
-                    flush_vcp(state, batch, out);
+                    flush_vcp(state, origin, batch, out);
                 }
                 let set = set.clone();
                 batch.push(
@@ -176,7 +190,7 @@ fn execute_frame_batched<'a>(
                 );
                 return;
             }
-            flush_vcp(state, batch, out);
+            flush_vcp(state, origin, batch, out);
 
             // The fused read path. A `NO_REPLY` `GET` is excluded on purpose:
             // it has nowhere to render into, and sending it round the ordinary
@@ -186,7 +200,7 @@ fn execute_frame_batched<'a>(
             {
                 let (opcode, request_id) = (request.opcode, request.request_id);
                 let rendered =
-                    execute_get_into(state, key, CommandKind::Get, Dialect::Vcp, &mut |value| {
+                    execute_get_into(state, key, CommandKind::Get, origin, &mut |value| {
                         vash_proto::vcp::encode::encode_value(out, opcode, request_id, value)
                     });
                 match rendered {
@@ -219,7 +233,7 @@ fn execute_frame_batched<'a>(
                     state,
                     keys,
                     CommandKind::GetMany,
-                    Dialect::Vcp,
+                    origin,
                     &mut |_, value| match value {
                         Some(value) => frame.hit(out, value),
                         None => frame.miss(out),
@@ -243,7 +257,7 @@ fn execute_frame_batched<'a>(
                 return;
             }
 
-            let result = execute(state, &request.command, Dialect::Vcp);
+            let result = execute(state, &request.command, origin);
 
             if request.no_reply {
                 if let Err(failed) = result {
@@ -269,7 +283,7 @@ fn execute_frame_batched<'a>(
         }) => {
             // Before the error is written, so a refused frame's response still
             // lands after the responses to everything that preceded it.
-            flush_vcp(state, batch, out);
+            flush_vcp(state, origin, batch, out);
             warn!(request_id, opcode, detail, "rejected malformed request");
             encode_error(out, opcode, request_id, status);
         }
@@ -278,7 +292,7 @@ fn execute_frame_batched<'a>(
         // neither of these is reachable. Answering rather than panicking keeps a
         // logic slip from taking the process down.
         Ok(Decoded::Incomplete { .. }) | Err(DecodeError::Fatal { .. }) => {
-            flush_vcp(state, batch, out);
+            flush_vcp(state, origin, batch, out);
             error!("frame passed to execute_frame_into was not a complete, valid frame");
             encode_error(out, 0, 0, Status::Internal);
         }

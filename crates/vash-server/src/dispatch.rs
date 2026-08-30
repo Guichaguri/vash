@@ -142,7 +142,7 @@ impl<'a, T> SetBatch<'a, T> {
     pub fn flush(
         &mut self,
         state: &ServerState,
-        dialect: Dialect,
+        origin: Origin,
         out: &mut Vec<u8>,
         mut render: impl FnMut(&mut Vec<u8>, &T, Result<u64, &Failed>),
     ) {
@@ -153,7 +153,7 @@ impl<'a, T> SetBatch<'a, T> {
         let started = std::time::Instant::now();
         match state.store.set_many(&self.sets) {
             Ok(cas) => {
-                count_stored(state, dialect, &self.sets, &cas, started.elapsed());
+                count_stored(state, origin, &self.sets, &cas, started.elapsed());
                 for (index, note) in self.notes.iter().enumerate() {
                     render(out, note, Ok(cas.get(index).copied().unwrap_or_default()));
                 }
@@ -167,7 +167,7 @@ impl<'a, T> SetBatch<'a, T> {
                 for (set, note) in self.sets.iter().zip(&self.notes) {
                     // `execute` counts and classifies, so the retry is indistinguishable
                     // from having never batched — which is the point of it.
-                    let outcome = execute(state, &Command::Set(set.clone()), dialect);
+                    let outcome = execute(state, &Command::Set(set.clone()), origin);
                     match outcome {
                         Ok(Reply::Stored(vash_core::Stored::Stored(cas))) => {
                             render(out, note, Ok(cas))
@@ -192,6 +192,44 @@ impl<'a, T> SetBatch<'a, T> {
     }
 }
 
+/// Who asked, and over what.
+///
+/// **This is the `Dialect` slot, widened rather than a parameter added beside
+/// it.** Every entry point below already carried the dialect to the counters;
+/// carrying the connection alongside it costs no signature a caller has to
+/// learn, and it puts the three facts that identify a request in one `Copy`
+/// value instead of threading them separately.
+///
+/// Fixed for a connection's life: the dialect is settled by the first byte and
+/// never revisited, and neither the id nor the peer can change. So it is built
+/// once, in `conn::handle`, and copied from there.
+#[derive(Debug, Clone, Copy)]
+pub struct Origin {
+    pub dialect: Dialect,
+    /// The connection's row in `stats conns`, so a slowlog entry and that
+    /// listing name the same thing.
+    pub conn_id: u64,
+    pub peer: std::net::SocketAddr,
+}
+
+impl Origin {
+    /// For call sites with no connection behind them — a test, or the sweeper.
+    ///
+    /// The peer is the unspecified address rather than a plausible-looking one:
+    /// `0.0.0.0:0` reads as "nothing was connected", which is the truth, where
+    /// `127.0.0.1:0` would read as a local client that does not exist.
+    pub fn internal(dialect: Dialect) -> Self {
+        Self {
+            dialect,
+            conn_id: 0,
+            peer: std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            ),
+        }
+    }
+}
+
 /// Counts a run of writes that stored, exactly as [`execute`] counts one.
 ///
 /// Shared by [`SetBatch::flush`] and the awaited write path in [`crate::conn`],
@@ -201,7 +239,7 @@ impl<'a, T> SetBatch<'a, T> {
 /// out narrower than reality.
 pub fn count_stored(
     state: &ServerState,
-    dialect: Dialect,
+    origin: Origin,
     sets: &[vash_core::Set<'_>],
     cas: &[u64],
     elapsed: std::time::Duration,
@@ -215,14 +253,14 @@ pub fn count_stored(
     // here rather than in `SetBatch::flush` for the same reason the counters
     // are: this is where both batch routes converge, so what an operator sees
     // cannot depend on which one a client's pipelining happened to take.
-    state.introspect.observed_batch(sets, dialect, elapsed);
+    state.introspect.observed_batch(sets, origin, elapsed);
 
     let each = elapsed / sets.len() as u32;
     for (index, set) in sets.iter().enumerate() {
         state
             .metrics
             .commands
-            .observe(CommandKind::Set, dialect, each);
+            .observe(CommandKind::Set, origin.dialect, each);
         state.metrics.outcomes.observe(
             &Command::Set(set.clone()),
             &Reply::Stored(vash_core::Stored::Stored(
@@ -336,7 +374,7 @@ pub fn execute_get_into(
     state: &ServerState,
     key: vash_core::Key<'_>,
     kind: CommandKind,
-    dialect: Dialect,
+    origin: Origin,
     render: &mut dyn FnMut(vash_core::ValueRef<'_>),
 ) -> Result<bool, Failed> {
     // Timed and counted exactly as `execute` does it, including observing the
@@ -345,8 +383,11 @@ pub fn execute_get_into(
     let started = std::time::Instant::now();
     let outcome = state.store.get_with(key, render);
     let elapsed = started.elapsed();
-    state.metrics.commands.observe(kind, dialect, elapsed);
-    state.introspect.observed_get(key, kind, dialect, elapsed);
+    state
+        .metrics
+        .commands
+        .observe(kind, origin.dialect, elapsed);
+    state.introspect.observed_get(key, kind, origin, elapsed);
 
     let hit = outcome.map_err(to_failed)?;
     state.metrics.read(u64::from(hit), u64::from(!hit));
@@ -376,7 +417,7 @@ pub fn execute_get_many_into(
     state: &ServerState,
     keys: &[vash_core::Key<'_>],
     kind: CommandKind,
-    dialect: Dialect,
+    origin: Origin,
     render: &mut dyn FnMut(usize, Option<vash_core::ValueRef<'_>>),
 ) -> Result<(), Failed> {
     let mut hits = 0u64;
@@ -389,7 +430,7 @@ pub fn execute_get_many_into(
     state
         .metrics
         .commands
-        .observe(kind, dialect, started.elapsed());
+        .observe(kind, origin.dialect, started.elapsed());
 
     // Counted before the error is propagated, exactly as `execute_get_into`
     // does: a read that failed still took the time it took. The hit split is
@@ -403,7 +444,7 @@ pub fn execute_get_many_into(
 pub fn execute(
     state: &ServerState,
     command: &Command<'_>,
-    dialect: Dialect,
+    origin: Origin,
 ) -> Result<Reply, Failed> {
     // Timed around `execute_inner` only, so this is the storage work and not the
     // wait to reach a thread that could do it. The wait is the shard writer's
@@ -413,10 +454,13 @@ pub fn execute(
     let outcome = execute_inner(state, command);
     let elapsed = started.elapsed();
     let kind = CommandKind::of(command);
-    state.metrics.commands.observe(kind, dialect, elapsed);
+    state
+        .metrics
+        .commands
+        .observe(kind, origin.dialect, elapsed);
     // After the histogram, and taking the queue wait the store published for
     // this thread — see `crate::introspect`.
-    state.introspect.observed(command, kind, dialect, elapsed);
+    state.introspect.observed(command, kind, origin, elapsed);
 
     // Counted here, at the single point every command passes through, so the
     // numbers cannot drift apart from what was actually served.
