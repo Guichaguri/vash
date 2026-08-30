@@ -242,7 +242,7 @@ async fn hotkeys(stream: &mut TcpStream, state: &ServerState, query: &str) -> st
             stream,
             403,
             "text/plain",
-            "hot keys name keys, so they need protocol.listing_enabled",
+            "hot keys and tags name what clients sent, so they need protocol.listing_enabled",
         )
         .await;
     }
@@ -252,7 +252,7 @@ async fn hotkeys(stream: &mut TcpStream, state: &ServerState, query: &str) -> st
         .unwrap_or(DEFAULT_COUNT)
         .clamp(1, MAX_COUNT);
 
-    let body = hotkeys_json(&state.introspect.hotkeys, count);
+    let body = hotkeys_json(&state.introspect.hotkeys, &state.introspect.hottags, count);
     respond(stream, 200, "application/json", &body).await
 }
 
@@ -479,6 +479,28 @@ struct HotKeyBody {
     samples_error: u64,
 }
 
+/// One tag in the invalidation ranking.
+///
+/// **No `estimated_` prefix anywhere here, and that is the point.** Tag
+/// invalidations are counted rather than sampled — they are rare and each one
+/// retires a whole working set — so these are counts. The keys above are
+/// estimates and say so; the difference between the two halves of this response
+/// is real and the field names carry it.
+#[cfg(feature = "introspect")]
+#[derive(serde::Serialize)]
+struct HotTagBody {
+    tag: String,
+    digest: String,
+    truncated: bool,
+    /// `DELETE_BY_TAG` commands that named this tag and found it registered.
+    invalidations: u64,
+    /// Space-Saving's inherited count. `0` means this row earned its total
+    /// rather than inheriting one, which is the ordinary case for tags: a
+    /// deployment has to invalidate more distinct tags than there are counters
+    /// before anything is evicted at all.
+    invalidations_error: u64,
+}
+
 /// The `/hotkeys` body.
 #[cfg(feature = "introspect")]
 #[derive(serde::Serialize)]
@@ -496,10 +518,23 @@ struct HotKeysBody {
     /// absent from this list is only known to be below that.
     counters_per_lane: usize,
     keys: Vec<HotKeyBody>,
+    /// Whether tag invalidations are being counted.
+    tags_enabled: bool,
+    /// Every invalidation that took effect, including any the ranking below
+    /// evicted. A tag's share of this is what makes it hot.
+    tag_invalidations: u64,
+    tag_counters_per_lane: usize,
+    /// Which tags are being invalidated, most first. Counts, not estimates —
+    /// see [`HotTagBody`].
+    tags: Vec<HotTagBody>,
 }
 
 #[cfg(feature = "introspect")]
-fn hotkeys_json(sampler: &crate::introspect::hotkeys::HotKeys, count: usize) -> String {
+fn hotkeys_json(
+    sampler: &crate::introspect::hotkeys::HotKeys,
+    tags: &crate::introspect::hottags::HotTags,
+    count: usize,
+) -> String {
     let merged = sampler.merge();
     let keys = merged
         .counters
@@ -518,12 +553,30 @@ fn hotkeys_json(sampler: &crate::introspect::hotkeys::HotKeys, count: usize) -> 
         })
         .collect();
 
+    let invalidations = tags.merge();
+    let ranked = invalidations
+        .counters
+        .iter()
+        .take(count)
+        .map(|counter| HotTagBody {
+            tag: escape_key(&counter.name),
+            digest: format!("xxh3:{:016x}", counter.digest),
+            truncated: counter.truncated,
+            invalidations: counter.invalidations,
+            invalidations_error: counter.error,
+        })
+        .collect();
+
     let body = HotKeysBody {
         enabled: sampler.is_enabled(),
         sample_rate: merged.sample_rate,
         sampled: merged.sampled,
         counters_per_lane: sampler.counters_per_lane(),
         keys,
+        tags_enabled: tags.is_enabled(),
+        tag_invalidations: invalidations.total,
+        tag_counters_per_lane: tags.counters_per_lane(),
+        tags: ranked,
     };
 
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| String::from("{}"))
@@ -815,6 +868,7 @@ mod tests {
     mod hotkeys {
         use super::*;
         use crate::introspect::hotkeys::HotKeys;
+        use crate::introspect::hottags::HotTags;
 
         #[test]
         fn the_body_names_every_count_as_a_sample_or_an_estimate() {
@@ -827,7 +881,7 @@ mod tests {
             }
             hot.observe(b"cold:key", false);
 
-            let json = hotkeys_json(&hot, 10);
+            let json = hotkeys_json(&hot, &HotTags::new(true, 8), 10);
             let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
 
             assert_eq!(value["enabled"], true);
@@ -860,7 +914,7 @@ mod tests {
                 hot.observe(b"hot:key", false);
             }
 
-            let json = hotkeys_json(&hot, 10);
+            let json = hotkeys_json(&hot, &HotTags::new(true, 8), 10);
             let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
             assert_eq!(value["sample_rate"], 64);
 
@@ -878,7 +932,7 @@ mod tests {
             let hot = HotKeys::new(0, 8);
             hot.observe(b"hot:key", false);
 
-            let json = hotkeys_json(&hot, 10);
+            let json = hotkeys_json(&hot, &HotTags::new(true, 8), 10);
             let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
             assert_eq!(value["enabled"], false);
             assert_eq!(value["sampled"], 0);
@@ -893,7 +947,7 @@ mod tests {
             hot.observe(&[0xff, 0x01], false);
             hot.observe(&[0xfe, 0x01], false);
 
-            let json = hotkeys_json(&hot, 10);
+            let json = hotkeys_json(&hot, &HotTags::new(true, 8), 10);
             let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
             let keys: Vec<&str> = value["keys"]
                 .as_array()

@@ -640,3 +640,20 @@ hotkeys_sample_rate = 128
 # thread's sampled stream. At 64 that is roughly 1.6% — enough to find the key
 # taking a third of the traffic, not the one taking half a percent.
 hotkeys_counters = 64
+
+# Rank which tags are being invalidated, on /hotkeys beside the keys.
+#
+# Its own switch, because it is not the same measurement. Tag invalidations are
+# **counted**, not sampled: DELETE_BY_TAG is rare — one command retires a whole
+# working set — and each one matters on its own, so there is no sample rate here
+# and nothing it reports is an estimate.
+#
+# Only invalidations that took effect are counted. A tag the registry has never
+# seen retires nothing, and counting it would let a client fill the ranking with
+# names that never existed.
+hottags_enabled = true
+
+# Counters in each per-lane tag summary. Eviction is unlikely to happen at all
+# below this many distinct tags, and a row's `invalidations_error` says whether
+# it did.
+hottags_counters = 64

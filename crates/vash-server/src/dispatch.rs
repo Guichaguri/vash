@@ -660,6 +660,9 @@ fn execute_inner(state: &ServerState, command: &Command<'_>) -> Result<Reply, Fa
             // `fanout_sync` this blocks until reachable peers acknowledge; in
             // `fanout` it is a queue push.
             if let Some(generation) = generation {
+                // Counted here rather than beside the command counters: only a
+                // generation says the tag existed and something was retired.
+                state.introspect.invalidated_tag(tag);
                 state.cluster.invalidate(tag, generation);
             }
             Ok(Reply::Invalidated(generation.is_some()))

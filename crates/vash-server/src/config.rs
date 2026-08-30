@@ -767,6 +767,15 @@ pub struct IntrospectConfig {
     /// sensitivity: a summary of `m` is guaranteed to hold anything above
     /// `1/m` of its thread's sampled stream.
     pub hotkeys_counters: usize,
+    /// Rank which tags are being invalidated.
+    ///
+    /// Deliberately separate from `hotkeys_enabled`, because the two are not
+    /// the same measurement: tag invalidations are **counted**, not sampled —
+    /// they are rare and each one retires a whole working set — so there is no
+    /// sample rate here, and nothing this produces is an estimate.
+    pub hottags_enabled: bool,
+    /// Counters in each per-lane tag summary.
+    pub hottags_counters: usize,
 }
 
 impl Default for IntrospectConfig {
@@ -777,6 +786,8 @@ impl Default for IntrospectConfig {
             hotkeys_enabled: true,
             hotkeys_sample_rate: 128,
             hotkeys_counters: 64,
+            hottags_enabled: true,
+            hottags_counters: 64,
         }
     }
 }

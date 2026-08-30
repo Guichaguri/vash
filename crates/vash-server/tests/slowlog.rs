@@ -512,3 +512,110 @@ async fn hotkeys_ranks_the_key_the_traffic_hit() {
         "reads should be counted apart from writes: {value}"
     );
 }
+
+// ---- hot tags --------------------------------------------------------------
+//
+// Phase 5. Tag invalidations are counted rather than sampled, so unlike the key
+// ranking these assertions are exact — which is itself the thing being checked.
+
+/// The whole reason phase 5 exists: `DELETE_BY_TAG` on a hot tag retires a
+/// working set at once, and an operator needs to know which tag that was.
+#[tokio::test]
+async fn hot_tags_rank_what_was_invalidated() {
+    let harness = Harness::start(true).await;
+
+    // Two tagged writes so both tags are registered — an invalidation of a tag
+    // the registry has never seen changes nothing and must not be counted.
+    harness
+        .resp(
+            "*5\r\n$7\r\nSETTAGS\r\n$6\r\npost:1\r\n$1\r\nv\r\n$1\r\n1\r\n$4\r\nnews\r\n",
+            1,
+        )
+        .await;
+    harness
+        .resp(
+            "*5\r\n$7\r\nSETTAGS\r\n$6\r\npost:2\r\n$1\r\nv\r\n$1\r\n1\r\n$7\r\nauthors\r\n",
+            1,
+        )
+        .await;
+
+    for _ in 0..3 {
+        harness
+            .resp("*2\r\n$8\r\nDELBYTAG\r\n$4\r\nnews\r\n", 1)
+            .await;
+    }
+    harness
+        .resp("*2\r\n$8\r\nDELBYTAG\r\n$7\r\nauthors\r\n", 1)
+        .await;
+
+    let response = harness.admin("/hotkeys").await;
+    let body = response.split_once("\r\n\r\n").expect("a body").1;
+    let value: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+
+    assert_eq!(value["tags_enabled"], true);
+    assert_eq!(
+        value["tag_invalidations"], 4,
+        "every invalidation is counted, none sampled: {value}"
+    );
+
+    let tags = value["tags"].as_array().expect("a tags array");
+    assert_eq!(
+        tags[0]["tag"], "news",
+        "the most-invalidated tag ranks first"
+    );
+    assert_eq!(tags[0]["invalidations"], 3);
+    assert_eq!(
+        tags[0]["invalidations_error"], 0,
+        "nothing was evicted, so the count was earned rather than inherited"
+    );
+    assert_eq!(tags[1]["tag"], "authors");
+    assert_eq!(tags[1]["invalidations"], 1);
+}
+
+/// An invalidation naming a tag nothing was ever written under retires nothing.
+/// Counting it would let a client fill the ranking with names that never
+/// existed, which is the same unbounded-cardinality problem §2 keeps out of the
+/// metrics.
+#[tokio::test]
+async fn an_invalidation_that_retired_nothing_is_not_counted() {
+    let harness = Harness::start(true).await;
+
+    for _ in 0..5 {
+        harness
+            .resp("*2\r\n$8\r\nDELBYTAG\r\n$5\r\nghost\r\n", 1)
+            .await;
+    }
+
+    let response = harness.admin("/hotkeys").await;
+    let body = response.split_once("\r\n\r\n").expect("a body").1;
+    let value: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+
+    assert_eq!(
+        value["tag_invalidations"], 0,
+        "a tag that was never registered retires nothing: {value}"
+    );
+    assert!(value["tags"].as_array().expect("an array").is_empty());
+}
+
+/// Tag names are what a client sent, so they sit behind the same gate the keys
+/// do — the route refuses outright rather than rendering digests.
+#[tokio::test]
+async fn hot_tags_are_behind_the_listing_gate_too() {
+    let closed = Harness::start(false).await;
+    closed
+        .resp(
+            "*5\r\n$7\r\nSETTAGS\r\n$6\r\npost:1\r\n$1\r\nv\r\n$1\r\n1\r\n$4\r\nnews\r\n",
+            1,
+        )
+        .await;
+    closed
+        .resp("*2\r\n$8\r\nDELBYTAG\r\n$4\r\nnews\r\n", 1)
+        .await;
+
+    let response = closed.admin("/hotkeys").await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(
+        !response.contains("news"),
+        "the gate leaked a tag: {response}"
+    );
+}

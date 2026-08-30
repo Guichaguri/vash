@@ -22,6 +22,8 @@
 #[cfg(feature = "introspect")]
 pub mod hotkeys;
 #[cfg(feature = "introspect")]
+pub mod hottags;
+#[cfg(feature = "introspect")]
 pub mod slowlog;
 
 use vash_core::{Command, Key};
@@ -35,6 +37,8 @@ pub struct Introspect {
     pub slowlog: slowlog::Slowlog,
     #[cfg(feature = "introspect")]
     pub hotkeys: hotkeys::HotKeys,
+    #[cfg(feature = "introspect")]
+    pub hottags: hottags::HotTags,
 }
 
 impl Introspect {
@@ -50,6 +54,7 @@ impl Introspect {
                 },
                 config.hotkeys_counters,
             ),
+            hottags: hottags::HotTags::new(config.hottags_enabled, config.hottags_counters),
         }
     }
 
@@ -210,6 +215,20 @@ impl Introspect {
         {
             None
         }
+    }
+}
+
+impl Introspect {
+    /// Records one `DELETE_BY_TAG` that took effect.
+    ///
+    /// Called only when the store reported a generation — that is, when the tag
+    /// was registered and something was actually retired. An invalidation
+    /// naming a tag the registry has never seen changes nothing, and counting
+    /// it would let a client fill the ranking with names that never existed.
+    #[inline]
+    pub fn invalidated_tag(&self, _tag: &[u8]) {
+        #[cfg(feature = "introspect")]
+        self.hottags.invalidated(_tag);
     }
 }
 

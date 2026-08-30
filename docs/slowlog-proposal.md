@@ -441,12 +441,50 @@ returning them added together would name the key and hide the diagnosis.
 | Surface | Decision | Why |
 |---|---|---|
 | Admin port, `GET /slowlog` | **Build.** JSON, newest first, `?count=` | The primary home. `admin.rs` already serves read-only JSON on a separate port operators already scrape, and `stats_json` is the pattern to copy |
-| Admin port, `GET /hotkeys` | **Build**, behind `listing_enabled` | Same, plus §2's gate — it discloses key names on a port with no authentication |
+| Admin port, `GET /hotkeys` | **Build**, behind `listing_enabled` | Same, plus §2's gate — it discloses key names on a port with no authentication. Carries the tag ranking too: tag names are client-supplied like keys, so they sit behind the same gate |
 | RESP `SLOWLOG GET/LEN/RESET/HELP` | **Build** | Real upstream grammar with real client and tooling support. Key rendering follows §3.3 |
 | RESP `INFO` | **One field, and not where this said.** `vash_slowlog_len` in the `Vash` section | This row claimed upstream reports `slowlog_len` in `Stats`. Checked against `redis:7-alpine`, it does not — Redis exposes the length through `SLOWLOG LEN` and has no such `INFO` field at all. Inventing one is the mistake §2's "a name matching is not a meaning matching" exists to prevent, so it goes where this server's own counters go. `Section::Vash` renders every `vash_`-prefixed name without a second table to keep in step |
 | memcached | **Nothing** | Upstream has no slowlog and no hot-key command. [introspection.md](introspection.md) §10 refused a `MATCH` filter on `metadump` because "a vash-only argument on a memcached command is a trap for tooling that passes class ids positionally". Inventing `stats slowlog` is the same trap with a bigger surface |
 | VCP opcode | **Defer** | `vash-client` is used by cluster peers and by the smoke example, neither of which needs this. It is one opcode whenever something does — [opcodes.md](opcodes.md) is the contract to extend, and nothing here forecloses it |
 | Prometheus | **Two counters only**: entries admitted, entries evicted | §2. No key labels, no per-entry series. The evicted counter is the one that tells an operator `max_len` is too small |
+
+### 5.1 Hot tags are counted, not sampled
+
+Phase 5's line was "hot tags, ranked the same way". Three parts of the same way
+turned out not to fit, and the differences are the design.
+
+**Counted, not sampled.** [§4.2](#42-sampling-and-the-arithmetic-that-sets-the-rate)
+justifies sampling with two facts about keys: reads arrive by the million, and a
+hot key is by definition one a uniform sample hits often. Neither holds for tag
+invalidation. `DELETE_BY_TAG` is *rare* — that is the whole point of it, one
+command retiring an arbitrary number of keys — and each one matters
+individually, because a single invalidation on the wrong tag **is** the
+incident. A stampede trigger the sampler skipped is worse than one nobody
+measured: the report would name a different tag, with confidence. So every
+invalidation is counted, and nothing on the tag half of `/hotkeys` carries an
+`estimated_` prefix. The two halves of that response mean different things and
+their field names say so.
+
+**Only invalidations that took effect.** A `DELETE_BY_TAG` naming a tag the
+registry has never seen retires nothing. Counting it would let a client fill the
+ranking with names that never existed — the unbounded-cardinality problem
+[§2](#2-the-rules-that-govern-both) keeps out of the metrics, arriving through
+a different door. The store already distinguishes the two by returning a
+generation only when something happened, so the gate was free.
+
+**No blast radius.** The obvious next column is how many keys each invalidation
+dropped, and it is not available: invalidation bumps a generation in constant
+time and reclamation happens lazily afterwards, which is exactly what makes
+`DELETE_BY_TAG` O(1) regardless of cardinality — the property
+[§13's goal](plan.md) is stated in. Counting the keys would mean walking the tag
+index on the invalidating request, turning the one constant-time destructive
+operation this server has into a linear one to produce a number for a dashboard.
+Named here so it reads as a decision rather than an omission.
+
+Tag *attachment* — which tags are written most — is also absent, and for an
+arithmetic reason: an exact count and a sampled one cannot share a ranking,
+because only one of them can be scaled. A column that is exact for one row and
+an estimate for another is precisely the number §2 exists to keep out.
 
 ## 6. Configuration
 
@@ -539,7 +577,7 @@ the surface area rather than after it. This is M13; M11 and M12 are taken by
 | **2** — **done** | RESP `SLOWLOG GET/LEN/RESET/HELP`, the length in `INFO vash`, the roles mapping, the §3.3 key gate | **Met, against a real `redis-cli` and a real Redis beside it.** `SLOWLOG GET` renders Redis's six-field entry; six of seven error forms match `redis:7-alpine` verbatim and the seventh is a recorded divergence; keys are digests until `listing_enabled`; `RESET` empties the ring and leaves the counters |
 | **3** — **done** | `GET /hotkeys` behind the listing gate, and the estimate's error published beside it. The summaries and the merge landed in phase 0 | **Met, with one refinement.** Gate 4 passes: the sample rate is honoured to 1.2%, the published `1/sqrt(samples)` is calibrated (mean |z| 0.88 against a predicted 0.80), and the route refuses without `listing_enabled`. But the top ten is recovered exactly only when the keys are separated by more than their combined error — see below |
 | **4** — **done** | `vash_slowlog_entries_total` and `vash_slowlog_evicted_total`, an [operations.md](operations.md#what-was-slow-and-where-did-the-time-go) runbook entry, and seven `protocol.md` divergence rows — the batch rule plus everything the RESP shape could not carry | **Met, by walking it.** Driving a real server to the alert and following the written steps reached a key digest and an exec-versus-queue verdict — and found step 1 citing a metric family that does not exist (`vash_command_latency_seconds`; it is `vash_command_seconds`), which is the error a runbook nobody walks always has |
-| **5** — *not committed* | Hot **tags**, ranked the same way | `DELETE_BY_TAG` on a hot tag invalidates a whole working set at once and is the most likely trigger for the stampede this server has no defence against. It is the natural companion to a stale-while-revalidate design and should be decided with that, not before it |
+| **5** — **done**, and not "ranked the same way" | Which tags are being invalidated, on `/hotkeys` beside the keys | Built ahead of the stale-while-revalidate design this row wanted it decided with. Nothing here forecloses that: counting which tag retires a working set is orthogonal to what a server does about it, and the count is what either answer would need. **Three departures from "the same way"** — §5.1 |
 
 ## 10. Testing
 

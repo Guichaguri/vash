@@ -443,6 +443,15 @@ key wants a client-side cache or a replica, a hot *written* key is a
 serialisation point on one shard's single writer thread and is the more
 damaging of the two.
 
+**8. If the misses arrive in waves.** The same response carries a `tags` list:
+which tags are being invalidated, and how often. These are **counts, not
+estimates** — invalidations are rare enough to count exactly — so a tag near the
+top of that list retired a working set that many times, and every client holding
+those keys went to the origin at once. A spike in `vash_misses_total` that
+starts abruptly and decays, rather than drifting, is that shape. There is no
+blast radius column and cannot cheaply be one: invalidation is O(1) precisely
+because it does not walk the keys it retires.
+
 **Afterwards.** `redis-cli SLOWLOG RESET` empties the ring without touching
 `vash_slowlog_entries_total` or `vash_slowlog_evicted_total`, so reproducing
 against a clean log costs no monitoring continuity. Turn `listing_enabled` back
