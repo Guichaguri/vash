@@ -112,6 +112,20 @@ pub enum ErrorReply<'a> {
     WrongArity(&'static str),
     /// `-ERR invalid expire time in '…' command`
     InvalidExpire(&'static str),
+    /// `-ERR unknown subcommand '…'. Try … HELP.`
+    ///
+    /// A container command's subcommand table missing what it was handed. The
+    /// wording was checked against `redis:7-alpine` rather than assumed, and
+    /// the first attempt got it wrong in both halves: Redis names the
+    /// *subcommand* it did not recognise, not the container, and it reports a
+    /// wrong argument count through [`Self::WrongArity`] under a
+    /// `container|sub` name instead of through this.
+    UnknownSubcommand {
+        /// The container, upper-cased as Redis prints it: `SLOWLOG`.
+        container: &'static str,
+        /// What the client sent. Escaped on the way out, being client bytes.
+        sub: &'a [u8],
+    },
     /// `-ERR <message>`
     Err(&'static str),
     /// `-<code> <message>`, for the prefixes clients special-case — `NOPROTO`,

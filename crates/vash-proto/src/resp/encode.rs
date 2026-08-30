@@ -71,6 +71,16 @@ pub fn error_reply(out: &mut Vec<u8>, reply: &ErrorReply<'_>) {
                 &format!("invalid expire time in '{name}' command"),
             );
         }
+        // Redis's own wording, down to the trailing pointer at `HELP`, which is
+        // what makes the error self-service rather than something a client has
+        // to look up.
+        ErrorReply::UnknownSubcommand { container, sub } => {
+            out.extend_from_slice(b"-ERR unknown subcommand '");
+            escape(out, sub);
+            out.extend_from_slice(b"'. Try ");
+            out.extend_from_slice(container.as_bytes());
+            out.extend_from_slice(b" HELP.\r\n");
+        }
         ErrorReply::Err(message) => error(out, "ERR", message),
         ErrorReply::Coded(code, message) => error(out, code, message),
     }

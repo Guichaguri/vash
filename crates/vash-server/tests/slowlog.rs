@@ -257,3 +257,149 @@ async fn a_read_is_recorded_by_the_fused_path() {
         "the fused read path never reached the slowlog: {log}"
     );
 }
+
+// ---- the RESP surface ------------------------------------------------------
+//
+// Phase 2. Its exit criteria are here: `redis-cli slowlog get` renders
+// unchanged, keys are digests until `listing_enabled`, and `RESET` clears the
+// buffer without touching the counters.
+
+/// Redis's entry is six fields and a client library indexes them positionally,
+/// so the shape is the contract and it is asserted field by field.
+#[tokio::test]
+async fn slowlog_get_renders_redis_six_field_entries() {
+    let harness = Harness::start(true).await;
+    harness
+        .resp("*3\r\n$3\r\nSET\r\n$5\r\nalpha\r\n$1\r\nv\r\n", 1)
+        .await;
+
+    let reply = harness
+        .resp("*2\r\n$7\r\nSLOWLOG\r\n$3\r\nGET\r\n", 1)
+        .await;
+
+    // The outer array, then one entry of exactly six.
+    assert!(reply.starts_with('*'), "expected an array: {reply:?}");
+    assert!(
+        reply.contains("*6\r\n"),
+        "an entry must have Redis's six fields: {reply:?}"
+    );
+    // Field four is the argument array: the command family and the key.
+    assert!(reply.contains("*2\r\n$3\r\nset\r\n"), "{reply:?}");
+    assert!(reply.contains("alpha"), "{reply:?}");
+    // Fields five and six are the client address and name, which this server
+    // does not record. Empty, not absent — the positions have to be there.
+    assert!(reply.ends_with("$0\r\n\r\n$0\r\n\r\n"), "{reply:?}");
+}
+
+/// The same §3.3 gate the admin route obeys, over the wire this time.
+#[tokio::test]
+async fn slowlog_get_withholds_keys_until_the_listing_gate_opens() {
+    let closed = Harness::start(false).await;
+    closed
+        .resp("*3\r\n$3\r\nSET\r\n$6\r\nsecret\r\n$1\r\nv\r\n", 1)
+        .await;
+    let reply = closed.resp("*2\r\n$7\r\nSLOWLOG\r\n$3\r\nGET\r\n", 1).await;
+    assert!(reply.contains("xxh3:"), "expected a digest: {reply:?}");
+    assert!(
+        !reply.contains("secret"),
+        "the gate leaked a key: {reply:?}"
+    );
+
+    let open = Harness::start(true).await;
+    open.resp("*3\r\n$3\r\nSET\r\n$6\r\nsecret\r\n$1\r\nv\r\n", 1)
+        .await;
+    let reply = open.resp("*2\r\n$7\r\nSLOWLOG\r\n$3\r\nGET\r\n", 1).await;
+    assert!(
+        reply.contains("secret"),
+        "the open gate names it: {reply:?}"
+    );
+}
+
+/// §3.6, and the distinction that makes `SLOWLOG RESET` legal where memcached's
+/// `stats reset` is refused: the ring is emptied, the counters are not.
+#[tokio::test]
+async fn slowlog_reset_clears_the_entries_and_not_the_counters() {
+    let harness = Harness::start(true).await;
+    harness
+        .resp("*3\r\n$3\r\nSET\r\n$5\r\nalpha\r\n$1\r\nv\r\n", 1)
+        .await;
+
+    let before = harness.slowlog().await;
+    let admitted = before["admitted"].as_u64().expect("a counter");
+    assert!(admitted > 0);
+    assert!(!entries(&before).is_empty());
+
+    let reply = harness
+        .resp("*2\r\n$7\r\nSLOWLOG\r\n$5\r\nRESET\r\n", 1)
+        .await;
+    assert!(reply.starts_with("+OK"), "{reply:?}");
+
+    let after = harness.slowlog().await;
+    assert_eq!(entries(&after).len(), 0, "the ring should be empty");
+    assert!(
+        after["admitted"].as_u64().expect("a counter") >= admitted,
+        "RESET must not walk a Prometheus counter backwards: {after}"
+    );
+}
+
+/// `LEN` is a count and must agree with what `GET` would return, or an operator
+/// paging the log is chasing a number that means something else.
+#[tokio::test]
+async fn slowlog_len_agrees_with_the_admin_route() {
+    let harness = Harness::start(true).await;
+    for key in ["one", "two", "three"] {
+        harness
+            .resp(
+                &format!("*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$1\r\nv\r\n", key.len()),
+                1,
+            )
+            .await;
+    }
+
+    let reply = harness
+        .resp("*2\r\n$7\r\nSLOWLOG\r\n$3\r\nLEN\r\n", 1)
+        .await;
+    let len: usize = reply
+        .trim_start_matches(':')
+        .trim_end()
+        .parse()
+        .unwrap_or_else(|_| panic!("expected an integer, got {reply:?}"));
+
+    let log = harness.slowlog().await;
+    assert_eq!(len, entries(&log).len(), "LEN and /slowlog disagree");
+}
+
+/// An unknown subcommand must be an error a client can act on, not silence and
+/// not a wrong answer.
+#[tokio::test]
+async fn slowlog_refuses_an_unknown_subcommand() {
+    let harness = Harness::start(true).await;
+    let reply = harness
+        .resp("*2\r\n$7\r\nSLOWLOG\r\n$5\r\nBOGUS\r\n", 1)
+        .await;
+    assert!(reply.starts_with("-ERR"), "{reply:?}");
+    assert!(reply.contains("SLOWLOG HELP"), "{reply:?}");
+}
+
+/// `INFO vash` carries the length under a `vash_` name, because Redis has no
+/// `slowlog_len` field of its own — the correction recorded in `stats::collect`.
+#[tokio::test]
+async fn info_reports_the_slowlog_length_under_a_vash_name() {
+    let harness = Harness::start(true).await;
+    harness
+        .resp("*3\r\n$3\r\nSET\r\n$5\r\nalpha\r\n$1\r\nv\r\n", 1)
+        .await;
+
+    let reply = harness.resp("*2\r\n$4\r\nINFO\r\n$4\r\nvash\r\n", 1).await;
+    assert!(
+        reply.contains("vash_slowlog_len:"),
+        "INFO vash should carry the length: {reply:?}"
+    );
+    // And a bare INFO must not: the Vash section is out of the default set,
+    // exactly as Redis keeps its optional sections out of it.
+    let default = harness.resp("*1\r\n$4\r\nINFO\r\n", 1).await;
+    assert!(
+        !default.contains("vash_slowlog_len:"),
+        "the Vash section leaked into a bare INFO: {default:?}"
+    );
+}

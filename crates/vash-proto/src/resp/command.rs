@@ -146,6 +146,23 @@ pub enum Command<'a> {
     Info {
         sections: super::encode::Sections,
     },
+    /// The `SLOWLOG` container command. See [`SlowlogSub`].
+    Slowlog(SlowlogSub),
+}
+
+/// Which `SLOWLOG` was asked for.
+///
+/// The four Redis defines that mean anything here. `HELP` is included because
+/// Redis's own error points a client at it, and an error that names a command
+/// the server then refuses is worse than no error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlowlogSub {
+    /// `SLOWLOG GET [count]`. `None` is a bare `GET`, which Redis answers with
+    /// ten entries; `-1` means everything and is the floor Redis enforces.
+    Get(Option<i64>),
+    Len,
+    Reset,
+    Help,
 }
 
 /// `SCAN`, decoded.
@@ -463,6 +480,8 @@ pub fn parse_command<'a>(
 
         b"SCAN" => parse_scan(args, consumed)?,
 
+        b"SLOWLOG" => parse_slowlog(args, consumed)?,
+
         // `INFO` never fails on its arguments: Redis answers an unrecognised
         // section with an empty string rather than an error, so a client
         // probing for a section it may not have gets a usable answer.
@@ -488,6 +507,90 @@ pub fn parse_command<'a>(
 }
 
 /// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`
+/// Parses the `SLOWLOG` container command.
+///
+/// # Three errors, not one
+///
+/// The first version answered every bad form with a single "unknown subcommand
+/// or wrong number of arguments" reply, assuming Redis treats the two mistakes
+/// alike. Checked against `redis:7-alpine`, it does not — and the wording is
+/// this project's contract:
+///
+/// ```text
+/// SLOWLOG            -> ERR wrong number of arguments for 'slowlog' command
+/// SLOWLOG LEN 1      -> ERR wrong number of arguments for 'slowlog|len' command
+/// SLOWLOG BOGUS      -> ERR unknown subcommand 'BOGUS'. Try SLOWLOG HELP.
+/// SLOWLOG GET xyz    -> ERR count should be greater than or equal to -1
+/// ```
+///
+/// A subcommand with a fixed arity reports it under a `slowlog|sub` name; only
+/// a name the table does not hold is an "unknown subcommand", and that names the
+/// subcommand rather than the container.
+///
+/// **One divergence, recorded rather than hidden:** `SLOWLOG GET 1 2` answers
+/// `wrong number of arguments for 'slowlog|get'` where Redis says `unknown
+/// subcommand or wrong number of arguments for 'GET'`. Redis reaches its generic
+/// container error there because `GET`'s declared arity is variadic and the
+/// check passes; this parser is exact, so it reports the arity directly. Both
+/// say the same thing to a human, and no client matches on either.
+fn parse_slowlog<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, ProtocolError<'a>> {
+    let arity = |name: &'static str| ProtocolError::Recoverable {
+        reply: ErrorReply::WrongArity(name),
+        consumed,
+    };
+
+    let Some(sub) = args.get(1) else {
+        return Err(arity("slowlog"));
+    };
+
+    // The subcommand and nothing else.
+    let only = |name: &'static str| {
+        if args.len() == 2 {
+            Ok(())
+        } else {
+            Err(arity(name))
+        }
+    };
+
+    let parsed = if sub.eq_ignore_ascii_case(b"GET") {
+        match args.len() {
+            2 => SlowlogSub::Get(None),
+            3 => {
+                // Redis's own message, covering both halves of one mistake: a
+                // count that is not a number, and one below its floor.
+                let count =
+                    parse_int(args[2])
+                        .filter(|n| *n >= -1)
+                        .ok_or(ProtocolError::Recoverable {
+                            reply: ErrorReply::Err("count should be greater than or equal to -1"),
+                            consumed,
+                        })?;
+                SlowlogSub::Get(Some(count))
+            }
+            _ => return Err(arity("slowlog|get")),
+        }
+    } else if sub.eq_ignore_ascii_case(b"LEN") {
+        only("slowlog|len")?;
+        SlowlogSub::Len
+    } else if sub.eq_ignore_ascii_case(b"RESET") {
+        only("slowlog|reset")?;
+        SlowlogSub::Reset
+    } else if sub.eq_ignore_ascii_case(b"HELP") {
+        only("slowlog|help")?;
+        SlowlogSub::Help
+    } else {
+        return Err(ProtocolError::Recoverable {
+            reply: ErrorReply::UnknownSubcommand {
+                container: "SLOWLOG",
+                sub,
+            },
+            consumed,
+        });
+    };
+
+    Ok(Command::Slowlog(parsed))
+}
+
 fn parse_scan<'a>(args: &[&'a [u8]], consumed: usize) -> Result<Command<'a>, ProtocolError<'a>> {
     let args = at_least(args, 2, "scan", consumed)?;
     let fail = |reply: ErrorReply<'a>| ProtocolError::Recoverable { reply, consumed };
@@ -1396,6 +1499,67 @@ mod tests {
             rejected(&[b"MSETTAGS", b"0", b"a", b"1", b"0"]),
             ErrorReply::Err("numkeys should be greater than 0")
         );
+    }
+
+    #[test]
+    fn parses_every_slowlog_subcommand() {
+        let sub = |args: &[&[u8]]| match command(args) {
+            Command::Slowlog(sub) => sub,
+            other => panic!("parsed as {other:?}"),
+        };
+
+        assert_eq!(sub(&[b"SLOWLOG", b"LEN"]), SlowlogSub::Len);
+        assert_eq!(sub(&[b"SLOWLOG", b"RESET"]), SlowlogSub::Reset);
+        assert_eq!(sub(&[b"SLOWLOG", b"HELP"]), SlowlogSub::Help);
+        assert_eq!(sub(&[b"SLOWLOG", b"GET"]), SlowlogSub::Get(None));
+        assert_eq!(sub(&[b"SLOWLOG", b"GET", b"5"]), SlowlogSub::Get(Some(5)));
+        // -1 is Redis's "everything", and the floor it enforces.
+        assert_eq!(sub(&[b"SLOWLOG", b"GET", b"-1"]), SlowlogSub::Get(Some(-1)));
+
+        // Subcommands are case-insensitive, as every Redis container command's
+        // are, and `redis-cli` sends whatever the user typed.
+        assert_eq!(sub(&[b"slowlog", b"get"]), SlowlogSub::Get(None));
+        assert_eq!(sub(&[b"SLOWLOG", b"Reset"]), SlowlogSub::Reset);
+    }
+
+    /// Each bad form answers with the reply `redis:7-alpine` answers with. The
+    /// wording was checked rather than assumed: the first version of this
+    /// parser used one message for all of them and matched Redis on none.
+    #[test]
+    fn refuses_a_slowlog_the_way_redis_does() {
+        assert_eq!(
+            rejected(&[b"SLOWLOG"]),
+            ErrorReply::WrongArity("slowlog"),
+            "a bare SLOWLOG names no subcommand"
+        );
+        assert_eq!(
+            rejected(&[b"SLOWLOG", b"LEN", b"1"]),
+            ErrorReply::WrongArity("slowlog|len")
+        );
+        assert_eq!(
+            rejected(&[b"SLOWLOG", b"RESET", b"now"]),
+            ErrorReply::WrongArity("slowlog|reset")
+        );
+        assert_eq!(
+            rejected(&[b"SLOWLOG", b"GET", b"1", b"2"]),
+            ErrorReply::WrongArity("slowlog|get")
+        );
+
+        // A name the table does not hold is the only "unknown subcommand", and
+        // it names the subcommand rather than the container.
+        assert_eq!(
+            rejected(&[b"SLOWLOG", b"BOGUS"]),
+            ErrorReply::UnknownSubcommand {
+                container: "SLOWLOG",
+                sub: b"BOGUS",
+            }
+        );
+
+        // A count that is not a number, and one below Redis's floor, are the
+        // same mistake and carry the same message.
+        let bad_count = ErrorReply::Err("count should be greater than or equal to -1");
+        assert_eq!(rejected(&[b"SLOWLOG", b"GET", b"xyz"]), bad_count);
+        assert_eq!(rejected(&[b"SLOWLOG", b"GET", b"-2"]), bad_count);
     }
 
     #[test]

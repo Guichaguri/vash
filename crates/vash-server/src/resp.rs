@@ -131,6 +131,7 @@ pub fn execute_block(
 /// names the one it collapsed onto, which is what the server has.
 fn roles_for(command: &Command<'_>) -> (crate::auth::Roles, &'static str) {
     use crate::auth::Roles;
+    use vash_proto::resp::command::SlowlogSub;
 
     match command {
         Command::Hello { .. } => (Roles::NONE, "hello"),
@@ -170,6 +171,18 @@ fn roles_for(command: &Command<'_>) -> (crate::auth::Roles, &'static str) {
 
         Command::DelByTag { .. } => (Roles::INVALIDATE, "delbytag"),
         Command::Scan(_) => (Roles::LIST, "scan"),
+
+        // `SLOWLOG` splits on its subcommand, as `SET … GET` splits on its
+        // options. `GET` discloses key names where `listing_enabled` permits
+        // it, which is `list` by the same reasoning that gates `SCAN`; `RESET`
+        // destroys an operator's evidence mid-incident and is fenced with it,
+        // so the authority that can read the log is the authority that can
+        // clear it. `LEN` is a count and `HELP` is static text, and neither
+        // discloses anything `INFO` does not.
+        Command::Slowlog(sub) => match sub {
+            SlowlogSub::Get(_) | SlowlogSub::Reset => (Roles::LIST, "slowlog"),
+            SlowlogSub::Len | SlowlogSub::Help => (Roles::NONE, "slowlog"),
+        },
     }
 }
 
@@ -387,6 +400,11 @@ pub fn inline_safe(command: &Command<'_>) -> bool {
             // of which walks anything.
             | Command::Info { .. }
     )
+    // `SLOWLOG` is missing for a related reason: `Slowlog::entries` locks every
+    // lane and clones what it finds, which is bounded by `slowlog_max_len`
+    // times the lanes that have recorded — not by anything small enough to run
+    // on a worker that other connections are waiting on.
+    //
     // `SCAN` is missing and must stay missing: it is bounded by
     // `listing_max_scan` records, not by anything a runtime worker should be
     // blocked for. `Command::ListKeys` — what it becomes — answers the same.
@@ -700,6 +718,10 @@ fn run(
         // helper is bypassed.
         Command::Scan(scan) => run_scan(state, scan, *version, out),
 
+        // Answered entirely from server state: the slowlog is not storage and
+        // there is nothing to translate into a domain command.
+        Command::Slowlog(sub) => run_slowlog(state, *sub, out),
+
         // Also more than one step, for a different reason: the boundary
         // invalidates one tag at a time and this command names several.
         Command::DelByTag { tags } => run_del_by_tag(state, tags, out),
@@ -771,6 +793,123 @@ fn run(
 /// into the next integer. Everything between is `LIST_KEYS`, gate and budget
 /// included — `dispatch::execute` refuses this when `listing_enabled` is clear,
 /// which is why there is no gate check here.
+/// `SLOWLOG GET | LEN | RESET | HELP`.
+///
+/// # What the shape can and cannot carry
+///
+/// Redis's entry is **six fields**, and this renders exactly six: a client
+/// library indexes them positionally, and `redis-cli slowlog get` is the thing
+/// §7 of the proposal said must render unchanged. That fixes two costs worth
+/// naming rather than discovering.
+///
+/// The first is that `queue_us` and `exec_us` — the split this slowlog exists
+/// for — have nowhere to go. Field three is one duration, so it carries their
+/// sum, which is what the request cost inside the server and is the honest
+/// single number. The split is on `GET /slowlog`, and pointing at it is better
+/// than inventing a seventh field that a positional client would trip over or
+/// smuggling `queue_us=34` into the argument array as if the client had sent it.
+///
+/// The second is the client address and name, fields five and six, which this
+/// server does not record — see `slowlog::Slowlog`. They render empty. That is
+/// not a fabricated measurement: an empty client name is what Redis itself
+/// returns for every connection that never sent `CLIENT SETNAME`.
+#[cfg(feature = "introspect")]
+fn run_slowlog(
+    state: &ServerState,
+    sub: vash_proto::resp::command::SlowlogSub,
+    out: &mut Vec<u8>,
+) -> Answered {
+    use vash_proto::resp::command::SlowlogSub;
+    use vash_proto::resp::encode;
+
+    /// Redis answers a bare `SLOWLOG GET` with ten entries.
+    const DEFAULT_COUNT: usize = 10;
+    /// A ceiling on the request, not on the log. A caller asking for everything
+    /// gets this many, which is the same bound `GET /slowlog` applies.
+    const MAX_COUNT: usize = 1024;
+
+    let log = &state.introspect.slowlog;
+    match sub {
+        SlowlogSub::Len => encode::integer(out, log.len() as i64),
+        SlowlogSub::Reset => {
+            // Entries only. `admitted` and `evicted` are Prometheus counters and
+            // walking them backwards would corrupt every rate over the window
+            // containing the reset — which is exactly why memcached's `stats
+            // reset` is refused. See docs/slowlog-proposal.md §3.6.
+            log.reset();
+            encode::ok(out);
+        }
+        SlowlogSub::Help => {
+            let lines = [
+                "SLOWLOG <subcommand> [<arg> ...]. Subcommands are:",
+                "GET [<count>]",
+                "    Return top <count> entries from the slowlog (default: 10).",
+                "    Entries are made of:",
+                "    id, timestamp, time in microseconds, arguments array,",
+                "    client IP and port, client name.",
+                "LEN",
+                "    Return the length of the slowlog.",
+                "RESET",
+                "    Reset the slowlog.",
+                "HELP",
+                "    Print this help.",
+            ];
+            encode::array(out, lines.len());
+            for line in lines {
+                encode::simple(out, line);
+            }
+        }
+        SlowlogSub::Get(count) => {
+            let count = match count {
+                // Redis reads a negative count as "everything".
+                Some(n) if n < 0 => MAX_COUNT,
+                Some(n) => (n as usize).min(MAX_COUNT),
+                None => DEFAULT_COUNT,
+            };
+            let entries = log.entries(count);
+            encode::array(out, entries.len());
+            for entry in &entries {
+                encode::array(out, 6);
+                encode::integer(out, entry.id as i64);
+                encode::integer(out, entry.timestamp as i64);
+                // Their sum, because the shape has one slot — see above.
+                encode::integer(out, entry.queue_us.saturating_add(entry.exec_us) as i64);
+
+                // The arguments array: what the request named, which is the
+                // command family and the key it reached for.
+                encode::array(out, 2);
+                encode::bulk(out, entry.command.name().as_bytes());
+                match state.protocol.listing_enabled {
+                    true => encode::bulk(out, &entry.key),
+                    // §3.3: the digest until enumeration is permitted. Still
+                    // enough to answer "is it the same key every time".
+                    false => encode::bulk(out, format!("xxh3:{:016x}", entry.digest).as_bytes()),
+                }
+
+                // Not recorded. Empty rather than absent: the field is
+                // positional and a client counts on it being there.
+                encode::bulk(out, b"");
+                encode::bulk(out, b"");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Without the feature the log does not exist, so neither does anything to
+/// report. Refused rather than answered with an empty array, which would read
+/// as "nothing was slow" — the one answer that is never true and never useful.
+#[cfg(not(feature = "introspect"))]
+fn run_slowlog(
+    _state: &ServerState,
+    _sub: vash_proto::resp::command::SlowlogSub,
+    _out: &mut Vec<u8>,
+) -> Answered {
+    Err(Failure::client(
+        "the slowlog needs a build with --features introspect",
+    ))
+}
+
 fn run_scan(
     state: &ServerState,
     scan: &vash_proto::resp::command::Scan<'_>,
@@ -1213,6 +1352,7 @@ fn translate<'a>(command: &Command<'a>) -> Result<vash_core::Command<'a>, Failur
         | Command::Auth(_)
         | Command::Hello { .. }
         | Command::Scan(_)
+        | Command::Slowlog(_)
         | Command::DelByTag { .. } => {
             error!("a connection command reached the storage boundary");
             return Err(Failure::internal());
@@ -1506,6 +1646,25 @@ mod tests {
             .0,
             Roles::LIST
         );
+
+        // `SLOWLOG` is the one command here whose authority depends on its
+        // subcommand, so each of the four is pinned rather than a sample.
+        use vash_proto::resp::command::SlowlogSub;
+        assert_eq!(
+            roles_for(&Command::Slowlog(SlowlogSub::Get(None))).0,
+            Roles::LIST,
+            "GET discloses key names where listing_enabled permits it"
+        );
+        assert_eq!(
+            roles_for(&Command::Slowlog(SlowlogSub::Reset)).0,
+            Roles::LIST,
+            "RESET destroys an operator's evidence and is fenced with GET"
+        );
+        assert_eq!(roles_for(&Command::Slowlog(SlowlogSub::Len)).0, Roles::NONE);
+        assert_eq!(
+            roles_for(&Command::Slowlog(SlowlogSub::Help)).0,
+            Roles::NONE
+        );
     }
 
     /// Every Redis command that touches storage, in one place.
@@ -1792,6 +1951,9 @@ mod tests {
             Command::DelByTag {
                 tags: vec![b"news"],
             },
+            // Locks every lane and clones what it finds. Bounded, but not by
+            // anything small enough to block a worker other connections wait on.
+            Command::Slowlog(vash_proto::resp::command::SlowlogSub::Get(None)),
         ] {
             assert!(!inline_safe(&command), "{command:?} must not run inline");
             assert!(

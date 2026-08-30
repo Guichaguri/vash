@@ -189,6 +189,20 @@ pub fn collect(state: &ServerState) -> Vec<(String, String)> {
         ("vash_writes".into(), metrics.rates.writes().to_string()),
     ];
 
+    // Under a `vash_` name, and that is a correction rather than a preference.
+    // docs/slowlog-proposal.md §5 proposed `slowlog_len` in `INFO`'s `Stats`
+    // section on the grounds that "upstream reports it there". Upstream does
+    // not: Redis exposes the length through `SLOWLOG LEN` and has no such
+    // field in `INFO` at all. Inventing one would be the mistake §2's "a name
+    // matching is not a meaning matching" exists to prevent, so it goes where
+    // this server's own counters go — `Section::Vash`, which renders every
+    // `vash_`-prefixed name here without a second table to keep in step.
+    #[cfg(feature = "introspect")]
+    stats.push((
+        "vash_slowlog_len".into(),
+        state.introspect.slowlog.len().to_string(),
+    ));
+
     match state.store.stats() {
         Ok(s) => stats.extend([
             ("curr_items".into(), s.entries.to_string()),

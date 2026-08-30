@@ -199,12 +199,25 @@ impl LaneGuard {
     }
 }
 
+/// How many lanes have been handed back, ever.
+///
+/// Test-only, and it exists because the free list's *length* stopped being a
+/// sound thing to assert on: `crate::introspect` stripes its rings and
+/// summaries over this same allocator, so any test thread may pop a freed lane
+/// while another test is looking at the list. A monotonic count cannot be
+/// disturbed that way — a concurrent claim removes an entry from the list but
+/// never un-returns one.
+#[cfg(test)]
+static LANES_RETURNED: AtomicU64 = AtomicU64::new(0);
+
 impl Drop for LaneGuard {
     fn drop(&mut self) {
         if self.0.owned
             && let Ok(mut free) = FREED_LANES.lock()
         {
             free.push(self.0.index);
+            #[cfg(test)]
+            LANES_RETURNED.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1520,10 +1533,14 @@ mod striping_tests {
     /// shared lane for the rest of its uptime.
     #[test]
     fn a_lane_is_returned_when_its_thread_exits() {
-        let before = FREED_LANES.lock().expect("free list").len();
-        // Sequential, so each thread has certainly exited before the next
-        // claims — which is what makes the reuse observable at all.
-        for _ in 0..4 {
+        const THREADS: u64 = 4;
+
+        // Counted rather than measured off the free list's length. `introspect`
+        // stripes over this allocator too, so any other test's thread may pop a
+        // freed lane between two reads of that list — which it did, and this
+        // test failed the day the second consumer arrived.
+        let before = LANES_RETURNED.load(Ordering::Relaxed);
+        for _ in 0..THREADS {
             std::thread::spawn(|| {
                 let claimed = lane();
                 assert!(claimed.owned, "a lone thread should get a private lane");
@@ -1531,9 +1548,9 @@ mod striping_tests {
             .join()
             .expect("thread");
         }
-        let after = FREED_LANES.lock().expect("free list").len();
+        let after = LANES_RETURNED.load(Ordering::Relaxed);
         assert!(
-            after > before,
+            after >= before + THREADS,
             "lanes are not being returned: {before} before, {after} after"
         );
     }
