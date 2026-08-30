@@ -77,6 +77,9 @@ mod linux {
     /// everything the machine happens to have cached.
     fn evict(path: &Path) {
         let file = std::fs::File::open(path).unwrap();
+        // SAFETY: the descriptor is open and outlives the call, and the advice
+        // only drops clean pages — it writes nothing and frees no memory this
+        // process holds.
         unsafe {
             libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
         }
@@ -95,6 +98,10 @@ mod linux {
         if len == 0 {
             return (0, 0);
         }
+        // SAFETY: `len` is the file's own length, checked non-zero above, and
+        // the descriptor stays open for the whole block. The mapping is read
+        // only, is measured through a `vec` sized for exactly its pages, and is
+        // unmapped before the block ends — nothing escapes it.
         unsafe {
             let map = libc::mmap(
                 std::ptr::null_mut(),

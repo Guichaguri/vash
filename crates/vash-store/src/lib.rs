@@ -84,6 +84,11 @@ pub struct PendingSetMany(Submitted);
 
 enum Submitted {
     /// Nothing to wait for — an implementation that applied the writes inline.
+    ///
+    /// `MemoryStore` is the only one, so this follows it behind `testing`.
+    /// Ungated it is dead code in the shipping build, and CI's `-D warnings`
+    /// makes that a failed build rather than a warning nobody reads.
+    #[cfg(feature = "testing")]
     Ready(Vec<u64>),
     /// One entry per shard the batch touched: where its results belong in the
     /// caller's ordering, and the reply it is waiting on.
@@ -94,6 +99,7 @@ enum Submitted {
 }
 
 impl PendingSetMany {
+    #[cfg(feature = "testing")]
     pub(crate) fn ready(cas: Vec<u64>) -> Self {
         Self(Submitted::Ready(cas))
     }
@@ -108,6 +114,7 @@ impl PendingSetMany {
     /// [`Store::set_many`] takes, and its callers are on the blocking pool.
     pub fn wait_blocking(self) -> Result<Vec<u64>> {
         match self.0 {
+            #[cfg(feature = "testing")]
             Submitted::Ready(cas) => Ok(cas),
             Submitted::Sharded { len, shards } => {
                 let mut results = vec![0u64; len];
@@ -128,6 +135,7 @@ impl PendingSetMany {
     /// Awaits every shard, holding no thread while they work.
     pub async fn wait(self) -> Result<Vec<u64>> {
         match self.0 {
+            #[cfg(feature = "testing")]
             Submitted::Ready(cas) => Ok(cas),
             Submitted::Sharded { len, shards } => {
                 let mut results = vec![0u64; len];

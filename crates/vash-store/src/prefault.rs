@@ -337,6 +337,9 @@ fn populate_page_tables(path: &Path, warmed: u64, lock: bool) -> bool {
             }
         }
 
+        // SAFETY: the range established above — this process's own mapping,
+        // clamped to the file behind it — and a read-only advice, as the
+        // preamble sets out.
         let populated = unsafe { libc::madvise(addr, len, MADV_POPULATE_READ) };
         if populated != 0 {
             // Pre-5.14, where `POPULATE_READ` is `EINVAL`. `WILLNEED` is
@@ -346,6 +349,8 @@ fn populate_page_tables(path: &Path, warmed: u64, lock: bool) -> bool {
             // and returns without waiting. Nothing is lost by that here — the
             // warming pass above already did the work this is asking for — and
             // it is exactly why the pass is the mechanism and this is the hint.
+            // SAFETY: the same range, and the same read-only advice contract,
+            // as the `POPULATE_READ` it falls back from.
             unsafe { libc::madvise(addr, len, libc::MADV_WILLNEED) };
         }
     }

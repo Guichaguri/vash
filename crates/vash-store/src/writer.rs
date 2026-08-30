@@ -133,10 +133,10 @@ impl SetManyPending {
 /// so is a smaller and more truthful change than widening a seam that eleven
 /// other callers do not want widened.
 ///
-/// The contract is narrow and [`take`] enforces the dangerous half of it:
-/// reading **clears**, so a command that submitted no write reads `0` rather
-/// than inheriting the wait of whatever this thread did last. A stale non-zero
-/// here would be charged to the wrong request.
+/// The contract is narrow and [`queue_wait::take`] enforces the dangerous half
+/// of it: reading **clears**, so a command that submitted no write reads `0`
+/// rather than inheriting the wait of whatever this thread did last. A stale
+/// non-zero here would be charged to the wrong request.
 pub mod queue_wait {
     #[cfg(feature = "introspect")]
     thread_local! {

@@ -33,7 +33,7 @@ const MAX_KEPT_KEY: usize = 128;
 pub struct Counter {
     /// `xxh3` of the **whole** key. Identity, and the only thing compared.
     pub digest: u64,
-    /// The first [`MAX_KEPT_KEY`] bytes of the key.
+    /// The first `MAX_KEPT_KEY` bytes of the key.
     pub key: Box<[u8]>,
     /// Whether `key` is the whole of it.
     pub truncated: bool,
@@ -205,7 +205,7 @@ impl HotKeys {
     ///
     /// The common path is an `xorshift32` step and a masked compare against a
     /// thread-local `Cell` — no atomics, no shared cache lines, no allocation,
-    /// no borrow flag. Everything else is in [`Self::admit`], behind a `#[cold]`
+    /// no borrow flag. Everything else is in `Self::admit`, behind a `#[cold]`
     /// so it is not inlined into every call site on the hottest path in the
     /// program.
     #[inline]

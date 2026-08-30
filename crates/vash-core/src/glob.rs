@@ -87,14 +87,14 @@ pub fn matches(pattern: &[u8], candidate: &[u8]) -> bool {
                     continue;
                 }
             }
-            Some(literal) => {
-                if literal == candidate[c] {
-                    p += 1;
-                    c += 1;
-                    continue;
-                }
+            Some(literal) if literal == candidate[c] => {
+                p += 1;
+                c += 1;
+                continue;
             }
-            None => {}
+            // A literal that did not match, and the exhausted pattern: both
+            // fall through to the backtrack below.
+            _ => {}
         }
 
         // Mismatch. Give the last star one more byte and try again from there.

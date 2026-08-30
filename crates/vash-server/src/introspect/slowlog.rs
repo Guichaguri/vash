@@ -59,7 +59,7 @@ pub struct Entry {
     pub peer: std::net::SocketAddr,
     /// How many keys the command named.
     pub keys: u32,
-    /// The first [`MAX_KEPT_KEY`] bytes of the first key.
+    /// The first `MAX_KEPT_KEY` bytes of the first key.
     ///
     /// Rendered or withheld by the surface, not here: §3.3 gates the *bytes*
     /// behind `listing_enabled` and falls back to [`Self::digest`]. Phase 0
@@ -211,7 +211,7 @@ impl Slowlog {
             let Ok(ring) = ring.lock() else { continue };
             merged.extend(ring.iter().cloned());
         }
-        merged.sort_unstable_by(|a, b| b.id.cmp(&a.id));
+        merged.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.id));
         merged.truncate(count);
         merged
     }
