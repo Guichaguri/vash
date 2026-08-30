@@ -225,7 +225,10 @@ impl<B: Backend> Store for VashStore<B> {
         if let [only] = self.shards.all() {
             let mut reader = only.engine.batch_reader()?;
             for (index, key) in keys.iter().enumerate() {
-                if reader.get_with(*key, |value| render(index, Some(value)))?.is_none() {
+                if reader
+                    .get_with(*key, |value| render(index, Some(value)))?
+                    .is_none()
+                {
                     render(index, None);
                 }
             }
@@ -243,7 +246,10 @@ impl<B: Backend> Store for VashStore<B> {
                 Some(open) => open,
                 slot => slot.insert(self.shards.all()[shard].engine.batch_reader()?),
             };
-            if reader.get_with(*key, |value| render(index, Some(value)))?.is_none() {
+            if reader
+                .get_with(*key, |value| render(index, Some(value)))?
+                .is_none()
+            {
                 render(index, None);
             }
         }

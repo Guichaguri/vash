@@ -475,7 +475,10 @@ fn slabs(state: &ServerState) -> Vec<(String, String)> {
     let metrics = &state.metrics;
 
     let mut slabs = vec![
-        (format!("{class}:get_hits"), metrics.rates.hits().to_string()),
+        (
+            format!("{class}:get_hits"),
+            metrics.rates.hits().to_string(),
+        ),
         (
             format!("{class}:cmd_set"),
             (metrics.commands.total(CommandKind::Set)

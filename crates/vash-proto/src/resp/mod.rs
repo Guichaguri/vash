@@ -544,8 +544,7 @@ mod tests {
         // Arbitrary argument bytes, the empty argument included, and bytes that
         // look like framing — a `$` or a CRLF inside a payload is legal, since
         // every argument is length-delimited.
-        let args =
-            proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..12), 1..6);
+        let args = proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..12), 1..6);
 
         proptest!(|(args in args)| {
             let mut input = format!("*{}\r\n", args.len()).into_bytes();
@@ -602,7 +601,10 @@ mod tests {
         for cut in 1..whole.len() {
             let partial = &whole[..cut];
             assert!(
-                matches!(peek(partial, |args: &[&[u8]]| args.len()), Ok(Framed::Incomplete)),
+                matches!(
+                    peek(partial, |args: &[&[u8]]| args.len()),
+                    Ok(Framed::Incomplete)
+                ),
                 "peek settled a {cut}-byte prefix",
             );
             assert!(
