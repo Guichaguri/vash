@@ -43,6 +43,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+// The one caller is inside the TLS block below, so a build without the feature
+// would warn on it. `--all-features` in CI is why that went unnoticed.
+#[cfg(feature = "tls")]
 use anyhow::Context;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -138,7 +141,7 @@ impl Cluster {
         let mut tasks = Vec::new();
 
         let credential = config
-            .credential()
+            .credential()?
             .map(|(name, secret)| vash_client::Credential::new(name, secret));
 
         for addr in &config.peers {

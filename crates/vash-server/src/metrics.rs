@@ -784,6 +784,16 @@ pub struct ServerMetrics {
     /// refused because the unauthenticated-connection budget was full.
     pub auth_timeouts: AtomicU64,
     pub auth_capacity_rejected: AtomicU64,
+    /// Connections closed for never sending a byte inside
+    /// `server.first_byte_timeout_ms`, and for buffering past
+    /// `server.max_buffered_bytes`.
+    ///
+    /// Kept apart from `auth_timeouts` beside them because these two do not ask
+    /// whether authentication is enforced: a deployment with `auth.required`
+    /// off sees only these, and reading them as authentication failures would
+    /// send an operator looking at a credential table that is not involved.
+    pub silent_timeouts: AtomicU64,
+    pub buffer_ceiling_closes: AtomicU64,
 
     /// Command rates and the hit/miss split, **striped per thread**.
     ///
@@ -824,6 +834,8 @@ impl Default for ServerMetrics {
             auth_denied: std::array::from_fn(|_| AtomicU64::new(0)),
             auth_timeouts: AtomicU64::new(0),
             auth_capacity_rejected: AtomicU64::new(0),
+            silent_timeouts: AtomicU64::new(0),
+            buffer_ceiling_closes: AtomicU64::new(0),
             rates: Rates::default(),
             errors_client: AtomicU64::new(0),
             errors_capacity: AtomicU64::new(0),
@@ -907,6 +919,16 @@ impl ServerMetrics {
 
     pub fn auth_capacity_rejected(&self) {
         self.auth_capacity_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection closed for never sending a byte.
+    pub fn silent_timeout(&self) {
+        self.silent_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection closed for holding more than it is allowed to.
+    pub fn buffer_ceiling(&self) {
+        self.buffer_ceiling_closes.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -1100,6 +1122,19 @@ pub fn render_prometheus(
         "counter",
         "Connections refused because the limit was reached.",
         load(&server.connections_rejected).to_string(),
+    );
+    metric!(
+        "vash_connections_silent_timeout_total",
+        "counter",
+        "Connections closed for never sending a byte within \
+         server.first_byte_timeout_ms.",
+        load(&server.silent_timeouts).to_string(),
+    );
+    metric!(
+        "vash_connections_buffer_ceiling_total",
+        "counter",
+        "Connections closed for buffering more than they are allowed to hold.",
+        load(&server.buffer_ceiling_closes).to_string(),
     );
     metric!(
         "vash_tls_handshakes_total",

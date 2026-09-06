@@ -49,6 +49,8 @@ pub struct ServerState {
     pub started: std::time::Instant,
     /// How this node is bound and bounded. See [`Binding`].
     pub binding: Binding,
+    /// What one connection may consume. See [`ConnLimits`].
+    pub limits: ConnLimits,
     /// Who is connected, for `stats conns`. See [`crate::connections`].
     pub connections: crate::connections::Registry,
     /// What was slow and which key is hot. See [`crate::introspect`].
@@ -87,9 +89,34 @@ pub struct Binding {
     pub read_buffer: u64,
 }
 
+/// What one connection may consume, whoever it turns out to be.
+///
+/// Separate from [`crate::auth::Limits`], which bounds a connection that has
+/// **not** authenticated and is therefore conditional on `auth.required`.
+/// These two are not: they apply to every connection on the server, which is
+/// the whole reason they exist — the pre-auth budget never armed at all in the
+/// default configuration, so until these there was no ceiling on a connection's
+/// memory and no deadline on one that sent nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnLimits {
+    /// `server.max_buffered_bytes`.
+    pub max_buffered_bytes: usize,
+    /// `server.first_byte_timeout_ms`. `0` disables the deadline.
+    pub first_byte_timeout_ms: u64,
+}
+
+impl From<&crate::config::ServerConfig> for ConnLimits {
+    fn from(config: &crate::config::ServerConfig) -> Self {
+        Self {
+            max_buffered_bytes: config.max_buffered_bytes,
+            first_byte_timeout_ms: config.first_byte_timeout_ms,
+        }
+    }
+}
+
 impl ServerState {
-    // Eight, and they are eight independent things a server is assembled from
-    // rather than one thing with eight parts. A parameter struct here would
+    // Nine, and they are nine independent things a server is assembled from
+    // rather than one thing with nine parts. A parameter struct here would
     // exist only to satisfy the lint, and every caller would fill it in field
     // by field at the call site this signature already is.
     #[expect(clippy::too_many_arguments)]
@@ -101,6 +128,7 @@ impl ServerState {
         cluster: Arc<Cluster>,
         inline_reads: bool,
         binding: Binding,
+        limits: ConnLimits,
         introspect: &crate::config::IntrospectConfig,
     ) -> Arc<Self> {
         let write_permits = Arc::new(tokio::sync::Semaphore::new(
@@ -123,6 +151,7 @@ impl ServerState {
             // became able to answer anything.
             started: std::time::Instant::now(),
             binding,
+            limits,
             connections: crate::connections::Registry::default(),
             introspect: crate::introspect::Introspect::new(introspect),
         })

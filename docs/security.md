@@ -4,6 +4,11 @@ A vulnerability analysis of the server and of the three protocols it speaks,
 against `563dda0`. Written the way the rest of `docs/` is: the finding first,
 then why it is what it is, then what closes it.
 
+**Status.** Seven of the sixteen are fixed, and §2's table says which. The
+three that were reproduced were re-run against the fix with the same scripts
+and the same measurements; those numbers are in the findings. What is left is
+ranked in §5.
+
 Scope: `vash-core`, `vash-proto`, `vash-store`, `vash-server`, `vash-client`,
 the shipped `Dockerfile` and `vash.example.toml`. Everything reachable from a
 socket was read; the storage engines' own C libraries (LMDB, libmdbx) were not
@@ -41,24 +46,27 @@ so reaching the port *is* holding a credential. That is a deliberate choice
 
 ## 2. Findings
 
-| # | Severity | Finding | Attacker |
-|---|---|---|---|
-| [V-01](#v-01) | **High** | A 12-byte VCP header commits 64 MiB of memory | A |
-| [V-02](#v-02) | **High** | No per-connection read-buffer ceiling after the pre-auth gate | A |
-| [V-03](#v-03) | **High** | Unauthenticated by default, and the shipped container binds `0.0.0.0` | A |
-| [V-04](#v-04) | Medium | Log injection through the `AUTH` username | A |
-| [V-05](#v-05) | Medium | No idle timeout except before authenticating | A |
-| [V-06](#v-06) | Medium | mTLS identity is non-deterministic for a multi-SAN certificate | B |
-| [V-07](#v-07) | Medium | The cluster peer secret sits in plaintext TOML, unchecked | local |
-| [V-08](#v-08) | Low | `VASH_AUTH_SECRET` is readable from the process environment | local |
-| [V-09](#v-09) | Low | Log-volume amplification from refused commands | A |
-| [V-10](#v-10) | Low | Batch counts size allocations before the items arrive | A |
-| [V-11](#v-11) | Low | `SCAN` cursors are server-wide with sequential tokens | B |
-| [V-12](#v-12) | Info | Username-existence timing side channel in `verify` | A |
-| [V-13](#v-13) | Info | `stats conns` and `CLUSTER` disclose peers at `Roles::NONE` | B |
-| [V-14](#v-14) | Info | The admin port has no authentication of its own | A |
-| [V-15](#v-15) | Info | The tag registry is fillable and has no per-client quota | B |
-| [V-16](#v-16) | Info | No supply-chain scanning in CI | — |
+| # | Severity | Finding | Attacker | Status |
+|---|---|---|---|---|
+| [V-01](#v-01) | **High** | A 12-byte VCP header commits 64 MiB of memory | A | **fixed** |
+| [V-02](#v-02) | **High** | No per-connection read-buffer ceiling after the pre-auth gate | A | **fixed** |
+| [V-03](#v-03) | **High** | Unauthenticated by default, and the shipped container binds `0.0.0.0` | A | **warned** |
+| [V-04](#v-04) | Medium | Log injection through the `AUTH` username | A | **fixed** |
+| [V-05](#v-05) | Medium | No idle timeout except before authenticating | A | **fixed** |
+| [V-06](#v-06) | Medium | mTLS identity is non-deterministic for a multi-SAN certificate | B | **fixed** |
+| [V-07](#v-07) | Medium | The cluster peer secret sits in plaintext TOML, unchecked | local | **fixed** |
+| [V-08](#v-08) | Low | `VASH_AUTH_SECRET` is readable from the process environment | local | open |
+| [V-09](#v-09) | Low | Log-volume amplification from refused commands | A | open |
+| [V-10](#v-10) | Low | Batch counts size allocations before the items arrive | A | open |
+| [V-11](#v-11) | Low | `SCAN` cursors are server-wide with sequential tokens | B | open |
+| [V-12](#v-12) | Info | Username-existence timing side channel in `verify` | A | open |
+| [V-13](#v-13) | Info | `stats conns` and `CLUSTER` disclose peers at `Roles::NONE` | B | open |
+| [V-14](#v-14) | Info | The admin port has no authentication of its own | A | open |
+| [V-15](#v-15) | Info | The tag registry is fillable and has no per-client quota | B | open |
+| [V-16](#v-16) | Info | No supply-chain scanning in CI | — | open |
+
+"Warned" is V-03 and only V-03: the deployment shape is unchanged and a line at
+startup now says so. See that finding for what a full fix would be.
 
 ---
 
@@ -117,6 +125,24 @@ it removes the amplification entirely. Widening `gated` would not work — that
 would break legitimate large frames on an authenticated connection — which is
 why this needs a bound of its own.
 
+**Fixed.** `drain` clamps the reserve to `max(capacity, buffered * 2)` before
+honouring it, so what a header *declares* can never size an allocation on its
+own — it is amortised doubling with the target known, which keeps the
+optimisation for a client genuinely streaming a large frame (it converges on the
+frame's size in a handful of steps and stops exactly there) and gives a client
+that has sent twelve bytes the buffer it already had. Re-run with the identical
+script:
+
+| | committed | working set |
+|---|---|---|
+| before the fix, holding 20 headers | 1310.7 MB | 11.4 MB |
+| **after the fix, holding 20 headers** | **28.6 MB** | **11.2 MB** |
+
+1283 MB of commit charge down to 1.0 MB, for the same 560 bytes of traffic.
+`conn::tests` pins the arithmetic and `tests/limits.rs` pins that an incomplete
+frame is still not an error — a clamped reserve must not turn a legal large
+frame into a disconnect.
+
 ---
 
 ### V-02
@@ -171,6 +197,34 @@ from `store.max_value_bytes` and `server.read_buffer`, enforced on every read
 for every connection. That is a strictly stronger statement than
 `PRE_AUTH_MAX_BUFFERED` makes and it subsumes it.
 
+**Fixed.** `server.max_buffered_bytes` is checked after every read, for every
+connection, without consulting the authentication state; `PRE_AUTH_MAX_BUFFERED`
+stays as the tighter ceiling for a connection that has presented nothing. The
+default is `ABSOLUTE_MAX_VALUE_LEN + 1 MiB` — the largest value this build can
+be configured to hold, plus framing — which is what VCP and memcached already
+enforced, so RESP joins them and nothing that was legal before is refused now.
+`Config::validate` refuses a ceiling that would not fit `store.max_value_bytes`,
+so a deployment that lowers it finds out at startup rather than as a disconnect
+under load.
+
+Re-run with the identical script, which previously reached 310.9 MB resident and
+had no reason to stop:
+
+```
+server closed the connection after 69.0 MiB (ConnectionResetError)
+```
+
+65 MiB is the ceiling and the remaining 4 MiB was in flight in socket buffers
+when the close landed. The whole exchange took 0.2 s, which is why sampling at
+250 ms never caught a peak — the deterministic assertions are in
+`tests/limits.rs`, at a ceiling small enough to observe.
+
+**This bounds the exposure; it does not make it nothing.** `max_connections *
+max_buffered_bytes` is now the worst case, which at the defaults is 10000 x 65
+MiB, and reaching it costs an attacker that much bandwidth rather than nothing
+at all. A deployment that knows its largest write should lower the ceiling; the
+example config says so.
+
 ---
 
 ### V-03
@@ -215,6 +269,26 @@ The smallest version of it here is a startup `warn!` when
 The fuller version is a `server.protected_mode` defaulting on, refusing
 commands from non-loopback peers on an unauthenticated server, which the
 `Dockerfile` would then have to opt out of explicitly and visibly.
+
+**Warned, not fixed, and the distinction matters.** `warn_if_unprotected` runs at
+startup and says so when `auth.required` is false and the cache port — or a TLS
+port that is not authenticating with client certificates — is bound to a
+non-loopback address:
+
+```
+WARN vash_server: SERVING WITHOUT AUTHENTICATION ON A NON-LOOPBACK ADDRESS:
+every client that can reach these ports can read, overwrite and invalidate the
+whole cache, and enumerate the other clients connected to it. Set auth.file (or
+VASH_AUTH_SECRET) together with auth.required, or bind to a loopback address, or
+make sure the port is reachable only from a network you trust
+addresses=0.0.0.0:11399
+```
+
+Nothing is refused and no deployment changes behaviour. Protected mode — the
+Redis answer, where such a server accepts connections and refuses commands from
+non-loopback peers — remains the fuller fix and remains unbuilt: it would be a
+behaviour change for everyone genuinely on a private network, which is a
+decision to take deliberately rather than fold into a security pass.
 
 ---
 
@@ -261,6 +335,19 @@ logging it, which VCP already does structurally. `cluster.rs:515` already gets
 this right with `tag = ?String::from_utf8_lossy(&entry.name)` — the pattern
 exists in the codebase, it is just not used in these two places.
 
+**Fixed.** `auth::log_name` truncates to `MAX_NAME_LEN` and the three call sites
+render it with `?` rather than `%`, so `Debug` escapes what survives. The
+identical exploit now produces one line:
+
+```
+WARN vash_server::resp: authentication failed name="attacker\n\u{1b}[2m2026-01-01T00:00:00.000000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2m…" failures=1
+```
+
+The newline is two characters, the ANSI escapes are `\u{1b}`, the whole field is
+quoted, and it is cut at 64 bytes with an ellipsis so a prefix cannot read as the
+whole of what was tried. No second entry is forged, and the 64 MiB-per-attempt
+log flood goes with it.
+
 ---
 
 ### V-05
@@ -291,6 +378,17 @@ connections that have sent nothing at all, which is a strictly smaller
 population than "idle" and contains no legitimate client. The
 `PRE_AUTH_MAX_BUFFERED` machinery is already shaped for this; it needs to stop
 asking whether authentication is enforced.
+
+**Fixed.** `server.first_byte_timeout_ms`, default 10000, closes a connection
+that has never sent a byte — and only that population, so
+[protocol.md](protocol.md)'s promise about established connections is untouched:
+one byte settles the dialect and this stops arming for good. `0` disables it, for
+a pool that opens connections eagerly. It does not ask whether authentication is
+enforced, which is the whole point.
+
+Measured against the default configuration: 50 connections opened, nothing sent,
+**50/50 closed by the server after 10.0 s**. `tests/limits.rs` pins both halves —
+that a silent connection goes, and that one which has spoken stays.
 
 ---
 
@@ -336,6 +434,19 @@ load time — `tls.rs` already notes that a subject which is not a valid
 which is safe but leaves a row that reads as a working credential and is not
 one, the same failure `parse_credential` refuses `hmac-sha256-key` to avoid.
 
+**Fixed.** `identity_for_certificate` now walks every row and returns a
+`CertificateMatch`: `None`, `One(identity)`, or `Ambiguous(rows)` with the names
+sorted so a log line is stable across processes. `peer_identity` closes the
+connection on `Ambiguous`, naming the rows — refusing rather than resolving,
+because an ambiguous certificate is a configuration mistake and silently picking
+one reading of it is how the mistake survives to be discovered by whatever it
+later authorises.
+
+The second half is fixed too: `tls::check_subjects` runs at startup whenever TLS
+is configured and refuses an `mtls:` row whose subject is not a name a
+certificate could be issued for. Such a row used to parse, load, and then match
+nothing for ever.
+
 ---
 
 ### V-07
@@ -359,6 +470,17 @@ supply it except through a file or a command line.
 Either would fix it: apply the same mode check to the config file whenever
 `cluster.auth_secret` is non-empty, or add the environment variable and let the
 file hold only a name.
+
+**Fixed.** `VASH_CLUSTER_SECRET` is the peer counterpart of `VASH_AUTH_SECRET`,
+so the secret need not live in a config file that gets no permission check.
+Setting both it and `cluster.auth_secret` is refused at startup rather than
+silently preferring one — the rule `Auth::load` already follows, and for the same
+reason: which credential a node presents must not depend on knowing a precedence
+order.
+
+The environment is not a secret store either, and V-08 applies here verbatim.
+What changed is that there is now a choice; the config file was the only place
+before.
 
 ---
 
@@ -732,27 +854,27 @@ admin routes. No client input reflected into an HTTP response.
 
 ---
 
-## 5. Recommendations, in order
+## 5. What is left
 
-1. **Bound the VCP reserve** (V-01) — the largest amplification measured here,
-   and a change confined to `measure_vcp`.
-2. **Add an absolute per-connection buffered-bytes ceiling** (V-02), checked on
-   every read regardless of auth state. This subsumes `PRE_AUTH_MAX_BUFFERED`
-   rather than replacing it.
-3. **Warn, or refuse, on a non-loopback bind with no credentials** (V-03), and
-   revisit the `Dockerfile` CMD. A startup `warn!` is one line and removes most
-   of the risk that the other findings are reachable at all.
-4. **Escape and truncate the logged username** (V-04) — `?` instead of `%`,
-   capped at `MAX_AUTH_NAME_LEN`, in `resp.rs:546` and `memcached.rs:450`.
-5. **Deadline connections that have sent nothing**, independent of whether
-   authentication is enforced (V-05).
-6. **Refuse an ambiguous client certificate** rather than picking by hash order
-   (V-06), and validate `mtls:` subjects at load.
-7. **Protect the peer secret** (V-07) — extend the mode check to the config
-   file, or add an environment variable for it.
-8. **Add `cargo audit` to CI** (V-16).
+V-01 through V-07 are done; the detail sits with each finding. What remains, in
+the order it is worth doing:
 
-Items 1, 2 and 4 are small and self-contained. Item 3 is the one that changes
-the shape of the threat model, because it is what decides whether the rest of
-this list describes an attack on a private service or an attack on the
-internet.
+1. **Protected mode** (V-03). The startup warning is the small version. The full
+   one — accept the connection, refuse the command, explain why — is what decides
+   whether the rest of this list describes an attack on a private service or an
+   attack on the internet, and it is a deliberate behaviour change rather than a
+   security patch.
+2. **`cargo audit` in CI** (V-16). The lockfile is clean today; nothing keeps
+   that sentence true.
+3. **Rate-limit the refusal logs** (V-09) — first occurrence plus a periodic
+   count, which is what they are useful for anyway.
+4. **A per-identity tag quota** (V-15), much easier to add before anyone depends
+   on there not being one.
+5. **Reserve batch vectors incrementally** (V-10). Bounded and transient today;
+   it matters only if either constant is raised.
+6. **Document `VASH_AUTH_SECRET`'s exposure** (V-08) in
+   [operations.md](operations.md), beside the variable.
+
+V-11, V-12, V-13 and V-14 are recorded rather than scheduled: each is a
+consequence of a decision the project has already taken deliberately, and the
+findings say which.

@@ -95,7 +95,7 @@ fn check_peer_role(config: &Config, credentials: &auth::Auth) -> anyhow::Result<
     if config.cluster.peers.is_empty() {
         return Ok(());
     }
-    let Some((name, _)) = config.cluster.credential() else {
+    let Some((name, _)) = config.cluster.credential()? else {
         return Ok(());
     };
     let Some(roles) = credentials.roles_of(name.as_bytes()) else {
@@ -109,6 +109,70 @@ fn check_peer_role(config: &Config, credentials: &auth::Auth) -> anyhow::Result<
          while every node still reported itself healthy. Add `roles=peer` to that row"
     );
     Ok(())
+}
+
+/// Says out loud that this server is reachable from off the box and refuses
+/// nobody.
+///
+/// **The default configuration is safe and the documented container one is
+/// not**, which is exactly the combination that goes unnoticed.
+/// `server.listen` defaults to `127.0.0.1:11311`, so nothing here fires for a
+/// developer running it locally. The `Dockerfile` ships
+/// `--listen 0.0.0.0:11311` with no credential, and `--listen 0.0.0.0` is also
+/// the first thing anyone types when a sibling container cannot connect — and
+/// at that moment every key in the cache is readable, writable and
+/// invalidatable by anything that can route to the port, with nothing said
+/// about it.
+///
+/// A warning rather than a refusal, deliberately. Redis met this and answered
+/// with protected mode, which is the stronger form and would be a behaviour
+/// change for anyone genuinely on a private network; a line at startup costs
+/// them nothing and is what an operator needs to have seen. It is `warn!` so
+/// it survives the default `log_level = "info"`.
+fn warn_if_unprotected(config: &Config, credentials: &auth::Auth) {
+    // Enforcement, not mere configuration: a table nothing is checked against
+    // protects no one, and the `auth.required is false` warning above covers
+    // that case separately.
+    if credentials.required() {
+        return;
+    }
+
+    let mut exposed: Vec<String> = Vec::new();
+    if !config.server.listen.ip().is_loopback() {
+        exposed.push(config.server.listen.to_string());
+    }
+    // The TLS port is encrypted and still unauthenticated, unless client
+    // certificates are what is authenticating it — in which case the handshake
+    // is the gate and there is nothing to warn about.
+    if config.tls.enabled()
+        && config.tls.client_auth != crate::config::ClientAuth::Required
+        && !tls_listen_is_loopback(&config.tls.listen)
+    {
+        exposed.push(config.tls.listen.clone());
+    }
+    if exposed.is_empty() {
+        return;
+    }
+
+    warn!(
+        addresses = %exposed.join(", "),
+        "SERVING WITHOUT AUTHENTICATION ON A NON-LOOPBACK ADDRESS: every client that can \
+         reach these ports can read, overwrite and invalidate the whole cache, and enumerate \
+         the other clients connected to it. Set auth.file (or VASH_AUTH_SECRET) together with \
+         auth.required, or bind to a loopback address, or make sure the port is reachable only \
+         from a network you trust"
+    );
+}
+
+/// Whether a `tls.listen` string names a loopback address.
+///
+/// The setting is a `String` rather than a `SocketAddr` because it may name a
+/// host, so this parses what it can and treats anything it cannot as exposed —
+/// the safe direction for a warning is to say something rather than nothing.
+fn tls_listen_is_loopback(listen: &str) -> bool {
+    listen
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback())
 }
 
 impl Server {
@@ -163,6 +227,10 @@ impl Server {
         // client.
         let credentials = auth::Auth::load(&config.auth)?;
         check_peer_role(&config, &credentials)?;
+        #[cfg(feature = "tls")]
+        if config.tls.enabled() {
+            tls::check_subjects(&credentials)?;
+        }
         if credentials.required() {
             info!("authentication is required on the cache port");
         } else if credentials.configured() {
@@ -170,6 +238,7 @@ impl Server {
             // who thinks they turned it on should be told they have not.
             warn!("credentials are configured but auth.required is false; nothing is refused");
         }
+        warn_if_unprotected(&config, &credentials);
 
         let auth_state = auth::AuthState::new(
             credentials,
@@ -245,6 +314,7 @@ impl Server {
                 max_blocking_threads: config.server.max_blocking_threads as u64,
                 read_buffer: config.server.read_buffer as u64,
             },
+            state::ConnLimits::from(&config.server),
             &config.observability.introspect,
         );
 
@@ -582,8 +652,17 @@ fn peer_identity(
     // which is what `SIGHUP` rotation means for a certificate.
     let auth = state.auth.current();
     match tls::identity_for(&auth, certificate) {
-        Some(identity) => Ok(Some(identity)),
-        None => Err(String::from("<no matching mtls: row>")),
+        crate::auth::CertificateMatch::One(identity) => Ok(Some(identity)),
+        crate::auth::CertificateMatch::None => Err(String::from("<no matching mtls: row>")),
+        // Closed rather than resolved. Which row a certificate belongs to used
+        // to be settled by `HashMap` iteration order, so a client whose SANs
+        // satisfied two rows got one of their role sets at random; refusing is
+        // the only answer that does not silently grant the wider one.
+        crate::auth::CertificateMatch::Ambiguous(rows) => Err(format!(
+            "<matches {} rows: {}>",
+            rows.len(),
+            rows.join(", ")
+        )),
     }
 }
 

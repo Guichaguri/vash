@@ -9,6 +9,32 @@ listen = "127.0.0.1:11311"
 # can fall back to the origin, a client left waiting cannot.
 max_connections = 10000
 read_buffer = 16384
+
+# Most bytes one connection may hold buffered, at any point in its life.
+#
+# The only absolute bound on what a single client can make this server hold,
+# and deliberately not conditional on authentication: a command is buffered
+# whole before it is parsed, so until the parser runs there is nothing to charge
+# the bytes to but the socket they arrived on. A connection past this is closed.
+#
+# The default is the largest value this build can be configured to hold plus a
+# mebibyte for framing, which is what VCP and memcached already enforced — so it
+# refuses nothing that was legal before it existed. Lower it to whatever your
+# largest write actually needs and the exposure drops with it:
+# max_connections * max_buffered_bytes is the worst case. Startup refuses a
+# value that would not fit store.max_value_bytes plus its framing.
+max_buffered_bytes = 68157440
+
+# How long a connection may send *nothing at all*, in milliseconds. 0 disables.
+#
+# Not an idle timeout: a pooled connection that has served requests and gone
+# quiet is left alone, as docs/protocol.md promises. This covers only
+# connections that have never sent a byte — a population that contains no
+# legitimate client, since every real one sends its first command immediately,
+# and every slowloris. Raise it or set it to 0 for a pool that opens connections
+# eagerly and holds them unused.
+first_byte_timeout_ms = 10000
+
 # Ceiling on concurrent store operations, and therefore on LMDB reader slots in
 # use. store.max_readers must exceed it, or reads fail with MDB_READERS_FULL
 # under load; startup refuses a config where it does not.
@@ -541,6 +567,11 @@ queue_depth = 1024
 # itself healthy. Startup refuses that configuration rather than running into
 # it. Empty auth_name means `default`.
 auth_name = ""
+# Leave empty and set VASH_CLUSTER_SECRET instead to keep the secret out of this
+# file — a config file is a document that ends up in version control, and unlike
+# the credential file it gets no permission check. Setting both is refused at
+# startup rather than silently preferring one, so which credential a node
+# presents never depends on knowing a precedence order.
 auth_secret = ""
 
 

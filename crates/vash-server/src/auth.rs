@@ -52,7 +52,9 @@ pub const SECRET_ENV: &str = "VASH_AUTH_SECRET";
 /// hygiene advice.
 pub const MIN_SECRET_LEN: usize = 16;
 
-const MAX_NAME_LEN: usize = 64;
+/// Longest credential name the file format accepts, and the ceiling
+/// [`log_name`] truncates to.
+pub const MAX_NAME_LEN: usize = 64;
 
 /// The authority a credential carries, as a bitset.
 ///
@@ -534,22 +536,70 @@ impl Auth {
     /// Linear in the number of `mtls:` rows, once per connection. The table is
     /// a handful of services, and each candidate costs a certificate parse, so
     /// an index would trade a real cost for an imaginary one.
-    pub fn identity_for_certificate(&self, matches: impl Fn(&str) -> bool) -> Option<Identity> {
+    ///
+    /// **Every row is tried, and two matches are a refusal.** Returning at the
+    /// first one was a real hole rather than an untidiness: `self.table` is a
+    /// `HashMap` with the default `RandomState`, so a certificate satisfying
+    /// two rows — one carrying SANs for both `billing.svc` and `billing`, or a
+    /// wildcard against several rows beneath it — picked its identity, and
+    /// therefore its role set, by hash iteration order. The holder of a
+    /// wildcard certificate could authenticate as whichever row came first,
+    /// which might be the one with `roles=flush`.
+    ///
+    /// Refusing is right rather than choosing the narrowest: an ambiguous
+    /// certificate is a configuration mistake, and silently picking one reading
+    /// of it is how the mistake survives to be discovered by whatever it later
+    /// authorises.
+    pub fn identity_for_certificate(&self, matches: impl Fn(&str) -> bool) -> CertificateMatch {
+        let mut found: Option<Identity> = None;
+        let mut ambiguous: Vec<String> = Vec::new();
+
         for (name, credential) in &self.table {
             let Some(subject) = &credential.subject else {
                 continue;
             };
-            if matches(subject) {
-                return Some(Identity {
-                    name: String::from_utf8_lossy(name)
-                        .into_owned()
-                        .into_boxed_str()
-                        .into(),
-                    roles: credential.roles,
-                });
+            if !matches(subject) {
+                continue;
+            }
+            let identity = Identity {
+                name: String::from_utf8_lossy(name)
+                    .into_owned()
+                    .into_boxed_str()
+                    .into(),
+                roles: credential.roles,
+            };
+            match &found {
+                None => found = Some(identity),
+                Some(first) => {
+                    if ambiguous.is_empty() {
+                        ambiguous.push(first.name().to_string());
+                    }
+                    ambiguous.push(identity.name().to_string());
+                }
             }
         }
-        None
+
+        match found {
+            None => CertificateMatch::None,
+            // Sorted so the log line naming them is stable across processes,
+            // which is the same defect this function exists to close.
+            Some(_) if !ambiguous.is_empty() => {
+                ambiguous.sort();
+                CertificateMatch::Ambiguous(ambiguous)
+            }
+            Some(identity) => CertificateMatch::One(identity),
+        }
+    }
+
+    /// The `mtls:` subjects in the table, for the startup check that they are
+    /// names a certificate could actually carry.
+    pub fn mtls_subjects(&self) -> impl Iterator<Item = (String, &str)> {
+        self.table.iter().filter_map(|(name, credential)| {
+            credential
+                .subject
+                .as_ref()
+                .map(|subject| (String::from_utf8_lossy(name).into_owned(), &**subject))
+        })
     }
 
     /// The roles a named row carries, for the startup checks that have to look
@@ -722,6 +772,23 @@ impl AuthState {
     }
 }
 
+/// Which credential row a verified client certificate belongs to.
+///
+/// Three outcomes rather than an `Option`, because "matches nothing" and
+/// "matches two rows" are different problems for the operator and must not be
+/// reported as the same one: the first is a client this deployment has not been
+/// told about, the second is a credential file that does not say what its
+/// author thinks it says.
+#[derive(Debug)]
+pub enum CertificateMatch {
+    /// No `mtls:` row claims this certificate.
+    None,
+    /// Exactly one does, and this is who it says the holder is.
+    One(Identity),
+    /// More than one does. The row names, sorted.
+    Ambiguous(Vec<String>),
+}
+
 /// Why a connection may not run a command.
 ///
 /// Both answer `UNAUTHORIZED` on the VCP wire — auth.md §6.2 widened that
@@ -823,6 +890,33 @@ pub fn roles_for_opcode(opcode: vash_proto::vcp::Opcode) -> Roles {
         O::TagSync => Roles::PEER,
         O::ListKeys | O::ListTags => Roles::LIST,
     }
+}
+
+/// Renders a client-supplied credential name for a log line.
+///
+/// **Both halves of this are load-bearing, and neither was there.** A failed
+/// authentication logs the name that was presented, which is bytes off the
+/// wire, and it used to reach `tracing`'s `Display` formatter whole and
+/// unescaped. The default `pretty` formatter writes a field value verbatim, so
+/// a name carrying a newline forged a complete log entry — its own timestamp,
+/// its own level, its own module path, in the same ANSI colours the real
+/// formatter uses. Call sites pair this with `?` rather than `%` so `Debug`
+/// escapes what survives.
+///
+/// The truncation is the other half. VCP bounds the name at
+/// [`crate::auth::MAX_NAME_LEN`] on the wire, but a Redis `AUTH` username is an
+/// ordinary bulk string and a memcached one rides inside a `set` value, so both
+/// admit 64 MiB — three attempts per connection, and no bound on connections.
+/// A credential longer than a name can be is not a name anyone configured.
+pub fn log_name(name: &[u8]) -> String {
+    let head = &name[..name.len().min(MAX_NAME_LEN)];
+    let mut rendered = String::from_utf8_lossy(head).into_owned();
+    if name.len() > MAX_NAME_LEN {
+        // Says the value was cut rather than letting a prefix read as the whole
+        // of what someone tried.
+        rendered.push('…');
+    }
+    rendered
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -1533,5 +1627,129 @@ mod tests {
         let (a, _) = generate("x", None).unwrap();
         let (b, _) = generate("x", None).unwrap();
         assert_ne!(a, b);
+    }
+
+    /// V-04. A credential name is bytes off the wire, and it used to reach the
+    /// log formatter whole and unescaped.
+    #[test]
+    fn a_logged_name_cannot_forge_a_log_line() {
+        // The reproduction: a newline, then something shaped like a real entry.
+        let forged = b"attacker\n2026-01-01T00:00:00.000000Z  INFO vash: audit log cleared";
+        let rendered = format!("{:?}", log_name(forged));
+
+        assert!(
+            !rendered.contains('\n'),
+            "the `?` the call sites use must escape the newline, not print it: {rendered}"
+        );
+        // Built rather than written out, so this assertion says "the escaped
+        // form of a newline" instead of depending on this file's own escaping.
+        let escaped = '\n'.escape_debug().to_string();
+        assert!(
+            rendered.contains(&escaped),
+            "and it must still show that one was there: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_logged_name_is_truncated_to_a_length_a_name_could_have() {
+        // Redis takes the username as an ordinary bulk string and memcached
+        // takes it inside a `set` value, so both admit 64 MiB of it.
+        let huge = vec![b'x'; 1024 * 1024];
+        let rendered = log_name(&huge);
+
+        assert!(
+            rendered.chars().count() <= MAX_NAME_LEN + 1,
+            "a megabyte of name must not reach the log: {} chars",
+            rendered.chars().count()
+        );
+        assert!(
+            rendered.ends_with('\u{2026}'),
+            "and the cut must be visible, so a prefix does not read as the whole"
+        );
+    }
+
+    #[test]
+    fn a_name_that_fits_is_rendered_unchanged() {
+        assert_eq!(log_name(b"billing-api"), "billing-api");
+        // Invalid UTF-8 still has to render as something.
+        assert!(!log_name(&[0xff, 0xfe]).is_empty());
+    }
+
+    /// V-06. Which row a certificate belongs to must not depend on hash order.
+    #[test]
+    fn a_certificate_matching_two_rows_is_refused() {
+        let table = parse(
+            "billing  mtls:billing.svc.internal  roles=read\n\
+             admin    mtls:admin.svc.internal    roles=flush\n",
+        )
+        .expect("the file must load");
+        let auth = Auth {
+            required: true,
+            table,
+        };
+
+        // A wildcard certificate satisfies both subjects. Returning at the
+        // first match handed it one of the two role sets at random.
+        let ambiguous = auth.identity_for_certificate(|subject| subject.ends_with(".svc.internal"));
+        match ambiguous {
+            CertificateMatch::Ambiguous(rows) => {
+                assert_eq!(rows, vec!["admin".to_string(), "billing".to_string()])
+            }
+            other => panic!("an ambiguous certificate must be refused, got {other:?}"),
+        }
+
+        // The unambiguous case is untouched, and still carries its own roles.
+        match auth.identity_for_certificate(|subject| subject == "billing.svc.internal") {
+            CertificateMatch::One(identity) => {
+                assert_eq!(identity.name(), "billing");
+                assert!(identity.roles().allows(Roles::READ));
+                assert!(!identity.roles().allows(Roles::FLUSH));
+            }
+            other => panic!("one match must resolve, got {other:?}"),
+        }
+
+        assert!(matches!(
+            auth.identity_for_certificate(|subject| subject == "nobody.internal"),
+            CertificateMatch::None
+        ));
+    }
+
+    #[test]
+    fn the_ambiguous_row_list_is_stable_across_runs() {
+        // Sorted, because the defect being fixed was exactly that a `HashMap`
+        // walk is not — a log line naming the rows in a different order each
+        // boot is the same problem one layer up.
+        let table = parse("a  mtls:one.internal\nb  mtls:two.internal\nc  mtls:three.internal\n")
+            .expect("the file must load");
+        let auth = Auth {
+            required: true,
+            table,
+        };
+        for _ in 0..8 {
+            match auth.identity_for_certificate(|s| s.ends_with(".internal")) {
+                CertificateMatch::Ambiguous(rows) => assert_eq!(rows, ["a", "b", "c"]),
+                other => panic!("expected an ambiguous match, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mtls_subjects_lists_only_the_certificate_rows() {
+        // One certificate row and one password row; only the first has a
+        // subject for the startup check to validate.
+        let table = parse(&format!(
+            "billing  mtls:billing.internal\napi  {}\n",
+            digest_line("api", SECRET)
+                .split_whitespace()
+                .nth(1)
+                .expect("a generated line has an algorithm field")
+        ))
+        .expect("the file must load");
+        let auth = Auth {
+            required: false,
+            table,
+        };
+        let subjects: Vec<_> = auth.mtls_subjects().collect();
+        assert_eq!(subjects, vec![("billing".to_string(), "billing.internal")]);
     }
 }

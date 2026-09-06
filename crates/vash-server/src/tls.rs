@@ -19,7 +19,7 @@ use anyhow::{Context, bail};
 use rustls::pki_types::UnixTime;
 use tokio_rustls::TlsAcceptor;
 
-use crate::auth::{Auth, Identity};
+use crate::auth::{Auth, CertificateMatch};
 use crate::config::{ClientAuth, TlsConfig};
 
 /// Reads the certificate chain and key, and builds the acceptor every TLS
@@ -190,17 +190,47 @@ pub fn record_expiry(config: &TlsConfig, metrics: &crate::metrics::ServerMetrics
 pub fn identity_for(
     auth: &Auth,
     certificate: &rustls::pki_types::CertificateDer<'_>,
-) -> Option<Identity> {
-    let parsed = webpki::EndEntityCert::try_from(certificate).ok()?;
+) -> CertificateMatch {
+    let Ok(parsed) = webpki::EndEntityCert::try_from(certificate) else {
+        return CertificateMatch::None;
+    };
     auth.identity_for_certificate(|subject| {
         let Ok(name) = rustls::pki_types::ServerName::try_from(subject) else {
             // A row whose subject is not a name a certificate could carry.
-            // Refusing it at load time would be better; refusing to match it
-            // is what keeps that from being a security hole in the meantime.
+            // `check_subjects` refuses these at startup now, so reaching this
+            // means the table was reloaded with one — still no match, which is
+            // what keeps a bad row from becoming a hole between reloads.
             return false;
         };
         parsed.verify_is_valid_for_subject_name(&name).is_ok()
     })
+}
+
+/// Refuses `mtls:` rows whose subject is not a name a certificate could carry.
+///
+/// Such a row is worse than a missing one: it reads as a working credential,
+/// parses without complaint, and then matches nothing for ever, so the service
+/// it was written for is refused with no indication of why. That is the same
+/// failure `parse_credential` refuses `hmac-sha256-key` rows to avoid, and it
+/// deserves the same answer — the credential file's rule is that it must never
+/// half-load.
+///
+/// It lives here rather than in the loader because deciding what a certificate
+/// can carry is X.509 work, and `auth` has no business knowing it — the same
+/// seam [`identity_for`] sits on. It runs only when TLS is configured: without
+/// a listener the rows are inert, and refusing to start over an unused one
+/// would be noise.
+pub fn check_subjects(auth: &Auth) -> anyhow::Result<()> {
+    for (row, subject) in auth.mtls_subjects() {
+        if rustls::pki_types::ServerName::try_from(subject).is_err() {
+            bail!(
+                "the credential row {row:?} has `mtls:{subject}`, which is not a DNS name or \
+                 IP address a certificate can be issued for. It would parse, load, and then \
+                 match no client for ever"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Ten years. The upper bound of the search below, and a ceiling on what the

@@ -447,7 +447,7 @@ fn execute_memcached_unauthenticated(
         None => {
             conn.fail();
             warn!(
-                name = %String::from_utf8_lossy(name),
+                name = ?crate::auth::log_name(name),
                 failures = conn.failures(),
                 "authentication failed"
             );

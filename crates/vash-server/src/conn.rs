@@ -86,6 +86,18 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     // is folded into the `select!` that already handles shutdown, so it costs
     // no timer task of its own.
     let deadline = tokio::time::Instant::now() + limits.timeout;
+    // **A second deadline, for a strictly smaller population.** The one above
+    // only arms when `auth.required` is set, so with authentication off — the
+    // default — nothing ever timed out, and `server.max_connections` sockets
+    // that send zero bytes took the whole budget for free. This one does not
+    // ask whether authentication is enforced; it asks only whether the peer has
+    // said anything, which no pooled connection worth keeping has failed to do.
+    // `docs/protocol.md`'s promise that an established connection is never
+    // idle-reaped is untouched: once a byte arrives this stops arming for good.
+    let silent_deadline = (state.limits.first_byte_timeout_ms > 0).then(|| {
+        tokio::time::Instant::now()
+            + std::time::Duration::from_millis(state.limits.first_byte_timeout_ms)
+    });
 
     loop {
         // Shutdown is only ever noticed *here*, between requests, where nothing
@@ -98,6 +110,11 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         // case in a cluster: peers keep their connections open indefinitely, so
         // every node would have one per peer.
         let unauthenticated = enforcing && !conn_auth.is_authenticated();
+        // Has this connection said anything at all? `protocol` is settled by
+        // the first byte and never cleared, so it is `None` exactly while
+        // nothing has arrived — which is the population `silent_deadline`
+        // exists for, and it contains no legitimate client.
+        let silent = protocol.is_none() && silent_deadline.is_some();
         let n = tokio::select! {
             read = stream.read_buf(&mut read_buf) => read?,
             _ = shutdown.changed() => {
@@ -107,6 +124,14 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             _ = tokio::time::sleep_until(deadline), if unauthenticated => {
                 debug!(timeout = ?limits.timeout, "closing a connection that never authenticated");
                 state.metrics.auth_timeout();
+                return Ok(());
+            }
+            _ = tokio::time::sleep_until(silent_deadline.unwrap_or(deadline)), if silent => {
+                debug!(
+                    timeout_ms = state.limits.first_byte_timeout_ms,
+                    "closing a connection that never sent a byte"
+                );
+                state.metrics.silent_timeout();
                 return Ok(());
             }
         };
@@ -121,17 +146,36 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             .bytes_read
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
-        // A connection that has presented nothing must not be able to make the
-        // server hold arbitrary bytes. Everything legal before authenticating
-        // is small — a VCP `HELLO` is 16 bytes and an `AUTH` at both ceilings
-        // is under 600, and the two text dialects' credentials are one short
-        // line each — so this is far above any honest pre-auth traffic and far
-        // below anything worth holding.
-        if unauthenticated && read_buf.len() > PRE_AUTH_MAX_BUFFERED {
+        // **No connection may make the server hold unbounded bytes**, and this
+        // is the one check that says so without consulting the authentication
+        // state. It used to arm only for `unauthenticated`, which is
+        // `enforcing && !authenticated` — so with `auth.required` off, the
+        // default, it never armed at all and there was no ceiling of any kind.
+        //
+        // A command is buffered whole before it is parsed, so until the parser
+        // runs there is nothing to charge the bytes to but the socket they came
+        // in on. RESP is where that bit: `MAX_ARGS` is 8200 and `MAX_BULK_LEN`
+        // is 64 MiB, so one legal command may declare half a terabyte of
+        // arguments, and every byte of it is held before the parser is allowed
+        // an opinion. Measured, one connection reached 310 MB resident — 300
+        // times `store.max_value_bytes` — and had no reason to stop.
+        //
+        // Two ceilings, because the populations differ. Everything legal before
+        // authenticating is small — a VCP `HELLO` is 16 bytes and an `AUTH` at
+        // both ceilings is under 600, and the two text dialects' credentials
+        // are one short line each — so a connection that has presented nothing
+        // gets the tighter one.
+        let ceiling = if unauthenticated {
+            PRE_AUTH_MAX_BUFFERED
+        } else {
+            state.limits.max_buffered_bytes
+        };
+        if read_buf.len() > ceiling {
             debug!(
                 buffered = read_buf.len(),
-                "closing an unauthenticated connection that buffered too much"
+                ceiling, unauthenticated, "closing a connection that buffered too much"
             );
+            state.metrics.buffer_ceiling();
             return Ok(());
         }
 
@@ -692,7 +736,23 @@ async fn drain<S: Copy + Send + 'static>(
     }
 
     if measured.reserve > 0 {
-        read_buf.reserve(measured.reserve.saturating_sub(read_buf.len()));
+        // **Never size an allocation from a length the peer merely declared.**
+        // `measured.reserve` comes from a frame header, and a VCP one may
+        // announce 64 MiB in twelve bytes — so honouring it outright let a
+        // client commit 64 MiB per connection for the cost of a header it never
+        // followed up on. Measured before this clamp: twenty connections and
+        // 560 bytes of traffic committed 1.28 GiB, and at the default
+        // `max_connections` that is 640 GiB from under 300 KB.
+        //
+        // Clamping to twice what has already arrived keeps everything the
+        // reserve was for and removes the leverage. It is amortised doubling —
+        // which `BytesMut` would do anyway — with the target known, so it never
+        // overshoots the frame: a client genuinely streaming a large one
+        // converges on its size in a handful of steps and stops there, and a
+        // client that has sent twelve bytes gets the buffer it already has.
+        let ceiling = read_buf.capacity().max(read_buf.len().saturating_mul(2));
+        let target = measured.reserve.min(ceiling);
+        read_buf.reserve(target.saturating_sub(read_buf.len()));
     }
 
     // Written after whatever the commands before it produced, which is the
@@ -835,4 +895,79 @@ fn measure_resp(buf: &[u8], runs: &mut Vec<Run>) -> Measured {
         }
     }
     measured
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+
+    /// The clamp `drain` applies before honouring a declared frame length.
+    ///
+    /// Extracted so the arithmetic can be checked without a socket. It must
+    /// stay in step with the call site; there is one line of it, and this is
+    /// what says what that line is for.
+    fn clamped(reserve: usize, buffered: usize, capacity: usize) -> usize {
+        let ceiling = capacity.max(buffered.saturating_mul(2));
+        reserve.min(ceiling)
+    }
+
+    #[test]
+    fn a_declared_length_cannot_reserve_more_than_twice_what_arrived() {
+        // The measured attack: twelve bytes of header announcing 64 MiB. Before
+        // the clamp this reserved the whole 64 MiB, which at the default
+        // connection limit is 640 GiB of commit charge for under 300 KB of
+        // traffic.
+        let declared = 64 * 1024 * 1024;
+        assert_eq!(
+            clamped(declared, 12, 16 * 1024),
+            16 * 1024,
+            "a header that arrived alone buys no more than the buffer already has"
+        );
+    }
+
+    #[test]
+    fn a_frame_being_streamed_still_converges_on_its_size() {
+        // What the reserve is *for*: a client genuinely sending a large frame
+        // reaches its size in a handful of doublings and stops there, rather
+        // than growing past it or reallocating all the way up.
+        let declared = 1024 * 1024;
+        let mut capacity = 16 * 1024;
+        let mut steps = 0;
+        while capacity < declared {
+            capacity = clamped(declared, capacity, capacity).max(capacity);
+            // Half arrived; the buffer is asked to hold the rest.
+            capacity = clamped(declared, capacity, capacity * 2).max(capacity);
+            steps += 1;
+            assert!(steps < 16, "the reserve must converge, not crawl");
+        }
+        assert_eq!(
+            capacity, declared,
+            "and it must stop exactly at the frame, never above it"
+        );
+    }
+
+    #[test]
+    fn the_clamp_never_shrinks_a_buffer_below_its_capacity() {
+        // `reserve` is handed `target - len`, so a target under `len` has to
+        // saturate rather than wrap. This is the guard on that.
+        let target = clamped(8, 4096, 16 * 1024);
+        assert_eq!(target.saturating_sub(4096), 0);
+    }
+
+    #[test]
+    fn a_real_bytesmut_does_not_grow_to_a_declared_length() {
+        // The property as the type actually behaves, rather than as the
+        // arithmetic above models it.
+        let mut buf = BytesMut::with_capacity(16 * 1024);
+        buf.extend_from_slice(&[0u8; 12]);
+
+        let declared = 64 * 1024 * 1024;
+        let target = clamped(declared, buf.len(), buf.capacity());
+        buf.reserve(target.saturating_sub(buf.len()));
+
+        assert!(
+            buf.capacity() < 1024 * 1024,
+            "a twelve-byte header must not commit megabytes, let alone {declared}"
+        );
+    }
 }

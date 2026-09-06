@@ -932,15 +932,17 @@ async fn removing_a_row_locks_the_certificate_out() {
     })
     .expect("the rewritten file must load");
     assert!(
-        reloaded
-            .identity_for_certificate(|subject| subject == "reports.internal")
-            .is_none(),
+        matches!(
+            reloaded.identity_for_certificate(|subject| subject == "reports.internal"),
+            vash_server::auth::CertificateMatch::None
+        ),
         "the removed row must be gone from the reloaded table"
     );
     assert!(
-        reloaded
-            .identity_for_certificate(|subject| subject == "billing.internal")
-            .is_some(),
+        matches!(
+            reloaded.identity_for_certificate(|subject| subject == "billing.internal"),
+            vash_server::auth::CertificateMatch::One(_)
+        ),
         "and the row that stayed must still be there"
     );
 }

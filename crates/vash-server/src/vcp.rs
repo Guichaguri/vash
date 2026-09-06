@@ -459,7 +459,7 @@ fn execute_auth(
                     // a near-miss credential in a log file is a credential in a
                     // log file.
                     warn!(
-                        name = %String::from_utf8_lossy(name),
+                        name = ?crate::auth::log_name(name),
                         failures = conn.failures(),
                         "authentication failed"
                     );

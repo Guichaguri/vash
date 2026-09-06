@@ -4,6 +4,16 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::Deserialize;
 
+/// Bytes a single write may occupy on the wire beyond its value.
+///
+/// The widest framing any dialect puts around one value: a maximum-length key,
+/// a full tag table (255 names of 255 bytes with their length prefixes), and
+/// the fixed headers. Used to check `server.max_buffered_bytes` against
+/// `store.max_value_bytes` — an over-estimate on purpose, because the cost of
+/// being generous here is a few hundred kilobytes of ceiling and the cost of
+/// being tight is a disconnected client.
+const MAX_FRAMING_OVERHEAD: usize = 512 * 1024;
+
 /// Only the settings M0 actually honours are present.
 ///
 /// The surface grows one milestone at a time on purpose: a config key that is
@@ -30,6 +40,37 @@ pub struct ServerConfig {
     pub max_connections: usize,
     /// Bytes reserved per connection read buffer.
     pub read_buffer: usize,
+    /// Most bytes one connection may hold buffered, at any point in its life.
+    ///
+    /// **The only absolute bound on what a single client can make this server
+    /// hold**, and it is deliberately not conditional on authentication: a
+    /// command is buffered whole before it is parsed, so until the parser runs
+    /// there is nothing to charge the bytes to but the socket they arrived on.
+    /// The pre-auth ceiling in `conn` is tighter and applies before a
+    /// credential is presented; this one applies always.
+    ///
+    /// It has to exceed the largest single command a client may legally send,
+    /// which is a whole value plus its framing — validation enforces that
+    /// against `store.max_value_bytes` rather than leaving it to be discovered
+    /// as a disconnect under load. Two of the three dialects had an equivalent
+    /// bound already (VCP's 64 MiB frame ceiling, memcached's line and value
+    /// limits); RESP had none, because its own ceiling is per *argument* and a
+    /// command may carry 8200 of them.
+    pub max_buffered_bytes: usize,
+    /// How long a connection may send **nothing at all** before it is closed,
+    /// in milliseconds. `0` disables it.
+    ///
+    /// Not an idle timeout, and the distinction is the whole point: a pooled
+    /// connection that has served requests and gone quiet is left alone, as
+    /// `docs/protocol.md` promises. This covers only connections that have
+    /// never sent a byte, which is a population containing no legitimate client
+    /// — every real one sends its first command immediately — and every
+    /// slowloris. Raise it, or set it to `0`, for a pool that opens connections
+    /// eagerly and holds them unused.
+    ///
+    /// Separate from `auth.timeout_ms`, which is the deadline to *authenticate*
+    /// and only arms when `auth.required` is set.
+    pub first_byte_timeout_ms: u64,
     /// Threads available for store operations.
     ///
     /// This is the ceiling on concurrent reads, and therefore on LMDB reader
@@ -533,18 +574,70 @@ impl ClusterConfig {
     }
 
     /// What peer connections should present, if anything.
-    pub fn credential(&self) -> Option<(&str, &str)> {
-        if self.auth_secret.is_empty() {
-            return None;
-        }
-        let name = if self.auth_name.is_empty() {
-            crate::auth::DEFAULT_NAME
-        } else {
-            &self.auth_name
+    ///
+    /// The secret comes from `cluster.auth_secret` or from
+    /// [`CLUSTER_SECRET_ENV`], and **never from both** — refused rather than
+    /// silently preferred, which is the rule [`crate::auth::Auth::load`]
+    /// already follows for the server's own credential and for the same
+    /// reason: which credentials a node is running with must not depend on
+    /// knowing a precedence order.
+    ///
+    /// The environment variable exists because the config file is the one
+    /// place this secret could previously live, and unlike the credential file
+    /// it gets no permission check — a config file is an operator's document
+    /// that ends up in version control, and a peer credential carries
+    /// [`crate::auth::Roles::PEER`], which sets any tag generation to any
+    /// value.
+    pub fn credential(&self) -> anyhow::Result<Option<(String, String)>> {
+        self.credential_from(std::env::var_os(CLUSTER_SECRET_ENV))
+    }
+
+    /// [`Self::credential`] with the environment handed in.
+    ///
+    /// Split out so the resolution can be tested without `std::env::set_var`,
+    /// which in Rust 2024 is `unsafe` precisely because it races every other
+    /// thread reading the environment — and a test binary runs its cases on
+    /// several. A mutex around the tests in this module would not have covered
+    /// the other suites calling [`Config::validate`], which reaches here.
+    fn credential_from(
+        &self,
+        from_env: Option<std::ffi::OsString>,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let secret = match (self.auth_secret.is_empty(), from_env) {
+            (false, Some(_)) => anyhow::bail!(
+                "both cluster.auth_secret and {CLUSTER_SECRET_ENV} are set; use one or the \
+                 other so it is unambiguous which credential this node presents to its peers"
+            ),
+            (false, None) => self.auth_secret.clone(),
+            (true, Some(secret)) => {
+                let secret = String::from_utf8_lossy(secret.as_encoded_bytes()).into_owned();
+                anyhow::ensure!(
+                    !secret.is_empty(),
+                    "{CLUSTER_SECRET_ENV} is set but empty. Unset it, or give it the secret \
+                     this node's cluster.auth_name authenticates with"
+                );
+                secret
+            }
+            (true, None) => return Ok(None),
         };
-        Some((name, &self.auth_secret))
+
+        let name = if self.auth_name.is_empty() {
+            crate::auth::DEFAULT_NAME.to_string()
+        } else {
+            self.auth_name.clone()
+        };
+        Ok(Some((name, secret)))
     }
 }
+
+/// Environment variable holding `cluster.auth_secret`, for deployments that
+/// keep secrets out of the config file.
+///
+/// The peer counterpart of [`crate::auth::SECRET_ENV`], and it carries the same
+/// caveat: a process environment is readable by anything running as the same
+/// user and is printed by `docker inspect`. It is better than a secret in a
+/// file nothing checks the mode of, which is what the alternative was.
+pub const CLUSTER_SECRET_ENV: &str = "VASH_CLUSTER_SECRET";
 
 /// Mirrors [`vash_core::ClusterMode`], kept separate so the domain crate does
 /// not take a serde dependency for the sake of the config file.
@@ -692,6 +785,15 @@ impl Default for ServerConfig {
             listen: "127.0.0.1:11311".parse().expect("valid default address"),
             max_connections: 10_000,
             read_buffer: 16 * 1024,
+            // The largest value this build can ever be configured to hold, plus
+            // a mebibyte for framing and for whatever one read brings in past
+            // the check. Chosen to match what VCP and memcached already
+            // enforced rather than to be tight, so that turning this on breaks
+            // nothing that was legal the day before — a deployment that wants a
+            // real bound lowers it, and validation makes sure it stays above
+            // `store.max_value_bytes`.
+            max_buffered_bytes: vash_core::ABSOLUTE_MAX_VALUE_LEN + 1024 * 1024,
+            first_byte_timeout_ms: 10_000,
             max_blocking_threads: 128,
         }
     }
@@ -835,6 +937,28 @@ impl Config {
             self.server.read_buffer >= vash_proto::vcp::HEADER_LEN,
             "server.read_buffer must hold at least one frame header"
         );
+        // A ceiling below the largest legal write is a server that disconnects
+        // a client for sending something it accepted the configuration for.
+        // The margin covers a `SET`'s framing — a 511-byte key and a full tag
+        // table are both well inside it — and leaves room for whatever one read
+        // brings in past the check.
+        anyhow::ensure!(
+            self.server.max_buffered_bytes >= self.store.max_value_bytes + MAX_FRAMING_OVERHEAD,
+            "server.max_buffered_bytes is {} bytes, which does not leave room for a \
+             store.max_value_bytes of {} plus its framing. A connection is closed above the \
+             ceiling, so a client would be disconnected for writing a value this server \
+             accepts: raise it to at least {}",
+            self.server.max_buffered_bytes,
+            self.store.max_value_bytes,
+            self.store.max_value_bytes + MAX_FRAMING_OVERHEAD
+        );
+        anyhow::ensure!(
+            self.server.max_buffered_bytes >= self.server.read_buffer,
+            "server.max_buffered_bytes ({}) is below server.read_buffer ({}), so a connection \
+             would be closed for filling the buffer it was given",
+            self.server.max_buffered_bytes,
+            self.server.read_buffer
+        );
         anyhow::ensure!(
             self.server.max_blocking_threads > 0,
             "server.max_blocking_threads must be > 0"
@@ -900,10 +1024,12 @@ impl Config {
         // writes keep working, TAG_SYNC starts being refused, and invalidations
         // quietly stop converging while every node reports itself healthy.
         // Refusing to start is the only failure mode an operator cannot miss.
+        // Resolves `cluster.auth_secret` against `VASH_CLUSTER_SECRET`, so a
+        // node configured with both is refused here rather than on the first
+        // peer exchange.
+        let peer_credential = self.cluster.credential()?;
         anyhow::ensure!(
-            !self.auth.required
-                || self.cluster.peers.is_empty()
-                || self.cluster.credential().is_some(),
+            !self.auth.required || self.cluster.peers.is_empty() || peer_credential.is_some(),
             "auth.required is set and {} peers are configured, but cluster.auth_secret is \
              empty. Peer traffic uses the cache port like any other client, so the peers \
              would be refused and tag invalidation would stop converging across the cluster \
@@ -1250,5 +1376,113 @@ mod tests {
 
         config.store.tags.max_per_record = 0;
         assert!(config.validate().is_err(), "a store that refuses every tag");
+    }
+
+    /// V-02's validation half: the ceiling has to fit what the store accepts.
+    ///
+    /// A connection is closed above `server.max_buffered_bytes`, so a ceiling
+    /// under `store.max_value_bytes` is a server that disconnects a client for
+    /// writing a value it advertises. Caught at startup rather than under load.
+    #[test]
+    fn a_buffer_ceiling_below_the_value_limit_is_refused() {
+        let mut config = Config::default();
+        config.store.max_value_bytes = 8 * 1024 * 1024;
+        config.server.max_buffered_bytes = 4 * 1024 * 1024;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("max_buffered_bytes"),
+            "the error must name the setting to raise: {error}"
+        );
+
+        // Exactly enough is enough.
+        config.server.max_buffered_bytes = 8 * 1024 * 1024 + MAX_FRAMING_OVERHEAD;
+        config
+            .validate()
+            .expect("room for a value plus its framing is valid");
+    }
+
+    #[test]
+    fn a_buffer_ceiling_below_the_read_buffer_is_refused() {
+        let mut config = Config::default();
+        config.store.max_value_bytes = 1024;
+        config.server.read_buffer = 1024 * 1024;
+        config.server.max_buffered_bytes = 64 * 1024;
+        assert!(
+            config.validate().is_err(),
+            "a connection must not be closed for filling the buffer it was given"
+        );
+    }
+
+    /// The default has to leave every legal frame room, or turning the ceiling
+    /// on breaks a deployment that was legal the day before.
+    #[test]
+    fn the_default_ceiling_covers_the_largest_configurable_value() {
+        let mut config = Config::default();
+        config.store.max_value_bytes = vash_core::ABSOLUTE_MAX_VALUE_LEN;
+        config
+            .validate()
+            .expect("the default ceiling must fit the largest value this build allows");
+    }
+
+    /// V-07. The peer secret can come from the environment instead of the file.
+    ///
+    /// Driven through `credential_from` rather than by setting the variable:
+    /// `std::env::set_var` races every other thread reading the environment,
+    /// and other suites in this binary call `validate`, which reaches the same
+    /// resolution. `credential` itself is the one line that reads the variable
+    /// and hands it here.
+    #[test]
+    fn the_peer_secret_may_come_from_the_environment() {
+        let mut cluster = ClusterConfig::default();
+
+        // Neither source: no credential, and that is not an error.
+        assert!(cluster.credential_from(None).unwrap().is_none());
+
+        // The environment alone.
+        let env = |value: &str| Some(std::ffi::OsString::from(value));
+        let (name, secret) = cluster
+            .credential_from(env("peer-secret-from-the-environment"))
+            .unwrap()
+            .expect("a credential");
+        assert_eq!(name, crate::auth::DEFAULT_NAME);
+        assert_eq!(secret, "peer-secret-from-the-environment");
+
+        // With an explicit name beside it.
+        cluster.auth_name = "peer-a".into();
+        let (name, _) = cluster
+            .credential_from(env("peer-secret-from-the-environment"))
+            .unwrap()
+            .expect("a credential");
+        assert_eq!(name, "peer-a");
+
+        // Both sources is refused rather than silently preferred, which is the
+        // rule `Auth::load` already follows for the server's own credential.
+        cluster.auth_secret = "peer-secret-from-the-file".into();
+        let error = cluster
+            .credential_from(env("peer-secret-from-the-environment"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(CLUSTER_SECRET_ENV) && error.contains("cluster.auth_secret"),
+            "the error must name both sources: {error}"
+        );
+
+        // The file alone still works, unchanged.
+        let (_, secret) = cluster
+            .credential_from(None)
+            .unwrap()
+            .expect("a credential");
+        assert_eq!(secret, "peer-secret-from-the-file");
+    }
+
+    #[test]
+    fn an_empty_peer_secret_in_the_environment_is_refused() {
+        let cluster = ClusterConfig::default();
+        assert!(
+            cluster
+                .credential_from(Some(std::ffi::OsString::new()))
+                .is_err(),
+            "an empty variable is someone meaning to set it and failing, not meaning to unset it"
+        );
     }
 }
