@@ -186,6 +186,33 @@ pub struct StoreConfig {
     ///
     /// Setting `inline_reads` directly still works and still skips the check.
     pub resident_mode: bool,
+    /// The largest read run, in commands, that is still served inline.
+    ///
+    /// Inline reads and the storage pool do not win the same workloads, and the
+    /// crossover is the size of the block. A hop is paid once per run: one
+    /// command pays all of it, sixteen pay a sixteenth each — and once it is
+    /// amortised, the pool's several threads beat inline reads confined to the
+    /// runtime workers. Measured on a four-core container, closed loop against
+    /// pipelined-by-16:
+    ///
+    /// | | pooled | inline |
+    /// |---|---:|---:|
+    /// | closed loop | 97,582 | **273,933** |
+    /// | pipelined | **741,206** | ~580,000 |
+    ///
+    /// So neither tier is right for both, and this is the line between them.
+    /// A run of this many commands or fewer goes inline; a longer one takes the
+    /// pool, which it would have taken anyway with `inline_reads` off.
+    ///
+    /// **`0` disables inlining entirely** and `usize::MAX` restores the old
+    /// unconditional behaviour. Both are reachable on purpose: the first makes
+    /// `inline_reads` a no-op without changing the other flags, and the second
+    /// is what every measurement before §23 was taken against.
+    ///
+    /// Only consulted when reads are inline at all — with `inline_reads` and
+    /// `resident_mode` both clear, every run takes the pool and this says
+    /// nothing. See `docs/performance-proposals.md` §23.
+    pub inline_max_commands: usize,
     pub write: WriteConfig,
     pub ttl: TtlConfig,
     pub tags: TagConfig,
@@ -816,6 +843,18 @@ impl Default for StoreConfig {
             prefault: false,
             inline_reads: false,
             resident_mode: false,
+            // **Swept, not guessed.** On a four-core container, `GET` medians
+            // of three fresh servers: closed loop reads 99,936 at `0` and
+            // ~283,000 at every value from `1` up, because a closed-loop block
+            // is one command. Pipelined-by-16 reads 825,131 at `0`, holds
+            // 773,000-841,000 through `1`-`8`, and falls to ~602,000 at `16`
+            // and above — the cliff is exactly where a sixteen-command block
+            // first qualifies to be inlined.
+            //
+            // So the flat region is 1 to 8 and this sits in the middle of it,
+            // with margin against both ends: below `1` the closed-loop win is
+            // given up, at `16` the pipelined one is.
+            inline_max_commands: 4,
             shards: 0,
             write: WriteConfig::default(),
             ttl: TtlConfig::default(),

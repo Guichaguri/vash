@@ -649,6 +649,8 @@ impl<B: Backend> Store for VashStore<B> {
             total.pending_reclaims += engine.pending_reclaims;
             total.map_size += engine.map_size;
             total.used_bytes += engine.used_bytes;
+            total.warmed_bytes += engine.warmed_bytes;
+            total.high_water_bytes += engine.high_water_bytes;
             total.readers_in_use += engine.readers_in_use;
             total.max_readers += engine.max_readers;
             // A single epoch across shards: they advance together on flush.

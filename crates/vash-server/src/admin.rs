@@ -998,6 +998,8 @@ mod tests {
             utilisation: 0.101_112_9,
             readers_in_use: 11,
             max_readers: 12,
+            warmed_bytes: 24,
+            high_water_bytes: 25,
             oldest_reader_age_ms: 13,
             epoch: 14,
             commits: 4,

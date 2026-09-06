@@ -28,6 +28,10 @@ pub struct ServerState {
     /// Read-only requests skip the hop to the storage tier. See
     /// [`crate::config::StoreConfig::inline_reads`].
     pub inline_reads: bool,
+    /// The longest read run, in commands, still worth serving inline. Only
+    /// consulted when [`Self::inline_reads`] is set. See
+    /// [`crate::config::StoreConfig::inline_max_commands`].
+    pub inline_max_commands: usize,
     /// How many awaited writes may be in flight at once.
     ///
     /// **Admission control that used to be accidental.** A write submitted from
@@ -115,8 +119,8 @@ impl From<&crate::config::ServerConfig> for ConnLimits {
 }
 
 impl ServerState {
-    // Nine, and they are nine independent things a server is assembled from
-    // rather than one thing with nine parts. A parameter struct here would
+    // Ten, and they are ten independent things a server is assembled from
+    // rather than one thing with ten parts. A parameter struct here would
     // exist only to satisfy the lint, and every caller would fill it in field
     // by field at the call site this signature already is.
     #[expect(clippy::too_many_arguments)]
@@ -127,6 +131,7 @@ impl ServerState {
         auth: AuthState,
         cluster: Arc<Cluster>,
         inline_reads: bool,
+        inline_max_commands: usize,
         binding: Binding,
         limits: ConnLimits,
         introspect: &crate::config::IntrospectConfig,
@@ -142,6 +147,7 @@ impl ServerState {
             metrics: crate::metrics::ServerMetrics::default(),
             cluster,
             inline_reads,
+            inline_max_commands,
             write_permits,
             scan_cursors: crate::scan::ScanCursors::new(
                 protocol.scan_cursors,

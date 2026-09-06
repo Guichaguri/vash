@@ -405,24 +405,60 @@ pub(crate) enum RunKind {
 
 /// A maximal stretch of commands of one kind, measured in bytes of the block.
 ///
-/// Byte lengths rather than command counts because that is what the executors
-/// take, and because the block is a refcounted `Bytes` — a run is a slice of it
-/// and costs no copy.
+/// Byte lengths because that is what the executors take, and because the block
+/// is a refcounted `Bytes` — a run is a slice of it and costs no copy.
+///
+/// `count` is carried beside `len` because the two answer different questions.
+/// The executors need the bytes; [`drain`] needs to know how many commands will
+/// share one hop, because that is what decides whether the hop is worth taking.
+/// See `docs/performance-proposals.md` §23.
 #[derive(Debug)]
 struct Run {
     len: usize,
+    count: usize,
     kind: RunKind,
 }
 
 impl Run {
-    /// Adds `len` bytes of `kind`, extending the run in progress when it
-    /// matches so that the common uniform block still produces exactly one.
+    /// Adds one command of `len` bytes and `kind`, extending the run in progress
+    /// when it matches so that the common uniform block still produces exactly
+    /// one.
+    ///
+    /// One call is one command — every call site is inside a loop that has just
+    /// framed a single command, and a recoverable parse error counts as the
+    /// command whose place it occupies.
     fn extend(runs: &mut Vec<Run>, kind: RunKind, len: usize) {
         match runs.last_mut() {
-            Some(last) if last.kind == kind => last.len += len,
-            _ => runs.push(Run { len, kind }),
+            Some(last) if last.kind == kind => {
+                last.len += len;
+                last.count += 1;
+            }
+            _ => runs.push(Run {
+                len,
+                count: 1,
+                kind,
+            }),
         }
     }
+}
+
+/// Whether a run of `count` commands of `kind` is worth serving inline.
+///
+/// **The hop is paid once per run**, so one command pays all of it and sixteen
+/// pay a sixteenth each — and once it is amortised, the pool's several threads
+/// beat inline reads confined to the runtime workers. Measured on a four-core
+/// container: closed loop 273,933 inline against 97,582 pooled, pipelined
+/// 741,206 pooled against ~580,000 inline. Neither tier wins both shapes, so
+/// the choice is per run. See `docs/performance-proposals.md` §23.
+///
+/// Extracted so the rule can be checked without a socket, and so `drain` and its
+/// one-run lookahead cannot drift apart — both call this.
+///
+/// Sending *more* runs to the pool never weakens what `inline_reads` asserts:
+/// the pool is the safe route by construction, and this only narrows where the
+/// residency bet is taken.
+fn worth_inlining(kind: RunKind, count: usize, enabled: bool, max_commands: usize) -> bool {
+    kind == RunKind::Reads && enabled && count <= max_commands
 }
 
 /// Executes a block of one dialect's commands, rendering the replies.
@@ -646,9 +682,11 @@ async fn drain<S: Copy + Send + 'static>(
         // already one run and still takes the awaited path.
         if !state.inline_reads && runs.len() > 1 {
             let whole = measured.complete;
+            let commands = runs.iter().map(|r| r.count).sum();
             runs.clear();
             runs.push(Run {
                 len: whole,
+                count: commands,
                 kind: RunKind::Other,
             });
         }
@@ -665,7 +703,15 @@ async fn drain<S: Copy + Send + 'static>(
             // What this run can take. A write run needs a dialect that decodes
             // one, which a gated connection is denied because its refusal is
             // the executor's to word.
-            let inline = runs[index].kind == RunKind::Reads && state.inline_reads;
+            //
+            // A read run goes inline only while it is small enough to be worth
+            // the hop it saves. See `worth_inlining`.
+            let inline = worth_inlining(
+                runs[index].kind,
+                runs[index].count,
+                state.inline_reads,
+                state.inline_max_commands,
+            );
             let awaitable = runs[index].kind == RunKind::Writes && writes.is_some();
 
             // Runs that both end up on the pool are merged into one hop, so a
@@ -673,7 +719,14 @@ async fn drain<S: Copy + Send + 'static>(
             // with `inline_reads` off, that includes its read runs.
             if !inline && !awaitable {
                 while let Some(next) = runs.get(index + 1) {
-                    let next_inline = next.kind == RunKind::Reads && state.inline_reads;
+                    // The same rule as `inline` above, or a read run headed for
+                    // the pool would break a merge it belongs in.
+                    let next_inline = worth_inlining(
+                        next.kind,
+                        next.count,
+                        state.inline_reads,
+                        state.inline_max_commands,
+                    );
                     let next_awaitable = next.kind == RunKind::Writes && writes.is_some();
                     if next_inline || next_awaitable {
                         break;
@@ -900,6 +953,64 @@ fn measure_resp(buf: &[u8], runs: &mut Vec<Run>) -> Measured {
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
+
+    use super::{Run, RunKind, worth_inlining};
+
+    #[test]
+    fn extend_counts_one_command_per_call_and_merges_like_kinds() {
+        let mut runs = Vec::new();
+        for _ in 0..16 {
+            Run::extend(&mut runs, RunKind::Reads, 30);
+        }
+        assert_eq!(runs.len(), 1, "a uniform block is still exactly one run");
+        assert_eq!(runs[0].count, 16, "one call is one command");
+        assert_eq!(runs[0].len, 480, "and the bytes still add up");
+
+        // A change of kind starts a new run, and the count starts again with it.
+        Run::extend(&mut runs, RunKind::Writes, 40);
+        Run::extend(&mut runs, RunKind::Writes, 40);
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[1].count, runs[1].len), (2, 80));
+        assert_eq!(runs[0].count, 16, "the finished run is left alone");
+    }
+
+    #[test]
+    fn a_closed_loop_read_goes_inline_and_a_pipelined_one_does_not() {
+        // The whole of §23 in two assertions: at the same threshold, one
+        // command takes the tier that suits one command and sixteen take the
+        // tier that suits sixteen.
+        assert!(worth_inlining(RunKind::Reads, 1, true, 4));
+        assert!(!worth_inlining(RunKind::Reads, 16, true, 4));
+        // And the boundary is inclusive, so the threshold names the largest run
+        // that still goes inline rather than the smallest that does not.
+        assert!(worth_inlining(RunKind::Reads, 4, true, 4));
+        assert!(!worth_inlining(RunKind::Reads, 5, true, 4));
+    }
+
+    #[test]
+    fn only_reads_are_ever_inlined() {
+        // Writes wait on the writer queue by design and `Other` covers the
+        // commands no fast path models, so neither may run on a runtime worker
+        // however short the run is.
+        for kind in [RunKind::Writes, RunKind::Other] {
+            assert!(
+                !worth_inlining(kind, 1, true, usize::MAX),
+                "{kind:?} must never be inlined"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flag_still_governs_and_the_bounds_are_reachable() {
+        // With inline reads off, the threshold says nothing at all — every run
+        // takes the pool, which is what the default configuration does today.
+        assert!(!worth_inlining(RunKind::Reads, 1, false, usize::MAX));
+        // `0` turns inlining off without touching the other flags...
+        assert!(!worth_inlining(RunKind::Reads, 1, true, 0));
+        // ...and `usize::MAX` restores the unconditional behaviour every
+        // measurement before §23 was taken against.
+        assert!(worth_inlining(RunKind::Reads, usize::MAX, true, usize::MAX));
+    }
 
     /// The clamp `drain` applies before honouring a declared frame length.
     ///

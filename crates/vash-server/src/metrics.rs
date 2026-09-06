@@ -1366,6 +1366,25 @@ pub fn render_prometheus(
         "Total map size across shards.",
         store.map_size.to_string(),
     );
+    // **A pair, and only the pair means anything.** Warming runs once at open,
+    // bounded by the high-water mark as it stood then; that mark only rises
+    // afterwards. So `vash_map_locked` is a verdict about the store as it was,
+    // and these two say how much of it that verdict still describes. Gauges
+    // rather than a `stats` line because the thing worth seeing is the gap
+    // opening over time. See `docs/performance-proposals.md` §24.
+    metric!(
+        "vash_bytes_warmed",
+        "gauge",
+        "Bytes prefaulted at open, and locked if resident_mode succeeded.",
+        store.warmed_bytes.to_string(),
+    );
+    metric!(
+        "vash_bytes_high_water",
+        "gauge",
+        "How far the store has ever been written. Above vash_bytes_warmed is \
+         neither prefaulted nor locked.",
+        store.high_water_bytes.to_string(),
+    );
     metric!(
         "vash_utilisation",
         "gauge",

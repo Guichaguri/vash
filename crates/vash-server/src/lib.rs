@@ -308,6 +308,7 @@ impl Server {
             auth_state,
             cluster,
             inline_reads,
+            config.store.inline_max_commands,
             state::Binding {
                 addr: listener.local_addr()?,
                 max_connections: config.server.max_connections as u64,

@@ -239,6 +239,19 @@ pub fn collect(state: &ServerState) -> Vec<(String, String)> {
                 "vash_oldest_reader_age_ms".into(),
                 s.oldest_reader_age_ms.to_string(),
             ),
+            // **The two halves of what `vash_map_locked` still covers.**
+            // Warming runs once, at open, bounded by the high-water mark as it
+            // stood then; the mark only rises afterwards. So `vash_map_locked
+            // yes` is a verdict about the store as it was, and these two say
+            // how much of the store it still describes. When they diverge, the
+            // difference is pages nothing prefaulted and nothing locked — which
+            // a read served inline can fault on, stalling every connection on
+            // that worker. See `docs/performance-proposals.md` §24.
+            ("vash_warmed_bytes".into(), s.warmed_bytes.to_string()),
+            (
+                "vash_high_water_bytes".into(),
+                s.high_water_bytes.to_string(),
+            ),
         ]),
         // Omitted rather than zeroed, and the whole group goes together: a
         // `curr_items` of 0 beside a real `cmd_get` reads as an empty cache
@@ -386,6 +399,14 @@ fn settings(state: &ServerState, tls: bool) -> Vec<(String, String)> {
         ),
         ("vash_resp_enabled".into(), yes_no(protocol.resp_enabled)),
         ("vash_inline_reads".into(), yes_no(state.inline_reads)),
+        // The line between the two tiers, in commands. Reported beside
+        // `vash_inline_reads` because that flag alone no longer says where a
+        // read goes — a run longer than this takes the pool even with inline
+        // reads on. See `docs/performance-proposals.md` §23.
+        (
+            "vash_inline_max_commands".into(),
+            state.inline_max_commands.to_string(),
+        ),
         // What `resident_mode` actually achieved, as opposed to what it asked
         // for. Reported separately from `vash_inline_reads` because the two
         // answer different questions — whether reads skip the hand-off, and

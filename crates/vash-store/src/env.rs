@@ -189,6 +189,7 @@ impl<B: Backend> Engine<B> {
             shard_count: shard_count.max(1),
             reader_ages: crate::readers::ReaderAges::default(),
             map_locked: warmed.locked,
+            warmed_bytes: warmed.bytes,
         })
     }
 

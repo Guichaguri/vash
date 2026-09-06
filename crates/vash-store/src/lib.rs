@@ -178,6 +178,18 @@ pub struct StoreStats {
     pub utilisation: f64,
     pub readers_in_use: u32,
     pub max_readers: u32,
+    /// Bytes that warming covered at open, summed across shards. With
+    /// `map_locked`, the extent of what is pinned in memory.
+    pub warmed_bytes: u64,
+    /// How far the store has ever been written, summed across shards.
+    ///
+    /// **Read this against `warmed_bytes`, not on its own.** Warming runs once,
+    /// at open, bounded by this mark as it stood then; the mark only rises
+    /// afterwards. The difference is the part of the store that
+    /// `store.resident_mode` asserted nothing about — pages neither prefaulted
+    /// nor locked, which a read served inline can still fault on. See
+    /// `docs/performance-proposals.md` §24.
+    pub high_water_bytes: u64,
     /// How long the oldest currently-open read transaction has been open.
     ///
     /// Plan §15's mitigation for the one High-impact storage risk: a read
@@ -230,6 +242,8 @@ impl Default for StoreStats {
             utilisation: 0.0,
             readers_in_use: 0,
             max_readers: 0,
+            warmed_bytes: 0,
+            high_water_bytes: 0,
             oldest_reader_age_ms: 0,
             epoch: 0,
             commits: 0,

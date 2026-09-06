@@ -245,6 +245,43 @@ inline_reads = false
 # Implies prefault, and inherits its startup cost.
 resident_mode = false
 
+# The largest read run, in commands, still served inline rather than handed to
+# the storage pool. Only consulted when reads are inline at all — with both
+# flags above clear, every run takes the pool and this says nothing.
+#
+# The two tiers do not win the same workloads, and the crossover is the size of
+# the block. A hop is paid once per run: one command pays all of it, sixteen pay
+# a sixteenth each — and once it is amortised, the pool's several threads beat
+# inline reads confined to the runtime workers. Measured on a four-core
+# container, closed loop against pipelined-by-16:
+#
+#                   pooled     inline
+#   closed loop     97,582    273,933
+#   pipelined      741,206   ~580,000
+#
+# So neither tier is right for both, and this is the line between them.
+#
+# Swept on a four-core container, GET, medians of three fresh servers:
+#
+#   threshold    closed loop    pipelined by 16
+#           0         99,936            825,131
+#           1        282,657            809,889
+#           2        282,726            841,223
+#           4        282,685            827,558
+#           8        283,831            773,000
+#          16        285,024            601,874
+#         MAX        282,927            601,663
+#
+# Any value from 1 up wins the closed loop in full, because a closed-loop block
+# is one command. The pipelined cliff is exactly at 16, where a sixteen-command
+# block first qualifies to be inlined. So the flat region is 1 to 8, and the
+# default sits in the middle of it with margin against both ends.
+#
+# 0 turns inlining off without touching the flags above. A very large value
+# restores the unconditional behaviour every measurement before this setting was
+# taken against. See docs/performance-proposals.md §23.
+inline_max_commands = 4
+
 [store.write]
 # LMDB permits one writer, so writes scale only by sharing transactions. A batch
 # is whatever queued while the previous commit was in flight.

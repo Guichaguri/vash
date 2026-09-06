@@ -98,6 +98,17 @@ pub struct Engine<B: Backend> {
     /// life of the environment: nothing here unlocks it, and nothing relocks a
     /// map that has since grown past what was locked.
     pub(crate) map_locked: bool,
+    /// How many bytes warming actually covered, which with `map_locked` is the
+    /// extent of what is pinned.
+    ///
+    /// **Reported so the bet can be seen expiring.** `map_locked` is a verdict
+    /// about the store as it was at open; this against the current high-water
+    /// mark is how much of the store that verdict still describes. A database
+    /// that has grown has pages above this that no one prefaulted and no one
+    /// locked, while `map_locked` still answers yes and `inline_reads` is still
+    /// serving reads from a runtime worker. See
+    /// `docs/performance-proposals.md` §24.
+    pub(crate) warmed_bytes: u64,
 }
 
 impl<B: Backend> Engine<B> {
@@ -205,6 +216,8 @@ impl<B: Backend> Engine<B> {
             utilisation: used_bytes as f64 / info.map_size as f64,
             readers_in_use: info.readers_in_use,
             max_readers: info.max_readers,
+            warmed_bytes: self.warmed_bytes,
+            high_water_bytes: info.high_water_bytes,
             epoch: self.epoch(),
             oldest_reader_age_ms: self.reader_ages.oldest_age_ms(self.now_ms()),
             // Owned by the writer thread, merged in by `VashStore::stats`.
