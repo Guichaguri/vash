@@ -102,12 +102,23 @@ Closed-loop latency, one request in flight per connection, 1 KiB values:
 
 These are vash measured against itself. For vash measured **beside Redis and
 memcached** — one client, one box, the same workload pointed at all three — see
-[docs/benchmarks.md](docs/benchmarks.md). The short version, on four cores with
-clients that wait for their answers, vash leads both on reads — 165,672 `GET`s a
-second against Redis's 53,310 and memcached's 140,011 — and trails Redis on
-writes, 44,930 `SET`s against 60,810. With clients that pipeline, reads lead
-again (718,449 against 482,181 and 707,270) and writes are three to five times
-behind.
+[docs/benchmarks.md](docs/benchmarks.md). The short version, measured on a
+dedicated EC2 server with the data on a local NVMe device:
+
+**Where the client waits for its answer, vash competes.** `GET` with
+`resident_mode` is 284,512 a second against Redis's 149,569 and memcached's
+284,191 — ahead of Redis, level with memcached. `SET` is 99,858 against 149,765
+and 298,511, so writes trail both.
+
+**Where the client pipelines, vash is behind both.** `GET` 609,164 against
+780,933 and 1,086,417; `SET` 285,122 against 936,481 and 1,506,991, three to five
+times behind.
+
+Earlier rounds of that document, measured on a laptop, reported vash leading both
+servers on reads in both shapes. The pipelined half of that
+[did not survive real hardware](docs/benchmarks.md#the-third-measurement-a-dedicated-server-and-a-read-lead-that-did-not-survive):
+Redis and memcached roughly doubled on a server and vash did not. The write
+figures survived unchanged.
 
 Against the goals set in [plan.md](docs/plan.md) §13 before any of it was built:
 
