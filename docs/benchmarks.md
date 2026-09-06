@@ -406,6 +406,21 @@ Writes land where the document already said they would: `SET` 3.4× behind Redis
 and 5.4× behind memcached, the mixed workload 2.3× and 3.4× — the "three to five
 times behind" claim, on hardware that removes its most-cited excuse.
 
+> **The plain `vash` row here is depressed by this document's own protocol, and
+> by about 27%.** The matrix runs pipelined `GET` immediately after closed-loop
+> `GET`, and a closed-loop run drives `tokio`'s blocking pool from 7 threads to
+> ~90 which then outlive it. Measured on servers that had served nothing else,
+> the same configuration medians **741,206** rather than the 582,170 above —
+> level with Redis rather than 1.3× behind it. Redis and memcached have no such
+> pool, so the effect is vash's alone and the protocol is biased against it.
+> `vash-resident` is unaffected, serving reads inline and never growing the pool,
+> so its 608,662 stands. See
+> [performance-proposals.md §23](performance-proposals.md#23-the-inlinepooled-choice-is-static-and-the-right-answer-inverts-with-block-size).
+> **The tables are left as measured**; correcting them means re-running the
+> matrix under a protocol that restarts between workloads *and* repopulates —
+> restarting alone empties Redis and memcached, which serve misses afterwards and
+> read 1.36M and 2.31M for the wrong reason. That re-run has not been done.
+
 ### The populate pass
 
 One connection, 128 in flight, 20,000 sequential `SET`s, median of four passes:
@@ -449,10 +464,19 @@ Two rows are not, and they are not close:
 
 **Every unstable row is a pipelined vash read without `resident_mode`.** All six
 `vash-resident` rows agree within 3.3%, as do all of Redis's and all of
-memcached's. Whatever produces the spread lives in the storage-thread hand-off on
-the read path, and `resident_mode` removes the variance along with the latency —
-which is a second, independent argument for the setting beyond the throughput it
-buys.
+memcached's.
+
+**The mechanism was found later, and it is the blocking pool's size.** A
+pipelined read's throughput depends on how many threads the *previous* workload
+left alive in `tokio`'s blocking pool — 836,387 on a server that had served
+nothing else against 540,658 on one that had just served a closed-loop run, which
+grows the pool from 7 threads to ~90. The spread here is that inheritance varying
+between rounds. `resident_mode` serves reads inline, never touches the pool, and
+is stable for exactly that reason — a second, independent argument for the setting
+beyond the throughput it buys. See
+[performance-proposals.md §23](performance-proposals.md#23-the-inlinepooled-choice-is-static-and-the-right-answer-inverts-with-block-size),
+which proposes routing by block size so the pool is never inflated by traffic it
+is the wrong tier for.
 
 **Two rounds were not enough, and this document has now made that mistake three
 times.** The first two rounds of this matrix were published with the second

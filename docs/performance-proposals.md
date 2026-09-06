@@ -1857,3 +1857,222 @@ roughly 10× on closed-loop `GET`. With the hand-off to the blocking pool still 
 the path, everything above is rounding error against it — anyone benchmarking
 these changes on the shipped defaults will correctly conclude they did nothing.
 (`store.durability` needs no such warning: it already defaults to `lazy`.)
+
+---
+
+# Measured on a server, and three of the answers changed
+
+Everything above was measured on a laptop, inside a WSL2 VM. §22–§25 were
+measured on an EC2 `c6id.2xlarge` — four physical cores, data on a local NVMe
+device, server pinned to `0,1,4,5` and client to `2,3,6,7`. See
+[benchmarks.md](benchmarks.md#the-third-measurement-a-dedicated-server-and-a-read-lead-that-did-not-survive)
+for the method.
+
+**The headline from that host**: Redis serves 141,573 closed-loop `GET`s using
+**88% of one core**, on a box that has four. It is single-threaded, and it is not
+the box's limit — it is its own. vash burns three cores to serve 97,582 of the
+same request. Per operation that is **6.2 µs against 30.4 µs**, and every
+proposal below is about that number rather than about throughput.
+
+| target | closed-loop `GET` | server CPU | µs CPU per op |
+|---|---:|---:|---:|
+| vash | 97,582 | 293% | 30.4 |
+| vash `resident_mode` | 273,933 | 314% | 11.5 |
+| redis | 141,573 | 88% | 6.2 |
+| memcached | 279,920 | 242% | 8.6 |
+
+---
+
+## 22. The hand-off is priced, and it is 19 µs of CPU per read
+
+**Status: measured. The single largest item on the read path.**
+
+The two vash rows above differ only in `store.resident_mode`, which serves reads
+inline instead of handing the block to `tokio`'s blocking pool. That one
+difference is **18.9 µs of CPU per read**, 62% of everything a default `GET`
+costs, and it is worth 2.8× on throughput.
+
+§16 estimated ~45 µs of per-request path for a write and called the obvious
+attacks exhausted. This prices the read half directly, on hardware, and it is
+larger than anything else on the path by an order of magnitude — the parsers are
+53.5 and 90.9 ns (§11), a storage read plus encode is 272 ns, and instrumentation
+after §19 is about 107 ns. **Everything the document has optimised since §17 sums
+to under 1% of what this one hand-off costs.**
+
+That is not an argument that those changes were wrong. It is an argument about
+what to do next, and about the warning §21 already ends on: measured on the
+shipped defaults, every one of them is rounding error against this.
+
+---
+
+## 23. The inline/pooled choice is static, and the right answer inverts with block size
+
+**Status: proposed, and the measurement that motivates it is unambiguous.**
+
+Five fresh servers per cell, restarted and repopulated before every run:
+
+| | pooled (default) | inline (`resident_mode`) | winner |
+|---|---:|---:|---|
+| closed-loop `GET` | 97,582 | **273,933** | inline, by 2.8× |
+| pipelined `GET` (16) | **741,206** | ~580,000 | pooled, by ~1.3× |
+
+**Neither setting is right for both shapes, and the codebase currently makes you
+choose once, at startup, for every block the server will ever see.**
+
+The reason is structural rather than incidental. A hop carries a whole block. At
+pipeline 1 a block is one command, so the hop's cost lands on one request and
+dominates it. At pipeline 16 the same hop is amortised over sixteen, the cost per
+request falls by that factor, and what is left is the pool's advantage: several
+blocks in flight on several threads, against inline reads confined to the four
+runtime workers.
+
+**The proposal**: decide per run rather than per process. `run_block` already
+takes `inline` as a parameter and `drain` already computes it per run —
+[`conn.rs`](../crates/vash-server/src/conn.rs) — as
+
+```rust
+let inline = runs[index].kind == RunKind::Reads && state.inline_reads;
+```
+
+`Run` carries `len` in bytes and `Run::extend` is called once per command, so a
+`count` field beside `len` costs one increment and makes the criterion exact:
+
+```rust
+let inline = runs[index].kind == RunKind::Reads
+    && state.inline_reads
+    && runs[index].count <= state.inline_max_commands;
+```
+
+**What it should be worth**: 273,933 closed loop *and* 741,206 pipelined, where
+today either configuration gives one and gives up the other. Against the other
+two servers that is level with memcached closed loop (279,920) and level with
+Redis pipelined (755,789), from a change that adds a counter and a comparison.
+
+**It does not weaken the safety argument.** `inline_reads` asserts that the map
+is resident so a read cannot fault on a runtime worker. Sending *more* blocks to
+the pool never violates that assertion — the pool is the safe route by
+construction. This narrows where the bet is taken; it does not widen it.
+
+**Acceptance criterion**: both rows above, from one binary and one configuration,
+within 10% of the better of the two columns. **The threshold is a measurement,
+not a guess** — sweep it; the crossover is somewhere between 1 and 16 commands
+and nothing here says where.
+
+### The pool inherits a size the last workload chose, and keeps it
+
+A second, related defect, and a production one rather than a benchmark artifact.
+`tokio`'s blocking pool grows on demand to `max_blocking_threads` (default 128)
+and its threads outlive the load that created them:
+
+| | pipelined `GET` | threads before → after |
+|---|---:|---|
+| on a fresh server | 836,387 | 7 → 7 |
+| after one closed-loop `GET` run | 540,658 | 7 → **92** |
+
+**A burst of unpipelined traffic costs 35% of pipelined throughput afterwards**,
+for as long as those threads live. Any deployment serving a mix of client styles
+meets this; the benchmark met it because the matrix always runs pipelined `GET`
+directly after the closed-loop one. It is most of why that row reads 582,170 in
+[benchmarks.md](benchmarks.md) and 741,206 when measured on a server that has
+served nothing else.
+
+§23's change removes the cause rather than the symptom: if a one-command block
+never reaches the pool, a hundred closed-loop connections never inflate it, and
+the pool stays sized for the pipelined work it is good at. That is why these are
+one proposal and not two, and it is why the answer is **not** to lower
+`max_blocking_threads` — swept on this host, the best setting for closed loop is
+4 (119,520 against 92,883 at 128) and the best for pipelined is 128 (804,031
+against 302,722 at 4). Sizing the pool cannot serve both shapes. Not using it for
+small blocks can.
+
+---
+
+## 24. `resident_mode` verifies residency once and trusts it for the process's life
+
+**Status: a correctness gap, found while measuring §23, and demonstrated by
+accident.**
+
+`resident_mode` prefaults every shard, `mlock`s each map, and enables
+`inline_reads` **only if every shard came back locked** — a careful bargain, and
+[`config.rs`](../crates/vash-server/src/config.rs) documents the stake plainly:
+when the working set is not resident, "a cold read stalls every connection
+sharing that worker."
+
+The check runs once. [`backend/lmdb.rs`](../crates/vash-store/src/backend/lmdb.rs)
+calls `warm()` at open, bounded by `high_water_bytes` **at that instant**, and
+nothing re-warms afterwards. Pages written later are neither prefaulted nor
+locked, and `inline_reads` stays on regardless. The config comment already says
+this — "It covers what exists at startup" — but says it as a caveat about
+coverage rather than as what it is: **the flag that gates the bet outlives the
+evidence for it.**
+
+Measured, unintentionally. A study that started each server on an empty store,
+populated it, and then read gave `resident_mode` **419,383** pipelined against
+~580,000 when the map is warmed against data that already exists — with
+`inline_reads` enabled throughout, because locking an empty map succeeds. The
+server reported `vash_map_locked yes` and served reads inline from pages it had
+never faulted.
+
+**The proposal**, in increasing order of cost:
+
+1. **Report the truth.** `vash_map_locked` says what happened at startup. Add the
+   high-water mark it covered and the current one, so an operator can see the bet
+   decaying. Cheap, and it turns a silent condition into a visible one.
+2. **Re-warm on growth.** When the high-water mark passes the warmed one by some
+   margin, prefault and lock the new range on a background thread.
+3. **Withdraw the bet when it stops holding.** If the lock cannot be extended,
+   clear `inline_reads` and go back to the pool — the failure mode the setting
+   already promises is "the default behaviour, never a stall", and today that
+   promise is only kept for conditions present at startup.
+
+(1) is worth doing whatever happens to §23, because a setting whose safety
+argument silently expires should at least say so.
+
+---
+
+## 25. What beating each server actually requires
+
+**Status: an assessment, so the next proposal is aimed at something reachable.**
+
+Medians of five fresh servers, one protocol, this host:
+
+| workload | vash, best config | redis | memcached | verdict |
+|---|---:|---:|---:|---|
+| closed-loop `GET` | 273,933 | 141,573 | 279,920 | **ahead of Redis 1.93×**, 2% behind memcached |
+| pipelined `GET` | 741,206 | 755,789 | 1,131,385 | level with Redis, 1.53× behind memcached |
+| closed-loop `SET` | 97,582 | 141,573 | 279,920 | behind both |
+| pipelined `SET` | 280,159 | 951,838 | 1,504,356 | 3.4× and 5.4× behind |
+
+**Reachable, and §23 is most of it.** Closed-loop reads already beat Redis and
+sit 2% off memcached. Pipelined reads are level with Redis and would clear it by
+removing the 34% spread §23's second half explains — that median is depressed by
+its low tail, not by its ceiling.
+
+**Reachable but unbudgeted: memcached on pipelined reads.** 1,131,385 against
+741,206 is 1.53×, or 3.6 µs of CPU per op against roughly 5.4. Nothing in this
+document decomposes that gap; §22 accounts for the closed-loop half and says
+nothing about this one. **It needs a profile before it needs a proposal**, and
+the candidates worth pricing are the per-command read transaction (a pipelined
+block of N single-key `GET`s opens N of them, where `MGET` of N keys opens one —
+`get_many_with` already exists to serve the fused form), the framing walk §21
+left at ~67 ns, and the clocks §21 puts at 95% of a `GET`'s instrumentation.
+
+**Not reachable, and it should stop being an objective.** Pipelined `SET` at
+280,159 against memcached's 1,504,356 is a copy-on-write B-tree committing to a
+disk against a hash insert into memory. §15 is worth building and will not close
+5.4×; §7 was measured against; §11 rules out more shards and another B-tree.
+[plan.md](plan.md) §6 chose this deliberately, and the thing it buys — a cache
+that still has your data after a restart, which neither of the other two
+configurations here does — is not available at memcached's write cost. The honest
+claim is the narrow one: **vash competes on reads and pays for durability on
+writes**, and no amount of tuning converts the second half into the first.
+
+### Order
+
+| | Proposal | Effort | Expected |
+|---|---|---|---|
+| 1 | §23 inline small blocks, pool large ones | a day | 2.8× closed-loop reads *and* keeps pipelined; removes the pool inflation with it |
+| 2 | §24 (1), report the residency the bet rests on | an hour | no throughput; stops a silent expiry |
+| 3 | §15 skip the redundant expiry put | an hour | the write path's largest single item |
+| 4 | profile the pipelined read against memcached | a day | decides whether §25's 1.53× is worth a proposal |
+| 5 | §24 (2) and (3), re-warm and withdraw | a week | makes `resident_mode` safe to default |
