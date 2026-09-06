@@ -415,7 +415,7 @@ times behind" claim, on hardware that removes its most-cited excuse.
 > pool, so the effect is vash's alone and the protocol is biased against it.
 > `vash-resident` is unaffected, serving reads inline and never growing the pool,
 > so its 608,662 stands. See
-> [performance-proposals.md §23](performance-proposals.md#23-the-inlinepooled-choice-is-static-and-the-right-answer-inverts-with-block-size).
+> [performance-proposals.md §23](performance-proposals.md#23-implemented-a-read-is-routed-by-the-size-of-its-block).
 > **The tables are left as measured**; correcting them means re-running the
 > matrix under a protocol that restarts between workloads *and* repopulates —
 > restarting alone empties Redis and memcached, which serve misses afterwards and
@@ -474,7 +474,7 @@ grows the pool from 7 threads to ~90. The spread here is that inheritance varyin
 between rounds. `resident_mode` serves reads inline, never touches the pool, and
 is stable for exactly that reason — a second, independent argument for the setting
 beyond the throughput it buys. See
-[performance-proposals.md §23](performance-proposals.md#23-the-inlinepooled-choice-is-static-and-the-right-answer-inverts-with-block-size),
+[performance-proposals.md §23](performance-proposals.md#23-implemented-a-read-is-routed-by-the-size-of-its-block),
 which proposes routing by block size so the pool is never inflated by traffic it
 is the wrong tier for.
 

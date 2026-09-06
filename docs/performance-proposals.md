@@ -1262,9 +1262,9 @@ from the same header, neither of which the shared run model describes.
 
 ---
 
-## 15. Writes are bound by the writer threads, and half of that is one redundant put
+## 15. Implemented: writes were bound by the writer threads, and half of that was one redundant put
 
-**Status: proposed, from a decomposition rather than a guess.**
+**Status: shipped, from a decomposition rather than a guess.**
 
 `SET`-only through the admin counters, four-core container, at HEAD:
 
@@ -1312,6 +1312,31 @@ writer counters rather than inferred from ops/s. **What it costs**: the
 self-healing property — an index row lost some other way stops being silently
 restored by the next overwrite. That is a real trade, and it should be made
 deliberately rather than as a side effect.
+
+### Shipped, and it met the criterion
+
+Pipelined `SET` on a four-core container, medians of three, taken off
+`vash_writer_commit_seconds_total` over `vash_committed_ops_total` as the
+criterion asked rather than inferred from throughput:
+
+| | commit per record | `SET` ops/s |
+|---|---:|---:|
+| before | 6.48 µs | 273,839 |
+| after | **4.91 µs** | **343,692** |
+
+**A 24% fall in the commit and 25.5% on the workload.** The baseline reads 6.48
+rather than the 11.2 above because that figure came from a different host; what
+the criterion asked was that it fall.
+
+The trade was taken deliberately and is written into the code at the branch. The
+risk it opens is not a lost value but a leak — a record missing from this index
+is never swept and can never be chosen as an eviction victim — so the test that
+pays for it rewrites a key into its own bucket fifty times and then requires the
+sweeper to reclaim it, which is the failure that would otherwise surface hours
+later under memory pressure.
+
+Writes are now 2.8× behind Redis and 4.4× behind memcached pipelined, from 3.4×
+and 5.4×. §25 says why that is not the gap to keep attacking.
 
 **Not the answer: more shards.** More writer threads is the obvious response to a
 writer-thread ceiling, and the arithmetic says there is no room — the server is
@@ -1905,9 +1930,10 @@ shipped defaults, every one of them is rounding error against this.
 
 ---
 
-## 23. The inline/pooled choice is static, and the right answer inverts with block size
+## 23. Implemented: a read is routed by the size of its block
 
-**Status: proposed, and the measurement that motivates it is unambiguous.**
+**Status: shipped. The crossover landed exactly where the mechanism said it
+would, and the setting it fixes stopped being a trade.**
 
 Five fresh servers per cell, restarted and repopulated before every run:
 
@@ -1958,6 +1984,52 @@ within 10% of the better of the two columns. **The threshold is a measurement,
 not a guess** — sweep it; the crossover is somewhere between 1 and 16 commands
 and nothing here says where.
 
+### Swept, and the cliff is where the mechanism put it
+
+`GET`, medians of three fresh servers, `resident_mode` on throughout because the
+setting says nothing when reads are not inline at all:
+
+| `inline_max_commands` | closed loop | pipelined by 16 |
+|---:|---:|---:|
+| 0 (never) | 99,936 | 825,131 |
+| 1 | 282,657 | 809,889 |
+| 2 | 282,726 | 841,223 |
+| **4** (default) | **282,685** | **827,558** |
+| 8 | 283,831 | 773,000 |
+| 16 | 285,024 | 601,874 |
+| MAX (always) | 282,927 | 601,663 |
+
+Every value from 1 up takes the closed loop in full, because a closed-loop block
+is one command and any threshold at all admits it. **The pipelined cliff is
+exactly at 16** — the first value at which a sixteen-command block qualifies to
+be inlined. That is the mechanism rather than a coincidence needing explanation,
+and it is the strongest evidence the model behind §23 was right. The flat region
+is 1 to 8; the default sits in the middle with margin against both ends.
+
+### What it actually bought: `resident_mode` stopped being a trade
+
+Against the baseline binary on the same host, three fresh servers each:
+
+| | closed loop | pipelined |
+|---|---:|---:|
+| baseline, `resident_mode` on | 280,909 | 601,818 |
+| **§23, `resident_mode` on** | **285,217** | **844,662** |
+
+**+40% pipelined with the closed loop held**, which is the whole claim. Before
+this, turning `resident_mode` on bought the closed loop by giving up pipelined
+throughput; there was no configuration that had both.
+
+It is also **steadier**, which was not predicted. §23's pipelined minimum across
+runs is 824,036 against a median of 844,662 — a tight band, where the pooled
+path still swings between 570,000 and 850,000 for the reasons the second half of
+this section gives. Routing the small blocks away from the pool leaves it doing
+only the work it is good at, and the variance goes with the inflation.
+
+**It does not change the shipped defaults.** With `inline_reads` clear the
+threshold never fires and closed-loop reads stay near 97,000. What §23 does is
+make `resident_mode` worth turning on; whether it should be *on by default* is
+§24 (2) and (3), which is what would make it safe to be.
+
 ### The pool inherits a size the last workload chose, and keeps it
 
 A second, related defect, and a production one rather than a benchmark artifact.
@@ -1987,10 +2059,10 @@ small blocks can.
 
 ---
 
-## 24. `resident_mode` verifies residency once and trusts it for the process's life
+## 24. Partly implemented: `resident_mode` verifies residency once and trusts it for the process's life
 
-**Status: a correctness gap, found while measuring §23, and demonstrated by
-accident.**
+**Status: (1) shipped, (2) and (3) still proposed. A correctness gap, found
+while measuring §23 and demonstrated by accident.**
 
 `resident_mode` prefaults every shard, `mlock`s each map, and enables
 `inline_reads` **only if every shard came back locked** — a careful bargain, and
@@ -2028,6 +2100,18 @@ never faulted.
 (1) is worth doing whatever happens to §23, because a setting whose safety
 argument silently expires should at least say so.
 
+**(1) shipped.** `Engine` records what warming covered; `StoreStats` carries
+`warmed_bytes` and `high_water_bytes` summed across shards; `stats` reports both
+beside `vash_map_locked`, and `/metrics` exposes `vash_bytes_warmed` and
+`vash_bytes_high_water` as gauges. Gauges rather than a line in `stats` because
+the thing worth seeing is the gap **opening over time**, which is a time series
+and therefore a dashboard. When they diverge, the difference is the part of the
+store `resident_mode` asserted nothing about.
+
+(2) and (3) are unbuilt, and they are what would make `resident_mode` safe to
+default — which, after §23, is the only thing still standing between the shipped
+configuration and the closed-loop read numbers in this document.
+
 ---
 
 ## 25. What beating each server actually requires
@@ -2038,15 +2122,27 @@ Medians of five fresh servers, one protocol, this host:
 
 | workload | vash, best config | redis | memcached | verdict |
 |---|---:|---:|---:|---|
-| closed-loop `GET` | 273,933 | 141,573 | 279,920 | **ahead of Redis 1.93×**, 2% behind memcached |
-| pipelined `GET` | 741,206 | 755,789 | 1,131,385 | level with Redis, 1.53× behind memcached |
+| closed-loop `GET` | 285,217 | 141,573 | 279,920 | **ahead of both** — 2.02× Redis, 1.9% over memcached |
+| pipelined `GET` | 844,662 | 755,789 | 1,131,385 | **ahead of Redis** 1.12×, 1.34× behind memcached |
 | closed-loop `SET` | 97,582 | 141,573 | 279,920 | behind both |
-| pipelined `SET` | 280,159 | 951,838 | 1,504,356 | 3.4× and 5.4× behind |
+| pipelined `SET` | 343,692 | 951,838 | 1,504,356 | 2.8× and 4.4× behind |
 
-**Reachable, and §23 is most of it.** Closed-loop reads already beat Redis and
-sit 2% off memcached. Pipelined reads are level with Redis and would clear it by
-removing the 34% spread §23's second half explains — that median is depressed by
-its low tail, not by its ceiling.
+**Updated after §23 and §15 shipped.** The read rows are `resident_mode` with
+`inline_max_commands = 4`; before §23 no single configuration reached both of
+them. The rows this document was written against were 273,933 / 741,206 /
+97,582 / 280,159.
+
+**Reached.** §23 did what it was costed at: closed-loop reads now beat both
+servers and pipelined reads beat Redis, from one configuration. The 34% spread
+its second half explains went with it — §23's pipelined minimum is 824,036
+against a median of 844,662, where the pooled path still swings 570,000 to
+850,000.
+
+**The one thing standing between this and the shipped defaults is §24 (2) and
+(3).** Every read figure above needs `resident_mode`, which is off by default
+because its safety argument expires silently as the store grows. §24 (1) makes
+that visible; (2) and (3) would make it hold, and only then is defaulting it on
+a decision rather than a gamble.
 
 **Reachable but unbudgeted: memcached on pipelined reads.** 1,131,385 against
 741,206 is 1.53×, or 3.6 µs of CPU per op against roughly 5.4. Nothing in this
@@ -2069,10 +2165,15 @@ writes**, and no amount of tuning converts the second half into the first.
 
 ### Order
 
-| | Proposal | Effort | Expected |
+| | Proposal | Effort | Outcome |
 |---|---|---|---|
-| 1 | §23 inline small blocks, pool large ones | a day | 2.8× closed-loop reads *and* keeps pipelined; removes the pool inflation with it |
-| 2 | §24 (1), report the residency the bet rests on | an hour | no throughput; stops a silent expiry |
-| 3 | §15 skip the redundant expiry put | an hour | the write path's largest single item |
-| 4 | profile the pipelined read against memcached | a day | decides whether §25's 1.53× is worth a proposal |
-| 5 | §24 (2) and (3), re-warm and withdraw | a week | makes `resident_mode` safe to default |
+| ~~1~~ | §23 route a read by block size | done | **2.9× closed-loop reads and +40% pipelined, together** — and the spread went with it | 
+| ~~2~~ | §24 (1), report the residency the bet rests on | done | no throughput; a silent expiry is now a visible one |
+| ~~3~~ | §15 skip the redundant expiry put | done | **−24% commit per record, +25.5% pipelined `SET`** |
+| 4 | §24 (2) and (3), re-warm and withdraw | a week | makes `resident_mode` safe to default, which is what every read figure above now waits on |
+| 5 | profile the pipelined read against memcached | a day | decides whether the remaining 1.34× is worth a proposal |
+
+**4 moved above 5.** It was last when the read numbers were hypothetical; now
+they are measured and unreachable on the shipped configuration, which makes the
+gap between "vash can do this" and "vash does this" the most valuable thing
+left — and larger than the 1.34× still separating it from memcached.
