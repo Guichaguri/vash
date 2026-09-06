@@ -200,6 +200,41 @@ fn overwriting_does_not_accumulate_index_entries() {
     assert_eq!(h.entries(), 1);
 }
 
+/// **An overwrite that skips the index put still leaves a sweepable record.**
+///
+/// §15 removed the unconditional `put` into the expiry index: a record that
+/// stays in its bucket is described by a byte-identical row, so writing it again
+/// reaches a state already on disk at the cost of a second B-tree insert and a
+/// second copy-on-write page. What that gives up is self-healing, and what it
+/// must **not** give up is the row itself — a record missing from this index is
+/// never swept and can never be evicted, which is a leak that only shows up
+/// under memory pressure hours later.
+///
+/// So: rewrite a key into its own bucket many times, then let the bucket come
+/// due. If any of those writes dropped the row, this hangs rather than passing.
+#[test]
+fn an_overwrite_inside_one_bucket_is_still_swept() {
+    let h = Harness::with(|c| c.write.sweep_interval_ms = 5);
+
+    // The same TTL every time, so every write lands in the bucket the first one
+    // established — which is exactly the case where the put is skipped.
+    for _ in 0..50 {
+        h.set(b"rewritten", b"v", 1);
+    }
+    assert_eq!(
+        h.expiry_entries(),
+        1,
+        "one row, established once and left alone"
+    );
+
+    h.wait_for("the rewritten key to be reclaimed", |h| h.entries() == 0);
+    assert_eq!(
+        h.expiry_entries(),
+        0,
+        "and the row goes with the record it described"
+    );
+}
+
 /// **Distinct keys sharing a bucket are distinct entries.** The expiry index is
 /// keyed by the deadline bucket and a hash of the user key, so every record
 /// expiring in the same second lands next to the others — if that second half

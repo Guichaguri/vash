@@ -782,30 +782,55 @@ impl<B: Backend> Engine<B> {
 
         wtxn.put(self.main, &prepared.key, &prepared.record)?;
 
-        // **The displaced entry is only in the way if the record changed
-        // bucket.** When it did not, the key below is byte-identical to the one
-        // already indexed and the put re-establishes it, so there is nothing to
-        // delete — and skipping that delete is the whole of what makes an
-        // overwrite cheap. When it did, the old entry is somewhere else in the
-        // index and has to go, or it outlives the record it describes.
+        // **The index row is only touched when the record changed bucket.**
         //
-        // The put stays unconditional even when the key is unchanged: it is one
-        // page against the delete's page plus rebalance, and it means an entry
-        // that somehow went missing is put back rather than assumed.
+        // The expiry key is `bucket || hash(user key)`, so a record that stays
+        // in its bucket is described by a byte-identical row with a
+        // byte-identical value. The delete-then-put pair around such a row
+        // removes it and puts back exactly what was removed — two B-tree
+        // operations and two copy-on-write pages to reach the state already on
+        // disk.
+        //
+        // §5 made the delete conditional for that reason and left the put
+        // unconditional as self-healing. §15 priced what the put costs: every
+        // write does a `get` and a `put` on the main table and an unconditional
+        // `put` here, and at pipeline 16 the commit is 54% of all server CPU at
+        // ~10.5 µs marginal per record. Half of that marginal work is this row.
+        //
+        // **What it gives up**, stated plainly because §15 asked for it to be a
+        // decision rather than a side effect: an index row lost some other way
+        // is no longer silently restored by the next overwrite of its record. A
+        // record missing from this index is not swept and cannot be chosen as an
+        // eviction victim, so the failure it opens is a leak rather than a lost
+        // value — and nothing in this codebase deletes an index row except the
+        // paths that delete the record with it.
+        let same_bucket = displaced.indexed_at.is_some_and(|previously| {
+            crate::expiry::bucket_for(previously, self.bucket_granularity_ms)
+                == crate::expiry::bucket_for(expires_at_ms, self.bucket_granularity_ms)
+        });
+
+        // When the bucket did change, the old entry is somewhere else in the
+        // index and has to go, or it outlives the record it describes.
         if let Some(previously) = displaced.indexed_at
-            && crate::expiry::bucket_for(previously, self.bucket_granularity_ms)
-                != crate::expiry::bucket_for(expires_at_ms, self.bucket_granularity_ms)
+            && !same_bucket
         {
             self.clear_expiry_row(wtxn, &prepared.key, previously)?;
         }
 
-        // Indexed unconditionally: a record outside this index cannot be chosen
-        // as an eviction victim, so a cache of TTL-less keys would have nothing
-        // to free under pressure. Never-expiring records sort last (see
-        // `expiry::NEVER_BUCKET`), so they go only after everything with a TTL.
-        let index_key =
-            crate::expiry::encode_key(expires_at_ms, &prepared.key, self.bucket_granularity_ms);
-        wtxn.put(self.exp, &index_key, &prepared.key)?;
+        // Indexed on every path that can change the row: a record outside this
+        // index cannot be chosen as an eviction victim, so a cache of TTL-less
+        // keys would have nothing to free under pressure. Never-expiring records
+        // sort last (see `expiry::NEVER_BUCKET`), so they go only after
+        // everything with a TTL.
+        //
+        // Skipped only when `same_bucket` proved the row is already there and
+        // already correct — a fresh key has no `indexed_at` and is always
+        // indexed here.
+        if !same_bucket {
+            let index_key =
+                crate::expiry::encode_key(expires_at_ms, &prepared.key, self.bucket_granularity_ms);
+            wtxn.put(self.exp, &index_key, &prepared.key)?;
+        }
 
         for tag in &prepared.tags {
             wtxn.put(
