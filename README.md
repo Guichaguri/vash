@@ -106,12 +106,12 @@ memcached** — one client, one box, the same workload pointed at all three — 
 dedicated EC2 server with the data on a local NVMe device:
 
 **Where the client waits for its answer, vash competes.** `GET` with
-`resident_mode` is 284,512 a second against Redis's 149,569 and memcached's
-284,191 — ahead of Redis, level with memcached. `SET` is 99,858 against 149,765
-and 298,511, so writes trail both.
+`resident_mode` is 284,318 a second against Redis's 149,368 and memcached's
+284,823 — ahead of Redis, level with memcached. `SET` is 99,580 against 150,252
+and 297,343, so writes trail both.
 
-**Where the client pipelines, vash is behind both.** `GET` 609,164 against
-780,933 and 1,086,417; `SET` 285,122 against 936,481 and 1,506,991, three to five
+**Where the client pipelines, vash is behind both.** `GET` 608,662 against
+792,115 and 1,102,280; `SET` 280,159 against 951,838 and 1,504,356, three to five
 times behind.
 
 Earlier rounds of that document, measured on a laptop, reported vash leading both
