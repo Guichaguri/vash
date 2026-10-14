@@ -2138,14 +2138,24 @@ its second half explains went with it — §23's pipelined minimum is 824,036
 against a median of 844,662, where the pooled path still swings 570,000 to
 850,000.
 
-**The one thing standing between this and the shipped defaults is §24 (2) and
-(3).** Every read figure above needs `resident_mode`, which is off by default
-because its safety argument expires silently as the store grows. §24 (1) makes
-that visible; (2) and (3) would make it hold, and only then is defaulting it on
-a decision rather than a gamble.
+**The one thing standing between this and the shipped defaults is §26.** Every
+read figure above needs `resident_mode`, and out of the box vash does 97,582
+closed-loop reads against Redis's 141,573 and memcached's 279,920 — it loses to
+both, on the configuration almost everyone runs. The gap between what this
+document measures and what the server does is now larger than any gap left
+between vash and either competitor.
+
+**And the reason it is off by default is not the one stated above.** This was
+written as though safety were the blocker, which §24 found. It is not what
+[`prefault.rs`](../crates/vash-store/src/prefault.rs) says: warming costs
+~2.2–3.7 s per GiB cold, so a 10 GB store spends tens of seconds starting
+against the sub-second cold start plan §13 asks for, "and that is why this is
+off by default". §24's expiring safety argument is a *second* problem, found
+later. Doing §24 (2) and (3) alone would leave `resident_mode` safe and still
+undefaultable, which is what the order below used to claim it would fix.
 
 **Reachable but unbudgeted: memcached on pipelined reads.** 1,131,385 against
-741,206 is 1.53×, or 3.6 µs of CPU per op against roughly 5.4. Nothing in this
+§23's 844,662 is 1.34×, or 3.6 µs of CPU per op against roughly 4.7. Nothing in this
 document decomposes that gap; §22 accounts for the closed-loop half and says
 nothing about this one. **It needs a profile before it needs a proposal**, and
 the candidates worth pricing are the per-command read transaction (a pipelined
@@ -2154,9 +2164,10 @@ block of N single-key `GET`s opens N of them, where `MGET` of N keys opens one �
 left at ~67 ns, and the clocks §21 puts at 95% of a `GET`'s instrumentation.
 
 **Not reachable, and it should stop being an objective.** Pipelined `SET` at
-280,159 against memcached's 1,504,356 is a copy-on-write B-tree committing to a
+343,692 against memcached's 1,504,356 is a copy-on-write B-tree committing to a
 disk against a hash insert into memory. §15 is worth building and will not close
-5.4×; §7 was measured against; §11 rules out more shards and another B-tree.
+4.4×; §15 shipped and bought 25.5% of it; §7 was measured against; §11 rules out
+more shards and another B-tree.
 [plan.md](plan.md) §6 chose this deliberately, and the thing it buys — a cache
 that still has your data after a restart, which neither of the other two
 configurations here does — is not available at memcached's write cost. The honest
@@ -2170,10 +2181,98 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~1~~ | §23 route a read by block size | done | **2.9× closed-loop reads and +40% pipelined, together** — and the spread went with it | 
 | ~~2~~ | §24 (1), report the residency the bet rests on | done | no throughput; a silent expiry is now a visible one |
 | ~~3~~ | §15 skip the redundant expiry put | done | **−24% commit per record, +25.5% pipelined `SET`** |
-| 4 | §24 (2) and (3), re-warm and withdraw | a week | makes `resident_mode` safe to default, which is what every read figure above now waits on |
+| 4 | §26 warm in the background, and keep warming | a week | removes **both** reasons `resident_mode` is off, and subsumes §24 (2) and (3) |
 | 5 | profile the pipelined read against memcached | a day | decides whether the remaining 1.34× is worth a proposal |
 
 **4 moved above 5.** It was last when the read numbers were hypothetical; now
 they are measured and unreachable on the shipped configuration, which makes the
 gap between "vash can do this" and "vash does this" the most valuable thing
 left — and larger than the 1.34× still separating it from memcached.
+
+---
+
+## 26. Warm in the background, and keep warming
+
+**Status: proposed. It subsumes §24 (2) and (3), and it is the only thing left
+between this document's read figures and the server as it ships.**
+
+Every read figure in §25 needs `resident_mode`. Out of the box vash serves
+97,582 closed-loop reads against Redis's 141,573 and memcached's 279,920 — it
+loses to both, on the configuration almost everyone runs. **The distance between
+what this document measures and what the server does is now larger than any
+distance left between vash and either competitor.**
+
+### Two reasons it is off, and they are not the same reason
+
+**Startup cost**, which is the one
+[`prefault.rs`](../crates/vash-store/src/prefault.rs) gives: warming reads the
+data file at sequential-read bandwidth, ~2.2–3.7 s per GiB cold, so a 10 GB
+store spends tens of seconds starting against the sub-second cold start plan §13
+asks for — "and that is why this is off by default".
+
+**An expiring safety argument**, which is §24's: the warm runs once, at open,
+bounded by the high-water mark of that instant, and `inline_reads` stays on as
+the store grows past it.
+
+§24 (2) and (3) address the second and leave the first untouched, so a server
+with them would be safe and still undefaultable. **This section is one mechanism
+that removes both**, which is why it replaces them rather than following them.
+
+### Make residency a maintained property, not a decision taken at open
+
+1. **Start serving immediately**, with reads on the pool — today's behaviour
+   exactly, and therefore today's cold start.
+2. **Warm and lock on a background thread.** When every shard comes back locked,
+   turn `inline_reads` on.
+3. **Keep checking.** When the high-water mark outruns what was warmed, warm the
+   new range and extend the lock. If it cannot be extended, turn `inline_reads`
+   off again.
+
+The startup cost disappears because nothing waits for the warm. The safety
+argument stops expiring because it is re-established rather than remembered. And
+the failure mode is unchanged and still the good one: a server that can never
+lock its map simply never turns inline reads on, which is exactly what it does
+today.
+
+### What it costs to build
+
+`inline_reads` becomes a value read per run rather than a constant decided at
+startup — an `AtomicBool` on `ServerState` and a relaxed load in
+[`worth_inlining`](../crates/vash-server/src/conn.rs), which already takes it as
+a parameter. A relaxed load against a hop measured at 18.9 µs (§22) is not a
+cost worth discussing.
+
+`Engine::map_locked` and `warmed_bytes` become atomics for the same reason, and
+`warm` gains a `from` offset so a re-warm reads the bytes that arrived rather
+than the whole file again. Without that, every recheck on a 10 GB store re-reads
+10 GB at the ~260 ms per GiB cached floor; with it, a recheck costs what the
+store grew. The `mlock` walk needs no such change — it already clamps each range
+to the warmed total and locking an already-locked range is harmless.
+
+**Both flips are safe mid-flight.** Turning inline reads *on* affects only runs
+measured after it; turning them *off* sends more runs to the pool, which §23
+establishes is the safe tier by construction. Nothing in flight changes tier.
+
+### Acceptance criteria
+
+1. **Cold start does not regress.** Time to first served request with
+   `resident_mode` on and a multi-gigabyte store, against the same store with it
+   off. The gap is the whole objection, and it should be gone rather than
+   smaller.
+2. **The flip happens, and is visible.** `vash_inline_reads` goes from no to yes
+   without a restart, and §24 (1)'s `vash_warmed_bytes` tracks
+   `vash_high_water_bytes` as the store grows rather than standing still.
+3. **The flip reverses.** With `RLIMIT_MEMLOCK` set below the store's eventual
+   size, a server that locked a small store and then grew past the limit turns
+   inline reads back off rather than serving inline from pages it never locked.
+4. **The read figures survive it.** §23's 285,217 and 844,662 reproduce on a
+   server that reached residency in the background rather than at open.
+
+### What this does not do
+
+**It does not turn `resident_mode` on by default**, and that should be a
+separate change with its own measurement. Defaulting it on means every server
+tries to `mlock` its whole map; the code already degrades gracefully when
+`RLIMIT_MEMLOCK` is short, logging and keeping the hand-off, but it is still a
+behaviour change for deployments that never asked for one. Build the mechanism,
+prove it against the four criteria, then decide the default on its own evidence.
