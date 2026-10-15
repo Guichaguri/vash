@@ -2057,6 +2057,15 @@ one proposal and not two, and it is why the answer is **not** to lower
 against 302,722 at 4). Sizing the pool cannot serve both shapes. Not using it for
 small blocks can.
 
+> **This explains some of the variance and not all of it.** The inflation above
+> is real and measured, but §27 later ran nine fresh servers an arm that had
+> served no closed-loop traffic at all and still found 2 of 9 and 1 of 9 samples
+> in a low mode near 550,000 — including on an arm with `inline_max_commands = 0`,
+> which never inlines anything and so can never inflate the pool. Something else
+> moves this row between roughly 550,000 and 850,000 on identical servers, and
+> nothing here has named it. See
+> [§27](#27-implemented-resident_mode-on-by-default).
+
 ---
 
 ## 24. Partly implemented: `resident_mode` verifies residency once and trusts it for the process's life
@@ -2138,12 +2147,12 @@ its second half explains went with it — §23's pipelined minimum is 824,036
 against a median of 844,662, where the pooled path still swings 570,000 to
 850,000.
 
-**The one thing standing between this and the shipped defaults is now a
-one-line change.** Every read figure above needs `resident_mode`, and out of the
-box vash does 97,582 closed-loop reads against Redis's 141,573 and memcached's
-279,920 — it loses to both, on the configuration almost everyone runs. The gap
-between what this document measures and what the server does is larger than any
-gap left between vash and either competitor.
+**There is no longer a gap between this and the shipped defaults.** Every read
+figure above needed `resident_mode`, and out of the box vash used to serve
+97,582 closed-loop reads against Redis's 141,573 and memcached's 279,920 — it
+lost to both, on the configuration almost everyone runs, while this document
+recorded it leading both. §27 turned the setting on: 276,571 on the shipped
+defaults, measured with no config file at all.
 
 **Both reasons it was off are gone.** §26 shipped and was measured against its
 own four criteria: cold start is back to the floor — 1,018 ms against the 2,935
@@ -2191,8 +2200,9 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~2~~ | §24 (1), report the residency the bet rests on | done | no throughput; a silent expiry is now a visible one |
 | ~~3~~ | §15 skip the redundant expiry put | done | **−24% commit per record, +25.5% pipelined `SET`** |
 | ~~4~~ | §26 warm in the background, and keep warming | done | **cold start back to the floor** (1,018 ms against 2,935), the pin re-established rather than remembered, and §23's read figures intact |
-| 5 | turn `resident_mode` on by default | a day | the point of §26, and now the only thing between these figures and the shipped server |
-| 6 | profile the pipelined read against memcached | a day | decides whether the remaining 1.34× is worth a proposal |
+| ~~5~~ | §27 turn `resident_mode` on by default | done | **2.7× closed-loop reads on the shipped defaults**, pipelined unchanged, and nothing worse where the lock cannot be had |
+| 6 | explain the pipelined read's bimodality | a day | §23's pool-inflation answer is measured but incomplete — see §27 |
+| 7 | profile the pipelined read against memcached | a day | decides whether the remaining 1.34× is worth a proposal |
 
 **4 moved above 5.** It was last when the read numbers were hypothetical; now
 they are measured and unreachable on the shipped configuration, which makes the
@@ -2351,3 +2361,96 @@ of warming to find.
 **Three near-identical numbers across arms that should differ is a harness
 result, not a null result.** Criteria 2, 3 and 4 were unaffected — they assert on
 states rather than durations — which is why they stood while this one was redone.
+
+---
+
+## 27. Implemented: `resident_mode` on by default
+
+**Status: shipped. The last thing standing between this document's read figures
+and the server as it ships.**
+
+Every read figure in §25 needed this setting. Out of the box vash served 97,582
+closed-loop reads against Redis's 141,573 and memcached's 279,920 — it lost to
+both, on the configuration almost everyone runs, while this document recorded it
+leading both. §26 removed the two reasons it could not be defaulted; this is the
+decision itself, kept separate so it would arrive with its own evidence rather
+than as a side effect of the mechanism that made it possible.
+
+### Measured on the shipped defaults, no config file in either arm
+
+**Closed loop.** Medians of five fresh servers:
+
+| | `GET` | `vash_inline_reads` |
+|---|---:|---|
+| before | 102,880 | no |
+| **after** | **276,571** | yes |
+
+**2.7×**, and it is the row that decides the comparison: 276,571 against Redis's
+141,573 and memcached's 279,920 turns losing to both into leading one and
+drawing with the other.
+
+**Pipelined, nine fresh servers an arm** — nine because five disagreed with
+five, 766,970 against 579,794, on a path whose own never-inline arm ranged
+551,284 to 856,610:
+
+| | median | mean | min | max | samples under 650k |
+|---|---:|---:|---:|---:|---|
+| before | 817,384 | 759,495 | 533,458 | 849,801 | 2 of 9 |
+| after | 827,136 | 793,721 | 570,464 | 856,053 | 1 of 9 |
+
+**No detectable difference.** The setting is marginally ahead on both median and
+mean with one fewer sample in the low mode, which is noise in both directions.
+The earlier 579,794 was a bad draw from a bimodal distribution, and reporting it
+as a 24% regression would have been reading a median as a central value when it
+is mostly a report of which mode won.
+
+### Where the lock cannot be had, nothing is worse
+
+The claim the default rests on is not that it always works. It is that where it
+cannot, the server lands exactly where it was. Given an 8 MiB `RLIMIT_MEMLOCK`,
+against a store that grows past it:
+
+| | `GET` | `vash_inline_reads`, before and after each run |
+|---|---:|---|
+| closed loop | 100,850 | `no` on all five samples |
+| pipelined | 840,929 | `no` on all five samples |
+
+100,850 against the 102,880 baseline. The warmer withdrew, every sample
+reported it, and the throughput is the old throughput.
+
+**A measurement error worth recording**, because it read as a safety failure. An
+earlier run of this reported `inline_reads=yes` under the 8 MiB ceiling. The
+server was behaving correctly; the script polled for the first `yes` and broke
+on it, and that `yes` arrives moments after startup when the store is still
+empty and an 8 MiB lock trivially succeeds. The store then grew past the ceiling
+and the warmer withdrew, as it should, before the run began. The throughput was
+what gave it away — 102,993, the pooled figure, against inline's 278,731. **A
+flag sampled at the wrong instant said the opposite of what the workload said**,
+and the workload was right.
+
+### What it costs, and the escape hatch
+
+Locked pages cannot be reclaimed, so a server whose store is large relative to
+its host is asking the kernel to pin that much. The kernel bounds this itself —
+`mlock` fails rather than evicting its way to success — and a failure lands on
+the path measured above. Set `store.resident_mode = false` on a host where the
+cache is a guest among other memory-hungry processes and the kernel should
+arbitrate instead.
+
+`store.prefault` stays `false` beside it. That one still blocks the open, and is
+a separate trade an operator asks for by name.
+
+### A correction §23 owes
+
+§23's second half explained the pipelined read spread as the blocking pool
+inheriting a size from a preceding closed-loop run, and said routing small
+blocks away from it would take the variance with the inflation. **The first half
+of that holds and the second does not.** Every arm above ran on a fresh server
+that had served no closed-loop traffic at all, and the spread is still there —
+2 of 9 and 1 of 9 samples in a low mode near 550,000, and a `inline_max_commands
+= 0` arm that never inlines anything ranging 551,284 to 856,610.
+
+So the pool-inflation effect is real and measured, and it is **not** the whole
+of the variance. Something else moves this row between roughly 550,000 and
+850,000 on identical fresh servers, and nothing in this document explains it
+yet. It is the reason every pipelined figure here is quoted with its spread.
