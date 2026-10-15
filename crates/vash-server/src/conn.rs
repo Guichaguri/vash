@@ -449,7 +449,8 @@ impl Run {
     }
 }
 
-/// Whether a run of `count` commands of `kind` is worth serving inline.
+/// Whether a run of `kind` is worth serving inline, in a block of
+/// `block_commands` commands.
 ///
 /// **The hop is paid once per run**, so one command pays all of it and sixteen
 /// pay a sixteenth each — and once it is amortised, the pool's several threads
@@ -458,14 +459,26 @@ impl Run {
 /// 741,206 pooled against ~580,000 inline. Neither tier wins both shapes, so
 /// the choice is per run. See `docs/performance-proposals.md` §23.
 ///
-/// Extracted so the rule can be checked without a socket, and so `drain` and its
-/// one-run lookahead cannot drift apart — both call this.
+/// **The count is the block's, not the run's**, and the difference is a 3.2×
+/// regression. A hop is paid per block, so that is the unit the question is
+/// about; asking it of each run is the same thing in a uniform block and not
+/// in a mixed one, where short read runs each clear a threshold the block they
+/// came from does not. See §31.
+///
+/// Extracted so the rule can be checked without a socket, and so `drain`, its
+/// one-run lookahead and the collapse that precedes them cannot drift apart —
+/// all three come from this one answer.
 ///
 /// Sending *more* runs to the pool never weakens what `inline_reads` asserts:
 /// the pool is the safe route by construction, and this only narrows where the
 /// residency bet is taken.
-fn worth_inlining(kind: RunKind, count: usize, enabled: bool, max_commands: usize) -> bool {
-    kind == RunKind::Reads && enabled && count <= max_commands
+fn worth_inlining(
+    kind: RunKind,
+    block_commands: usize,
+    enabled: bool,
+    max_commands: usize,
+) -> bool {
+    kind == RunKind::Reads && enabled && block_commands <= max_commands
 }
 
 /// Executes a block of one dialect's commands, rendering the replies.
@@ -688,15 +701,38 @@ async fn drain<S: Copy + Send + 'static>(
             "every measured byte belongs to exactly one run"
         );
 
+        // **The tier is chosen for the block, not for each run of it.**
+        //
+        // A hop is paid once per block — that is §23's whole argument — so the
+        // question "is this worth inlining" is a question about the block. The
+        // first implementation asked it of each *run*, which is the same thing
+        // in a uniform block and not in a mixed one: sixteen commands at 1:9
+        // split into short read runs that each cleared the threshold, so a
+        // block that should take one pooled hop took several inline segments.
+        // Measured, that cost the 1:9 pipelined workload 579,306 against
+        // 179,079. See `docs/performance-proposals.md` §31.
+        let block_commands: usize = runs.iter().map(|r| r.count).sum();
+        let reads_inline = worth_inlining(
+            RunKind::Reads,
+            block_commands,
+            state.inline_reads(),
+            state.inline_max_commands,
+        );
+
         // **Splitting only pays when the reads have somewhere better to go.**
-        // With `inline_reads` off a read run takes the same blocking pool an
-        // `Other` run does, so peeling the writes out of a mixed block buys
-        // nothing for them and fragments what used to be a single hop into
-        // several. Measured on the default configuration, a 1:9 pipelined
-        // workload fell from 147,180 to 85,521 ops/s that way. Collapsing to one
-        // run restores exactly the old route; a block that is *only* writes is
-        // already one run and still takes the awaited path.
-        if !state.inline_reads() && runs.len() > 1 {
+        // When they do not, peeling the writes out of a mixed block buys them
+        // nothing and fragments what used to be a single hop into several.
+        // Measured, a 1:9 pipelined workload fell from 147,180 to 85,521 ops/s
+        // that way. Collapsing to one run restores exactly the old route; a
+        // block that is *only* writes is already one run and still takes the
+        // awaited path.
+        //
+        // The condition is `reads_inline` rather than `inline_reads` because
+        // those stopped being the same thing once the threshold existed: with
+        // the flag on and a block over the threshold, reads take the pool and
+        // splitting buys them nothing — which is exactly the mixed pipelined
+        // case above.
+        if !reads_inline && runs.len() > 1 {
             let whole = measured.complete;
             let commands = runs.iter().map(|r| r.count).sum();
             runs.clear();
@@ -720,14 +756,9 @@ async fn drain<S: Copy + Send + 'static>(
             // one, which a gated connection is denied because its refusal is
             // the executor's to word.
             //
-            // A read run goes inline only while it is small enough to be worth
-            // the hop it saves. See `worth_inlining`.
-            let inline = worth_inlining(
-                runs[index].kind,
-                runs[index].count,
-                state.inline_reads(),
-                state.inline_max_commands,
-            );
+            // Decided for the block above; a run only has to say whether it
+            // is the kind that may take it.
+            let inline = runs[index].kind == RunKind::Reads && reads_inline;
             let awaitable = runs[index].kind == RunKind::Writes && writes.is_some();
 
             // Runs that both end up on the pool are merged into one hop, so a
@@ -737,12 +768,7 @@ async fn drain<S: Copy + Send + 'static>(
                 while let Some(next) = runs.get(index + 1) {
                     // The same rule as `inline` above, or a read run headed for
                     // the pool would break a merge it belongs in.
-                    let next_inline = worth_inlining(
-                        next.kind,
-                        next.count,
-                        state.inline_reads(),
-                        state.inline_max_commands,
-                    );
+                    let next_inline = next.kind == RunKind::Reads && reads_inline;
                     let next_awaitable = next.kind == RunKind::Writes && writes.is_some();
                     if next_inline || next_awaitable {
                         break;
@@ -988,6 +1014,31 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!((runs[1].count, runs[1].len), (2, 80));
         assert_eq!(runs[0].count, 16, "the finished run is left alone");
+    }
+
+    /// **The regression §31 fixed, as an assertion.**
+    ///
+    /// A mixed pipelined block splits into short read runs. Judged per run,
+    /// each of them clears a threshold of 4 and goes inline, so a block that
+    /// should take one pooled hop takes several inline segments — which cost
+    /// the 1:9 pipelined workload 579,306 against 179,079. Judged per block,
+    /// the sixteen commands it came from do not clear the threshold and the
+    /// whole block takes the pool.
+    #[test]
+    fn a_short_read_run_inside_a_pipelined_block_is_not_inlined() {
+        // What a 1:9 block of sixteen looks like after splitting: runs of a
+        // few reads between single writes.
+        let block = 16;
+        for run_len in [1, 2, 3, 4] {
+            assert!(
+                !worth_inlining(RunKind::Reads, block, true, 4),
+                "a {run_len}-command read run inside a {block}-command block                  must take the tier the block takes"
+            );
+        }
+        // And the same run in a block small enough to be worth inlining still
+        // is — the rule narrowed where the bet is taken, it did not remove it.
+        assert!(worth_inlining(RunKind::Reads, 1, true, 4));
+        assert!(worth_inlining(RunKind::Reads, 4, true, 4));
     }
 
     #[test]
