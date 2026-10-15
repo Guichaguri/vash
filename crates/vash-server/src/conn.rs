@@ -620,7 +620,16 @@ async fn run_block<S: Copy + Send + 'static>(
     // which may happen on a runtime worker. The block is re-parsed on the
     // blocking thread so the borrowed key and value slices never cross a task
     // boundary.
+    //
+    // **Timed from here to the first instruction on the other side**, which is
+    // the gap §30 is about: the pipelined read has two stable modes, the
+    // difference between them is latency rather than work, and removing this
+    // hand-off is the only thing measured that removes the instability. Two
+    // clock reads per block — not per command — so under 3 ns a request at the
+    // sixteen commands a block that section measured.
+    let submitted = std::time::Instant::now();
     let joined = tokio::task::spawn_blocking(move || {
+        state.metrics.handoff_wait.observe(submitted.elapsed());
         let closing = run(
             &state,
             &mut authenticating,

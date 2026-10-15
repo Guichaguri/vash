@@ -26,6 +26,82 @@ const LATENCY_BOUNDS_US: [u64; 11] = [
     10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 25_000, 100_000,
 ];
 
+/// Upper bounds of the hand-off buckets, in **nanoseconds**.
+///
+/// A separate ladder from [`LATENCY_BOUNDS_US`] because it answers a different
+/// question at a different scale. That one resolves a request, where tens of
+/// microseconds is the interesting floor; this one resolves the gap between a
+/// block being handed to the blocking pool and a thread picking it up, where
+/// the whole question is whether that gap is a few hundred nanoseconds or a
+/// few microseconds — the difference between a thread that was awake and one
+/// the kernel had to wake. Both would land in the first bucket up there.
+///
+/// Spans 100 ns to 1 ms: below the first bucket the hand-off is free, above the
+/// last something is wrong rather than slow. See
+/// `docs/performance-proposals.md` §30.
+const HANDOFF_BOUNDS_NS: [u64; 11] = [
+    100, 250, 500, 1_000, 2_000, 5_000, 10_000, 25_000, 50_000, 100_000, 1_000_000,
+];
+
+/// How long blocks wait between being submitted to the blocking pool and being
+/// picked up.
+///
+/// **Why this exists.** §30 established that the pipelined read has two stable
+/// modes, that the difference between them is latency rather than work — the
+/// server burns the same CPU in both — and that the variance lives in this
+/// hand-off: the same workload with the hand-off removed runs with a 1% spread
+/// against this path's 37%. What it could not establish from outside is *what*
+/// the hand-off is waiting for. A bimodal distribution here with a floor around
+/// a futex wake says the pool's threads are parking between blocks; a flat one
+/// says the wait is not where the time goes and sends the search to the reply
+/// write path.
+///
+/// Its own type rather than [`Histogram`] because of the bucket ladder above,
+/// and the cumulative-bucket loop is duplicated rather than generalised: that
+/// type is shared with the TLS handshake and the striped command histograms,
+/// and making it generic over bounds and scale to serve one diagnostic is a
+/// larger change than the eight lines it would save.
+#[derive(Debug, Default)]
+pub struct HandoffHistogram {
+    buckets: [AtomicU64; HANDOFF_BOUNDS_NS.len() + 1],
+    sum_ns: AtomicU64,
+    count: AtomicU64,
+}
+
+impl HandoffHistogram {
+    /// Two clock reads per **block**, not per command — at the sixteen
+    /// commands a block §30 measured, under 3 ns a request against the 4.7 µs
+    /// one costs.
+    #[inline]
+    pub fn observe(&self, waited: std::time::Duration) {
+        let nanos = waited.as_nanos().min(u64::MAX as u128) as u64;
+        let bucket = HANDOFF_BOUNDS_NS
+            .iter()
+            .position(|bound| nanos <= *bound)
+            .unwrap_or(HANDOFF_BOUNDS_NS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(nanos, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render(&self, out: &mut String, name: &str) {
+        let mut running = 0u64;
+        for (index, bound) in HANDOFF_BOUNDS_NS.iter().enumerate() {
+            running += self.buckets[index].load(Ordering::Relaxed);
+            let seconds = *bound as f64 / 1e9;
+            let _ = writeln!(out, "{name}_bucket{{le=\"{seconds}\"}} {running}");
+        }
+        running += self.buckets[HANDOFF_BOUNDS_NS.len()].load(Ordering::Relaxed);
+        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {running}");
+        let _ = writeln!(
+            out,
+            "{name}_sum {:.9}",
+            self.sum_ns.load(Ordering::Relaxed) as f64 / 1e9
+        );
+        let _ = writeln!(out, "{name}_count {}", self.count.load(Ordering::Relaxed));
+    }
+}
+
 /// A fixed-bucket latency histogram.
 ///
 /// Hand-rolled, like everything else here: a global recorder would be more
@@ -767,6 +843,9 @@ pub struct ServerMetrics {
     pub tls_cert_expiry: AtomicU64,
     /// How long completed handshakes took.
     pub tls_handshake_latency: Histogram,
+    /// How long blocks wait to be picked up off the blocking pool. See
+    /// [`HandoffHistogram`].
+    pub handoff_wait: HandoffHistogram,
 
     /// Successful authentications, failed ones, and commands refused for want
     /// of one.
@@ -838,6 +917,7 @@ impl Default for ServerMetrics {
             tls_identity_rejected: AtomicU64::new(0),
             tls_cert_expiry: AtomicU64::new(0),
             tls_handshake_latency: Histogram::default(),
+            handoff_wait: HandoffHistogram::default(),
             auth_ok: AtomicU64::new(0),
             auth_failed: AtomicU64::new(0),
             auth_refused: AtomicU64::new(0),
@@ -1191,6 +1271,15 @@ pub fn render_prometheus(
     server
         .tls_handshake_latency
         .render(&mut out, "vash_tls_handshake_seconds", "");
+
+    let _ = writeln!(
+        out,
+        "# HELP vash_handoff_wait_seconds Time a block waits between being          submitted to the blocking pool and a thread picking it up. Bimodal,          with a floor around a futex wake, means the pool is parking between          blocks."
+    );
+    let _ = writeln!(out, "# TYPE vash_handoff_wait_seconds histogram");
+    server
+        .handoff_wait
+        .render(&mut out, "vash_handoff_wait_seconds");
 
     // A timestamp rather than a remaining duration, which is the convention
     // every other exporter of this follows — the alert is written as
