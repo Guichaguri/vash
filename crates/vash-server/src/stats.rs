@@ -398,7 +398,7 @@ fn settings(state: &ServerState, tls: bool) -> Vec<(String, String)> {
             yes_no(protocol.memcached_enabled),
         ),
         ("vash_resp_enabled".into(), yes_no(protocol.resp_enabled)),
-        ("vash_inline_reads".into(), yes_no(state.inline_reads)),
+        ("vash_inline_reads".into(), yes_no(state.inline_reads())),
         // The line between the two tiers, in commands. Reported beside
         // `vash_inline_reads` because that flag alone no longer says where a
         // read goes — a run longer than this takes the pool even with inline

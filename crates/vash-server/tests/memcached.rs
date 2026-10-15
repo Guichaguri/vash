@@ -1850,14 +1850,38 @@ async fn noreply_inside_a_run_suppresses_only_itself() {
 async fn resident_mode_serves_reads_inline_only_when_the_map_is_locked() {
     let server = TestServer::start_with(|config| config.store.resident_mode = true).await;
     let mut c = server.connect().await;
-    let fields = stat_fields(&mut c, "stats settings\r\n").await;
 
-    let locked = fields.get("vash_map_locked").expect("vash_map_locked");
-    let inline = fields.get("vash_inline_reads").expect("vash_inline_reads");
-    assert_eq!(
-        inline, locked,
-        "resident mode must serve reads inline exactly when it locked the map"
-    );
+    // **Settled rather than sampled.** Under §26 the warm runs on a background
+    // thread, so these two converge a moment after the server starts answering
+    // rather than before it does. Reading once would assert on whichever
+    // instant the scheduler happened to hand over.
+    //
+    // The direction they converge from is the safe one, and the loop pins that
+    // too: `warm_step` publishes the lock before the warmer publishes inline
+    // reads, so a disagreement means a locked map still being served through
+    // the pool. The reverse — inline reads over a map that is not locked — is
+    // the condition the whole setting exists to avoid, and is asserted against
+    // on every pass rather than merely waited out.
+    let mut locked = String::new();
+    let mut inline = String::new();
+    for _ in 0..100 {
+        let fields = stat_fields(&mut c, "stats settings\r\n").await;
+        locked = fields.get("vash_map_locked").expect("vash_map_locked").clone();
+        inline = fields
+            .get("vash_inline_reads")
+            .expect("vash_inline_reads")
+            .clone();
+        if inline == locked {
+            return;
+        }
+        assert_eq!(
+            inline, "no",
+            "reads went inline while vash_map_locked read {locked}, which is the \
+             unsafe disagreement rather than the transient one"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("resident mode never settled: vash_map_locked {locked}, vash_inline_reads {inline}");
 }
 
 /// Asking for `inline_reads` directly still means it, whatever the lock did:

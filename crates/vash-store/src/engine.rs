@@ -94,21 +94,30 @@ pub struct Engine<B: Backend> {
     pub(crate) shard_count: usize,
     /// See [`crate::readers`].
     pub(crate) reader_ages: crate::readers::ReaderAges,
-    /// Whether this shard's map was pinned in memory at open. Fixed for the
-    /// life of the environment: nothing here unlocks it, and nothing relocks a
-    /// map that has since grown past what was locked.
-    pub(crate) map_locked: bool,
-    /// How many bytes warming actually covered, which with `map_locked` is the
+    /// Whether this shard's map is pinned in memory **right now**.
+    ///
+    /// Atomic because it is no longer settled at open: §26's background warmer
+    /// sets it when a warm succeeds and clears it when the lock cannot be
+    /// extended over a store that has grown. A reader that finds `true` is
+    /// being told the warmer last saw every page up to `warmed_bytes` locked.
+    pub(crate) map_locked: std::sync::atomic::AtomicBool,
+    /// How many bytes warming has covered, which with `map_locked` is the
     /// extent of what is pinned.
     ///
-    /// **Reported so the bet can be seen expiring.** `map_locked` is a verdict
-    /// about the store as it was at open; this against the current high-water
-    /// mark is how much of the store that verdict still describes. A database
-    /// that has grown has pages above this that no one prefaulted and no one
-    /// locked, while `map_locked` still answers yes and `inline_reads` is still
-    /// serving reads from a runtime worker. See
-    /// `docs/performance-proposals.md` §24.
-    pub(crate) warmed_bytes: u64,
+    /// **Reported so the bet can be seen expiring, and now so it can be
+    /// repaired.** Against the current high-water mark this is how much of the
+    /// store the `map_locked` verdict describes; the gap is what the warmer
+    /// reads next, and what it passes as `from` so it pays for the growth
+    /// rather than for the whole file. See `docs/performance-proposals.md`
+    /// §24 and §26.
+    pub(crate) warmed_bytes: AtomicU64,
+    /// This shard's own configuration, kept so the warmer can re-run without
+    /// the caller threading it back in.
+    ///
+    /// A clone per shard: a `PathBuf` and a dozen scalars, against a background
+    /// step that would otherwise need the config plumbed from the server down
+    /// through the store on every tick.
+    pub(crate) config: crate::config::StoreConfig,
 }
 
 impl<B: Backend> Engine<B> {
@@ -216,7 +225,7 @@ impl<B: Backend> Engine<B> {
             utilisation: used_bytes as f64 / info.map_size as f64,
             readers_in_use: info.readers_in_use,
             max_readers: info.max_readers,
-            warmed_bytes: self.warmed_bytes,
+            warmed_bytes: self.warmed_bytes.load(Ordering::Relaxed),
             high_water_bytes: info.high_water_bytes,
             epoch: self.epoch(),
             oldest_reader_age_ms: self.reader_ages.oldest_age_ms(self.now_ms()),

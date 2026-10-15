@@ -448,6 +448,21 @@ pub trait Store: Send + Sync + 'static {
     /// already — answer `true`.
     fn map_locked(&self) -> bool;
 
+    /// Brings every shard's residency up to date, and reports whether it holds
+    /// across all of them.
+    ///
+    /// One step of §26's background warmer. Warms what has arrived since the
+    /// last step, extends the pin over it, and answers the same question
+    /// [`Self::map_locked`] does — but having just re-established it rather
+    /// than having remembered it from startup.
+    ///
+    /// **Blocking, and deliberately so**: it reads the data file. The server
+    /// runs it on a thread that may block, never on a runtime worker.
+    ///
+    /// Cheap when the store has not grown, so a caller may run it on a timer
+    /// rather than wiring up a growth signal.
+    fn warm_step(&self) -> bool;
+
     /// Removes a key. Returns whether it was live beforehand, so callers can
     /// distinguish a real delete from a miss.
     fn delete(&self, key: Key<'_>) -> Result<bool>;

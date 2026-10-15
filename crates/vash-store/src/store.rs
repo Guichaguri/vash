@@ -326,6 +326,23 @@ impl<B: Backend> Store for VashStore<B> {
                 .all(|shard| shard.engine.map_locked())
     }
 
+    fn warm_step(&self) -> bool {
+        let shards = self.shards.all();
+        if shards.is_empty() {
+            return false;
+        }
+        // Every shard is stepped, and then the verdict is taken — rather than
+        // `all()`, which would short-circuit and leave the shards after the
+        // first failure unwarmed and unexamined. A store whose second shard
+        // cannot be locked still wants its first one warm, because the next
+        // step is cheaper for it.
+        let mut locked = true;
+        for shard in shards {
+            locked &= shard.engine.warm_step();
+        }
+        locked
+    }
+
     fn store(&self, set: &Set<'_>) -> Result<crate::Written> {
         self.ensure_tags_registered(std::slice::from_ref(set))?;
         let shard = self.shards.for_key(set.key.as_bytes());

@@ -213,6 +213,22 @@ pub struct StoreConfig {
     /// `resident_mode` both clear, every run takes the pool and this says
     /// nothing. See `docs/performance-proposals.md` §23.
     pub inline_max_commands: usize,
+    /// How often the background warmer re-establishes residency, in
+    /// milliseconds.
+    ///
+    /// Only meaningful with `resident_mode`. The warmer reads whatever the
+    /// store has grown since its last pass and extends the pin over it, so a
+    /// tick costs what the store grew rather than what it holds — which is why
+    /// this can be a timer instead of a growth signal.
+    ///
+    /// The cost of a longer interval is the window in which a grown store is
+    /// serving reads inline from pages that are not pinned. The cost of a
+    /// shorter one is a `/proc/self/maps` walk and an `mlock` over ranges
+    /// already locked. Seconds is the right order; `0` stops the warmer after
+    /// its first pass, which is the old behaviour of deciding once.
+    ///
+    /// See `docs/performance-proposals.md` §26.
+    pub resident_recheck_ms: u64,
     pub write: WriteConfig,
     pub ttl: TtlConfig,
     pub tags: TagConfig,
@@ -855,6 +871,10 @@ impl Default for StoreConfig {
             // with margin against both ends: below `1` the closed-loop win is
             // given up, at `16` the pipelined one is.
             inline_max_commands: 4,
+            // Seconds, not milliseconds: the window this bounds is how long a
+            // store that just grew may serve inline reads over unpinned pages,
+            // and a cache's working set does not usually double between ticks.
+            resident_recheck_ms: 5_000,
             shards: 0,
             write: WriteConfig::default(),
             ttl: TtlConfig::default(),
@@ -1244,6 +1264,13 @@ impl Config {
             // question about data that is not there.
             prefault: self.store.prefault || self.store.resident_mode,
             lock_map: self.store.resident_mode,
+            // **Only an explicit `prefault` makes the server wait for it.**
+            // `resident_mode` implies warming, but what it is actually after is
+            // the pin, and blocking startup on that was the stated reason it is
+            // off by default — tens of seconds for a large store, against
+            // plan §13's sub-second cold start. Warmed in the background
+            // instead; see `docs/performance-proposals.md` §26.
+            warm_at_open: self.store.prefault,
             bucket_granularity_ms: self.store.ttl.bucket_granularity_ms,
             max_tags: self.store.tags.max_tags,
             max_tags_per_record: self.store.tags.max_per_record,

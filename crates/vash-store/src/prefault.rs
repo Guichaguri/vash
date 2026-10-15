@@ -143,9 +143,22 @@ const CHUNK: usize = 1024 * 1024;
 /// serves correctly.
 /// `lock` additionally asks for the mapping to be pinned — see
 /// [`Warmed::locked`], which reports whether it worked.
-pub(crate) fn prefault(dir: &Path, high_water: u64, lock: bool) -> std::io::Result<Warmed> {
+///
+/// `from` is where the sequential read starts, so a re-warm pays for the bytes
+/// that arrived rather than for the whole file again — the difference between a
+/// recheck costing what the store grew and costing ~260 ms per GiB of whatever
+/// it already holds. Pass `0` for a first warm. The returned `bytes` is the
+/// cumulative mark reached, not the length of this read: the `mlock` walk
+/// clamps each range against it, and it has to describe the whole warmed
+/// prefix. See `docs/performance-proposals.md` §26.
+pub(crate) fn prefault(
+    dir: &Path,
+    from: u64,
+    high_water: u64,
+    lock: bool,
+) -> std::io::Result<Warmed> {
     let path = dir.join(DATA_FILE);
-    let bytes = warm_page_cache(&path, high_water)?;
+    let bytes = warm_page_cache(&path, from, high_water)?;
 
     #[cfg(target_os = "linux")]
     let locked = populate_page_tables(&path, bytes, lock);
@@ -190,16 +203,30 @@ fn raise_memlock_limit() {
     }
 }
 
-/// Reads the data file up to `limit`, so its pages are in the OS page cache.
+/// Reads the data file from `from` up to `limit`, so its pages are in the OS
+/// page cache.
 ///
 /// The bytes are read into a buffer and thrown away — the copy is the point of
 /// contact, not the data. Sequential, so the device delivers it at streaming
 /// bandwidth rather than at the random-access rate a fault-driven warm-up would
 /// get.
-fn warm_page_cache(path: &Path, limit: u64) -> std::io::Result<u64> {
+///
+/// Returns the **cumulative** mark reached rather than the bytes this call
+/// read, because that is what the caller reports and what the `mlock` walk
+/// clamps against. A `from` at or past `limit` reads nothing and answers
+/// `from`, which is the right answer for a store that has not grown.
+fn warm_page_cache(path: &Path, from: u64, limit: u64) -> std::io::Result<u64> {
+    use std::io::Seek;
+
+    if from >= limit {
+        return Ok(from);
+    }
     let mut file = std::fs::File::open(path)?;
+    if from > 0 {
+        file.seek(std::io::SeekFrom::Start(from))?;
+    }
     let mut buf = vec![0u8; CHUNK];
-    let mut total = 0u64;
+    let mut total = from;
     while total < limit {
         let want = CHUNK.min(usize::try_from(limit - total).unwrap_or(CHUNK));
         match file.read(&mut buf[..want]) {
@@ -375,7 +402,7 @@ mod tests {
         let len = CHUNK + 4096;
         let dir = with_data_file(len);
         assert_eq!(
-            prefault(dir.path(), len as u64, false)
+            prefault(dir.path(), 0, len as u64, false)
                 .expect("prefault")
                 .bytes,
             len as u64
@@ -393,7 +420,7 @@ mod tests {
         let dir = with_data_file(8 * CHUNK);
         let high_water = CHUNK as u64;
         assert_eq!(
-            prefault(dir.path(), high_water, false)
+            prefault(dir.path(), 0, high_water, false)
                 .expect("prefault")
                 .bytes,
             high_water
@@ -406,7 +433,7 @@ mod tests {
     fn stops_at_the_end_of_a_short_file() {
         let dir = with_data_file(4096);
         assert_eq!(
-            prefault(dir.path(), 8 * CHUNK as u64, false)
+            prefault(dir.path(), 0, 8 * CHUNK as u64, false)
                 .expect("prefault")
                 .bytes,
             4096
@@ -418,6 +445,6 @@ mod tests {
     #[test]
     fn reports_a_missing_data_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(prefault(dir.path(), CHUNK as u64, false).is_err());
+        assert!(prefault(dir.path(), 0, CHUNK as u64, false).is_err());
     }
 }

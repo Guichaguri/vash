@@ -290,7 +290,12 @@ impl Backend for MdbxBackend {
         unsafe { check(ffi::mdbx_env_sync_ex(self.env, true, false), "env_sync") }
     }
 
-    fn warm(&self, config: &StoreConfig) -> Warmed {
+    // `from` is ignored, and that is the engine difference rather than an
+    // omission: mdbx warms through one primitive that takes the whole map, so
+    // there is no prefix to skip. LMDB's warm is a sequential read of its data
+    // file, which is why that one can resume and this one has nothing to resume
+    // from. A re-warm here costs the same as a first warm.
+    fn warm(&self, config: &StoreConfig, _from: u64) -> Warmed {
         if !config.prefault {
             return Warmed::default();
         }

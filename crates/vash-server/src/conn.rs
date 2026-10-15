@@ -680,7 +680,7 @@ async fn drain<S: Copy + Send + 'static>(
         // workload fell from 147,180 to 85,521 ops/s that way. Collapsing to one
         // run restores exactly the old route; a block that is *only* writes is
         // already one run and still takes the awaited path.
-        if !state.inline_reads && runs.len() > 1 {
+        if !state.inline_reads() && runs.len() > 1 {
             let whole = measured.complete;
             let commands = runs.iter().map(|r| r.count).sum();
             runs.clear();
@@ -709,7 +709,7 @@ async fn drain<S: Copy + Send + 'static>(
             let inline = worth_inlining(
                 runs[index].kind,
                 runs[index].count,
-                state.inline_reads,
+                state.inline_reads(),
                 state.inline_max_commands,
             );
             let awaitable = runs[index].kind == RunKind::Writes && writes.is_some();
@@ -724,7 +724,7 @@ async fn drain<S: Copy + Send + 'static>(
                     let next_inline = worth_inlining(
                         next.kind,
                         next.count,
-                        state.inline_reads,
+                        state.inline_reads(),
                         state.inline_max_commands,
                     );
                     let next_awaitable = next.kind == RunKind::Writes && writes.is_some();

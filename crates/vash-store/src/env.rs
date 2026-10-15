@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use vash_core::Clock;
 
-use crate::backend::{Backend, FULL, ReadTxn, WriteTxn};
+use crate::backend::{Backend, FULL, ReadTxn, Warmed, WriteTxn};
 use crate::config::StoreConfig;
 use crate::engine::{Engine, Pressure};
 use crate::error::{Result, StoreError};
@@ -153,7 +153,18 @@ impl<B: Backend> Engine<B> {
         // After the commit above, so the file is at its final length and
         // nothing warmed here is about to be rewritten. Best-effort by
         // contract — see [`Backend::warm`].
-        let warmed = backend.warm(config);
+        //
+        // **Skipped when the warm belongs in the background.** `prefault` is a
+        // deliberate trade of startup time for a warm first request and still
+        // happens here; `resident_mode` wants the map pinned, and waiting tens
+        // of seconds for that is the stated reason it is off by default. That
+        // one is left to the warmer, which flips inline reads on when the pin
+        // is established. See `docs/performance-proposals.md` §26.
+        let warmed = if config.warm_at_open {
+            backend.warm(config, 0)
+        } else {
+            Warmed::default()
+        };
 
         info!(
             path = %config.path.display(),
@@ -188,16 +199,55 @@ impl<B: Backend> Engine<B> {
             shard_index,
             shard_count: shard_count.max(1),
             reader_ages: crate::readers::ReaderAges::default(),
-            map_locked: warmed.locked,
-            warmed_bytes: warmed.bytes,
+            map_locked: std::sync::atomic::AtomicBool::new(warmed.locked),
+            warmed_bytes: AtomicU64::new(warmed.bytes),
+            config: config.clone(),
         })
     }
 
     /// Whether this shard's map is pinned in memory, so a read cannot fault to
     /// disk. What `store.resident_mode` checks before it puts reads on a
     /// runtime worker; see [`crate::backend::Warmed::locked`].
+    ///
+    /// **A current answer, not a startup one.** [`Self::warm_step`] moves it in
+    /// both directions.
     pub fn map_locked(&self) -> bool {
-        self.map_locked
+        self.map_locked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Brings this shard's residency up to date, and reports whether it holds.
+    ///
+    /// One step of §26's background warmer: warm whatever has arrived since the
+    /// last step, extend the pin over it, and publish both answers. Returns
+    /// whether the map is pinned **now**, which is what decides if reads may run
+    /// on a runtime worker.
+    ///
+    /// Cheap when nothing has grown — `warm` is handed the mark the last step
+    /// reached, so a store that has not moved reads no bytes. That is what makes
+    /// this safe to call on a timer rather than only on a growth signal, and it
+    /// is why [`crate::backend::Backend::warm`] takes a `from`.
+    ///
+    /// **Clearing matters as much as setting.** A store that grew past what
+    /// could be locked has pages nothing pinned, and leaving `map_locked` at
+    /// `true` is exactly the expiring bet §24 found. A failed step publishes
+    /// `false` and the server puts reads back on the pool.
+    pub fn warm_step(&self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        if !self.config.prefault {
+            return false;
+        }
+        let from = self.warmed_bytes.load(Ordering::Relaxed);
+        let high_water = self.backend.info().high_water_bytes;
+        // Nothing new, and nothing to re-decide: a pin established over the
+        // whole file is still a pin over the whole file.
+        if from >= high_water && from > 0 {
+            return self.map_locked.load(Ordering::Relaxed);
+        }
+        let warmed = self.backend.warm(&self.config, from);
+        self.warmed_bytes.store(warmed.bytes, Ordering::Relaxed);
+        self.map_locked.store(warmed.locked, Ordering::Relaxed);
+        warmed.locked
     }
 
     pub fn write_txn(&self) -> Result<B::RwTxn<'_>> {

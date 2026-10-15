@@ -285,6 +285,12 @@ impl Store for MemoryStore {
         true
     }
 
+    /// Already resident, and permanently: there is no file and no mapping, so
+    /// there is nothing to warm and nothing that can stop being warm.
+    fn warm_step(&self) -> bool {
+        true
+    }
+
     /// Applied inline — there is no writer thread to wait for — so the handle
     /// comes back already resolved.
     fn submit_set_many(&self, sets: &[Set<'_>]) -> Result<crate::PendingSetMany> {

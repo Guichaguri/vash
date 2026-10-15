@@ -161,6 +161,19 @@ pub struct StoreConfig {
     ///
     /// [`Store::map_locked`]: crate::Store::map_locked
     pub lock_map: bool,
+    /// Whether the warm happens before the store opens, or afterwards on a
+    /// background thread.
+    ///
+    /// **This is what separates the two settings that ask for warming.**
+    /// `server.store.prefault` is a deliberate trade of startup time for
+    /// predictable first-request latency, so it warms at open and the server
+    /// waits. `server.store.resident_mode` asks for something else — reads
+    /// served inline, which needs the map *pinned* rather than merely read —
+    /// and paying tens of seconds of startup for it was the stated reason it is
+    /// off by default. So it warms in the background instead, and inline reads
+    /// turn on when the pin is established rather than before the first
+    /// request. See `docs/performance-proposals.md` §26.
+    pub warm_at_open: bool,
     /// Granularity that expiry-index buckets are rounded up to. Coarser means
     /// fewer distinct index keys and less write amplification; it never delays
     /// a read from seeing the key as expired, because the read path checks the
@@ -284,6 +297,9 @@ impl Default for StoreConfig {
             write_map: false,
             prefault: false,
             lock_map: false,
+            // Only meaningful with `prefault`, and `true` because the setting
+            // that asks for warming at open is the one that names it.
+            warm_at_open: true,
             bucket_granularity_ms: 1000,
             max_tags: 100_000,
             max_tags_per_record: vash_core::DEFAULT_MAX_TAGS,

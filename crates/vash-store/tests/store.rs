@@ -2361,3 +2361,80 @@ fn a_store_with_write_map_still_serves() {
     assert_eq!(h.get(b"k").as_deref(), Some(&b"w"[..]));
     assert_eq!(h.expiry_entries(), 1);
 }
+
+/// **A warm step is idempotent and cheap once the store has not grown.**
+///
+/// §26 runs this on a timer, so a step over a store that has not moved must
+/// read nothing and must not change its own answer. The `from` mark is what
+/// makes that true: `warm` is handed where the last step finished, so a store
+/// at the same high-water mark has no range left to cover.
+#[test]
+fn a_warm_step_over_an_unchanged_store_is_stable() {
+    let h = Harness::with(|c| c.prefault = true);
+    h.set(b"k", b"v", 0);
+
+    let first = h.store().warm_step();
+    let covered = h.store().stats().unwrap().warmed_bytes;
+    assert!(covered > 0, "a warm with prefault on must cover something");
+
+    for _ in 0..5 {
+        assert_eq!(
+            h.store().warm_step(),
+            first,
+            "a step over an unchanged store must not change its own answer"
+        );
+        assert_eq!(
+            h.store().stats().unwrap().warmed_bytes,
+            covered,
+            "nor re-cover ground it already covered"
+        );
+    }
+}
+
+/// **Warming follows the store as it grows**, which is the half §24 found
+/// missing: the mark was taken once at open and never moved again, so a store
+/// that outgrew it kept claiming a residency that covered less and less of it.
+#[test]
+fn a_warm_step_follows_a_growing_store() {
+    let h = Harness::with(|c| c.prefault = true);
+    h.set(b"seed", b"v", 0);
+    h.store().warm_step();
+    let before = h.store().stats().unwrap().warmed_bytes;
+
+    // Enough to push the high-water mark well past where the first step
+    // finished, which a handful of small records would not do.
+    for i in 0..4_000u32 {
+        h.set(format!("grow-{i:05}").as_bytes(), &[b'x'; 512], 0);
+    }
+    let high_water = h.store().stats().unwrap().high_water_bytes;
+    assert!(
+        high_water > before,
+        "the store has to actually grow for this to test anything: {high_water} vs {before}"
+    );
+
+    h.store().warm_step();
+    let after = h.store().stats().unwrap().warmed_bytes;
+    assert!(
+        after > before,
+        "a step after growth must cover more than one before it: {after} vs {before}"
+    );
+    assert!(
+        after >= high_water,
+        "and must reach the mark the store had grown to: {after} vs {high_water}"
+    );
+}
+
+/// **With warming off, a step claims nothing.**
+///
+/// The failure this guards is the one that matters: a server whose store was
+/// never warmed must not be told its map is resident, because that is what
+/// decides whether reads may run on a runtime worker.
+#[test]
+fn a_warm_step_without_prefault_never_claims_residency() {
+    let h = Harness::new();
+    h.set(b"k", b"v", 0);
+
+    assert!(!h.store().warm_step());
+    assert_eq!(h.store().stats().unwrap().warmed_bytes, 0);
+    assert!(!h.store().map_locked());
+}

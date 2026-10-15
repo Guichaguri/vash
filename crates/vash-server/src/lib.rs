@@ -281,25 +281,23 @@ impl Server {
             .await
             .with_context(|| format!("binding {}", config.server.listen))?;
 
-        // `resident_mode` is a request, not a setting: it earns inline reads
-        // only by having locked every shard's map. Reported either way, because
-        // "I asked for this and did not get it" is exactly the thing an
-        // operator must not have to infer from a throughput graph.
-        let inline_reads = if config.store.resident_mode && !config.store.inline_reads {
-            let locked = store.map_locked();
-            if locked {
-                info!("resident mode: every shard's map is locked; serving reads inline");
-            } else {
-                warn!(
-                    "resident mode: the map could not be locked, so reads keep the \
-                     storage-pool hand-off. Raise RLIMIT_MEMLOCK above the store's \
-                     size, or set store.inline_reads to assert residency yourself"
-                );
-            }
-            locked
-        } else {
-            config.store.inline_reads
-        };
+        // **`resident_mode` starts as false and is earned.** It is a request
+        // for every shard's map to be pinned, and under §26 that happens on a
+        // background thread rather than before the first request — so the
+        // server opens with reads on the pool, exactly as a server without the
+        // setting does, and `spawn_warmer` turns them inline once the pin is
+        // established. An operator watching for it sees the transition logged
+        // and `vash_inline_reads` change without a restart.
+        //
+        // `store.inline_reads` set directly is the operator asserting residency
+        // themselves, which skips the check as it always has.
+        let inline_reads = config.store.inline_reads;
+        if config.store.resident_mode && !config.store.inline_reads {
+            info!(
+                "resident mode: warming in the background; reads stay on the \
+                 storage-pool hand-off until every shard's map is locked"
+            );
+        }
 
         let state = ServerState::new(
             Arc::clone(&store),
@@ -452,6 +450,16 @@ impl Server {
         // Joined before the store is closed below: a detached task holding an
         // `Arc<ServerState>` would keep the LMDB environment open past
         // shutdown.
+        // §26. Joined below for the reason the others are: a detached task
+        // holding an `Arc<ServerState>` would keep the environment open past
+        // shutdown.
+        let warm_task = spawn_warmer(
+            Arc::clone(&state),
+            config.store.resident_mode && !config.store.inline_reads,
+            std::time::Duration::from_millis(config.store.resident_recheck_ms),
+            conn_stopped.clone(),
+        );
+
         let reload_task = spawn_reload(
             Arc::clone(&state),
             config.auth.clone(),
@@ -577,6 +585,9 @@ impl Server {
             let _ = task.await;
         }
         if let Some(task) = reload_task {
+            let _ = task.await;
+        }
+        if let Some(task) = warm_task {
             let _ = task.await;
         }
         let outstanding = config.server.max_connections as u32;
@@ -791,6 +802,81 @@ async fn serve_encrypted(
 ///
 /// A reload that fails leaves the running table in place and logs. Refusing to
 /// start on a bad file is right, because nothing is serving yet; swapping in an
+/// §26's background warmer: keeps residency true rather than remembering it.
+///
+/// **Why this exists at all.** `resident_mode` asks for every shard's map to be
+/// pinned so reads can run on a runtime worker without risking a fault. Doing
+/// that at open cost startup time proportional to the data — tens of seconds
+/// for a large store, which is the stated reason the setting is off by default
+/// — and it settled the question once, so a store that grew past what was
+/// locked kept serving reads inline from pages nothing had pinned. One loop
+/// fixes both: nothing waits for the warm, and the warm never stops checking.
+///
+/// Each step runs on a blocking thread, because it reads the data file.
+/// Steps are cheap once the store is warm: `warm_step` is handed the mark the
+/// last one reached, so a store that has not grown reads no bytes.
+///
+/// **It publishes failure as readily as success.** A step that cannot extend
+/// the pin clears `inline_reads` and reads go back to the storage pool, which
+/// is the behaviour a server without this setting has always had.
+fn spawn_warmer(
+    state: Arc<ServerState>,
+    governs: bool,
+    interval: std::time::Duration,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // **Only `resident_mode` hands this loop the flag.** An operator who set
+    // `store.inline_reads` directly has asserted residency themselves, and the
+    // configuration promises that assertion "still works and still skips the
+    // check" — a warmer that found no `prefault` to do, answered `false` and
+    // switched their reads back to the pool would be overriding them. It is
+    // their deployment and their claim.
+    if !governs {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        loop {
+            let warming = Arc::clone(&state.store);
+            // `spawn_blocking` rather than the runtime: this reads a file.
+            let locked = match tokio::task::spawn_blocking(move || warming.warm_step()).await {
+                Ok(locked) => locked,
+                // The step panicked. Treating that as "not resident" is the
+                // conservative answer, and the one that keeps reads safe.
+                Err(e) => {
+                    error!(error = %e, "the residency warmer panicked; keeping reads on the pool");
+                    false
+                }
+            };
+
+            // Logged on the transition only. A tick that found nothing new is
+            // the common case and says nothing worth a line.
+            if state.set_inline_reads(locked) {
+                if locked {
+                    info!("resident mode: every shard's map is locked; serving reads inline");
+                } else {
+                    warn!(
+                        "resident mode: the map is no longer fully locked, so reads are \
+                         back on the storage-pool hand-off. The store has outgrown what \
+                         could be pinned — raise RLIMIT_MEMLOCK above its size"
+                    );
+                }
+            }
+
+            // `0` means warm once and stop, which is the old behaviour of
+            // settling the question at startup — kept reachable because an
+            // operator with a store that never grows has no reason to pay for
+            // the walk.
+            if interval.is_zero() {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = stopping.changed() => return,
+            }
+        }
+    }))
+}
+
 /// empty table because someone truncated the file mid-edit is not.
 #[cfg(unix)]
 fn spawn_reload(

@@ -161,7 +161,7 @@ impl Backend for LmdbBackend {
         self.env.force_sync().map_err(map_err)
     }
 
-    fn warm(&self, config: &StoreConfig) -> Warmed {
+    fn warm(&self, config: &StoreConfig, from: u64) -> Warmed {
         if !config.prefault {
             return Warmed::default();
         }
@@ -169,7 +169,7 @@ impl Backend for LmdbBackend {
         // separating the data from a sparse file the size of the whole map.
         // See `prefault` — getting this wrong is expensive and silent.
         let high_water = self.info().high_water_bytes;
-        match crate::prefault::prefault(&config.path, high_water, config.lock_map) {
+        match crate::prefault::prefault(&config.path, from, high_water, config.lock_map) {
             Ok(warmed) => warmed,
             Err(err) => {
                 // Logged and ignored on purpose: a map that could not be warmed

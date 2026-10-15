@@ -187,7 +187,14 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// Best-effort by contract. The result is *reported* rather than assumed
     /// because a caller uses it to decide whether reads may run on a runtime
     /// worker — see [`crate::Store::map_locked`].
-    fn warm(&self, config: &StoreConfig) -> Warmed;
+    ///
+    /// **Callable more than once.** `from` is the mark a previous warm reached,
+    /// so a re-warm covers what has arrived since rather than the whole map
+    /// again; `0` is a first warm. `Warmed::bytes` is the cumulative mark, not
+    /// this call's read, because that is what the next call passes back in and
+    /// what any pinning has to be clamped against. See
+    /// `docs/performance-proposals.md` §26.
+    fn warm(&self, config: &StoreConfig, from: u64) -> Warmed;
 
     /// Releases the environment.
     ///

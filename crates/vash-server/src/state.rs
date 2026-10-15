@@ -27,7 +27,16 @@ pub struct ServerState {
     pub cluster: Arc<Cluster>,
     /// Read-only requests skip the hop to the storage tier. See
     /// [`crate::config::StoreConfig::inline_reads`].
-    pub inline_reads: bool,
+    ///
+    /// **Atomic because residency is maintained rather than decided.** §26's
+    /// background warmer sets this when every shard's map comes back pinned and
+    /// clears it when a store that has grown can no longer be pinned over.
+    /// Read through [`Self::inline_reads`].
+    ///
+    /// Both directions are safe mid-flight: a run is routed once, when it is
+    /// measured, and turning this off only sends more runs to the pool — which
+    /// §23 establishes is the safe tier by construction.
+    inline_reads: std::sync::atomic::AtomicBool,
     /// The longest read run, in commands, still worth serving inline. Only
     /// consulted when [`Self::inline_reads`] is set. See
     /// [`crate::config::StoreConfig::inline_max_commands`].
@@ -119,6 +128,26 @@ impl From<&crate::config::ServerConfig> for ConnLimits {
 }
 
 impl ServerState {
+    /// Whether reads may currently run on a runtime worker.
+    ///
+    /// A relaxed load: the answer is a routing hint that is allowed to be one
+    /// run stale in either direction, and a hop costs 18.9 µs (§22) against an
+    /// atomic load's handful of nanoseconds.
+    #[inline]
+    pub fn inline_reads(&self) -> bool {
+        self.inline_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publishes what §26's warmer last established.
+    ///
+    /// Returns whether this changed the answer, so the caller can log a
+    /// transition without logging every tick that found nothing new.
+    pub fn set_inline_reads(&self, enabled: bool) -> bool {
+        self.inline_reads
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed)
+            != enabled
+    }
+
     // Ten, and they are ten independent things a server is assembled from
     // rather than one thing with ten parts. A parameter struct here would
     // exist only to satisfy the lint, and every caller would fill it in field
@@ -146,7 +175,7 @@ impl ServerState {
             auth,
             metrics: crate::metrics::ServerMetrics::default(),
             cluster,
-            inline_reads,
+            inline_reads: std::sync::atomic::AtomicBool::new(inline_reads),
             inline_max_commands,
             write_permits,
             scan_cursors: crate::scan::ScanCursors::new(
