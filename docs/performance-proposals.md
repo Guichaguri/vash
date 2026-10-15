@@ -2201,8 +2201,27 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~3~~ | §15 skip the redundant expiry put | done | **−24% commit per record, +25.5% pipelined `SET`** |
 | ~~4~~ | §26 warm in the background, and keep warming | done | **cold start back to the floor** (1,018 ms against 2,935), the pin re-established rather than remembered, and §23's read figures intact |
 | ~~5~~ | §27 turn `resident_mode` on by default | done | **2.7× closed-loop reads on the shipped defaults**, pipelined unchanged, and nothing worse where the lock cannot be had |
-| 6 | explain the pipelined read's bimodality | a day | §23's pool-inflation answer is measured but incomplete — see §27 |
-| 7 | profile the pipelined read against memcached | a day | decides whether the remaining 1.34× is worth a proposal |
+| 6 | §30 explain the pipelined read's bimodality | part done | **latency, not work** — five hypotheses eliminated, one left and a test for it |
+| 7 | §28 commit on the submitting thread when uncontended | a week | the one row vash still loses to Redis that is not structural |
+| 8 | §29 fuse consecutive single-key reads into one transaction | two days | 5–10% of a pipelined read, and it will not close the 1.34× alone |
+| 9 | `read_header`'s framing walk | a day | ~67 ns a `GET`, roughly 5% of one core |
+| 10 | profile the pipelined read against memcached | a day | what is left of the 1.34× once 8 and 9 are in |
+
+**6 is first and it buys nothing.** Every pipelined figure in this document is
+quoted with a ±35% band, so no change below 35% on that row can be told from
+noise — which is most of them. Until the low mode is explained, 8 and 10 cannot
+be evaluated even if they work. It is the cheapest item here and the only one
+that makes the others measurable.
+
+§30 took it as far as establishing the *shape*: the server is waiting, not
+working — its CPU is flat at ~225% across a 1.5× range of throughput, and
+neither side ever reaches its ceiling. Five hypotheses are eliminated with
+measurements, one is left, and the test for it is written down. The counter it
+needed, `vash_socket_reads_total`, shipped with it.
+
+**The clocks are deliberately absent.** §21 puts them at 95% of a `GET`'s
+instrumentation, which is ~2% of four cores, and §19 already argued against all
+three obvious fixes on correctness grounds. That argument has not changed.
 
 **4 moved above 5.** It was last when the read numbers were hypothetical; now
 they are measured and unreachable on the shipped configuration, which makes the
@@ -2454,3 +2473,94 @@ So the pool-inflation effect is real and measured, and it is **not** the whole
 of the variance. Something else moves this row between roughly 550,000 and
 850,000 on identical fresh servers, and nothing in this document explains it
 yet. It is the reason every pipelined figure here is quoted with its spread.
+
+---
+
+## 30. The pipelined read's two modes are latency, not work
+
+**Status: five hypotheses eliminated, the shape of the answer established, the
+mechanism not yet confirmed. Recorded so the next attempt starts from here
+rather than from the top.**
+
+Pipelined `GET` lands in one of two modes, decided within the first moments of
+a process and held for its life: roughly 550,000 or roughly 850,000 operations
+a second, on identical fresh servers with identical configuration. Every
+pipelined figure in this document is quoted with the resulting ±35% band, which
+is wider than most of the improvements left to make — so nothing below §25's
+item 6 can be evaluated until this is understood.
+
+### What it is not
+
+Each of these was measured, not reasoned about, and each is dead:
+
+| Hypothesis | What killed it |
+|---|---|
+| Transparent huge pages | Host is in `madvise`; vash never asks for them, and the map is file-backed |
+| Blocking-pool size | 135 threads alive and 132 having run, on every one of 12 runs, both modes |
+| Thread and SMT placement | Work spread evenly over all four vCPUs on every run, both modes |
+| Block size | **15.00–15.11 commands per block on every run**, fast and slow alike |
+| Work scattered over cold threads | Four threads at ~24.8% each, half the CPU in three threads, identical in both modes |
+
+The block-size one is worth dwelling on because it was wrong in an instructive
+way. Voluntary context switches separate the modes perfectly, so smaller blocks
+— more hand-offs per command — looked like the obvious cause. Measuring it
+directly said 15 commands a block in both modes. The switches were real; the
+inference from them was not.
+
+### What it is
+
+**Neither side is saturated, and the server's CPU does not move with
+throughput.** Sampled over ten runs, server and client each pinned to two
+physical cores, so 400% is the ceiling for both:
+
+| ops/s | server CPU | client CPU | µs of server CPU per op |
+|---:|---:|---:|---:|
+| 551,757 | 210% | 136% | 3.8 |
+| 555,234 | 234% | 123% | 4.2 |
+| 559,061 | 221% | 137% | 4.0 |
+| 787,063 | 231% | 189% | 2.9 |
+| 837,750 | 255% | 180% | 3.0 |
+| 857,649 | 228% | 217% | 2.7 |
+
+The server burns about 225% in both modes while delivering a 1.5× range of
+throughput, and never approaches its ceiling. The client's CPU simply tracks
+how much work it is getting back.
+
+**So this is a latency phenomenon, not a throughput one.** At 100 connections
+and 16 in flight, throughput is requests-in-flight over round-trip time; a
+longer round trip drops it with nobody busy. Five experiments looked for extra
+work being done, and there is none being done.
+
+That reinstates the context-switch signal as the right clue, read wrongly. The
+extra switches are not CPU — they are **park and wake on the hand-off path**,
+and per block rather than per command:
+
+| | voluntary switches per block |
+|---|---:|
+| fast mode | ~2.1 — one hand-off there and back, the floor |
+| slow mode | ~3.7 |
+
+### The hypothesis left standing, and how to kill it
+
+**Whether the blocking pool's threads stay hot between blocks.** A hand-off to a
+thread that is awake is cheap; one to a parked thread costs a futex wake, which
+is latency, which lowers throughput, which makes the next thread likelier to
+have parked. That is positive feedback with two stable points, and it would be
+settled by how the first moments of a run happen to land — which is exactly the
+observed behaviour.
+
+It also predicts something already measured. The always-inline arm takes **no
+hand-off at all**, and it is the only configuration here that does not have two
+modes: 596,202 to 606,327 across the §23 sweep, a 1% spread, against the pooled
+path's 550,000 to 860,000.
+
+**The cheap test**: raise offered load — pipeline 64 rather than 16, or more
+connections — so that blocks arrive faster than a thread can park between them.
+If the low mode disappears as load rises, the mechanism is parking. If both
+modes survive at every depth, it is not, and the next suspect is the reply
+write path rather than the dispatch one.
+
+**What it would be worth.** Removing the low mode does not raise the ceiling —
+the fast mode is already ~850,000 — but it would move the *median* of this row
+from roughly 800,000 to roughly 850,000 and, far more usefully, make every
+future change on the read path measurable at better than ±35%.
