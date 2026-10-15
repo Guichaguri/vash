@@ -1866,7 +1866,10 @@ async fn resident_mode_serves_reads_inline_only_when_the_map_is_locked() {
     let mut inline = String::new();
     for _ in 0..100 {
         let fields = stat_fields(&mut c, "stats settings\r\n").await;
-        locked = fields.get("vash_map_locked").expect("vash_map_locked").clone();
+        locked = fields
+            .get("vash_map_locked")
+            .expect("vash_map_locked")
+            .clone();
         inline = fields
             .get("vash_inline_reads")
             .expect("vash_inline_reads")
