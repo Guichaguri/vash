@@ -2203,8 +2203,8 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~5~~ | §27 turn `resident_mode` on by default | done | **2.7× closed-loop reads on the shipped defaults**, pipelined unchanged, and nothing worse where the lock cannot be had |
 | ~~6~~ | §30 explain the pipelined read's bimodality | closed, unsolved | six hypotheses dead; it is queueing, ~97% of a 2 ms round trip that no component owns. **Change the measurement, not the server** |
 | ~~7~~ | §28 commit on the submitting thread when uncontended | **dropped** | priced at 12% before building: 115,432 against Redis's 141,573. Does not clear the row it was for |
-| 8 | §29 fuse consecutive single-key reads into one transaction | two days | 5–10% of a pipelined read, and it will not close the 1.34× alone. **Now the first unbuilt item** |
-| 9 | `read_header`'s framing walk | a day | ~67 ns a `GET`, roughly 5% of one core |
+| ~~8~~ | §29 fuse consecutive single-key reads into one transaction | **shelved** | priced at 126 ns a command, ~4.5% of a CPU budget that is not the binding constraint. Small, not wrong |
+| 9 | `read_header`'s framing walk | a day | ~67 ns a `GET`. **Price it first** — the same arithmetic that shelved §29 likely applies |
 | 10 | profile the pipelined read against memcached | a day | what is left of the 1.34× once 8 and 9 are in |
 
 **6 is first and it buys nothing.** Every pipelined figure in this document is
@@ -2806,3 +2806,70 @@ That answer has not changed.
 nine-minute measurement off counters that already existed killed a week of
 work. §30 spent six experiments building instrumentation for a question whose
 prize was never bounded first. Bound the prize, then build.
+
+---
+
+## 29. Priced and shelved: fusing consecutive single-key reads
+
+**Status: measured before building, as §28 was. The prize is ~4.5% of CPU on
+one workload shape, on a path that is not CPU-bound. Not built.**
+
+§18 fused the multi-key *commands* — `MGET`, `get k1 k2` — so those take one
+reader for the batch. A pipelined block of N **single-key** `GET`s does not:
+[`dispatch::execute_get_into`](../crates/vash-server/src/dispatch.rs) calls
+`get_with` per command, so each opens a read transaction of its own. At the
+fifteen commands a block §30 measured, that is fifteen transactions where one
+would serve, and `get_many_with` already exists to serve the fused form.
+
+### What it is worth
+
+`cargo bench -p vash-bench --bench hot_path`, the same keys through both paths,
+medians:
+
+| keys | fused `get_many_with` | separate `get_with` × N | saved per command |
+|---:|---:|---:|---:|
+| 2 | 570.7 ns | 561.5 ns | **−5 ns** — fusing is slower |
+| 16 | 3.154 µs | 5.174 µs | 126 ns |
+| 100 | 17.50 µs | 34.91 µs | 174 ns |
+
+A read transaction costs about 135 ns: a clock read for the snapshot, a
+reader-slot update, and `mdb_txn_begin` against a thread-local slot. Fifteen of
+them per block is ~2 µs, or ~126 ns a command.
+
+**Against the CPU a pipelined read actually costs — 2.7 to 3.0 µs, from 837,750
+ops/s at 255% and 857,649 at 228% — that is 4.2% to 4.6%.** The bottom of the
+5–10% this was estimated at.
+
+### Why even that overstates it
+
+**The path is not CPU-bound.** §30 measured the server flat at ~225% of a 400%
+ceiling across a 1.5× throughput range, with ~97% of the round trip being
+queueing no component owns. Removing 4.5% of the service time on a resource at
+56% utilisation does not return 4.5% of throughput. As latency it is 2 µs off a
+1,780 µs block round trip: 0.1%.
+
+**It does nothing for closed-loop reads.** One command a block is nothing to
+fuse, and that is the row where vash leads Redis by 1.95× and the measurement
+is stable.
+
+**And it cannot be unconditional.** At two keys the fused path is *slower* —
+the batch machinery costs more than the transaction it saves — so this needs a
+run-length threshold, which is more branching in `drain` on top of §23's.
+
+### Why it is shelved rather than rejected
+
+§28 was dropped at 12%. Building §29 at 4.5% would be applying a weaker
+standard to the item whose bench had already been written, which is sunk cost
+rather than judgement.
+
+But unlike §28 it is **not wrong, only small**, and two things would change the
+arithmetic. If the server ever becomes CPU-bound — more connections per core
+than the four vCPUs here, or a deployment that pins fewer — 4.5% of service
+time starts returning throughput. And if §25's item 10 finds the memcached gap
+is an accumulation of several per-command costs rather than one, this is one of
+them and they are worth taking together rather than singly.
+
+**What shipped from the attempt**: `read_separate_gets_then_encode`, beside the
+fused arm it is measured against. The gap between the two is now standing
+evidence rather than something to re-derive, and the next person to reach for
+this proposal gets the number before the week.

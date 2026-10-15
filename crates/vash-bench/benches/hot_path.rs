@@ -510,6 +510,41 @@ fn read_batch_of_many_in_txn(bencher: divan::Bencher, keys: usize) {
     });
 }
 
+/// **What a pipelined block of separate `GET`s costs today**, against the fused
+/// arm above over the same keys.
+///
+/// §18 fused the *multi-key commands* — `MGET`, `get k1 k2` — so those take one
+/// reader for the batch. A pipelined block of N **single-key** `GET`s does not:
+/// `dispatch::execute_get_into` calls `get_with` per command, so each one opens
+/// a read transaction of its own. At the fifteen commands a block that §30
+/// measured, that is fifteen transactions where one would serve.
+///
+/// The gap between this and `read_batch_of_many_in_txn` is what §29 is worth,
+/// and it is measured before §29 is built — §28 was costed at a week on an
+/// assumption that turned out to be 12%, and this is the same question asked
+/// the cheap way first.
+///
+/// A transaction is not free and not expensive: a clock read for the snapshot,
+/// a reader-slot update, and `mdb_txn_begin` against a thread-local slot. The
+/// point of measuring is that "not expensive" is not a number.
+#[divan::bench(args = [2, 16, 100], sample_size = 200)]
+fn read_separate_gets_then_encode(bencher: divan::Bencher, keys: usize) {
+    let store = BatchFixture::new(keys);
+    let lookups = store.keys();
+
+    let mut out = Vec::with_capacity(keys * (BatchFixture::VALUE_LEN + 64));
+    bencher.bench_local(|| {
+        out.clear();
+        for key in divan::black_box(&lookups) {
+            vash_store::Store::get_with(&store.store, *key, &mut |value| {
+                out.extend_from_slice(value.data)
+            })
+            .unwrap();
+        }
+        divan::black_box(out.len())
+    });
+}
+
 /// **A VCP `GET_MANY` as it was framed.** Three copies of every value — out of
 /// the map into a `Value`, out of that into the body, out of the body into the
 /// write buffer — and two allocations on top of the one per hit that building a
