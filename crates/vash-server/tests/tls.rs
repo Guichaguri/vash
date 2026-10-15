@@ -381,29 +381,45 @@ async fn stats_conns_marks_encrypted_connections() {
     // a rollout is looking for.
     let _plain = server.connect_plain().await;
 
-    // Asked over the encrypted connection, so the answer includes itself.
-    encrypted.send(b"stats conns\r\n").await;
-    let text = tokio::time::timeout(DEADLINE, async {
-        let mut out = Vec::new();
+    // **Polled rather than asked once.** `connect_plain` returns when the TCP
+    // handshake completes, which says nothing about the server having accepted
+    // the connection and registered it — so a single `stats conns` is a race
+    // against the accept loop, and one this test used to win only because the
+    // server had nothing else to do at startup. It stopped winning when the
+    // residency warmer gave it something.
+    //
+    // What is being asserted is that a silent plaintext connection *appears*,
+    // not how many microseconds it takes to, so waiting for it is the honest
+    // shape. The deadline still fails the test if it never shows up.
+    let mut flags: Vec<String> = Vec::new();
+    let found = tokio::time::timeout(DEADLINE, async {
         loop {
-            let mut chunk = [0u8; 64 * 1024];
-            let read = encrypted.stream.read(&mut chunk).await.unwrap();
-            out.extend_from_slice(&chunk[..read]);
-            if out.ends_with(b"END\r\n") {
-                return String::from_utf8(out).unwrap();
+            // Asked over the encrypted connection, so the answer includes itself.
+            encrypted.send(b"stats conns\r\n").await;
+            let mut out = Vec::new();
+            let text = loop {
+                let mut chunk = [0u8; 64 * 1024];
+                let read = encrypted.stream.read(&mut chunk).await.unwrap();
+                out.extend_from_slice(&chunk[..read]);
+                if out.ends_with(b"END\r\n") {
+                    break String::from_utf8(out).unwrap();
+                }
+            };
+            flags = text
+                .lines()
+                .filter(|line| line.contains(":vash_tls "))
+                .map(|line| line.rsplit(' ').next().unwrap().to_string())
+                .collect();
+            if flags.iter().any(|f| f == "yes") && flags.iter().any(|f| f == "no") {
+                return;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("reading stats conns timed out");
+    .await;
 
-    let flags: Vec<&str> = text
-        .lines()
-        .filter(|line| line.contains(":vash_tls "))
-        .map(|line| line.rsplit(' ').next().unwrap())
-        .collect();
     assert!(
-        flags.contains(&"yes") && flags.contains(&"no"),
+        found.is_ok(),
         "one encrypted and one plaintext connection are open, so both must \
          appear: {flags:?}"
     );
