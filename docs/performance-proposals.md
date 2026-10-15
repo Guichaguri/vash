@@ -2204,6 +2204,7 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~6~~ | §30 explain the pipelined read's bimodality | closed, unsolved | six hypotheses dead; it is queueing, ~97% of a 2 ms round trip that no component owns. **Change the measurement, not the server** |
 | ~~7~~ | §28 commit on the submitting thread when uncontended | **dropped** | priced at 12% before building: 115,432 against Redis's 141,573. Does not clear the row it was for |
 | ~~8~~ | §29 fuse consecutive single-key reads into one transaction | **shelved** | priced at 126 ns a command, ~4.5% of a CPU budget that is not the binding constraint. Small, not wrong |
+| **0** | **§31 apply §23's threshold per block, not per run** | **an hour** | **a 3.2× regression on mixed pipelined traffic, shipped in §27** |
 | 9 | `read_header`'s framing walk | a day | ~67 ns a `GET`. **Price it first** — the same arithmetic that shelved §29 likely applies |
 | 10 | profile the pipelined read against memcached | a day | what is left of the 1.34× once 8 and 9 are in |
 
@@ -2873,3 +2874,99 @@ them and they are worth taking together rather than singly.
 fused arm it is measured against. The gap between the two is now standing
 evidence rather than something to re-derive, and the next person to reach for
 this proposal gets the number before the week.
+
+---
+
+## 31. §23's threshold is applied to the run, and a hop is paid per block
+
+**Status: a regression, introduced by §27, found by the fourth measurement.
+3.2× on mixed pipelined traffic. The fix is a one-line change of granularity.**
+
+[benchmarks.md](benchmarks.md#the-row-that-is-a-defect-not-a-result) measures
+the same binary 3.2× apart on the 1:9 pipelined workload, with `resident_mode`
+the only difference:
+
+| 1:9 pipelined | ops/s | spread |
+|---|---:|---:|
+| `vash` — `resident_mode` on, the default | **179,079** | 69% |
+| `vash-memcache` | 174,182 | 94% |
+| `vash-relaxed` | 222,570 | 89% |
+| `vash-pooled` — `resident_mode` off | **579,306** | 22% |
+
+### What went wrong
+
+A mixed block is split into runs so each can take the tier that suits it, and
+the split is undone when it would not pay:
+
+```rust
+if !state.inline_reads() && runs.len() > 1 { /* collapse to one run */ }
+```
+
+That guard is §14's, and it is there because a mixed block fragmenting into
+several hops instead of one cost a 1:9 pipelined workload **147,180 → 85,521**.
+It was correct when `inline_reads` was off by default, because then a read run
+had nowhere better to go and splitting bought nothing.
+
+**§27 made `resident_mode` the default, which turns `inline_reads` on, which
+skips the collapse.** The fragmentation §14 removed came back, and nothing in
+§27's own measurements would have caught it: they were pure-read and pure-write
+workloads, where a block is one run and there is nothing to fragment.
+
+### The deeper error, which is §23's
+
+§23's argument is that **a hop is paid once per block**, so one command in a
+block pays all of it and sixteen pay a sixteenth each. That is correct, and the
+implementation then applied the threshold to the **run**:
+
+```rust
+let inline = worth_inlining(runs[index].kind, runs[index].count, ...);
+```
+
+In a uniform block the two are the same thing and the sweep that chose the
+threshold used uniform blocks, so nothing disagreed. In a mixed block they are
+not: sixteen commands at 1:9 split into short read runs of four or fewer, each
+of which qualifies to be inlined — so a block that should take **one** pooled
+hop takes several inline segments instead, and pays the fragmentation §14
+measured.
+
+### The fix
+
+Decide at block granularity, which is where §23's own reasoning placed it: a
+read run goes inline only when the **whole block** is within the threshold.
+
+```rust
+let inline = worth_inlining(runs[index].kind, measured_commands, ...);
+```
+
+It preserves both of §23's results and removes the regression:
+
+| | block | today | with the fix |
+|---|---|---|---|
+| closed loop | 1 command | inline ✓ | inline ✓ — 241,960 kept |
+| pipelined pure reads | ~15 commands, one run | pooled ✓ | pooled ✓ — 834,427 kept |
+| pipelined mixed | ~15 commands, many runs | **fragmented ✗** | one pooled hop — ~579,306 |
+
+**Acceptance criterion**: the 1:9 pipelined row reaches `vash-pooled`'s figure
+with `resident_mode` on, and the closed-loop and pure-read rows do not move.
+All three are in the fourth measurement, so this is measurable against numbers
+that already exist.
+
+### Until it lands
+
+**A deployment serving mixed pipelined traffic should set
+`store.resident_mode = false`.** That is the `vash-pooled` row, and it gives up
+2.9× on closed-loop reads to avoid 3.2× on mixed pipelined ones — which is the
+right trade only for that traffic shape, and is why the fix matters rather than
+the workaround.
+
+### What this says about §27
+
+§27 turned the setting on against four criteria and a measured 2.9×, and the
+reasoning still holds for the workloads it measured. What it did not do was
+measure a **mixed** workload, and the one guard in the codebase that depends on
+`inline_reads` being off is exactly the one a mixed workload exercises.
+
+The lesson is narrow and worth keeping: a flag that gates behaviour elsewhere
+cannot be defaulted on against measurements that never reach the other site.
+`grep` for the flag before changing its default — there was one other use, and
+it was the one that mattered.

@@ -10,7 +10,14 @@ quoting anything here. The short version: one laptop, one container host, 20
 seconds per run, the whole matrix run twice. These are orders of magnitude, not
 measurements.
 
-**The matrix has since been re-run on a dedicated server, and the read lead below
+**The current measurement is
+[the fourth](#the-fourth-measurement-a-protocol-that-survives-what-the-third-one-taught)**,
+and it is the one to quote: a fresh server per run, repopulated, hits verified,
+and every row carrying its own spread and sample count. The three rounds before
+it are kept as the record of how it got there, each with its corrections
+attached.
+
+**The matrix was re-run on a dedicated server, and the read lead below
 did not survive it.** The write ratios did, almost exactly. Read
 [The third measurement](#the-third-measurement-a-dedicated-server-and-a-read-lead-that-did-not-survive)
 before quoting any read figure from the laptop tables — it is the one that ran on
@@ -416,10 +423,11 @@ times behind" claim, on hardware that removes its most-cited excuse.
 > `vash-resident` is unaffected, serving reads inline and never growing the pool,
 > so its 608,662 stands. See
 > [performance-proposals.md §23](performance-proposals.md#23-implemented-a-read-is-routed-by-the-size-of-its-block).
-> **The tables are left as measured**; correcting them means re-running the
-> matrix under a protocol that restarts between workloads *and* repopulates —
-> restarting alone empties Redis and memcached, which serve misses afterwards and
-> read 1.36M and 2.31M for the wrong reason. That re-run has not been done.
+> **The tables are left as measured.** The re-run that corrects them has since
+> been done — see
+> [The fourth measurement](#the-fourth-measurement-a-protocol-that-survives-what-the-third-one-taught),
+> where the same configuration reads 834,427 rather than 582,170 and leads
+> Redis rather than trailing it.
 
 ### The populate pass
 
@@ -529,6 +537,163 @@ can write to it — the same failure the [Dockerfile](../Dockerfile) warns about
 for volumes.
 
 ---
+
+---
+
+## The fourth measurement: a protocol that survives what the third one taught
+
+The third measurement's tables were published with two corrections attached and
+a third owed: its pipelined rows were depressed ~27% by the protocol itself,
+and the re-run that would fix them was recorded as not done. This is that
+re-run, on **2026-10-15**, vash at `dbe7e2e`, on an EC2 `c6id.2xlarge` with the
+data on the instance-store NVMe and the same core split — server `0,1,4,5`,
+client `2,3,6,7`.
+
+### Five changes to the protocol, each from something that went wrong
+
+1. **A fresh server per run, not per target.** The old protocol ran six
+   workloads against one server, so a closed-loop run left ~90 blocking threads
+   alive and the pipelined run after it measured 553,000 against 836,000 on a
+   server that had served nothing else. Redis and memcached have no such pool,
+   so that bias was vash's alone.
+2. **Repopulated after every restart.** Restarting alone empties Redis and
+   memcached — persistence is off by design — and an earlier attempt at this
+   had them "winning" at 1.36M and 2.31M while serving an empty keyspace.
+3. **Hits checked on every read run**, and a miss-serving run discarded rather
+   than reported.
+4. **Seven samples on vash's pipelined rows**, three elsewhere. That row is
+   bimodal between roughly 550,000 and 860,000, and five samples disagreed with
+   five in the third measurement — 766,970 against 579,794.
+5. **The resident targets wait for the data to be warm**, not for the flag.
+   `vash_inline_reads` turns yes moments after startup while the store is still
+   empty and locking nothing trivially succeeds; waiting on it alone began each
+   run before the populated data was resident and served the first seconds at
+   the pooled rate. That cost closed-loop `GET` 214,034 against the 241,960
+   below. `warmed_bytes >= high_water_bytes` is no better — both read 32,768 on
+   an empty store — so the mark is captured *after* populating and waited for
+   by value.
+
+**Every row carries its own spread and sample count.** A median over a bimodal
+distribution mostly reports which mode won, and a reader is entitled to see
+which rows that applies to.
+
+### The target list changed with the default
+
+`resident_mode` is on by default since §27, so `vash` **is** the resident
+configuration and the old `vash-resident` row is gone. In its place is
+**`vash-pooled`** — `resident_mode = false`, which is what the shipped default
+used to be, and now the more informative contrast.
+
+### Closed loop — one request in flight per connection, 100 connections
+
+| Workload | Target | ops/s | avg ms | p50 | p99 | p99.9 | spread | n |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| SET only | vash | 102,742 | 0.97 | 0.93 | 2.14 | 5.50 | 2% | 3 |
+| SET only | vash-memcache | 83,287 | 1.20 | 1.15 | 2.51 | 6.01 | 8% | 3 |
+| SET only | vash-pooled | 105,721 | 0.95 | 0.90 | 2.04 | 5.25 | 4% | 3 |
+| SET only | vash-relaxed | 43,582 | 2.29 | 2.22 | 2.98 | 4.16 | 1% | 3 |
+| SET only | redis | 139,787 | 0.72 | 0.69 | 1.38 | 1.71 | 1% | 3 |
+| SET only | **memcached** | **287,554** | 0.35 | 0.32 | 0.53 | 0.66 | 1% | 3 |
+| GET only | **vash** | **241,960** | 0.41 | 0.40 | 0.87 | 1.15 | 8% | 3 |
+| GET only | vash-memcache | 201,151 | 0.50 | 0.46 | 1.12 | 1.52 | 3% | 3 |
+| GET only | vash-pooled | 72,571 | 1.38 | 1.36 | 2.90 | 3.77 | 3% | 3 |
+| GET only | vash-relaxed | 227,578 | 0.44 | 0.42 | 0.92 | 1.21 | 2% | 3 |
+| GET only | redis | 136,151 | 0.73 | 0.71 | 1.43 | 1.80 | 1% | 3 |
+| GET only | **memcached** | **277,977** | 0.36 | 0.34 | 0.54 | 0.61 | 2% | 3 |
+| 1:9 mixed | vash | 182,103 | 0.55 | 0.53 | 1.16 | 2.67 | 1% | 3 |
+| 1:9 mixed | vash-memcache | 175,242 | 0.57 | 0.55 | 1.18 | 2.50 | 2% | 3 |
+| 1:9 mixed | vash-pooled | 80,193 | 1.25 | 1.21 | 2.72 | 3.52 | 17% | 3 |
+| 1:9 mixed | vash-relaxed | 167,744 | 0.60 | 0.57 | 1.41 | 3.92 | 1% | 3 |
+| 1:9 mixed | redis | 136,847 | 0.73 | 0.70 | 1.42 | 1.57 | 1% | 3 |
+| 1:9 mixed | **memcached** | **278,286** | 0.36 | 0.34 | 0.54 | 0.61 | 2% | 3 |
+
+**vash leads Redis on closed-loop reads by 1.78×** — 241,960 against 136,151 —
+and reaches 87% of memcached. On the mixed workload it leads Redis by 1.33×.
+**It trails both on writes**, 102,742 against 139,787 and 287,554, which is
+where this document has had it since the engine was chosen.
+
+**`vash-pooled` is the row that shows what §27 bought**: 72,571 against vash's
+241,960 on the same hardware and the same binary, differing only in whether the
+map is pinned and reads served inline. That is the 2.9× the setting was turned
+on for, reproduced under a protocol built to doubt it.
+
+### Pipelined — 16 requests in flight per connection, 100 connections
+
+| Workload | Target | ops/s | avg ms | p50 | p99 | p99.9 | spread | n |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| SET only | vash | 327,344 | 4.88 | 4.64 | 9.92 | 17.02 | 6% | 7 |
+| SET only | vash-memcache | 263,363 | 6.07 | 5.63 | 13.95 | 18.43 | 1% | 7 |
+| SET only | vash-pooled | 327,537 | 4.88 | 4.64 | 9.86 | 15.62 | 4% | 7 |
+| SET only | vash-relaxed | 72,699 | 22.00 | 22.91 | 36.09 | 38.14 | 1% | 7 |
+| SET only | redis | 862,456 | 1.85 | 1.83 | 2.51 | 4.16 | 2% | 3 |
+| SET only | **memcached** | **1,415,067** | 1.13 | 0.92 | 4.25 | 8.13 | 1% | 3 |
+| GET only | **vash** | **834,427** | 1.91 | 1.81 | 4.74 | 6.88 | **25%** | 7 |
+| GET only | vash-memcache | 529,262 | 3.02 | 2.75 | 8.03 | 10.56 | **43%** | 7 |
+| GET only | vash-pooled | 699,699 | 2.28 | 2.16 | 5.57 | 7.62 | **37%** | 7 |
+| GET only | vash-relaxed | 829,167 | 1.93 | 1.81 | 4.67 | 6.91 | 7% | 7 |
+| GET only | redis | 714,525 | 2.24 | 2.33 | 3.17 | 5.86 | 2% | 3 |
+| GET only | **memcached** | **1,113,769** | 1.43 | 1.33 | 2.06 | 5.15 | 2% | 3 |
+| 1:9 mixed | vash | 179,079 | 8.93 | 8.57 | 19.07 | 27.77 | **69%** | 7 |
+| 1:9 mixed | vash-memcache | 174,182 | 9.18 | 8.96 | 18.82 | 23.30 | **94%** | 7 |
+| 1:9 mixed | **vash-pooled** | **579,306** | 2.76 | 2.62 | 6.37 | 10.30 | 22% | 7 |
+| 1:9 mixed | vash-relaxed | 222,570 | 7.18 | 6.97 | 14.46 | 18.18 | **89%** | 7 |
+| 1:9 mixed | redis | 732,154 | 2.18 | 2.27 | 3.18 | 4.42 | 0% | 3 |
+| 1:9 mixed | **memcached** | **1,178,434** | 1.35 | 1.25 | 1.94 | 3.87 | 1% | 3 |
+
+**vash now leads Redis on pipelined reads too** — 834,427 against 714,525 —
+which the third measurement had backwards at 608,662 against 792,115, because
+its protocol was depressing that row and not Redis's. memcached remains ahead
+at 1,113,769.
+
+**The spread column is doing real work here.** Every vash pipelined read row
+carries 25–43%; every Redis and memcached row carries 0–2%. That asymmetry is
+the subject of
+[performance-proposals.md §30](performance-proposals.md#30-the-pipelined-reads-two-modes-are-latency-not-work),
+which established it is latency rather than work, eliminated six explanations,
+and could not name a seventh.
+
+### The row that is a defect, not a result
+
+**`vash` serves 179,079 on the mixed pipelined workload where `vash-pooled`
+serves 579,306** — the same binary, 3.2× apart, with `resident_mode` the only
+difference. `vash-memcache` and `vash-relaxed` show the same collapse. This is
+a regression and it was introduced by turning `resident_mode` on by default.
+
+The mechanism is in
+[`conn.rs`](../crates/vash-server/src/conn.rs). A mixed block is split into
+runs of reads and writes so each can take the tier that suits it, and the split
+is undone when it would not pay:
+
+```rust
+if !state.inline_reads() && runs.len() > 1 { /* collapse to one run */ }
+```
+
+That guard exists because §14 measured a 1:9 pipelined workload falling from
+147,180 to 85,521 when a mixed block fragmented into several hops instead of
+one. **`resident_mode` being the default turns `inline_reads` on, which skips
+the collapse, which reinstates exactly that fragmentation.**
+
+The deeper error is that §23 applied its threshold to the *run* when a hop is
+paid per *block*. A mixed block of sixteen commands splits into short read runs
+of four or fewer, each of which qualifies to be inlined — so a block that
+should take one pooled hop takes several inline segments instead. The decision
+belongs at block granularity, where §23's own argument placed it.
+
+Proposed, with the fix, in
+[performance-proposals.md §31](performance-proposals.md#31-23s-threshold-is-applied-to-the-run-and-a-hop-is-paid-per-block).
+**Until it lands, a deployment serving mixed pipelined traffic should set
+`store.resident_mode = false`**, which is the `vash-pooled` row above.
+
+### What this does not re-measure
+
+The populate pass has no fourth-measurement row. It is a single-connection load
+phase rather than a workload, the third measurement found it one of the
+steadiest rows on this hardware, and nothing since has touched the write path.
+
+These numbers also come from a different `c6id.2xlarge` than the third
+measurement's, which is worth remembering before reading small differences
+between the two as changes: closed-loop `GET` measured 276,571 there against
+241,960 here on the same configuration, and nothing in between explains 13%.
 
 ## Reading the numbers
 
