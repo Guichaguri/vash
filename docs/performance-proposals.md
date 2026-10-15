@@ -2202,8 +2202,8 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~4~~ | §26 warm in the background, and keep warming | done | **cold start back to the floor** (1,018 ms against 2,935), the pin re-established rather than remembered, and §23's read figures intact |
 | ~~5~~ | §27 turn `resident_mode` on by default | done | **2.7× closed-loop reads on the shipped defaults**, pipelined unchanged, and nothing worse where the lock cannot be had |
 | ~~6~~ | §30 explain the pipelined read's bimodality | closed, unsolved | six hypotheses dead; it is queueing, ~97% of a 2 ms round trip that no component owns. **Change the measurement, not the server** |
-| 7 | §28 commit on the submitting thread when uncontended | a week | the one row vash still loses to Redis that is not structural |
-| 8 | §29 fuse consecutive single-key reads into one transaction | two days | 5–10% of a pipelined read, and it will not close the 1.34× alone |
+| ~~7~~ | §28 commit on the submitting thread when uncontended | **dropped** | priced at 12% before building: 115,432 against Redis's 141,573. Does not clear the row it was for |
+| 8 | §29 fuse consecutive single-key reads into one transaction | two days | 5–10% of a pipelined read, and it will not close the 1.34× alone. **Now the first unbuilt item** |
 | 9 | `read_header`'s framing walk | a day | ~67 ns a `GET`, roughly 5% of one core |
 | 10 | profile the pipelined read against memcached | a day | what is left of the 1.34× once 8 and 9 are in |
 
@@ -2229,6 +2229,13 @@ it. Two pieces of instrumentation shipped out of the attempt —
 **The clocks are deliberately absent.** §21 puts them at 95% of a `GET`'s
 instrumentation, which is ~2% of four cores, and §19 already argued against all
 three obvious fixes on correctness grounds. That argument has not changed.
+
+**And the list has shortened by measurement rather than by work.** §30 closed
+without a culprit and §28 was dropped before a line was written, both because
+the prize was bounded first. What those two share is the finding that at 100
+connections against four vCPUs this server spends ~87% of a write and ~97% of a
+read waiting rather than working — so the items below are 5–12% slices of a
+small remainder, and the honest ceiling on all of them together is modest.
 
 **4 moved above 5.** It was last when the read numbers were hypothetical; now
 they are measured and unreachable on the shipped configuration, which makes the
@@ -2731,3 +2738,71 @@ remove the problem from the benchmark:
 invisible from outside the process — `perf stat -p` attached to nothing and
 `/proc/pid/io` counts `read` but not `recv` — and both are now standing
 instrumentation rather than one-off scaffolding.
+
+---
+
+## 28. Rejected before building: commit on the submitting thread when uncontended
+
+**Status: proposed, priced, and dropped. The prize is 12% and the proposal was
+costed at a week to close a 45% gap.**
+
+The idea was sound in shape. Every write crosses the queue to a writer thread
+and back, and at pipeline 1 the mean batch is small, so group commit has almost
+nothing to batch — the round trip is being paid to reach a writer that is idle.
+When the queue is empty and the write lock is free, take the transaction on the
+calling thread instead.
+
+**It was not measured first, and it should have been.** The whole case rested on
+the writer-queue wait being a large share of a closed-loop write, and that is
+readable from `vash_writer_queue_wait_seconds_total` over
+`vash_committed_ops_total` without writing a line of code.
+
+### The measurement, five fresh servers a row
+
+| | ops/s | round trip | queue wait | batch | commit per record | wait ÷ rtt |
+|---|---:|---:|---:|---:|---:|---:|
+| closed loop | 102,116 | 979 µs | **113 µs** | 4.3 | 10.9 µs | **11.5%** |
+| pipelined 16 | 323,042 | 4,953 µs | 123 µs | 87.9 | 5.3 µs | 2.5% |
+
+**The queue wait is 11.5% of a closed-loop write, not the ~40% §15 implied.**
+That section recorded 0.411 ms at pipeline 1; this host reads 0.113 ms. The
+laptop's figure was WSL2 against a virtual disk, inflated 3.6× like everything
+else measured there.
+
+**So the ceiling on §28 is 12%.** Remove the hop completely and the round trip
+goes 979 µs to 866 µs, which at 100 connections is 115,432 ops/s — against
+Redis's 141,573. **It does not clear the row it was proposed to clear**, and it
+would have cost a week against the single-writer invariant and the ordering
+guarantees, which are the expensive things in this codebase to get wrong.
+
+### What the same table says about where a write actually goes
+
+The commit is 10.9 µs of 979. **Storage is about 13% of a closed-loop write end
+to end** — queue wait and commit together — and the other ~87% is the request
+path: the wake, the read, the parse, the reply, the write.
+
+That is §16's conclusion, now measured on hardware rather than inferred: what is
+left on closed-loop writes is per-request syscalls, and closing it needs batched
+I/O or fewer round trips rather than anything in or around the storage tier.
+
+It is also the same shape §30 found on the read side, where ~97% of the round
+trip was queueing no component owned. **At 100 connections against four vCPUs,
+both halves of this server spend most of a request waiting rather than working**,
+and the components left to optimise are 5–12% slices of the remainder.
+
+### What this changes
+
+**§28 is dropped rather than deferred.** A rewritten version would have to
+target the request path, which is §16's territory and not this one.
+
+**And the 4.3-record batch is worth noticing on its own.** At pipeline 1 the
+commit costs 10.9 µs a record against 5.3 µs at a batch of 88 — the fixed part
+of a commit divided by a small batch. §10 already tried to grow that batch by
+lingering for company and reverted it: the wait costs more than the amortisation
+buys, and the test suite went from 6 seconds to 42 before a governor was added.
+That answer has not changed.
+
+**The method generalises, and is the point of recording this at all.** One
+nine-minute measurement off counters that already existed killed a week of
+work. §30 spent six experiments building instrumentation for a question whose
+prize was never bounded first. Bound the prize, then build.
