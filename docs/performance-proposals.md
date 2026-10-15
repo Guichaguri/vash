@@ -2201,7 +2201,7 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~3~~ | §15 skip the redundant expiry put | done | **−24% commit per record, +25.5% pipelined `SET`** |
 | ~~4~~ | §26 warm in the background, and keep warming | done | **cold start back to the floor** (1,018 ms against 2,935), the pin re-established rather than remembered, and §23's read figures intact |
 | ~~5~~ | §27 turn `resident_mode` on by default | done | **2.7× closed-loop reads on the shipped defaults**, pipelined unchanged, and nothing worse where the lock cannot be had |
-| 6 | §30 explain the pipelined read's bimodality | part done | **latency, not work** — five hypotheses eliminated, one left and a test for it |
+| 6 | §30 explain the pipelined read's bimodality | part done | **latency, not work, and it lives in the hand-off** — closing it needs the hand-off instrumented, not another sweep |
 | 7 | §28 commit on the submitting thread when uncontended | a week | the one row vash still loses to Redis that is not structural |
 | 8 | §29 fuse consecutive single-key reads into one transaction | two days | 5–10% of a pipelined read, and it will not close the 1.34× alone |
 | 9 | `read_header`'s framing walk | a day | ~67 ns a `GET`, roughly 5% of one core |
@@ -2560,7 +2560,88 @@ If the low mode disappears as load rises, the mechanism is parking. If both
 modes survive at every depth, it is not, and the next suspect is the reply
 write path rather than the dispatch one.
 
+That test was run, and it could not settle the question — see below. It did
+localise the variance, which is the more useful half.
+
 **What it would be worth.** Removing the low mode does not raise the ceiling —
 the fast mode is already ~850,000 — but it would move the *median* of this row
 from roughly 800,000 to roughly 850,000 and, far more usefully, make every
 future change on the read path measurable at better than ±35%.
+
+### The load test: parking not confirmed, but the variance is localised
+
+§30 proposed raising the arrival rate until blocks arrive faster than a thread
+can park. Two arms, six fresh servers each.
+
+**The clean arm failed its own premise.** Holding pipeline at 16 and raising
+connections was meant to raise arrival rate with block size fixed. Throughput
+does not rise with connections — it peaks at 100 and falls:
+
+| connections | median | spread | client CPU |
+|---:|---:|---:|---:|
+| 48 | 553,452 | 7.7% | 239% |
+| **100** | **754,350** | **37.6%** | 327% |
+| 200 | 562,506 | 7.4% | 235% |
+| 400 | 496,386 | 10.9% | 218% |
+
+Past 100 connections the server spends more on polling more sockets than it
+gains in parallelism. So the arrival rate never rose and the arm says nothing
+about parking.
+
+**The other arm raises throughput and stays confounded**, as predicted when it
+was written:
+
+| pipeline | median | spread | commands per block | switches per op |
+|---:|---:|---:|---:|---:|
+| 4 | 528,817 | 1.7% | 4.76 | 0.088 |
+| 16 | 772,148 | 18.5% | 18.02 | 0.185 |
+| 64 | 1,154,683 | 4.2% | 53.86 | 0.067 |
+
+The spread does collapse at depth 64 — and hops per command fell 3.4× with it,
+so parking and "fewer hand-offs to be unlucky with" remain indistinguishable.
+The client sat at 396% of its 400% there, so 1,154,683 is the client's ceiling
+and not the server's.
+
+**Parking is therefore neither confirmed nor refuted**, and the test as designed
+cannot settle it: tokio exposes no way to stop its blocking threads parking, so
+the variable cannot be moved on its own.
+
+### What the load test did establish
+
+**The bimodality is localised, not universal.** It appears at roughly pipeline
+16 and roughly 100 connections, and at every other operating point measured the
+spread is 1.7% to 10.9%. That operating point is the one
+[benchmarks.md](benchmarks.md) uses for every pipelined row in this repository,
+which is why this looked like a property of the read path rather than of a
+corner of it.
+
+**And the decisive comparison was already in hand.** From §23's sweep, at the
+same depth, the same connections and the same block size, differing only in
+whether the run takes the hand-off:
+
+| | pipelined `GET` | spread |
+|---|---|---:|
+| always inline — no hand-off | 596,202–606,327 | **1%** |
+| pooled — hand-off per block | 550,000–860,000 | 37% |
+
+**The variance lives in the hand-off**, whatever the mechanism inside it turns
+out to be. That is the same path §22 priced at 18.9 µs and the same one §23
+routes around, so the hand-off is now both the largest cost on the read path
+and the whole of its instability.
+
+### What follows from that
+
+The honest summary is that §30 cannot be closed by measurement from outside.
+What would close it is instrumenting the hand-off itself — timing the interval
+between a block being submitted to the pool and a thread picking it up, and
+reporting its distribution. A bimodal wait there, with a floor at a futex wake,
+would confirm parking; a flat one would send this to the reply write path.
+
+That is a day of work on a tracing span rather than another sweep, and it is
+worth doing before §29, because §29's 5–10% cannot be measured on a row with a
+37% band.
+
+**It also changes what §23 is worth.** Routing small blocks away from the pool
+was costed as a throughput change. On this evidence it is also the only
+configuration that makes the pipelined read *predictable*, and that is the
+larger half of its value.
