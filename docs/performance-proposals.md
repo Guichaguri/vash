@@ -2201,7 +2201,7 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~3~~ | §15 skip the redundant expiry put | done | **−24% commit per record, +25.5% pipelined `SET`** |
 | ~~4~~ | §26 warm in the background, and keep warming | done | **cold start back to the floor** (1,018 ms against 2,935), the pin re-established rather than remembered, and §23's read figures intact |
 | ~~5~~ | §27 turn `resident_mode` on by default | done | **2.7× closed-loop reads on the shipped defaults**, pipelined unchanged, and nothing worse where the lock cannot be had |
-| 6 | §30 explain the pipelined read's bimodality | part done | **latency, not work, and it lives in the hand-off** — closing it needs the hand-off instrumented, not another sweep |
+| ~~6~~ | §30 explain the pipelined read's bimodality | closed, unsolved | six hypotheses dead; it is queueing, ~97% of a 2 ms round trip that no component owns. **Change the measurement, not the server** |
 | 7 | §28 commit on the submitting thread when uncontended | a week | the one row vash still loses to Redis that is not structural |
 | 8 | §29 fuse consecutive single-key reads into one transaction | two days | 5–10% of a pipelined read, and it will not close the 1.34× alone |
 | 9 | `read_header`'s framing walk | a day | ~67 ns a `GET`, roughly 5% of one core |
@@ -2213,11 +2213,18 @@ noise — which is most of them. Until the low mode is explained, 8 and 10 canno
 be evaluated even if they work. It is the cheapest item here and the only one
 that makes the others measurable.
 
-§30 took it as far as establishing the *shape*: the server is waiting, not
-working — its CPU is flat at ~225% across a 1.5× range of throughput, and
-neither side ever reaches its ceiling. Five hypotheses are eliminated with
-measurements, one is left, and the test for it is written down. The counter it
-needed, `vash_socket_reads_total`, shipped with it.
+§30 established the shape and then closed without a culprit. The server is
+waiting rather than working — CPU flat at ~225% across a 1.5× throughput range,
+neither side near its ceiling — and the round trip is 1.8–2.7 ms for a cache
+served from RAM, of which ~97% is queueing that no single component owns. Six
+hypotheses are dead, including the hand-off itself, whose wait is the same ~3%
+of the round trip in both modes.
+
+**So item 6 is answered the other way**: the spread is 1.7–10.9% at every depth
+and connection count except the one the benchmark uses, so quote that row as a
+median of nine or measure it at depth 4 or 64. Items 7 to 10 no longer wait on
+it. Two pieces of instrumentation shipped out of the attempt —
+`vash_socket_reads_total` and `vash_handoff_wait_seconds`.
 
 **The clocks are deliberately absent.** §21 puts them at 95% of a `GET`'s
 instrumentation, which is ~2% of four cores, and §19 already argued against all
@@ -2645,3 +2652,82 @@ worth doing before §29, because §29's 5–10% cannot be measured on a row with
 was costed as a throughput change. On this evidence it is also the only
 configuration that makes the pipelined read *predictable*, and that is the
 larger half of its value.
+
+### The hand-off, instrumented: parking is dead, and so is the hand-off as a cause
+
+`vash_handoff_wait_seconds` times a block from being submitted to the blocking
+pool to the first instruction on the other side. Ten fresh servers at the
+operating point where both modes live:
+
+| ops/s | mean hand-off wait | blocks ≤ 25 µs | blocks > 25 µs |
+|---:|---:|---:|---:|
+| 841,363 | 55.1 µs | 0.0% | 100% |
+| 826,382 | 56.8 µs | 0.0% | 100% |
+| 806,447 | 59.2 µs | 0.0% | 100% |
+| 785,094 | 60.3 µs | 0.0% | 100% |
+| 768,682 | 62.0 µs | 0.0% | 100% |
+| 713,735 | 70.5 µs | 0.0% | 100% |
+| 695,612 | 74.4 µs | 0.0% | 100% |
+| 568,350 | 90.0 µs | 0.0% | 100% |
+| 564,678 | 90.5 µs | 0.0% | 100% |
+| 553,475 | 92.6 µs | 0.0% | 100% |
+
+**Parking is refuted.** A futex wake costs single-digit microseconds. Every
+block waits more than 25 µs and the mean is 55–93 µs, so the pool is not waking
+sleeping threads — blocks are queueing for a slot on four vCPUs that are
+already carrying four runtime workers, the writer threads and each other.
+
+**And the hand-off is not the cause either, which the same table says.** The
+wait tracks throughput monotonically and looks damning until it is put beside
+the round trip it belongs to. At 100 connections each holding one block in
+flight, a block's round trip is `100 ÷ (ops/s ÷ 15)`:
+
+| | round trip | hand-off wait | share |
+|---|---:|---:|---:|
+| fast mode | 1.78 ms | 55.1 µs | 3.1% |
+| slow mode | 2.71 ms | 92.6 µs | 3.4% |
+
+**The same fraction in both.** The wait scales with congestion rather than
+producing it: 37 µs of the 930 µs that separates the modes, which is 4% of the
+difference. This is a thermometer, not the disease.
+
+It also undoes the inference drawn from §23's inline arm. If the hand-off wait
+were the cause, deleting the hand-off should yield the *fast* mode; inline
+instead yields a stable ~600,000, below the pooled path's fast mode of
+~860,000. The hand-off buys parallelism and costs predictability. Its wait is
+not the variable.
+
+### Where this leaves §30, and the recommendation to stop
+
+Six hypotheses are now dead: huge pages, pool size, thread placement, block
+size, work scattered over cold threads, and thread parking. What is known is
+sharper than when this started and is enough to act on:
+
+* **It is latency, not work.** Server CPU is flat at ~225% across a 1.5×
+  throughput range, and neither side ever nears its ceiling.
+* **The round trip is ~1.8–2.7 ms** for a cache serving from RAM, so the system
+  is deeply queue-bound at this operating point: 100 connections contending for
+  four vCPUs, and ~97% of each round trip is queueing that no single component
+  owns.
+* **It is localised.** The spread is 1.7–10.9% at every other depth and
+  connection count measured; 37% belongs to pipeline 16 at 100 connections.
+
+**The recommendation is to stop hunting and change the measurement.** Chasing
+the remaining 96% means accounting for a 2 ms round trip across the socket, the
+runtime's own queues and the scheduler, which is a profiler-and-tracing project
+rather than another sweep, and the prize is removing a low mode whose ceiling —
+~860,000 — is already reached by the fast one. Against that, two cheap things
+remove the problem from the benchmark:
+
+1. **Quote pipelined rows as medians of nine or more**, which is what §27
+   already had to do to tell 579,794 from 827,136.
+2. **Or measure the pipelined row at depth 4 or 64**, where the spread is 1.7%
+   and 4.2%. Depth 64 also reaches 1,154,683 — above memcached's pipeline-16
+   figure, though the client was saturated at 396% of its quota, so that is a
+   floor on vash rather than a comparison.
+
+**What was gained beyond the negative results**: `vash_socket_reads_total` and
+`vash_handoff_wait_seconds` both ship. Block size and hand-off wait were
+invisible from outside the process — `perf stat -p` attached to nothing and
+`/proc/pid/io` counts `read` but not `recv` — and both are now standing
+instrumentation rather than one-off scaffolding.
