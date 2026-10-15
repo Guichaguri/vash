@@ -642,6 +642,16 @@ pub struct OutcomeMetrics {
     /// classic one.
     pub meta_commands: AtomicU64,
     pub bytes_read: AtomicU64,
+    /// Socket reads that returned something — one per `read_buf` that was not
+    /// a disconnect, which is **one per block**.
+    ///
+    /// Against the command counters this is how many commands a client gets
+    /// into one read, which is the quantity the whole dispatch tier turns on:
+    /// a hop is paid per block, so one command in a read pays all of it and
+    /// sixteen pay a sixteenth each (§22, §23). It is also the only way to see
+    /// from outside whether clients are actually pipelining, as opposed to
+    /// asking for a pipeline and having it arrive in pieces.
+    pub socket_reads: AtomicU64,
     pub bytes_written: AtomicU64,
 }
 
@@ -1318,6 +1328,12 @@ pub fn render_prometheus(
         "counter",
         "Bytes read from client sockets.",
         load(&server.outcomes.bytes_read).to_string(),
+    );
+    metric!(
+        "vash_socket_reads_total",
+        "counter",
+        "Socket reads that returned data, one per block. Divided into the          command counters, how many commands a client gets into one read.",
+        load(&server.outcomes.socket_reads).to_string(),
     );
     metric!(
         "vash_network_written_bytes_total",

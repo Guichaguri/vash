@@ -138,13 +138,20 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         if n == 0 {
             return Ok(()); // clean disconnect
         }
-        // One relaxed add per syscall, which is nothing beside the syscall. The
-        // pair is what turns a request rate into a bandwidth figure.
+        // Two relaxed adds per syscall, which is nothing beside the syscall.
+        // The bytes turn a request rate into a bandwidth figure; the count
+        // turns it into a block size, which is what decides what the dispatch
+        // tier below costs — see `socket_reads`.
         state
             .metrics
             .outcomes
             .bytes_read
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .outcomes
+            .socket_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // **No connection may make the server hold unbounded bytes**, and this
         // is the one check that says so without consulting the authentication
