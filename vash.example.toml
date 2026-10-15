@@ -234,16 +234,32 @@ inline_reads = false
 #
 # When the lock is refused — no RLIMIT_MEMLOCK headroom, or a platform where
 # LMDB's mapping cannot be found, which today is everything but Linux — the
-# server says so in the log and keeps the hand-off. The failure mode is the
+# server says so in the log and keeps the hand-off. The failure mode is the old
 # default behaviour, never a stall. `stats settings` reports what happened as
-# vash_map_locked.
+# vash_map_locked, and vash_warmed_bytes against vash_high_water_bytes says how
+# much of the store that answer still covers.
 #
-# It covers what exists at startup. A database that grows while serving has
-# unlocked pages above the mark this locked, so this is for a working set loaded
-# before traffic arrives rather than one that doubles at runtime.
+# ON BY DEFAULT, which it could not be until two things were true. The warm ran
+# at open and cost startup time proportional to the data — ~0.9 s per GiB on
+# NVMe, tens of seconds for a large store. And it settled residency once, so a
+# store that grew past what was locked kept serving reads inline over pages
+# nothing had pinned. Both are gone: the warm is a background loop that keeps
+# checking, cold start measured 1,018 ms against a 1,063 ms floor on a 2.1 GB
+# store, and a store grown past its memlock ceiling now turns inline reads back
+# OFF. See docs/performance-proposals.md §26.
 #
-# Implies prefault, and inherits its startup cost.
-resident_mode = false
+# Worth 2.9x on closed-loop reads — 285,217 against 97,582 — which is the
+# difference between leading both Redis and memcached on that workload and
+# losing to both.
+#
+# What it costs: locked pages cannot be reclaimed. The kernel bounds that
+# itself — mlock fails rather than evicting its way to success, and a failure
+# lands on the path above. Set it false on a host where the cache is a guest
+# among other memory-hungry processes and you would rather the kernel arbitrate.
+#
+# Implies prefault's warming, but not its startup cost: `prefault` below still
+# blocks the open, and is a separate trade asked for by name.
+resident_mode = true
 
 # The largest read run, in commands, still served inline rather than handed to
 # the storage pool. Only consulted when reads are inline at all — with both

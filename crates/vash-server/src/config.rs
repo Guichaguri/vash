@@ -174,17 +174,35 @@ pub struct StoreConfig {
     ///
     /// When the lock is refused — no `RLIMIT_MEMLOCK` headroom, or a platform
     /// where LMDB's mapping cannot be located — the server logs why, leaves
-    /// reads on the storage pool, and carries on. The failure mode is the
-    /// current default, never a stall.
+    /// reads on the storage pool, and carries on. The failure mode is the old
+    /// default, never a stall.
     ///
-    /// **What it does not cover**: pages written after startup. The lock spans
-    /// the map's high-water mark at open, so a database that grows while
-    /// serving has unlocked pages above it. This is a read-mostly setting for a
-    /// working set that is loaded before traffic arrives, which is what a cache
-    /// in front of an origin usually is — it is not a promise about a store that
-    /// doubles in size at runtime.
+    /// **On by default**, which it could not be until two things were true.
+    /// Warming ran at open and cost startup time proportional to the data —
+    /// ~0.9 s per GiB on NVMe, tens of seconds for a large store against
+    /// plan §13's sub-second cold start. And it settled residency once, so a
+    /// store that grew past what was locked went on serving reads inline over
+    /// pages nothing had pinned. §26 made the warm a background loop that keeps
+    /// checking, which removed both: cold start measured 1,018 ms against a
+    /// 1,063 ms floor on a 2.1 GB store, and a store grown past its memlock
+    /// ceiling now turns inline reads back *off* rather than keeping a promise
+    /// it stopped being able to make.
     ///
-    /// Setting `inline_reads` directly still works and still skips the check.
+    /// It is worth 2.9× on closed-loop reads — 285,217 against 97,582 — which
+    /// is the difference between leading both Redis and memcached on that
+    /// workload and losing to both.
+    ///
+    /// **What it costs, and why it is still the right default.** Locked pages
+    /// cannot be reclaimed, so a server whose store is large relative to the
+    /// host is asking the kernel to pin that much. The kernel bounds this
+    /// itself: `mlock` fails rather than evicting its way to success, and a
+    /// failure here lands on the documented path — logged, reads back on the
+    /// pool, no stall. Set this to `false` on a host where the cache is a guest
+    /// among other memory-hungry processes and you would rather the kernel
+    /// arbitrate.
+    ///
+    /// Setting `inline_reads` directly still works, still skips the check, and
+    /// is left alone by the background warmer.
     pub resident_mode: bool,
     /// The largest read run, in commands, that is still served inline.
     ///
@@ -858,7 +876,15 @@ impl Default for StoreConfig {
             write_map: false,
             prefault: false,
             inline_reads: false,
-            resident_mode: false,
+            // **On**, since §26. Both reasons it could not be were measured
+            // away: the warm no longer blocks startup, and residency is
+            // re-established on a timer rather than assumed from open. It is
+            // worth 2.9× on closed-loop reads, and where it cannot be had the
+            // server degrades to exactly what this flag being `false` does.
+            //
+            // `prefault` stays `false` beside it: that one still blocks the
+            // open, and it is a separate trade an operator asks for by name.
+            resident_mode: true,
             // **Swept, not guessed.** On a four-core container, `GET` medians
             // of three fresh servers: closed loop reads 99,936 at `0` and
             // ~283,000 at every value from `1` up, because a closed-loop block
