@@ -2204,7 +2204,7 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~6~~ | §30 explain the pipelined read's bimodality | closed, unsolved | six hypotheses dead; it is queueing, ~97% of a 2 ms round trip that no component owns. **Change the measurement, not the server** |
 | ~~7~~ | §28 commit on the submitting thread when uncontended | **dropped** | priced at 12% before building: 115,432 against Redis's 141,573. Does not clear the row it was for |
 | ~~8~~ | §29 fuse consecutive single-key reads into one transaction | **shelved** | priced at 126 ns a command, ~4.5% of a CPU budget that is not the binding constraint. Small, not wrong |
-| **0** | **§31 apply §23's threshold per block, not per run** | **an hour** | **a 3.2× regression on mixed pipelined traffic, shipped in §27** |
+| ~~0~~ | §31 apply §23's threshold per block, not per run | done | **3.0× recovered** on mixed pipelined traffic; closed loop and pure reads unmoved |
 | 9 | `read_header`'s framing walk | a day | ~67 ns a `GET`. **Price it first** — the same arithmetic that shelved §29 likely applies |
 | 10 | profile the pipelined read against memcached | a day | what is left of the 1.34× once 8 and 9 are in |
 
@@ -2877,10 +2877,10 @@ this proposal gets the number before the week.
 
 ---
 
-## 31. §23's threshold is applied to the run, and a hop is paid per block
+## 31. Implemented: §23's threshold was applied to the run, and a hop is paid per block
 
-**Status: a regression, introduced by §27, found by the fourth measurement.
-3.2× on mixed pipelined traffic. The fix is a one-line change of granularity.**
+**Status: shipped. A regression introduced by §27, found by the fourth
+measurement, 3.0× recovered.**
 
 [benchmarks.md](benchmarks.md#the-row-that-is-a-defect-not-a-result) measures
 the same binary 3.2× apart on the 1:9 pipelined workload, with `resident_mode`
@@ -2950,6 +2950,30 @@ It preserves both of §23's results and removes the regression:
 with `resident_mode` on, and the closed-loop and pure-read rows do not move.
 All three are in the fourth measurement, so this is measurable against numbers
 that already exist.
+
+### Measured, with the two builds interleaved
+
+Across sessions this host moved closed-loop `GET` between 276,571, 241,960 and
+217,452 on one unchanged configuration, so a before-and-after taken hours apart
+cannot separate the change from the box. The two builds were alternated rep by
+rep inside one session instead, with the order flipped each rep so neither arm
+systematically went first.
+
+| | before | after | |
+|---|---:|---:|---|
+| 1:9 pipelined, median of 7 | 196,202 | **588,445** | **3.0×** |
+| 1:9 pipelined, mean | 266,988 | 538,559 | 2.0× |
+| closed-loop `GET`, median of 7 | 222,544 | 219,394 | −1.4%, within noise |
+| pipelined `GET` (full matrix) | 834,427 | 838,074 | unchanged |
+
+**All three criteria met.** 588,445 is above the 581,197 the same workload
+reaches with `resident_mode` off, so it is full recovery rather than partial.
+Closed-loop `GET` is unchanged, which the code predicts — a one-command block
+takes the identical branch — and both arms read ~220,000 in this session where
+the matrix runs hours apart read 241,960 and 217,452.
+
+**The interleaving is the finding to keep.** Taken across sessions, this change
+would have read as a 10% closed-loop regression it did not cause.
 
 ### Until it lands
 

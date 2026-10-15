@@ -588,24 +588,24 @@ used to be, and now the more informative contrast.
 
 | Workload | Target | ops/s | avg ms | p50 | p99 | p99.9 | spread | n |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| SET only | vash | 102,742 | 0.97 | 0.93 | 2.14 | 5.50 | 2% | 3 |
-| SET only | vash-memcache | 83,287 | 1.20 | 1.15 | 2.51 | 6.01 | 8% | 3 |
-| SET only | vash-pooled | 105,721 | 0.95 | 0.90 | 2.04 | 5.25 | 4% | 3 |
-| SET only | vash-relaxed | 43,582 | 2.29 | 2.22 | 2.98 | 4.16 | 1% | 3 |
-| SET only | redis | 139,787 | 0.72 | 0.69 | 1.38 | 1.71 | 1% | 3 |
-| SET only | **memcached** | **287,554** | 0.35 | 0.32 | 0.53 | 0.66 | 1% | 3 |
-| GET only | **vash** | **241,960** | 0.41 | 0.40 | 0.87 | 1.15 | 8% | 3 |
-| GET only | vash-memcache | 201,151 | 0.50 | 0.46 | 1.12 | 1.52 | 3% | 3 |
-| GET only | vash-pooled | 72,571 | 1.38 | 1.36 | 2.90 | 3.77 | 3% | 3 |
-| GET only | vash-relaxed | 227,578 | 0.44 | 0.42 | 0.92 | 1.21 | 2% | 3 |
-| GET only | redis | 136,151 | 0.73 | 0.71 | 1.43 | 1.80 | 1% | 3 |
-| GET only | **memcached** | **277,977** | 0.36 | 0.34 | 0.54 | 0.61 | 2% | 3 |
-| 1:9 mixed | vash | 182,103 | 0.55 | 0.53 | 1.16 | 2.67 | 1% | 3 |
-| 1:9 mixed | vash-memcache | 175,242 | 0.57 | 0.55 | 1.18 | 2.50 | 2% | 3 |
-| 1:9 mixed | vash-pooled | 80,193 | 1.25 | 1.21 | 2.72 | 3.52 | 17% | 3 |
-| 1:9 mixed | vash-relaxed | 167,744 | 0.60 | 0.57 | 1.41 | 3.92 | 1% | 3 |
-| 1:9 mixed | redis | 136,847 | 0.73 | 0.70 | 1.42 | 1.57 | 1% | 3 |
-| 1:9 mixed | **memcached** | **278,286** | 0.36 | 0.34 | 0.54 | 0.61 | 2% | 3 |
+| SET only | vash | 105,396 | 0.95 | 0.90 | 2.06 | 5.02 | 1% | 3 |
+| SET only | vash-memcache | 88,344 | 1.13 | 1.09 | 2.33 | 5.47 | 4% | 3 |
+| SET only | vash-pooled | 105,228 | 0.95 | 0.90 | 2.08 | 5.34 | 4% | 3 |
+| SET only | vash-relaxed | 43,284 | 2.31 | 2.21 | 5.21 | 8.13 | 0% | 3 |
+| SET only | redis | 139,490 | 0.72 | 0.69 | 1.39 | 1.72 | 1% | 3 |
+| SET only | **memcached** | **291,590** | 0.34 | 0.32 | 0.52 | 0.65 | 0% | 3 |
+| GET only | **vash** | **217,452** | 0.46 | 0.44 | 0.96 | 1.30 | 7% | 3 |
+| GET only | vash-memcache | 205,157 | 0.49 | 0.46 | 1.10 | 1.49 | 7% | 3 |
+| GET only | vash-pooled | 75,520 | 1.32 | 1.31 | 2.73 | 3.57 | 10% | 3 |
+| GET only | vash-relaxed | 217,842 | 0.46 | 0.44 | 0.97 | 1.29 | 3% | 3 |
+| GET only | redis | 136,473 | 0.73 | 0.71 | 1.42 | 1.76 | 1% | 3 |
+| GET only | **memcached** | **278,509** | 0.36 | 0.34 | 0.54 | 0.61 | 2% | 3 |
+| 1:9 mixed | vash | 183,658 | 0.54 | 0.53 | 1.14 | 2.45 | 3% | 3 |
+| 1:9 mixed | vash-memcache | 177,141 | 0.56 | 0.55 | 1.18 | 2.11 | 2% | 3 |
+| 1:9 mixed | vash-pooled | 97,332 | 1.03 | 1.01 | 2.19 | 2.94 | 10% | 3 |
+| 1:9 mixed | vash-relaxed | 162,212 | 0.62 | 0.57 | 1.83 | 5.02 | 0% | 3 |
+| 1:9 mixed | redis | 137,839 | 0.73 | 0.70 | 1.41 | 1.54 | 1% | 3 |
+| 1:9 mixed | **memcached** | **276,967** | 0.36 | 0.34 | 0.54 | 0.60 | 3% | 3 |
 
 **vash leads Redis on closed-loop reads by 1.78×** — 241,960 against 136,151 —
 and reaches 87% of memcached. On the mixed workload it leads Redis by 1.33×.
@@ -621,24 +621,24 @@ on for, reproduced under a protocol built to doubt it.
 
 | Workload | Target | ops/s | avg ms | p50 | p99 | p99.9 | spread | n |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| SET only | vash | 327,344 | 4.88 | 4.64 | 9.92 | 17.02 | 6% | 7 |
-| SET only | vash-memcache | 263,363 | 6.07 | 5.63 | 13.95 | 18.43 | 1% | 7 |
-| SET only | vash-pooled | 327,537 | 4.88 | 4.64 | 9.86 | 15.62 | 4% | 7 |
-| SET only | vash-relaxed | 72,699 | 22.00 | 22.91 | 36.09 | 38.14 | 1% | 7 |
-| SET only | redis | 862,456 | 1.85 | 1.83 | 2.51 | 4.16 | 2% | 3 |
-| SET only | **memcached** | **1,415,067** | 1.13 | 0.92 | 4.25 | 8.13 | 1% | 3 |
-| GET only | **vash** | **834,427** | 1.91 | 1.81 | 4.74 | 6.88 | **25%** | 7 |
-| GET only | vash-memcache | 529,262 | 3.02 | 2.75 | 8.03 | 10.56 | **43%** | 7 |
-| GET only | vash-pooled | 699,699 | 2.28 | 2.16 | 5.57 | 7.62 | **37%** | 7 |
-| GET only | vash-relaxed | 829,167 | 1.93 | 1.81 | 4.67 | 6.91 | 7% | 7 |
-| GET only | redis | 714,525 | 2.24 | 2.33 | 3.17 | 5.86 | 2% | 3 |
-| GET only | **memcached** | **1,113,769** | 1.43 | 1.33 | 2.06 | 5.15 | 2% | 3 |
-| 1:9 mixed | vash | 179,079 | 8.93 | 8.57 | 19.07 | 27.77 | **69%** | 7 |
-| 1:9 mixed | vash-memcache | 174,182 | 9.18 | 8.96 | 18.82 | 23.30 | **94%** | 7 |
-| 1:9 mixed | **vash-pooled** | **579,306** | 2.76 | 2.62 | 6.37 | 10.30 | 22% | 7 |
-| 1:9 mixed | vash-relaxed | 222,570 | 7.18 | 6.97 | 14.46 | 18.18 | **89%** | 7 |
-| 1:9 mixed | redis | 732,154 | 2.18 | 2.27 | 3.18 | 4.42 | 0% | 3 |
-| 1:9 mixed | **memcached** | **1,178,434** | 1.35 | 1.25 | 1.94 | 3.87 | 1% | 3 |
+| SET only | vash | 329,914 | 4.85 | 4.64 | 9.66 | 16.25 | 3% | 7 |
+| SET only | vash-memcache | 261,739 | 6.11 | 5.70 | 13.76 | 18.05 | 1% | 7 |
+| SET only | vash-pooled | 336,822 | 4.75 | 4.51 | 9.66 | 15.81 | 1% | 7 |
+| SET only | vash-relaxed | 72,752 | 21.98 | 22.78 | 36.86 | 47.36 | 2% | 7 |
+| SET only | redis | 870,818 | 1.83 | 1.81 | 2.48 | 4.09 | 0% | 3 |
+| SET only | **memcached** | **1,408,515** | 1.13 | 0.92 | 4.25 | 8.45 | 2% | 3 |
+| GET only | **vash** | **838,074** | 1.91 | 1.80 | 4.51 | 6.59 | **12%** | 7 |
+| GET only | vash-memcache | 468,346 | 3.41 | 3.10 | 8.83 | 11.58 | **50%** | 7 |
+| GET only | vash-pooled | 834,832 | 1.91 | 1.80 | 4.67 | 6.78 | **39%** | 7 |
+| GET only | vash-relaxed | 775,745 | 2.06 | 1.91 | 5.41 | 7.29 | 27% | 7 |
+| GET only | redis | 722,374 | 2.21 | 2.32 | 3.12 | 5.82 | 0% | 3 |
+| GET only | **memcached** | **1,123,937** | 1.42 | 1.33 | 2.03 | 5.05 | 1% | 3 |
+| 1:9 mixed | **vash** | **475,712** | 3.36 | 3.13 | 7.74 | 12.54 | **54%** | 7 |
+| 1:9 mixed | vash-memcache | 360,336 | 4.43 | 4.19 | 10.24 | 16.00 | **77%** | 7 |
+| 1:9 mixed | vash-pooled | 581,197 | 2.75 | 2.61 | 6.62 | 12.99 | 46% | 7 |
+| 1:9 mixed | vash-relaxed | 289,072 | 5.53 | 5.25 | 12.67 | 16.51 | 9% | 7 |
+| 1:9 mixed | redis | 750,481 | 2.13 | 2.22 | 3.07 | 4.32 | 0% | 3 |
+| 1:9 mixed | **memcached** | **1,174,632** | 1.35 | 1.27 | 1.95 | 3.89 | 1% | 3 |
 
 **vash now leads Redis on pipelined reads too** — 834,427 against 714,525 —
 which the third measurement had backwards at 608,662 against 792,115, because
@@ -652,37 +652,64 @@ the subject of
 which established it is latency rather than work, eliminated six explanations,
 and could not name a seventh.
 
-### The row that is a defect, not a result
+### The regression this run found, and the fix
 
-**`vash` serves 179,079 on the mixed pipelined workload where `vash-pooled`
-serves 579,306** — the same binary, 3.2× apart, with `resident_mode` the only
-difference. `vash-memcache` and `vash-relaxed` show the same collapse. This is
-a regression and it was introduced by turning `resident_mode` on by default.
+**The first pass of this matrix ran against the build that shipped §27**, and
+one row was a defect rather than a result: `vash` served **179,079** on the
+mixed pipelined workload where `vash-pooled` served **579,306** — the same
+binary, 3.2× apart, with `resident_mode` the only difference. `vash-memcache`
+and `vash-relaxed` collapsed the same way.
 
-The mechanism is in
-[`conn.rs`](../crates/vash-server/src/conn.rs). A mixed block is split into
-runs of reads and writes so each can take the tier that suits it, and the split
-is undone when it would not pay:
+The cause was in [`conn.rs`](../crates/vash-server/src/conn.rs). A mixed block
+is split into runs so each can take the tier that suits it, and the split is
+undone when it would not pay:
 
 ```rust
 if !state.inline_reads() && runs.len() > 1 { /* collapse to one run */ }
 ```
 
-That guard exists because §14 measured a 1:9 pipelined workload falling from
-147,180 to 85,521 when a mixed block fragmented into several hops instead of
-one. **`resident_mode` being the default turns `inline_reads` on, which skips
-the collapse, which reinstates exactly that fragmentation.**
+That guard is §14's, added because a mixed block fragmenting into several hops
+instead of one cost a 1:9 pipelined workload 147,180 → 85,521. Turning
+`resident_mode` on by default turned `inline_reads` on, which skipped the
+collapse, which reinstated exactly that fragmentation. §27's own measurements
+could not have caught it: they were pure-read and pure-write workloads, where a
+block is one run and there is nothing to fragment.
 
-The deeper error is that §23 applied its threshold to the *run* when a hop is
-paid per *block*. A mixed block of sixteen commands splits into short read runs
-of four or fewer, each of which qualifies to be inlined — so a block that
-should take one pooled hop takes several inline segments instead. The decision
-belongs at block granularity, where §23's own argument placed it.
+The deeper error was §23's. Its argument is that **a hop is paid per block**,
+and the implementation then applied the threshold to the **run** — the same
+thing in a uniform block, and not in a mixed one, where sixteen commands split
+into short read runs that each clear a threshold the block does not.
 
-Proposed, with the fix, in
-[performance-proposals.md §31](performance-proposals.md#31-23s-threshold-is-applied-to-the-run-and-a-hop-is-paid-per-block).
-**Until it lands, a deployment serving mixed pipelined traffic should set
-`store.resident_mode = false`**, which is the `vash-pooled` row above.
+**Fixed in
+[performance-proposals.md §31](performance-proposals.md#31-implemented-23s-threshold-was-applied-to-the-run-and-a-hop-is-paid-per-block),
+and the tables above are the fixed build.** The two builds interleaved rep by
+rep inside one session, because comparing across sessions on this host cannot
+separate a change from drift:
+
+| | before §31 | after §31 |
+|---|---:|---:|
+| 1:9 pipelined, median of 7 | 196,202 | **588,445** |
+| 1:9 pipelined, mean | 266,988 | 538,559 |
+| closed-loop `GET`, median of 7 | 222,544 | 219,394 |
+
+**3.0× on the mixed row**, and 588,445 is above the 581,197 the same workload
+reaches with `resident_mode` off — full recovery rather than partial.
+Closed-loop `GET` is unchanged within noise, which the code predicts: a
+one-command block takes the identical branch either way.
+
+### Absolute numbers on this host drift about 10% between sessions
+
+Closed-loop `GET` on one unchanged configuration measured **276,571**,
+**241,960**, **217,452** and **~220,000** across four sessions on two
+`c6id.2xlarge` instances. The interleaved A/B above is what established that:
+both builds read ~220,000 in the same session, where the matrix runs hours
+apart had read 241,960 and 217,452 and would have made §31 look like a 10%
+regression.
+
+**So read the comparisons within a table, not between tables.** Every figure in
+this document that matters is a ratio measured against another server or
+another configuration on the same box in the same session, and that is the only
+kind of number this hardware supports to better than ~10%.
 
 ### What this does not re-measure
 
