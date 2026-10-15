@@ -2138,12 +2138,21 @@ its second half explains went with it — §23's pipelined minimum is 824,036
 against a median of 844,662, where the pooled path still swings 570,000 to
 850,000.
 
-**The one thing standing between this and the shipped defaults is §26.** Every
-read figure above needs `resident_mode`, and out of the box vash does 97,582
-closed-loop reads against Redis's 141,573 and memcached's 279,920 — it loses to
-both, on the configuration almost everyone runs. The gap between what this
-document measures and what the server does is now larger than any gap left
-between vash and either competitor.
+**The one thing standing between this and the shipped defaults is now a
+one-line change.** Every read figure above needs `resident_mode`, and out of the
+box vash does 97,582 closed-loop reads against Redis's 141,573 and memcached's
+279,920 — it loses to both, on the configuration almost everyone runs. The gap
+between what this document measures and what the server does is larger than any
+gap left between vash and either competitor.
+
+**Both reasons it was off are gone.** §26 shipped and was measured against its
+own four criteria: cold start is back to the floor — 1,018 ms against the 2,935
+warming at open cost, on a 2.1 GB store — and the pin is re-established on a
+timer rather than remembered from startup, including being *withdrawn* when a
+store outgrows what can be locked. What is left is the decision itself, which is
+deliberately a separate change: turning it on means every server tries to
+`mlock` its map, and that deserves its own measurement rather than arriving as a
+side effect of the mechanism that made it safe.
 
 **And the reason it is off by default is not the one stated above.** This was
 written as though safety were the blocker, which §24 found. It is not what
@@ -2181,8 +2190,9 @@ writes**, and no amount of tuning converts the second half into the first.
 | ~~1~~ | §23 route a read by block size | done | **2.9× closed-loop reads and +40% pipelined, together** — and the spread went with it | 
 | ~~2~~ | §24 (1), report the residency the bet rests on | done | no throughput; a silent expiry is now a visible one |
 | ~~3~~ | §15 skip the redundant expiry put | done | **−24% commit per record, +25.5% pipelined `SET`** |
-| 4 | §26 warm in the background, and keep warming | a week | removes **both** reasons `resident_mode` is off, and subsumes §24 (2) and (3) |
-| 5 | profile the pipelined read against memcached | a day | decides whether the remaining 1.34× is worth a proposal |
+| ~~4~~ | §26 warm in the background, and keep warming | done | **cold start back to the floor** (1,018 ms against 2,935), the pin re-established rather than remembered, and §23's read figures intact |
+| 5 | turn `resident_mode` on by default | a day | the point of §26, and now the only thing between these figures and the shipped server |
+| 6 | profile the pipelined read against memcached | a day | decides whether the remaining 1.34× is worth a proposal |
 
 **4 moved above 5.** It was last when the read numbers were hypothetical; now
 they are measured and unreachable on the shipped configuration, which makes the
@@ -2191,10 +2201,11 @@ left — and larger than the 1.34× still separating it from memcached.
 
 ---
 
-## 26. Warm in the background, and keep warming
+## 26. Implemented: warm in the background, and keep warming
 
-**Status: proposed. It subsumes §24 (2) and (3), and it is the only thing left
-between this document's read figures and the server as it ships.**
+**Status: shipped, and measured against all four of its own criteria. It
+subsumes §24 (2) and (3). `resident_mode` is still off by default — that is a
+separate change, and the one this unblocks.**
 
 Every read figure in §25 needs `resident_mode`. Out of the box vash serves
 97,582 closed-loop reads against Redis's 141,573 and memcached's 279,920 — it
@@ -2276,3 +2287,67 @@ tries to `mlock` its whole map; the code already degrades gracefully when
 `RLIMIT_MEMLOCK` is short, logging and keeping the hand-off, but it is still a
 behaviour change for deployments that never asked for one. Build the mechanism,
 prove it against the four criteria, then decide the default on its own evidence.
+
+### Measured against all four, and they hold
+
+On the EC2 box, server pinned to two physical cores, data on the instance-store
+NVMe.
+
+**1. Cold start does not regress.** Time from `docker run` to the first answered
+request, page cache dropped before each, on a 2.1 GB store:
+
+| | round 1 | round 2 |
+|---|---:|---:|
+| `resident_mode`, warming at open (before §26) | 2,935 ms | 2,940 ms |
+| **`resident_mode`, warming in the background** | **1,018 ms** | **1,040 ms** |
+| no `resident_mode` — the floor | 1,063 ms | 932 ms |
+
+**§26's arm is indistinguishable from not having the setting at all**, which is
+what the criterion asked for: the gap gone rather than smaller. Warming at open
+costs ~1.9 s on 2.1 GB, or ~0.9 s per GiB — lower than the 2.2–3.7 s per GiB
+[`prefault.rs`](../crates/vash-store/src/prefault.rs) quotes, because that was
+WSL2 against a virtual disk and this is NVMe. On the 10 GB store plan §13 worries
+about, this removes something closer to nine seconds.
+
+**2. The flip happens, and is visible.** `vash_inline_reads` went from `no` to
+`yes` with no restart, and `vash_bytes_warmed` reached `vash_bytes_high_water`
+exactly — 247,451,648 both — rather than standing at whatever the store held when
+it opened.
+
+**3. The flip reverses.** A server given 96 MiB of `RLIMIT_MEMLOCK`, warmed over
+a small store and then grown past that ceiling:
+
+| | `vash_inline_reads` | `vash_map_locked` | warmed | high water |
+|---|---|---|---:|---:|
+| small store | yes | yes | 17,395,712 | 17,395,712 |
+| after growing past the limit | **no** | **no** | 116,092,928 | 116,092,928 |
+
+and the log carries the whole sequence — background warming, the pin
+established, then `the map is no longer fully locked, so reads are back on the
+storage-pool hand-off`. **This is the criterion that distinguishes §26 from a
+mechanism that only flips one way**, which would have passed the other three and
+still been the bug §24 found.
+
+**4. The read figures survive it.** §23's numbers, measured there on a server
+warmed at open, reproduced on one that reached residency in the background:
+
+| | §23 | §26 | |
+|---|---:|---:|---|
+| closed-loop `GET` | 285,217 | 278,951 | −2.2% |
+| pipelined `GET` | 844,662 | 844,090 | −0.07% |
+
+### The first attempt measured its own probe
+
+Recorded because it is the kind of mistake that reads as a result. The first run
+of criterion 1 returned 6,115 ms, 6,011 ms and 6,098 ms for the three arms —
+near-identical, including for the two that should differ most, which is what
+gave it away. The probe sent `version` and then read to EOF with a five-second
+timeout, and the memcached text dialect holds the connection open, so every poll
+cost five seconds and every arm was reporting the timeout rather than the
+server. The store was 236 MB rather than multi-gigabyte on top of that, because
+the populate asked for 10,000 requests instead of 90,000, leaving under a second
+of warming to find.
+
+**Three near-identical numbers across arms that should differ is a harness
+result, not a null result.** Criteria 2, 3 and 4 were unaffected — they assert on
+states rather than durations — which is why they stood while this one was redone.
